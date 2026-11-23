@@ -1,0 +1,228 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "anomaly": {
+      "address": "zoikosuite.ai.anomaly.v1",
+      "messages": {
+        "detected": {
+          "$ref": "#/components/messages/anomaly.detected"
+        }
+      }
+    },
+    "classification": {
+      "address": "zoikosuite.ai.classification.v1",
+      "messages": {
+        "suggested": {
+          "$ref": "#/components/messages/classification.suggested"
+        }
+      }
+    },
+    "document-extraction": {
+      "address": "zoikosuite.ai.document-extraction.v1",
+      "messages": {
+        "completed": {
+          "$ref": "#/components/messages/document-extraction.completed"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "anomaly.detected": {
+        "contentType": "application/json",
+        "description": "Producer: AI/Rules. Primary consumers / intent: Investigation queue. Family: Data, AI & Integrations. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ai.anomaly.detected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Anomaly signal: detected.",
+        "title": "anomaly detected",
+        "x-zoiko-event-type": "com.zoikosuite.ai.anomaly.detected",
+        "x-zoiko-origin": "spec"
+      },
+      "classification.suggested": {
+        "contentType": "application/json",
+        "description": "Producer: AI Classification. Primary consumers / intent: Human/deterministic validation. Family: Data, AI & Integrations. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ai.classification.suggested",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Suggestion: suggested.",
+        "title": "classification suggested",
+        "x-zoiko-event-type": "com.zoikosuite.ai.classification.suggested",
+        "x-zoiko-origin": "spec"
+      },
+      "document-extraction.completed": {
+        "contentType": "application/json",
+        "description": "Producer: AI Extraction. Primary consumers / intent: Human validation/owning workflow. Family: Data, AI & Integrations. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.ai.document-extraction.completed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Extraction result: completed.",
+        "title": "document-extraction completed",
+        "x-zoiko-event-type": "com.zoikosuite.ai.document-extraction.completed",
+        "x-zoiko-origin": "spec"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite ai domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.anomaly": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/anomaly"
+      },
+      "description": "Producer(s): AI/Rules. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/anomaly/messages/detected"
+        }
+      ],
+      "summary": "Publish anomaly facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.classification": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/classification"
+      },
+      "description": "Producer(s): AI Classification. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/classification/messages/suggested"
+        }
+      ],
+      "summary": "Publish classification facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.document-extraction": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/document-extraction"
+      },
+      "description": "Producer(s): AI Extraction. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/document-extraction/messages/completed"
+        }
+      ],
+      "summary": "Publish document-extraction facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

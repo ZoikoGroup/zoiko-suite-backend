@@ -137,16 +137,19 @@ func TestMigration000005_BackfillsLegacyRowsAndReverses(t *testing.T) {
 		_, err = pool.Exec(ctx, string(b))
 		require.NoError(t, err, path)
 	}
-	// Stop at 000004 to write legacy rows; migrations after 000005 are
-	// applied at the end, on top of the legacy data.
+	// Stop at 000004 to write legacy rows; migrations after 000005 (main's
+	// 000006-000011 control plane and this branch's lifecycle/control-totals
+	// migration) are applied at the end, on top of the legacy data, so each
+	// is proven against a database that already holds pre-000005 rows.
 	var up5 string
 	var later []string
 	for _, f := range files {
-		if strings.Contains(filepath.Base(f), "000005_") {
+		base := filepath.Base(f)
+		if strings.Contains(base, "000005_") {
 			up5 = f
 			continue
 		}
-		if filepath.Base(f) > "000005" {
+		if base > "000005" {
 			later = append(later, f)
 			continue
 		}

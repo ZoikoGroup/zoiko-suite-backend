@@ -41,10 +41,14 @@ var (
 	ErrRequestRefused = errors.New("general-ledger-svc refused the request")
 	// ErrInconsistent: the answer does not describe what was asked for.
 	ErrInconsistent = errors.New("general-ledger-svc returned inconsistent ledger entries")
-	// ErrWindowTooLarge: QueryLedger has no cursor and caps a page at 1000
-	// entries, so a full page cannot be told apart from a truncated one. A
-	// partial read could miss the one journal that matches, and "no
-	// candidate" would then be false.
+	// ErrWindowTooLarge: QueryLedger's keyset cursor (general-ledger-svc
+	// A15) is followed to completion, but only up to maxPages worth of
+	// entries — a single cash account's search window realistically never
+	// needs that many, and an unbounded follow loop against a misbehaving
+	// or adversarial upstream would never fail closed, just hang. Beyond
+	// that bound this is still a refusal, not a partial read: "no
+	// candidate" must never be returned for a window this service could not
+	// actually finish reading.
 	ErrWindowTooLarge = errors.New("cash account has too many ledger entries in the search window to read completely")
 	// ErrScopeMissing: no verified tenant or principal to forward.
 	ErrScopeMissing = errors.New("tenant and principal are required to read general-ledger-svc")
@@ -53,7 +57,11 @@ var (
 const (
 	// maxEntries is general-ledger-svc's store.MaxListLimit. It must be asked
 	// for exactly: a larger limit is silently replaced by its default (200).
-	maxEntries       = 1000
+	maxEntries = 1000
+	// maxPages bounds how many maxEntries-sized pages ListCashAccountEntries
+	// follows before failing closed with ErrWindowTooLarge — see that var's
+	// doc comment.
+	maxPages         = 20
 	maxResponseBytes = 16 << 20
 	dateLayout       = "2006-01-02"
 )
@@ -88,11 +96,22 @@ type ledgerEntry struct {
 	CreditAmount    json.Number `json:"credit_amount"`
 	CurrencyCode    string      `json:"currency_code"`
 	TransactionDate string      `json:"transaction_date"`
+	EntrySeq        int64       `json:"entry_seq"`
+}
+
+// ledgerEntryPage is general-ledger-svc's QueryLedger response shape (A15):
+// NextCursor is present exactly when more rows exist past this page.
+type ledgerEntryPage struct {
+	Entries    []ledgerEntry `json:"entries"`
+	NextCursor *int64        `json:"next_cursor"`
 }
 
 // ListCashAccountEntries returns scope.LegalEntityID's FINALIZED ledger
 // entries on accountCode with a transaction_date in [from, to] (YYYY-MM-DD,
-// inclusive). One call per cash account per run, never per line.
+// inclusive). One call per cash account per run normally, never per line —
+// more than one only when the window holds more than maxEntries rows, in
+// which case this follows general-ledger-svc's keyset cursor
+// (after_entry_seq, A15) until it reports no more, up to maxPages.
 func (c *Client) ListCashAccountEntries(ctx context.Context, scope Scope, accountCode, from, to string) ([]domain.LedgerEntry, error) {
 	if scope.TenantID == "" || scope.PrincipalID == "" {
 		return nil, ErrScopeMissing
@@ -106,6 +125,59 @@ func (c *Client) ListCashAccountEntries(ctx context.Context, scope Scope, accoun
 		return nil, fmt.Errorf("window end %q: %w", to, err)
 	}
 
+	out := make([]domain.LedgerEntry, 0, maxEntries)
+	var after *int64
+	for page := 0; ; page++ {
+		if page >= maxPages {
+			return nil, fmt.Errorf("%w: account %s, %s to %s: more than %d pages of %d entries",
+				ErrWindowTooLarge, accountCode, from, to, maxPages, maxEntries)
+		}
+		raw, next, err := c.queryLedgerPage(ctx, scope, accountCode, from, to, after)
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range raw {
+			// Every row is checked against the scope asked for: a filter
+			// silently ignored upstream would otherwise turn into proposals
+			// about another entity's or account's journals.
+			switch {
+			case e.JournalID == "":
+				return nil, fmt.Errorf("%w: entry without journal_id", ErrInconsistent)
+			case e.TenantID != scope.TenantID || e.LegalEntityID != scope.LegalEntityID:
+				return nil, fmt.Errorf("%w: journal %s is outside the requested tenant and legal entity", ErrInconsistent, e.JournalID)
+			case e.AccountCode != accountCode:
+				return nil, fmt.Errorf("%w: journal %s entry is on account %s, asked for %s", ErrInconsistent, e.JournalID, e.AccountCode, accountCode)
+			}
+			date, err := time.Parse(dateLayout, e.TransactionDate)
+			if err != nil || date.Before(fromDate) || date.After(toDate) {
+				return nil, fmt.Errorf("%w: journal %s transaction_date %q is outside %s to %s", ErrInconsistent, e.JournalID, e.TransactionDate, from, to)
+			}
+			debit, err := exactAmount(e.DebitAmount)
+			if err != nil {
+				return nil, fmt.Errorf("%w: journal %s debit_amount: %v", ErrInconsistent, e.JournalID, err)
+			}
+			credit, err := exactAmount(e.CreditAmount)
+			if err != nil {
+				return nil, fmt.Errorf("%w: journal %s credit_amount: %v", ErrInconsistent, e.JournalID, err)
+			}
+			out = append(out, domain.LedgerEntry{
+				JournalID: e.JournalID, TenantID: e.TenantID, LegalEntityID: e.LegalEntityID,
+				AccountCode: e.AccountCode, CurrencyCode: e.CurrencyCode, TransactionDate: e.TransactionDate,
+				Debit: debit, Credit: credit,
+			})
+		}
+		if next == nil {
+			return out, nil
+		}
+		after = next
+	}
+}
+
+// queryLedgerPage makes one GET /v1/ledger/entries call and returns its raw
+// entries and next_cursor, unvalidated — ListCashAccountEntries checks every
+// row against the requested scope/window across every page, not just the
+// first.
+func (c *Client) queryLedgerPage(ctx context.Context, scope Scope, accountCode, from, to string, after *int64) ([]ledgerEntry, *int64, error) {
 	q := url.Values{
 		"legal_entity_id":       {scope.LegalEntityID},
 		"account_code":          {accountCode},
@@ -114,72 +186,40 @@ func (c *Client) ListCashAccountEntries(ctx context.Context, scope Scope, accoun
 		"journal_status":        {"FINALIZED"},
 		"limit":                 {strconv.Itoa(maxEntries)},
 	}
+	if after != nil {
+		q.Set("after_entry_seq", strconv.FormatInt(*after, 10))
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/ledger/entries?"+q.Encode(), nil)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrServiceUnavailable, err)
+		return nil, nil, fmt.Errorf("%w: %v", ErrServiceUnavailable, err)
 	}
 	setEnvelopeHeaders(ctx, req, scope)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		c.logger.Error("general-ledger-svc unreachable — failing closed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", ErrServiceUnavailable, err)
+		return nil, nil, fmt.Errorf("%w: %v", ErrServiceUnavailable, err)
 	}
 	defer resp.Body.Close()
 	switch {
 	case resp.StatusCode == http.StatusOK:
 	case resp.StatusCode >= 500:
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
-		return nil, fmt.Errorf("%w: HTTP %d", ErrServiceUnavailable, resp.StatusCode)
+		return nil, nil, fmt.Errorf("%w: HTTP %d", ErrServiceUnavailable, resp.StatusCode)
 	default:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		c.logger.Error("general-ledger-svc refused the ledger read",
 			zap.Int("status", resp.StatusCode), zap.ByteString("body", body))
-		return nil, fmt.Errorf("%w: HTTP %d", ErrRequestRefused, resp.StatusCode)
+		return nil, nil, fmt.Errorf("%w: HTTP %d", ErrRequestRefused, resp.StatusCode)
 	}
 
 	dec := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes))
 	dec.UseNumber()
-	var raw []ledgerEntry
-	if err := dec.Decode(&raw); err != nil {
-		return nil, fmt.Errorf("%w: unreadable body: %v", ErrInconsistent, err)
+	var page ledgerEntryPage
+	if err := dec.Decode(&page); err != nil {
+		return nil, nil, fmt.Errorf("%w: unreadable body: %v", ErrInconsistent, err)
 	}
-	if len(raw) >= maxEntries {
-		return nil, fmt.Errorf("%w: account %s, %s to %s: %d or more entries", ErrWindowTooLarge, accountCode, from, to, maxEntries)
-	}
-
-	out := make([]domain.LedgerEntry, 0, len(raw))
-	for _, e := range raw {
-		// Every row is checked against the scope asked for: a filter
-		// silently ignored upstream would otherwise turn into proposals
-		// about another entity's or account's journals.
-		switch {
-		case e.JournalID == "":
-			return nil, fmt.Errorf("%w: entry without journal_id", ErrInconsistent)
-		case e.TenantID != scope.TenantID || e.LegalEntityID != scope.LegalEntityID:
-			return nil, fmt.Errorf("%w: journal %s is outside the requested tenant and legal entity", ErrInconsistent, e.JournalID)
-		case e.AccountCode != accountCode:
-			return nil, fmt.Errorf("%w: journal %s entry is on account %s, asked for %s", ErrInconsistent, e.JournalID, e.AccountCode, accountCode)
-		}
-		date, err := time.Parse(dateLayout, e.TransactionDate)
-		if err != nil || date.Before(fromDate) || date.After(toDate) {
-			return nil, fmt.Errorf("%w: journal %s transaction_date %q is outside %s to %s", ErrInconsistent, e.JournalID, e.TransactionDate, from, to)
-		}
-		debit, err := exactAmount(e.DebitAmount)
-		if err != nil {
-			return nil, fmt.Errorf("%w: journal %s debit_amount: %v", ErrInconsistent, e.JournalID, err)
-		}
-		credit, err := exactAmount(e.CreditAmount)
-		if err != nil {
-			return nil, fmt.Errorf("%w: journal %s credit_amount: %v", ErrInconsistent, e.JournalID, err)
-		}
-		out = append(out, domain.LedgerEntry{
-			JournalID: e.JournalID, TenantID: e.TenantID, LegalEntityID: e.LegalEntityID,
-			AccountCode: e.AccountCode, CurrencyCode: e.CurrencyCode, TransactionDate: e.TransactionDate,
-			Debit: debit, Credit: credit,
-		})
-	}
-	return out, nil
+	return page.Entries, page.NextCursor, nil
 }
 
 // exactAmount parses a ledger amount without going through float64. An

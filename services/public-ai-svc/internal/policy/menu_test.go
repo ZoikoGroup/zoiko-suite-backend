@@ -62,3 +62,11 @@ func TestEveryIntentHasADefaultCTA(t *testing.T) {
 		}
 	}
 }
+
+func TestTopicChipsClassifyToTheirIntent(t *testing.T) {
+	for intent, c := range topicChips {
+		if d := Classify(c.Message); d.Exception != "" || d.Primary != intent {
+			t.Errorf("%s chip %q classifies to %s/%s", intent, c.Message, d.Exception, d.Primary)
+		}
+	}
+}

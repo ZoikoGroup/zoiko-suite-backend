@@ -39,10 +39,9 @@ func approvedAllocationRule(t *testing.T, ctx context.Context, s *store.PgStore,
 	if _, err := s.CreateAllocationRule(ctx, rule, "key-"+rule.RuleVersionID, testRequestHash); err != nil {
 		t.Fatalf("CreateAllocationRule: %v", err)
 	}
-	if err := s.ApproveAllocationRule(ctx, rule.RuleVersionID, "approver-1", time.Now().UTC()); err != nil {
+	if _, err := s.ApproveAllocationRule(ctx, rule, "approver-1", uuid.NewString(), testRequestHash, time.Now().UTC()); err != nil {
 		t.Fatalf("ApproveAllocationRule: %v", err)
 	}
-	rule.Status = domain.AllocationRuleStatusApproved
 	return rule
 }
 
@@ -65,7 +64,7 @@ func TestPgStore_ACC09_SupersedeAllocationRule_RealDB(t *testing.T) {
 		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
 	}
 	now := time.Now().UTC()
-	if err := s.SupersedeAllocationRule(ctx, original.RuleID, newVersion, now); err != nil {
+	if _, err := s.SupersedeAllocationRule(ctx, original.RuleID, newVersion, now, uuid.NewString(), testRequestHash); err != nil {
 		t.Fatalf("SupersedeAllocationRule: %v", err)
 	}
 	if newVersion.Version != 2 {
@@ -120,7 +119,7 @@ func TestPgStore_ACC09_SupersedeAllocationRule_NoCurrentVersion_Refused(t *testi
 		Drivers:   []domain.AllocationDriver{{RecipientAccountCode: "6100-Sales", WeightPercentage: 100}},
 		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
 	}
-	err := s.SupersedeAllocationRule(ctx, ruleID, newVersion, time.Now().UTC())
+	_, err := s.SupersedeAllocationRule(ctx, ruleID, newVersion, time.Now().UTC(), uuid.NewString(), testRequestHash)
 	if err == nil {
 		t.Fatal("expected SupersedeAllocationRule to refuse a rule whose current version is still DRAFT")
 	}

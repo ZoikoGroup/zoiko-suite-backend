@@ -12,7 +12,7 @@ import (
 )
 
 type postingEventLine struct {
-	AccountCode  string  `json:"account_code"`
+	MappingKey   string  `json:"mapping_key"`
 	DebitAmount  float64 `json:"debit_amount,omitempty"`
 	CreditAmount float64 `json:"credit_amount,omitempty"`
 }
@@ -35,7 +35,7 @@ type postingExecutionResponse struct {
 // asset-management-svc's and inventory-management-svc's own
 // clients.LedgerLine.
 type LedgerLine struct {
-	AccountCode  string
+	MappingKey   string // ACC-02 mapping key, resolved to an account by the ledger
 	DebitAmount  float64
 	CreditAmount float64
 }
@@ -52,7 +52,7 @@ func (c *Clients) PostRecognitionAccountingEvent(ctx context.Context, tenantID, 
 		SourceEventID: sourceEventID, CorrelationID: correlationID,
 	}
 	for _, l := range lines {
-		body.Lines = append(body.Lines, postingEventLine{AccountCode: l.AccountCode, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount})
+		body.Lines = append(body.Lines, postingEventLine{MappingKey: l.MappingKey, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount})
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {

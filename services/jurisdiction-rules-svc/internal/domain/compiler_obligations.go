@@ -34,7 +34,11 @@ func (c CompileCalendar) moduleMap() map[string]any {
 	hs := append([]Holiday(nil), c.Holidays...)
 	sort.Slice(hs, func(a, b int) bool { return hs[a].Date < hs[b].Date })
 	for _, h := range hs {
-		hol = append(hol, map[string]any{"date": h.Date, "name": h.Name})
+		row := map[string]any{"date": h.Date, "name": h.Name}
+		if h.ObservedDate != "" {
+			row["observed_rule"], row["observed_date"] = h.ObservedRule, h.ObservedDate
+		}
+		hol = append(hol, row)
 	}
 	wk := append([]int{}, c.WeekendDays...)
 	sort.Ints(wk)

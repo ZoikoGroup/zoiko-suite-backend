@@ -113,6 +113,21 @@ func (s *PgStore) enqueueEvent(ctx context.Context, tx pgx.Tx, tenantID, actorID
 	return nil
 }
 
+// enqueueMigrationEvent is enqueueEvent with positional arguments, the form
+// control_plane_store.go (batch ref, crosswalk, certificate, program,
+// extract) calls.
+func (s *PgStore) enqueueMigrationEvent(ctx context.Context, tx pgx.Tx, typeSegment, fact, legacyType, aggregateType, tenantID, legalEntityID, aggregateID, actorID, correlationID string, data any) error {
+	return s.enqueueEvent(ctx, tx, tenantID, actorID, correlationID, migrationEvent{
+		TypeSegment:   typeSegment,
+		Fact:          fact,
+		LegacyType:    legacyType,
+		AggregateType: aggregateType,
+		AggregateID:   aggregateID,
+		LegalEntityID: legalEntityID,
+		Data:          data,
+	})
+}
+
 // isNoRows reports whether err is pgx's "no rows" (a missing or
 // RLS-hidden row).
 func isNoRows(err error) bool {

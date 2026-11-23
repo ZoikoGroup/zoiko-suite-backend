@@ -72,7 +72,7 @@ services:
       - ../services/exception-escalation-svc/deployments/migrations:/migrations/exception-escalation:ro
       - postgres_p5_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U postgres -d postgres"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -98,8 +98,9 @@ services:
 
   contract-lifecycle-svc:
     build:
-      context: ../services/contract-lifecycle-svc
-      dockerfile: Dockerfile
+      # Root context: go.mod replaces zoiko.io/identity-envelope (D2-2.F07).
+      context: ..
+      dockerfile: services/contract-lifecycle-svc/Dockerfile
     container_name: contract-lifecycle-svc-p5
     ports:
       - "8119:8119"
@@ -243,8 +244,9 @@ services:
 
   counterparty-management-svc:
     build:
-      context: ../services/counterparty-management-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing - see the Dockerfile.
+      context: ../services
+      dockerfile: counterparty-management-svc/Dockerfile
     container_name: counterparty-management-svc-p5
     ports:
       - "8124:8124"
@@ -253,6 +255,7 @@ services:
       DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/counterparty_management?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.counterparty.events"
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:80"
       JURISDICTION_RULES_URL: "http://authorization-svc:80"
     depends_on:
@@ -518,13 +521,14 @@ services:
 
   exception-escalation-svc:
     build:
-      context: ../services/exception-escalation-svc
-      dockerfile: Dockerfile
+      context: ../services
+      dockerfile: exception-escalation-svc/Dockerfile
     container_name: exception-escalation-svc-p5
     ports:
       - "8133:8133"
     environment:
       PORT: "8133"
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/exception_escalation?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.exception-escalation.events"

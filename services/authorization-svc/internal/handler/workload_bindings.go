@@ -160,6 +160,11 @@ func (h *Handler) ListWorkloadBindings(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
+	// API-4 cursor paging, opt-in (page_size / cursor) — see paging.go.
+	if pageRequested(r) {
+		writePage(w, r, list, func(x domain.WorkloadBinding) string { return x.WorkloadID }, 0)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"workload_bindings": list})
 }
 
@@ -188,7 +193,12 @@ func (h *Handler) setWorkloadBindingActive(w http.ResponseWriter, r *http.Reques
 	if !h.requirePermission(w, r, principalID, tenantScope, PermissionWorkloadManage) {
 		return
 	}
-	if _, ok := h.readCommand(w, &r); !ok {
+	bodyVersion, ok := h.readCommand(w, &r)
+	if !ok {
+		return
+	}
+	expected, ok := expectedVersion(w, r, bodyVersion)
+	if !ok {
 		return
 	}
 	store, ok := h.workloadStore(w)
@@ -197,6 +207,29 @@ func (h *Handler) setWorkloadBindingActive(w http.ResponseWriter, r *http.Reques
 	}
 	_, _, reason := domain.AuditFrom(r.Context())
 	workloadID := chi.URLParam(r, "workload_id")
+	if expected > 0 {
+		// The tenant's bindings are few; the list is the read that sees an
+		// inactive one too.
+		list, err := store.ListWorkloadBindings(r.Context(), tenantScope)
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		found := false
+		for _, wb := range list {
+			if wb.WorkloadID == workloadID {
+				found = true
+				if wb.Version != expected {
+					writeVersionConflict(w, r)
+					return
+				}
+			}
+		}
+		if !found {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "workload_binding_not_found"})
+			return
+		}
+	}
 	eventType := "iam.workload_binding.deactivated"
 	if active {
 		eventType = "iam.workload_binding.reactivated"
@@ -214,6 +247,6 @@ func (h *Handler) setWorkloadBindingActive(w http.ResponseWriter, r *http.Reques
 	case err != nil:
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 	default:
-		writeJSON(w, http.StatusOK, out)
+		writeJSONWithETag(w, http.StatusOK, out, out.Version)
 	}
 }

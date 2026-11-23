@@ -508,6 +508,85 @@ func TestGetPaymentAttempt_NotFound(t *testing.T) {
 	}
 }
 
+// TestListPaymentAttempts_RequiresLegalEntityAndReadPermission is
+// SPEC_DEVIATIONS A1's authorization proof: no principal is 401, no
+// legal_entity_id is 400 before the store is ever touched, and a denied
+// PAYMENT_ATTEMPT_READ is 403.
+func TestListPaymentAttempts_RequiresLegalEntityAndReadPermission(t *testing.T) {
+	az := &stubAuthz{}
+	r := newTestRouter(newStubStore(), az, provideradapter.NewStubProviderAdapter())
+	prepareAttempt(t, r, newPrepareReq("idem-list-authz", "invoice-payment"))
+
+	req := httptest.NewRequest(http.MethodGet, "/bnk06/attempts/?legal_entity_id="+testLegalEntity, nil)
+	req.Header.Set("X-Tenant-Id", testTenant)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("without X-Principal-Id: expected 401, got %d: %s", w.Code, w.Body.String())
+	}
+
+	w = doRequest(r, http.MethodGet, "/bnk06/attempts/", nil, testTenant)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("without legal_entity_id: expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+
+	az.deny = true
+	w = doRequest(r, http.MethodGet, "/bnk06/attempts/?legal_entity_id="+testLegalEntity, nil, testTenant)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("without PAYMENT_ATTEMPT_READ: expected 403, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestListPaymentAttempts_ScopesByLegalEntityAndFiltersByStatus is the
+// correctness proof: an attempt in a different legal entity never appears,
+// and an explicit status filter excludes everything else.
+func TestListPaymentAttempts_ScopesByLegalEntityAndFiltersByStatus(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter())
+	inScope := prepareAttempt(t, r, newPrepareReq("idem-list-1", "invoice-payment"))
+	prepareAttempt(t, r, newPrepareReq("idem-list-2", "invoice-payment"))
+	otherEntityReq := newPrepareReq("idem-list-other-entity", "invoice-payment")
+	otherEntityReq.LegalEntityID = "le-bnk06-other"
+	prepareAttempt(t, r, otherEntityReq)
+
+	w := doRequest(r, http.MethodGet, "/bnk06/attempts/?legal_entity_id="+testLegalEntity, nil, testTenant)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Items []domain.PaymentAttemptSummary `json:"items"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(resp.Items) != 2 {
+		t.Fatalf("expected exactly the 2 attempts in %s, got %d: %s", testLegalEntity, len(resp.Items), w.Body.String())
+	}
+	for _, it := range resp.Items {
+		if it.LegalEntityID != testLegalEntity {
+			t.Fatalf("expected only %s's attempts, got one from %s", testLegalEntity, it.LegalEntityID)
+		}
+	}
+
+	// Submit one of them so a status filter has something to distinguish.
+	w = doRequest(r, http.MethodPost, "/bnk06/attempts/"+inScope.AttemptID+"/submit", nil, testTenant)
+	if w.Code != http.StatusOK {
+		t.Fatalf("submit: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	w = doRequest(r, http.MethodGet, "/bnk06/attempts/?legal_entity_id="+testLegalEntity+"&status=SUBMITTED", nil, testTenant)
+	if w.Code != http.StatusOK {
+		t.Fatalf("filtered list: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var filtered struct {
+		Items []domain.PaymentAttemptSummary `json:"items"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &filtered); err != nil {
+		t.Fatalf("decode filtered response: %v", err)
+	}
+	if len(filtered.Items) != 1 || filtered.Items[0].AttemptID != inScope.AttemptID {
+		t.Fatalf("expected exactly the one SUBMITTED attempt, got %+v", filtered.Items)
+	}
+}
+
 // TestReadEndpoints_RequirePrincipalAndReadPermission proves every
 // attempt-reading endpoint is closed to anonymous callers and to principals
 // without PAYMENT_ATTEMPT_READ, not only the write commands.

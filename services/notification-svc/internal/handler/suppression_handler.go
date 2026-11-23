@@ -50,11 +50,14 @@ func (h *Handler) AddSuppression(w http.ResponseWriter, r *http.Request) {
 	// level safety record. We use the tenant ID as the resource target for the
 	// authz check. The tenant scope is already enforced by RLS; this gate is
 	// about which principal can create records in it.
-	if h.authz != nil {
-		if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, actionSuppressionManage); err != nil {
-			h.writeAuthzErr(w, r, err)
-			return
-		}
+	// Fail closed: an unset authorizer must refuse, never skip the check.
+	if h.authz == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "service_unavailable", "authorization not configured")
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, actionSuppressionManage); err != nil {
+		h.writeAuthzErr(w, r, err)
+		return
 	}
 
 	if h.suppressions == nil {
@@ -94,11 +97,14 @@ func (h *Handler) ListSuppressions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.authz != nil {
-		if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, actionSuppressionManage); err != nil {
-			h.writeAuthzErr(w, r, err)
-			return
-		}
+	// Fail closed: an unset authorizer must refuse, never skip the check.
+	if h.authz == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "service_unavailable", "authorization not configured")
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, actionSuppressionManage); err != nil {
+		h.writeAuthzErr(w, r, err)
+		return
 	}
 
 	limit, offset, ok := parsePaging(w, r)

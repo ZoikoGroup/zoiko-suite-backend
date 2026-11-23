@@ -26,6 +26,8 @@ type TemplateDefinition struct {
 	CreatedAt            time.Time  `json:"created_at"`
 	RetiredAt            *time.Time `json:"retired_at,omitempty"`
 	RetiredByPrincipalID *string    `json:"retired_by_principal_id,omitempty"`
+	// RecordVersion is the optimistic-concurrency token (migration 000034).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // TemplateVersionStatus values. Draft -> Review -> Approved -> Published
@@ -65,6 +67,8 @@ type TemplateVersion struct {
 	PublishedAt           *time.Time `json:"published_at,omitempty"`
 	RetiredAt             *time.Time `json:"retired_at,omitempty"`
 	SupersededByVersionID *string    `json:"superseded_by_version_id,omitempty"`
+	// RecordVersion is the optimistic-concurrency token (migration 000034).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // CreateTemplateParams is CreateTemplate's input.
@@ -190,6 +194,19 @@ type ErrTemplateVariablesMissing struct {
 
 func (e ErrTemplateVariablesMissing) Error() string {
 	return fmt.Sprintf("version %s requires variables: %s", e.VersionID, strings.Join(e.Missing, ", "))
+}
+
+// ErrTemplateVariablesUndeclared backs ValidateTemplate: the wording references a variable
+// the version's schema does not declare. Blocking it at validation (spec BIZ-03: a missing
+// variable schema blocks publication) keeps an undeclared variable from rendering as blank
+// text at send time.
+type ErrTemplateVariablesUndeclared struct {
+	VersionID  string
+	Undeclared []string
+}
+
+func (e ErrTemplateVariablesUndeclared) Error() string {
+	return fmt.Sprintf("version %s uses variables its schema does not declare: %s", e.VersionID, strings.Join(e.Undeclared, ", "))
 }
 
 // ErrTemplateVariablesUnexpected backs RenderPreview and the governed-template

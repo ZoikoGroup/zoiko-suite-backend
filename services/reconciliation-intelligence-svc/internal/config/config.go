@@ -38,6 +38,11 @@ type Config struct {
 	// line's book side from (A2a; see internal/ledger).
 	GeneralLedgerURL string
 
+	// BankingConnectorURL is banking-connector-svc's base URL — read-only,
+	// for the NORMALIZED canonical transactions a candidate search proposes
+	// when no journal matches a line (A2b; see internal/banking).
+	BankingConnectorURL string
+
 	// CandidateSearchHorizonDays bounds how far from a statement date the
 	// candidate search reads (CANDIDATE_SEARCH_HORIZON_DAYS, 1-366, default
 	// 31). It is a read bound, not a match criterion: whether a journal is an
@@ -70,6 +75,7 @@ func Load() (*Config, error) {
 	financialControlURL := getEnv("FINANCIAL_CONTROL_SERVICE_URL", "http://financial-control-svc:8171")
 	bankReconciliationURL := getEnv("BANK_RECONCILIATION_SERVICE_URL", "http://bank-reconciliation-svc:8102")
 	generalLedgerURL := getEnv("GENERAL_LEDGER_SERVICE_URL", "http://general-ledger-svc:8098")
+	bankingConnectorURL := getEnv("BANKING_CONNECTOR_SERVICE_URL", "http://banking-connector-svc:8145")
 	horizon, err := strconv.Atoi(getEnv("CANDIDATE_SEARCH_HORIZON_DAYS", "31"))
 	if err != nil || horizon < 1 || horizon > 366 {
 		return nil, fmt.Errorf("CANDIDATE_SEARCH_HORIZON_DAYS must be a whole number of days from 1 to 366")
@@ -88,6 +94,7 @@ func Load() (*Config, error) {
 		BankReconciliationURL: bankReconciliationURL,
 
 		GeneralLedgerURL:           generalLedgerURL,
+		BankingConnectorURL:        bankingConnectorURL,
 		CandidateSearchHorizonDays: horizon,
 
 		AuthzMTLSEnabled:         getEnv("AUTHZ_MTLS_ENABLED", "false") == "true",

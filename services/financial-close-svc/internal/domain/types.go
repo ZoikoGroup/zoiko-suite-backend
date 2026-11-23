@@ -55,6 +55,126 @@ type SubledgerControlRun struct {
 	Status                 string    `json:"status"` // MATCHED | EXCEPTION
 	RunAt                  time.Time `json:"run_at"`
 	RunByPrincipalID       string    `json:"run_by_principal_id"`
+
+	// CertificationStatus and the fields below are migration 000025's ACC-06
+	// governance layer (SPEC_DEVIATIONS A1). Status above is the run's own
+	// immutable finding; CertificationStatus is a separate fact layered on
+	// top — "has a human signed off this period's control is reliable" —
+	// nil until CertifyControl or RejectControl runs.
+	CertificationStatus    *string    `json:"certification_status,omitempty"` // CERTIFIED | FAILED
+	CertifiedAt            *time.Time `json:"certified_at,omitempty"`
+	CertifiedByPrincipalID *string    `json:"certified_by_principal_id,omitempty"`
+	CertificationNote      string     `json:"certification_note,omitempty"`
+}
+
+// Control exception lifecycle states (ACC-06's state model for an
+// EXCEPTION run's resolution workflow).
+const (
+	ControlExceptionStatusOpen     = "OPEN"
+	ControlExceptionStatusAssigned = "ASSIGNED"
+	ControlExceptionStatusResolved = "RESOLVED"
+)
+
+// ControlExceptionCertificationCertified/Failed are SubledgerControlRun's
+// CertificationStatus values — ACC-06's "Certified or Failed" terminal
+// split.
+const (
+	ControlCertificationCertified = "CERTIFIED"
+	ControlCertificationFailed    = "FAILED"
+)
+
+// ControlException is the companion row a run that lands EXCEPTION gets:
+// its own resolution workflow, with a real owner and a real recorded
+// approval — the exact gap SPEC_DEVIATIONS A1 names ("a break is 'resolved'
+// by running the control again until it matches; no resolution, owner or
+// approval is recorded").
+type ControlException struct {
+	ControlExceptionID    string     `json:"control_exception_id"`
+	TenantID              string     `json:"tenant_id"`
+	ControlRunID          string     `json:"control_run_id"`
+	LegalEntityID         string     `json:"legal_entity_id"`
+	FiscalPeriod          string     `json:"fiscal_period"`
+	Subledger             string     `json:"subledger"`
+	BookID                string     `json:"book_id,omitempty"`
+	Status                string     `json:"status"` // OPEN | ASSIGNED | RESOLVED
+	AssignedToPrincipalID string     `json:"assigned_to_principal_id,omitempty"`
+	AssignedAt            *time.Time `json:"assigned_at,omitempty"`
+	ResolutionNote        string     `json:"resolution_note,omitempty"`
+	ResolvedAt            *time.Time `json:"resolved_at,omitempty"`
+	ResolvedByPrincipalID string     `json:"resolved_by_principal_id,omitempty"`
+	CreatedAt             time.Time  `json:"created_at"`
+}
+
+type AssignExceptionRequest struct {
+	AssignedToPrincipalID string `json:"assigned_to_principal_id"`
+}
+
+// RecordResolutionRequest is RecordResolution's body: a real resolution
+// note is mandatory, not optional evidence (ACC-06's own evidence/lineage
+// requirement: "matching evidence, exceptions and approver").
+type RecordResolutionRequest struct {
+	ResolutionNote string `json:"resolution_note"`
+}
+
+// CertifyControlRequest/RejectControlRequest act on one specific run, named
+// by the URL's {id} — not resolved from a scope — so the certifier is
+// always certifying (or failing) the exact finding they looked at.
+type CertifyControlRequest struct {
+	Note string `json:"note,omitempty"`
+}
+
+type RejectControlRequest struct {
+	Reason string `json:"reason"`
+}
+
+// Close blocking reasons for GetCloseBlockingControls. They mirror the
+// three ways the close-readiness check treats a required control as not
+// proven: never run, run but still carrying an unresolved exception, or
+// stale after a reopen (the run predates the reopen, so it proves nothing
+// about the reopened books).
+const (
+	CloseBlockingReasonNoRun               = "NO_CONTROL_RUN"
+	CloseBlockingReasonUnresolvedException = "UNRESOLVED_EXCEPTION"
+	CloseBlockingReasonNotReperformed      = "NOT_REPERFORMED"
+)
+
+// CloseBlockingControl is one required SUBLEDGER_CONTROL that is currently
+// keeping the entity's close from being proven, with the latest finding and
+// (when one exists) its resolution workflow. GetCloseBlockingControls is the
+// read contract behind this; the classification reuses the same
+// requiredControlIssues logic the close itself runs.
+type CloseBlockingControl struct {
+	RequirementID string `json:"requirement_id,omitempty"`
+	LegalEntityID string `json:"legal_entity_id"`
+	Subledger     string `json:"subledger"`
+	BookID        string `json:"book_id,omitempty"`
+	// Baseline is true for the AR/AP controls every entity must prove even
+	// though they are not checklist rows (and therefore cannot be removed).
+	Baseline         bool                 `json:"baseline"`
+	BlockingReason   string               `json:"blocking_reason"`
+	Issue            string               `json:"issue"`
+	LatestRun        *SubledgerControlRun `json:"latest_run,omitempty"`
+	ControlException *ControlException    `json:"control_exception,omitempty"`
+}
+
+// VarianceBreakdown is the arithmetic half of ExplainVariance: the two totals
+// that produced the finding, their difference, and the tolerance the run was
+// judged against.
+type VarianceBreakdown struct {
+	SubledgerTotalAmount   float64 `json:"subledger_total_amount"`
+	GLControlBalanceAmount float64 `json:"gl_control_balance_amount"`
+	DifferenceAmount       float64 `json:"difference_amount"`
+	ToleranceAmount        float64 `json:"tolerance_amount"`
+	WithinTolerance        bool    `json:"within_tolerance"`
+}
+
+// VarianceExplanation is ACC-06's ExplainVariance query: the run, why it
+// found what it found, and — for an EXCEPTION run — the exception's complete
+// resolution trail (who was assigned, who resolved it, when, and the note).
+type VarianceExplanation struct {
+	ControlRun          *SubledgerControlRun `json:"control_run"`
+	DifferenceBreakdown VarianceBreakdown    `json:"difference_breakdown"`
+	ControlException    *ControlException    `json:"control_exception,omitempty"`
 }
 
 type RunSubledgerControlRequest struct {
@@ -521,108 +641,15 @@ type ReversePriorRevaluationRequest struct {
 	PriorRunID string `json:"prior_run_id"`
 }
 
-// ACC-17 (Opening Balance & Migration) — verbatim from spec: "Planned →
-// Loaded → Validated → Approved → Posted → Reconciled → Certified;
-// failed/quarantined as needed." Planned collapses into LOADED for the
-// same reason ACC-10's Planned/Calculated did — CreateMigrationAccountingBatch
-// loads every crosswalk entry synchronously, so there is no durable
-// intermediate "just planned" state to expose.
-const (
-	MigrationBatchStatusLoaded      = "LOADED"
-	MigrationBatchStatusValidated   = "VALIDATED"
-	MigrationBatchStatusApproved    = "APPROVED"
-	MigrationBatchStatusPosted      = "POSTED"
-	MigrationBatchStatusReconciled  = "RECONCILED"
-	MigrationBatchStatusCertified   = "CERTIFIED"
-	MigrationBatchStatusQuarantined = "QUARANTINED"
-)
-
-// MigrationBatch is ACC-17's own authority — "MigrationAccountingBatch,
-// opening journal proposals, source crosswalk and reconciliation/
-// certification refs," explicitly never "Bypass of ACC-04/05": opening
-// balances post through GL's real journal lifecycle and this service's
-// real period status, exactly like every other capability.
-type MigrationBatch struct {
-	BatchID                string                    `json:"batch_id"`
-	TenantID               string                    `json:"tenant_id"`
-	LegalEntityID          string                    `json:"legal_entity_id"`
-	FiscalPeriod           string                    `json:"fiscal_period"`
-	SourceSystemName       string                    `json:"source_system_name"`
-	SourceExtractHash      string                    `json:"source_extract_hash"`
-	ExpectedRowCount       int                       `json:"expected_row_count"`
-	ExpectedTotalDebits    float64                   `json:"expected_total_debits"`
-	ExpectedTotalCredits   float64                   `json:"expected_total_credits"`
-	Status                 string                    `json:"status"`
-	QuarantineReason       *string                   `json:"quarantine_reason,omitempty"`
-	JournalID              *string                   `json:"journal_id,omitempty"`
-	CreatedAt              time.Time                 `json:"created_at"`
-	CreatedByPrincipalID   string                    `json:"created_by_principal_id"`
-	ValidatedAt            *time.Time                `json:"validated_at,omitempty"`
-	ApprovedAt             *time.Time                `json:"approved_at,omitempty"`
-	ApprovedByPrincipalID  *string                   `json:"approved_by_principal_id,omitempty"`
-	PostedAt               *time.Time                `json:"posted_at,omitempty"`
-	ReconciledAt           *time.Time                `json:"reconciled_at,omitempty"`
-	CertifiedAt            *time.Time                `json:"certified_at,omitempty"`
-	CertifiedByPrincipalID *string                   `json:"certified_by_principal_id,omitempty"`
-	CertificationReason    *string                   `json:"certification_reason,omitempty"`
-	Entries                []MigrationCrosswalkEntry `json:"entries,omitempty"`
-
-	// CurrencyCode is the ISO 4217 currency this batch's opening-balance journal is is booked in. ACC-03 makes
-	// currency a caller-supplied journal input and general-ledger-svc refuses
-	// a journal without one. Service-local until a REF-02 Currency Registry
-	// exists; "" only on a row written before migration 000022, which cannot
-	// post until one is set (SPEC_DEVIATIONS A13).
-	CurrencyCode string `json:"currency_code,omitempty"`
-}
-
-// Crosswalk entry open-item types — see migration 000013's doc comment.
-const (
-	MigrationCrosswalkTypeAROpenItem = "AR_OPEN_ITEM"
-	MigrationCrosswalkTypeAPOpenItem = "AP_OPEN_ITEM"
-)
-
-// MigrationCrosswalkEntry is one source-to-target line — permanent
-// evidence (migration 000009), never mutated.
-type MigrationCrosswalkEntry struct {
-	EntryID           string  `json:"entry_id"`
-	BatchID           string  `json:"batch_id"`
-	SourceReferenceID string  `json:"source_reference_id"`
-	SourceAccountCode string  `json:"source_account_code"`
-	TargetAccountCode string  `json:"target_account_code"`
-	DebitAmount       float64 `json:"debit_amount"`
-	CreditAmount      float64 `json:"credit_amount"`
-
-	// SourceReferenceType/PartyID are ACC-17's own closure of "Open AR
-	// included both in history and opening state" (see migration 000013's
-	// doc comment) — set only when this entry represents a real open AR
-	// or AP item being migrated, so ValidateOpeningBalances knows to check
-	// it against the subledger's own live history. Nil for an ordinary GL
-	// balance line, which has no such history to double-book against.
-	SourceReferenceType *string `json:"source_reference_type,omitempty"`
-	PartyID             *string `json:"party_id,omitempty"`
-}
-
-type CreateMigrationBatchRequest struct {
-	LegalEntityID     string `json:"legal_entity_id"`
-	FiscalPeriod      string `json:"fiscal_period"`
-	SourceSystemName  string `json:"source_system_name"`
-	SourceExtractHash string `json:"source_extract_hash"`
-	CurrencyCode      string `json:"currency_code"`
-	// ExpectedRowCount/ExpectedTotalDebits/ExpectedTotalCredits are the
-	// SOURCE system's own declared control totals — independent of
-	// whatever Entries actually arrives with, so ValidateOpeningBalances
-	// can catch "source-target row counts match but values differ" (the
-	// spec's own negative path) rather than only ever checking the batch
-	// against itself.
-	ExpectedRowCount     int                       `json:"expected_row_count"`
-	ExpectedTotalDebits  float64                   `json:"expected_total_debits"`
-	ExpectedTotalCredits float64                   `json:"expected_total_credits"`
-	Entries              []MigrationCrosswalkEntry `json:"entries"`
-}
-
-type CertifyMigrationBatchRequest struct {
-	Reason string `json:"reason"`
-}
+// ACC-17's migration-batch domain types (MigrationBatch,
+// MigrationCrosswalkEntry, CreateMigrationBatchRequest,
+// CertifyMigrationBatchRequest, and the MigrationBatchStatus*/
+// MigrationCrosswalkType* constants, formerly here) were retired along with
+// its handlers and store methods — see SPEC_DEVIATIONS.md A9.
+// MigrationBatchStatusQuarantined stays: it is the one status value
+// internal/store's ACC-18 lineage test still writes into the retained,
+// now-read-only migration_batches table.
+const MigrationBatchStatusQuarantined = "QUARANTINED"
 
 // ACC-16 (Signed Financial Snapshot) — verbatim from spec: "Draft →
 // Sealed → Certified → Superseded; sealed content never edited in
@@ -1069,6 +1096,29 @@ var (
 	// throughout the AST/INV/PRJ build — the caller must say which book.
 	ErrBookIDRequiredForAssets = errorString("book_id is required when subledger is ASSETS")
 
+	// ── ACC-06 Subledger Control governance (migration 000025) ──────────
+
+	ErrControlExceptionNotFound = errorString("control exception not found")
+	// ErrControlExceptionNotOpenOrAssigned guards AssignException and
+	// RecordResolution: an exception already RESOLVED is closed history,
+	// not something a later command re-opens.
+	ErrControlExceptionNotOpenOrAssigned = errorString("control exception is not OPEN or ASSIGNED")
+	ErrResolutionNoteRequired            = errorString("resolution_note is required")
+	ErrNoControlRunForScope              = errorString("no subledger control run exists for this legal_entity_id/fiscal_period/subledger/book_id")
+	// ErrControlHasUnresolvedException is ACC-06's own negative path,
+	// "Certify with unresolved material break": a legal entity may not
+	// remove a SUBLEDGER_CONTROL close requirement, or certify a control,
+	// while that control's latest run carries an OPEN or ASSIGNED
+	// exception — "close role cannot waive unresolved mandatory break."
+	ErrControlHasUnresolvedException = errorString("the control's latest run carries an unresolved (OPEN or ASSIGNED) exception")
+	// ErrControlSelfCertification is ACC-06's maker-checker: "Preparer
+	// cannot certify own material control." The certifier must differ from
+	// whoever ran the control, and from whoever resolved its exception (if
+	// any) — the same person closing both ends of the loop is exactly the
+	// bypass maker-checker exists to prevent.
+	ErrControlSelfCertification = errorString("the principal who ran or resolved this control cannot also certify it")
+	ErrControlAlreadyCertified  = errorString("this control run is already certified or failed")
+
 	// ErrControlAccountMappingNotFound is returned when
 	// control_account_mapping_key names no current mapping — ACC-06 must
 	// never guess which GL account a subledger reconciles against.
@@ -1203,45 +1253,14 @@ var (
 	// reversing.
 	ErrPriorRevaluationNotPosted = errorString("prior revaluation run is not POSTED and cannot be reversed")
 
-	ErrMigrationBatchNotFound          = errorString("migration batch not found")
-	ErrNoMigrationEntries              = errorString("a migration batch must include at least one crosswalk entry")
-	ErrInvalidMigrationBatchTransition = errorString("migration batch is not in a status that allows this action")
-
-	// ErrOpeningTBDoesNotBalance is returned when a batch's crosswalk
-	// entries don't sum debits-equal-credits exactly — the spec's own
-	// negative path, "Opening TB forced with suspense plug": refusing to
-	// post an unbalanced opening position is what prevents a plug, rather
-	// than silently absorbing the difference into any account.
-	ErrOpeningTBDoesNotBalance = errorString("opening trial balance does not balance: debits must equal credits with no suspense plug")
-
-	// ErrSuspenseAccountNotAllowed is returned when a crosswalk entry
-	// targets an account whose code names it a suspense/clearing account
-	// — the same negative path as ErrOpeningTBDoesNotBalance, caught even
-	// when the entries happen to balance overall.
-	ErrSuspenseAccountNotAllowed = errorString("crosswalk entries may not target a suspense account")
-
-	ErrDuplicateSourceReference = errorString("source_reference_id is duplicated within this batch")
-
-	// ErrControlTotalsMismatch is returned when the source system's own
-	// declared row count or debit/credit totals don't match what was
-	// actually loaded — the spec's own negative path, "source-target row
-	// counts match but values differ" (and its inverse: counts differ
-	// too).
-	ErrControlTotalsMismatch = errorString("loaded entries do not match the source system's declared control totals")
-
-	ErrMigrationTargetAccountInvalid = errorString("crosswalk entry target_account_code is not a real, active account")
-
-	ErrMigrationPeriodLocked = errorString("cannot post opening balances into a LOCKED fiscal period")
-
-	// ErrOpenItemAlreadyExistsInHistory is the spec's own negative path,
-	// "Open AR included both in history and opening state" — a crosswalk
-	// entry flagged AR_OPEN_ITEM/AP_OPEN_ITEM whose invoice_number already
-	// exists in accounts-receivable-svc's/accounts-payable-svc's own real
-	// history would double-book that receivable/payable: once via its
-	// real, live invoice and again via this migration's opening balance.
-	ErrOpenItemAlreadyExistsInHistory = errorString("crosswalk entry's open item already exists in the subledger's own history")
-
-	ErrPartyIDRequiredForOpenItem = errorString("party_id is required when source_reference_type is set")
+	// ACC-17's migration-batch errors (ErrMigrationBatchNotFound,
+	// ErrMigrationBatchRaceLost, ErrNoMigrationEntries,
+	// ErrInvalidMigrationBatchTransition, ErrOpeningTBDoesNotBalance,
+	// ErrSuspenseAccountNotAllowed, ErrDuplicateSourceReference,
+	// ErrControlTotalsMismatch, ErrMigrationTargetAccountInvalid,
+	// ErrMigrationPeriodLocked, ErrOpenItemAlreadyExistsInHistory,
+	// ErrPartyIDRequiredForOpenItem) were retired along with its handlers
+	// and store methods — see SPEC_DEVIATIONS.md A9.
 
 	ErrLineageQuarantineReasonRequired = errorString("reason is required to quarantine a lineage gap")
 	ErrLineageAsOfRequired             = errorString("as_of is required and must be RFC3339")
@@ -1318,10 +1337,10 @@ const (
 // GLJournalTypeAccrual, but are a different purpose).
 const (
 	GLJournalPurposeAccrual        = "ACCRUAL"         // ACC-07 recognition
-	GLJournalPurposePrepayment     = "PREPAYMENT"       // ACC-08 recognition and termination
-	GLJournalPurposeAllocation     = "ALLOCATION"       // ACC-09 allocation
-	GLJournalPurposeRevaluation    = "REVALUATION"      // ACC-10 FX revaluation
-	GLJournalPurposeOpeningBalance = "OPENING_BALANCE"  // ACC-17 opening balances
+	GLJournalPurposePrepayment     = "PREPAYMENT"      // ACC-08 recognition and termination
+	GLJournalPurposeAllocation     = "ALLOCATION"      // ACC-09 allocation
+	GLJournalPurposeRevaluation    = "REVALUATION"     // ACC-10 FX revaluation
+	GLJournalPurposeOpeningBalance = "OPENING_BALANCE" // ACC-17 opening balances
 )
 
 // general-ledger-svc's closed close-journal designations (its

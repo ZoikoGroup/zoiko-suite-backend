@@ -1,0 +1,16 @@
+# Prometheus for the isolated ZoikoSuite Assistant stack (Doc 08 §14).
+# Runs on the public-ai network only; it never scrapes or reaches the main
+# ZoikoSuite services (INV-01). /metrics is internal like /health/*: the edge
+# routes only /public-ai/v1/* to the service.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/prometheus-rules-public-ai.yml
+
+scrape_configs:
+  - job_name: public-ai-svc
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["public-ai-svc:9091"] # the admin listener (PUBLIC_AI_ADMIN_ADDR)

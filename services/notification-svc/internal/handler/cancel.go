@@ -56,6 +56,13 @@ func (h *Handler) CancelNotification(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, r, err)
 		return
 	}
+
+	// Check If-Match for optimistic concurrency (API-3), after authorization so
+	// an unauthorized caller never learns the notification's version.
+	if !h.requireIfMatch(w, r, existing.RecordVersion) {
+		return
+	}
+
 	n, err := h.store.CancelNotification(r.Context(), id, tenantID, principalID, req.Reason, time.Now().UTC())
 	switch {
 	case errors.Is(err, domain.ErrCancelNotAllowed):
@@ -69,5 +76,5 @@ func (h *Handler) CancelNotification(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, n)
+	writeJSONWithETag(w, http.StatusOK, n, n.RecordVersion)
 }

@@ -1,0 +1,139 @@
+name: public-ai nightly
+
+# Doc 07 §37 and Doc 06 §24 for the public assistant (public-ai-svc):
+#   nightly — fixture replay (full tests on Postgres, golden set x5 against the
+#             approved baseline, drills, traceability incl. P1) and a ZAP API
+#             scan of the running service (DAST);
+#   weekly  — longer fuzzing and the load / fault-injection profiles.
+# Reports are kept as artifacts. PR CI stays fast; these catch drift.
+on:
+  schedule:
+    - cron: "30 2 * * *" # nightly 02:30 UTC
+    - cron: "0 4 * * 1"  # weekly, Monday 04:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-ai-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+    working-directory: services/public-ai-svc
+
+jobs:
+  replay:
+    name: Fixture replay and release gates
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
+        env:
+          POSTGRES_DB: testdb
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: secretpassword
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d testdb"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: services/public-ai-svc/go.mod
+          cache-dependency-path: services/public-ai-svc/go.sum
+      - name: Tests (race, Postgres) and traceability
+        env:
+          TEST_DATABASE_URL: postgres://postgres:secretpassword@localhost:5432/testdb?sslmode=disable
+        run: |
+          go test -race -json -count=1 ./... > test.json
+          go run ./cmd/traceability -csv ../../docs/suivo/sec-t-traceability.csv -json test.json
+          go run ./cmd/traceability -csv ../../docs/suivo/sec-t-traceability.csv -json test.json -priority P1
+      - name: Golden set x5 against the approved baseline
+        run: go run ./cmd/evalrun -repeats 5 -sha "${{ github.sha }}" -baseline testdata/golden/baseline.json -out eval-report.json
+      - name: Operational drills
+        run: go run ./cmd/drill -out drill-report.json
+      # Doc 03 §12/§16, KB-018: every official route and source page answers
+      # 2xx and redirects only within the allowlist (placeholders skipped).
+      - name: Link check (public KB release)
+        run: go run ./cmd/linkcheck -dir data/public-kb -out linkcheck.json
+      - name: Keep reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: public-ai-nightly-replay
+          path: |
+            services/public-ai-svc/test.json
+            services/public-ai-svc/eval-report.json
+            services/public-ai-svc/drill-report.json
+            services/public-ai-svc/linkcheck.json
+          if-no-files-found: ignore
+
+  zap:
+    name: ZAP API scan (DAST)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: services/public-ai-svc/go.mod
+          cache-dependency-path: services/public-ai-svc/go.sum
+      - name: Start the service (dev mode, mock model, fixtures)
+        env:
+          PUBLIC_AI_ENABLED: "true"
+          PUBLIC_AI_ENVIRONMENT: dev
+          PUBLIC_AI_HTTP_ADDR: 127.0.0.1:8001
+          PUBLIC_AI_ALLOWED_ORIGINS: http://localhost:3000
+        run: |
+          go build -o /tmp/public-ai-svc ./cmd/server
+          /tmp/public-ai-svc > /tmp/server.log 2>&1 &
+          for i in $(seq 1 60); do
+            curl -fsS -H 'Origin: http://localhost:3000' http://127.0.0.1:8001/public-ai/v1/health/public && exit 0
+            sleep 1
+          done
+          cat /tmp/server.log
+          exit 1
+      # The API definition drives the scan; every request carries an allowed
+      # Origin so the scan reaches the handlers instead of the Origin gate.
+      - name: zap-api-scan
+        working-directory: .
+        run: |
+          mkdir -p zap && cp services/public-ai-svc/api/openapi.yaml zap/
+          chmod -R a+rwx zap
+          docker run --rm --network host -v "$PWD/zap:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af \
+            zap-api-scan.py -t /zap/wrk/openapi.yaml -f openapi -O http://127.0.0.1:8001 \
+            -r zap-report.html -J zap-report.json -I \
+            -z "-config replacer.full_list(0).description=origin -config replacer.full_list(0).enabled=true -config replacer.full_list(0).matchtype=REQ_HEADER -config replacer.full_list(0).matchstr=Origin -config replacer.full_list(0).regex=false -config replacer.full_list(0).replacement=http://localhost:3000"
+      - name: Keep the ZAP report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: public-ai-zap-report
+          path: zap/zap-report.*
+          if-no-files-found: ignore
+
+  weekly:
+    name: Long fuzz and load / fault profiles
+    if: github.event.schedule == '0 4 * * 1' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: services/public-ai-svc/go.mod
+          cache-dependency-path: services/public-ai-svc/go.sum
+      - name: Fuzz (5 minutes per target)
+        run: |
+          go test ./internal/policy -run '^$' -fuzz FuzzClassifyAndRedact -fuzztime 5m
+          go test ./internal/contract -run '^$' -fuzz FuzzTurnRequest -fuzztime 5m
+          go test ./internal/contract -run '^$' -fuzz FuzzAnalyticsRequest -fuzztime 2m
+          go test ./internal/knowledge -run '^$' -fuzz FuzzParseMarkdownSource -fuzztime 5m
+      - name: Load and fault-injection profiles (QA-T060, QA-T063)
+        run: go test -count=1 -v ./cmd/loadtest

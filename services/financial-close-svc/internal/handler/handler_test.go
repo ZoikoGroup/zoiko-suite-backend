@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,6 +37,7 @@ type stubStore struct {
 	reopenRequests []*domain.ReopenRequest
 
 	controlRuns         []domain.SubledgerControlRun
+	controlExceptions   map[string]*domain.ControlException // control_exception_id -> row
 	closeRequirements   []*domain.CloseRequirement
 	listRequirementsErr error
 	createRunErr        error
@@ -79,10 +81,6 @@ type stubStore struct {
 	createFXRunErr  error
 	approveFXErr    error
 	markFXPostedErr error
-
-	migrationBatches       map[string]*domain.MigrationBatch
-	createMigrationErr     error
-	transitionMigrationErr error
 
 	snapshots             map[string]*domain.FinancialSnapshot
 	createSnapshotErr     error
@@ -134,6 +132,7 @@ func (s *stubStore) recordClaim(key, command, hash, id string) {
 func newStubStore() *stubStore {
 	return &stubStore{
 		periods:                make(map[string]*domain.FiscalPeriod),
+		controlExceptions:      make(map[string]*domain.ControlException),
 		schedules:              make(map[string]*domain.AccrualSchedule),
 		recognitions:           make(map[string][]domain.RecognitionInstance),
 		prepaymentSchedules:    make(map[string]*domain.PrepaymentSchedule),
@@ -141,7 +140,6 @@ func newStubStore() *stubStore {
 		allocationRules:        make(map[string]*domain.AllocationRule),
 		allocationRuns:         make(map[string]*domain.AllocationRun),
 		fxRuns:                 make(map[string]*domain.FXRevaluationRun),
-		migrationBatches:       make(map[string]*domain.MigrationBatch),
 		snapshots:              make(map[string]*domain.FinancialSnapshot),
 		projectionStatus:       make(map[string]*domain.LineageProjectionStatus),
 	}
@@ -252,6 +250,38 @@ func (s *stubStore) ApplyPeriodTransition(_ context.Context, id string, allowedF
 	return &out, nil
 }
 
+// startSoftCloseOrCloseReview is the claim-aware shared body behind
+// StartSoftCloseTransition and EnterCloseReviewTransition: look up the
+// claim first (replaying if found), otherwise apply the transition via the
+// same logic ApplyPeriodTransition uses and record the claim.
+func (s *stubStore) startSoftCloseOrCloseReview(ctx context.Context, command string, id string, allowedFrom []string, u domain.PeriodUpdate, fact, legacyType, correlationID, actorID, key, hash string) (*domain.FiscalPeriod, bool, error) {
+	if claimedID, replay, err := s.lookupClaim(key, command, hash); err != nil || replay {
+		if replay {
+			if found := s.periods[claimedID]; found != nil {
+				out := *found
+				return &out, true, nil
+			}
+		}
+		return nil, replay, err
+	}
+	fp, err := s.ApplyPeriodTransition(ctx, id, allowedFrom, u, fact, legacyType, correlationID, actorID)
+	if err != nil {
+		return fp, false, err
+	}
+	s.recordClaim(key, command, hash, id)
+	return fp, false, nil
+}
+
+func (s *stubStore) StartSoftCloseTransition(ctx context.Context, id string, u domain.PeriodUpdate, fact, legacyType, correlationID, actorID, key, hash string) (*domain.FiscalPeriod, bool, error) {
+	u.To = domain.PeriodSoftClose
+	return s.startSoftCloseOrCloseReview(ctx, "StartSoftClose", id, []string{domain.PeriodOpen}, u, fact, legacyType, correlationID, actorID, key, hash)
+}
+
+func (s *stubStore) EnterCloseReviewTransition(ctx context.Context, id string, u domain.PeriodUpdate, fact, legacyType, correlationID, actorID, key, hash string) (*domain.FiscalPeriod, bool, error) {
+	u.To = domain.PeriodCloseReview
+	return s.startSoftCloseOrCloseReview(ctx, "EnterCloseReview", id, []string{domain.PeriodSoftClose}, u, fact, legacyType, correlationID, actorID, key, hash)
+}
+
 func (s *stubStore) CreateReopenRequest(_ context.Context, req *domain.ReopenRequest, correlationID, actorID string) error {
 	fp, ok := s.periods[req.FiscalPeriodID]
 	if !ok {
@@ -344,6 +374,16 @@ func (s *stubStore) GetCloseHistory(_ context.Context, periodID string) (*domain
 	return h, nil
 }
 
+func (s *stubStore) GetLatestTransitionPrincipal(_ context.Context, periodID, toState string) (string, error) {
+	for i := len(s.transitions) - 1; i >= 0; i-- {
+		t := s.transitions[i]
+		if t.FiscalPeriodID == periodID && t.ToState == toState {
+			return t.PrincipalID, nil
+		}
+	}
+	return "", nil
+}
+
 func (s *stubStore) CreateCloseRequirement(_ context.Context, cr *domain.CloseRequirement) (bool, error) {
 	for _, ex := range s.closeRequirements {
 		if ex.RemovedAt == nil && ex.LegalEntityID == cr.LegalEntityID && ex.Kind == cr.Kind &&
@@ -389,11 +429,48 @@ func (s *stubStore) RemoveCloseRequirement(_ context.Context, id, principalID, r
 	return nil, domain.ErrCloseRequirementNotFound
 }
 
+func cloneControlException(e *domain.ControlException) *domain.ControlException {
+	cp := *e
+	return &cp
+}
+
+func (s *stubStore) findControlRun(id string) *domain.SubledgerControlRun {
+	for i := range s.controlRuns {
+		if s.controlRuns[i].ControlRunID == id {
+			return &s.controlRuns[i]
+		}
+	}
+	return nil
+}
+
+func (s *stubStore) findControlException(id string) *domain.ControlException {
+	if s.controlExceptions == nil {
+		s.controlExceptions = make(map[string]*domain.ControlException)
+	}
+	return s.controlExceptions[id]
+}
+
 func (s *stubStore) CreateControlRun(_ context.Context, run *domain.SubledgerControlRun, correlationID, actorID string) error {
 	if s.createRunErr != nil {
 		return s.createRunErr
 	}
 	s.controlRuns = append(s.controlRuns, *run)
+	// Mirror the real store's transaction: a run that lands EXCEPTION gets
+	// exactly one OPEN resolution-workflow row.
+	if run.Status == "EXCEPTION" {
+		exc := &domain.ControlException{
+			ControlExceptionID: uuid.NewString(),
+			TenantID:           run.TenantID,
+			ControlRunID:       run.ControlRunID,
+			LegalEntityID:      run.LegalEntityID,
+			FiscalPeriod:       run.FiscalPeriod,
+			Subledger:          run.Subledger,
+			BookID:             run.BookID,
+			Status:             domain.ControlExceptionStatusOpen,
+			CreatedAt:          run.RunAt,
+		}
+		s.controlExceptions[exc.ControlExceptionID] = exc
+	}
 	return nil
 }
 
@@ -408,6 +485,154 @@ func (s *stubStore) ListControlRuns(_ context.Context, legalEntityID, fiscalPeri
 		}
 	}
 	return out, nil
+}
+
+func (s *stubStore) GetControlRun(_ context.Context, controlRunID string) (*domain.SubledgerControlRun, error) {
+	run := s.findControlRun(controlRunID)
+	if run == nil {
+		return nil, domain.ErrNoControlRunForScope
+	}
+	cp := *run
+	return &cp, nil
+}
+
+func (s *stubStore) GetLatestControlRun(_ context.Context, legalEntityID, fiscalPeriod, subledger, bookID string) (*domain.SubledgerControlRun, error) {
+	var latest *domain.SubledgerControlRun
+	for i := range s.controlRuns {
+		run := &s.controlRuns[i]
+		if run.LegalEntityID != legalEntityID || run.Subledger != subledger || run.BookID != bookID {
+			continue
+		}
+		if fiscalPeriod != "" && run.FiscalPeriod != fiscalPeriod {
+			continue
+		}
+		if latest == nil || run.RunAt.After(latest.RunAt) ||
+			(run.RunAt.Equal(latest.RunAt) && run.ControlRunID > latest.ControlRunID) {
+			latest = run
+		}
+	}
+	if latest == nil {
+		return nil, domain.ErrNoControlRunForScope
+	}
+	cp := *latest
+	return &cp, nil
+}
+
+func (s *stubStore) GetControlException(_ context.Context, controlExceptionID string) (*domain.ControlException, error) {
+	exc := s.findControlException(controlExceptionID)
+	if exc == nil {
+		return nil, domain.ErrControlExceptionNotFound
+	}
+	return cloneControlException(exc), nil
+}
+
+func (s *stubStore) GetControlExceptionByRun(_ context.Context, controlRunID string) (*domain.ControlException, error) {
+	for _, exc := range s.controlExceptions {
+		if exc.ControlRunID == controlRunID {
+			return cloneControlException(exc), nil
+		}
+	}
+	return nil, domain.ErrControlExceptionNotFound
+}
+
+func (s *stubStore) AssignException(_ context.Context, controlExceptionID, assignedToPrincipalID, actorID, correlationID string) (*domain.ControlException, error) {
+	exc := s.findControlException(controlExceptionID)
+	if exc == nil {
+		return nil, domain.ErrControlExceptionNotFound
+	}
+	if exc.Status == domain.ControlExceptionStatusResolved {
+		return nil, domain.ErrControlExceptionNotOpenOrAssigned
+	}
+	now := time.Now().UTC()
+	exc.Status = domain.ControlExceptionStatusAssigned
+	exc.AssignedToPrincipalID = assignedToPrincipalID
+	exc.AssignedAt = &now
+	return cloneControlException(exc), nil
+}
+
+func (s *stubStore) RecordResolution(_ context.Context, controlExceptionID, resolutionNote, actorID, correlationID string) (*domain.ControlException, error) {
+	if strings.TrimSpace(resolutionNote) == "" {
+		return nil, domain.ErrResolutionNoteRequired
+	}
+	exc := s.findControlException(controlExceptionID)
+	if exc == nil {
+		return nil, domain.ErrControlExceptionNotFound
+	}
+	if exc.Status == domain.ControlExceptionStatusResolved {
+		return nil, domain.ErrControlExceptionNotOpenOrAssigned
+	}
+	now := time.Now().UTC()
+	exc.Status = domain.ControlExceptionStatusResolved
+	exc.ResolutionNote = resolutionNote
+	exc.ResolvedAt = &now
+	exc.ResolvedByPrincipalID = actorID
+	return cloneControlException(exc), nil
+}
+
+func (s *stubStore) ListOpenExceptions(_ context.Context, legalEntityID string) ([]domain.ControlException, error) {
+	var out []domain.ControlException
+	for _, exc := range s.controlExceptions {
+		if exc.LegalEntityID == legalEntityID &&
+			(exc.Status == domain.ControlExceptionStatusOpen || exc.Status == domain.ControlExceptionStatusAssigned) {
+			out = append(out, *exc)
+		}
+	}
+	return out, nil
+}
+
+// HasUnresolvedException mirrors the real query: only the LATEST run for the
+// (legal entity, subledger, book) pair counts, across every period. An old
+// EXCEPTION superseded by a later MATCHED run does not block forever.
+func (s *stubStore) HasUnresolvedException(_ context.Context, legalEntityID, subledger, bookID string) (bool, error) {
+	latest, err := s.GetLatestControlRun(context.Background(), legalEntityID, "", subledger, bookID)
+	if err != nil {
+		if errors.Is(err, domain.ErrNoControlRunForScope) {
+			return false, nil
+		}
+		return false, err
+	}
+	if latest.Status != "EXCEPTION" {
+		return false, nil
+	}
+	exc, err := s.GetControlExceptionByRun(context.Background(), latest.ControlRunID)
+	if err != nil {
+		return false, nil
+	}
+	return exc.Status == domain.ControlExceptionStatusOpen || exc.Status == domain.ControlExceptionStatusAssigned, nil
+}
+
+func (s *stubStore) CertifyControlRun(_ context.Context, controlRunID, certificationStatus, note, principalID, actorID, correlationID string) (*domain.SubledgerControlRun, error) {
+	run := s.findControlRun(controlRunID)
+	if run == nil {
+		return nil, domain.ErrNoControlRunForScope
+	}
+	if run.CertificationStatus != nil {
+		return nil, domain.ErrControlAlreadyCertified
+	}
+	if run.RunByPrincipalID == principalID {
+		return nil, domain.ErrControlSelfCertification
+	}
+	if run.Status == "EXCEPTION" {
+		exc, err := s.GetControlExceptionByRun(context.Background(), controlRunID)
+		if err == nil {
+			if exc.Status != domain.ControlExceptionStatusResolved && certificationStatus == domain.ControlCertificationCertified {
+				return nil, domain.ErrControlHasUnresolvedException
+			}
+			if exc.ResolvedByPrincipalID == principalID {
+				return nil, domain.ErrControlSelfCertification
+			}
+		} else if !errors.Is(err, domain.ErrControlExceptionNotFound) {
+			return nil, err
+		}
+	}
+	now := time.Now().UTC()
+	status := certificationStatus
+	run.CertificationStatus = &status
+	run.CertifiedAt = &now
+	run.CertifiedByPrincipalID = &principalID
+	run.CertificationNote = note
+	cp := *run
+	return &cp, nil
 }
 
 func (s *stubStore) CreateAccrualSchedule(_ context.Context, sch *domain.AccrualSchedule, key, hash string) (bool, error) {
@@ -460,20 +685,36 @@ func (s *stubStore) transitionAccrual(scheduleID, fromStatus, toStatus string) e
 	return nil
 }
 
-func (s *stubStore) SubmitAccrualSchedule(_ context.Context, scheduleID, principalID string, at time.Time) error {
-	if err := s.transitionAccrual(scheduleID, domain.AccrualStatusDraft, domain.AccrualStatusPendingApproval); err != nil {
-		return err
+func (s *stubStore) SubmitAccrualSchedule(_ context.Context, sch *domain.AccrualSchedule, principalID, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "SubmitAccrual", hash); err != nil || replay {
+		if replay {
+			*sch = *s.schedules[id]
+		}
+		return replay, err
 	}
-	s.schedules[scheduleID].SubmittedAt, s.schedules[scheduleID].SubmittedByPrincipalID = &at, &principalID
-	return nil
+	if err := s.transitionAccrual(sch.ScheduleID, domain.AccrualStatusDraft, domain.AccrualStatusPendingApproval); err != nil {
+		return false, err
+	}
+	s.schedules[sch.ScheduleID].SubmittedAt, s.schedules[sch.ScheduleID].SubmittedByPrincipalID = &at, &principalID
+	*sch = *s.schedules[sch.ScheduleID]
+	s.recordClaim(key, "SubmitAccrual", hash, sch.ScheduleID)
+	return false, nil
 }
 
-func (s *stubStore) ApproveAccrualSchedule(_ context.Context, scheduleID, principalID string, at time.Time) error {
-	if err := s.transitionAccrual(scheduleID, domain.AccrualStatusPendingApproval, domain.AccrualStatusApproved); err != nil {
-		return err
+func (s *stubStore) ApproveAccrualSchedule(_ context.Context, sch *domain.AccrualSchedule, principalID, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "ApproveAccrual", hash); err != nil || replay {
+		if replay {
+			*sch = *s.schedules[id]
+		}
+		return replay, err
 	}
-	s.schedules[scheduleID].ApprovedAt, s.schedules[scheduleID].ApprovedByPrincipalID = &at, &principalID
-	return nil
+	if err := s.transitionAccrual(sch.ScheduleID, domain.AccrualStatusPendingApproval, domain.AccrualStatusApproved); err != nil {
+		return false, err
+	}
+	s.schedules[sch.ScheduleID].ApprovedAt, s.schedules[sch.ScheduleID].ApprovedByPrincipalID = &at, &principalID
+	*sch = *s.schedules[sch.ScheduleID]
+	s.recordClaim(key, "ApproveAccrual", hash, sch.ScheduleID)
+	return false, nil
 }
 
 func (s *stubStore) ActivateAccrualSchedule(_ context.Context, scheduleID string) error {
@@ -494,27 +735,48 @@ func (s *stubStore) CompleteAccrualSchedule(_ context.Context, scheduleID string
 	return s.transitionAccrual(scheduleID, domain.AccrualStatusActive, domain.AccrualStatusCompleted)
 }
 
-func (s *stubStore) CancelAccrualSchedule(_ context.Context, scheduleID, fromStatus, principalID string, at time.Time) error {
-	if err := s.transitionAccrual(scheduleID, fromStatus, domain.AccrualStatusCancelled); err != nil {
-		return err
+func (s *stubStore) CancelAccrualSchedule(_ context.Context, sch *domain.AccrualSchedule, principalID, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "CancelAccrual", hash); err != nil || replay {
+		if replay {
+			*sch = *s.schedules[id]
+		}
+		return replay, err
 	}
-	s.schedules[scheduleID].CancelledAt, s.schedules[scheduleID].CancelledByPrincipalID = &at, &principalID
-	return nil
+	existing, ok := s.schedules[sch.ScheduleID]
+	if !ok {
+		return false, domain.ErrAccrualNotFound
+	}
+	if existing.Status == domain.AccrualStatusCompleted || existing.Status == domain.AccrualStatusCancelled {
+		return false, domain.ErrInvalidAccrualTransition
+	}
+	existing.Status = domain.AccrualStatusCancelled
+	existing.CancelledAt, existing.CancelledByPrincipalID = &at, &principalID
+	*sch = *existing
+	s.recordClaim(key, "CancelAccrual", hash, sch.ScheduleID)
+	return false, nil
 }
 
-func (s *stubStore) AmendAccrualSchedule(_ context.Context, scheduleID string, totalAmount float64, periodCount int) error {
+func (s *stubStore) AmendAccrualSchedule(_ context.Context, sch *domain.AccrualSchedule, totalAmount float64, periodCount int, key, hash string) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "AmendFutureSchedule", hash); err != nil || replay {
+		if replay {
+			*sch = *s.schedules[id]
+		}
+		return replay, err
+	}
 	if s.amendAccrualErr != nil {
-		return s.amendAccrualErr
+		return false, s.amendAccrualErr
 	}
-	sch, ok := s.schedules[scheduleID]
+	existing, ok := s.schedules[sch.ScheduleID]
 	if !ok {
-		return domain.ErrAccrualNotFound
+		return false, domain.ErrAccrualNotFound
 	}
-	if sch.Status != domain.AccrualStatusApproved && sch.Status != domain.AccrualStatusActive {
-		return domain.ErrInvalidAccrualTransition
+	if existing.Status != domain.AccrualStatusApproved && existing.Status != domain.AccrualStatusActive {
+		return false, domain.ErrInvalidAccrualTransition
 	}
-	sch.TotalAmount, sch.PeriodCount = totalAmount, periodCount
-	return nil
+	existing.TotalAmount, existing.PeriodCount = totalAmount, periodCount
+	*sch = *existing
+	s.recordClaim(key, "AmendFutureSchedule", hash, sch.ScheduleID)
+	return false, nil
 }
 
 func (s *stubStore) CreateRecognitionInstance(_ context.Context, inst *domain.RecognitionInstance) (bool, error) {
@@ -624,12 +886,20 @@ func (s *stubStore) transitionPrepayment(scheduleID, fromStatus, toStatus string
 	return nil
 }
 
-func (s *stubStore) ApprovePrepaymentSchedule(_ context.Context, scheduleID, principalID string, at time.Time) error {
-	if err := s.transitionPrepayment(scheduleID, domain.PrepaymentStatusDraft, domain.PrepaymentStatusApproved); err != nil {
-		return err
+func (s *stubStore) ApprovePrepaymentSchedule(_ context.Context, sch *domain.PrepaymentSchedule, principalID, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "ApprovePrepayment", hash); err != nil || replay {
+		if replay {
+			*sch = *s.prepaymentSchedules[id]
+		}
+		return replay, err
 	}
-	s.prepaymentSchedules[scheduleID].ApprovedAt, s.prepaymentSchedules[scheduleID].ApprovedByPrincipalID = &at, &principalID
-	return nil
+	if err := s.transitionPrepayment(sch.ScheduleID, domain.PrepaymentStatusDraft, domain.PrepaymentStatusApproved); err != nil {
+		return false, err
+	}
+	s.prepaymentSchedules[sch.ScheduleID].ApprovedAt, s.prepaymentSchedules[sch.ScheduleID].ApprovedByPrincipalID = &at, &principalID
+	*sch = *s.prepaymentSchedules[sch.ScheduleID]
+	s.recordClaim(key, "ApprovePrepayment", hash, sch.ScheduleID)
+	return false, nil
 }
 
 func (s *stubStore) ActivatePrepaymentSchedule(_ context.Context, scheduleID string) error {
@@ -650,29 +920,49 @@ func (s *stubStore) CompletePrepaymentSchedule(_ context.Context, scheduleID str
 	return s.transitionPrepayment(scheduleID, domain.PrepaymentStatusActive, domain.PrepaymentStatusCompleted)
 }
 
-func (s *stubStore) TerminatePrepaymentSchedule(_ context.Context, scheduleID, fromStatus, principalID, reason, treatment string, at time.Time) error {
-	if err := s.transitionPrepayment(scheduleID, fromStatus, domain.PrepaymentStatusTerminated); err != nil {
-		return err
+func (s *stubStore) TerminatePrepaymentSchedule(_ context.Context, sch *domain.PrepaymentSchedule, principalID, reason, treatment, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "TerminatePrepayment", hash); err != nil || replay {
+		if replay {
+			*sch = *s.prepaymentSchedules[id]
+		}
+		return replay, err
 	}
-	sch := s.prepaymentSchedules[scheduleID]
-	sch.TerminatedAt, sch.TerminatedByPrincipalID = &at, &principalID
-	sch.TerminationReason, sch.TerminationFinalTreatment = &reason, &treatment
-	return nil
+	existing, ok := s.prepaymentSchedules[sch.ScheduleID]
+	if !ok {
+		return false, domain.ErrPrepaymentNotFound
+	}
+	if existing.Status == domain.PrepaymentStatusCompleted || existing.Status == domain.PrepaymentStatusTerminated {
+		return false, domain.ErrInvalidPrepaymentTransition
+	}
+	existing.Status = domain.PrepaymentStatusTerminated
+	existing.TerminatedAt, existing.TerminatedByPrincipalID = &at, &principalID
+	existing.TerminationReason, existing.TerminationFinalTreatment = &reason, &treatment
+	*sch = *existing
+	s.recordClaim(key, "TerminatePrepayment", hash, sch.ScheduleID)
+	return false, nil
 }
 
-func (s *stubStore) ModifyFuturePrepaymentSchedule(_ context.Context, scheduleID string, totalAmount float64, periodCount int) error {
+func (s *stubStore) ModifyFuturePrepaymentSchedule(_ context.Context, sch *domain.PrepaymentSchedule, totalAmount float64, periodCount int, key, hash string) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "ModifyPrepayment", hash); err != nil || replay {
+		if replay {
+			*sch = *s.prepaymentSchedules[id]
+		}
+		return replay, err
+	}
 	if s.modifyPrepaymentErr != nil {
-		return s.modifyPrepaymentErr
+		return false, s.modifyPrepaymentErr
 	}
-	sch, ok := s.prepaymentSchedules[scheduleID]
+	existing, ok := s.prepaymentSchedules[sch.ScheduleID]
 	if !ok {
-		return domain.ErrPrepaymentNotFound
+		return false, domain.ErrPrepaymentNotFound
 	}
-	if sch.Status != domain.PrepaymentStatusApproved && sch.Status != domain.PrepaymentStatusActive {
-		return domain.ErrInvalidPrepaymentTransition
+	if existing.Status != domain.PrepaymentStatusApproved && existing.Status != domain.PrepaymentStatusActive {
+		return false, domain.ErrInvalidPrepaymentTransition
 	}
-	sch.TotalAmount, sch.PeriodCount = totalAmount, periodCount
-	return nil
+	existing.TotalAmount, existing.PeriodCount = totalAmount, periodCount
+	*sch = *existing
+	s.recordClaim(key, "ModifyPrepayment", hash, sch.ScheduleID)
+	return false, nil
 }
 
 func (s *stubStore) CreatePrepaymentRecognition(_ context.Context, inst *domain.PrepaymentRecognitionInstance) (bool, error) {
@@ -741,30 +1031,60 @@ func (s *stubStore) ListAllocationRules(_ context.Context, legalEntityID string)
 	return out, nil
 }
 
-func (s *stubStore) ApproveAllocationRule(_ context.Context, ruleVersionID, principalID string, at time.Time) error {
-	if s.approveRuleErr != nil {
-		return s.approveRuleErr
-	}
+// findAllocationRuleVersion searches the current-version-only map by
+// rule_version_id, since a superseded (non-current) version is never stored
+// — real enough for these stub tests, which never replay against a version
+// that has since been superseded again.
+func (s *stubStore) findAllocationRuleVersion(id string) *domain.AllocationRule {
 	for _, rule := range s.allocationRules {
-		if rule.RuleVersionID == ruleVersionID {
-			if rule.Status != domain.AllocationRuleStatusDraft {
-				return domain.ErrInvalidAllocationRuleTransition
-			}
-			rule.Status = domain.AllocationRuleStatusApproved
-			rule.ApprovedAt, rule.ApprovedByPrincipalID = &at, &principalID
-			return nil
+		if rule.RuleVersionID == id {
+			return rule
 		}
 	}
-	return domain.ErrAllocationRuleNotFound
+	return nil
 }
 
-func (s *stubStore) SupersedeAllocationRule(_ context.Context, ruleID string, newVersion *domain.AllocationRule, supersededAt time.Time) error {
+func (s *stubStore) ApproveAllocationRule(_ context.Context, rule *domain.AllocationRule, principalID, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "ApproveAllocationRule", hash); err != nil || replay {
+		if replay {
+			if found := s.findAllocationRuleVersion(id); found != nil {
+				*rule = *found
+			}
+		}
+		return replay, err
+	}
+	if s.approveRuleErr != nil {
+		return false, s.approveRuleErr
+	}
+	existing := s.findAllocationRuleVersion(rule.RuleVersionID)
+	if existing == nil {
+		return false, domain.ErrAllocationRuleNotFound
+	}
+	if existing.Status != domain.AllocationRuleStatusDraft {
+		return false, domain.ErrInvalidAllocationRuleTransition
+	}
+	existing.Status = domain.AllocationRuleStatusApproved
+	existing.ApprovedAt, existing.ApprovedByPrincipalID = &at, &principalID
+	*rule = *existing
+	s.recordClaim(key, "ApproveAllocationRule", hash, rule.RuleVersionID)
+	return false, nil
+}
+
+func (s *stubStore) SupersedeAllocationRule(_ context.Context, ruleID string, newVersion *domain.AllocationRule, supersededAt time.Time, key, hash string) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "SupersedeAllocationRule", hash); err != nil || replay {
+		if replay {
+			if found := s.findAllocationRuleVersion(id); found != nil {
+				*newVersion = *found
+			}
+		}
+		return replay, err
+	}
 	if s.supersedeRuleErr != nil {
-		return s.supersedeRuleErr
+		return false, s.supersedeRuleErr
 	}
 	current, ok := s.allocationRules[ruleID]
 	if !ok || (current.Status != domain.AllocationRuleStatusApproved && current.Status != domain.AllocationRuleStatusActive) {
-		return domain.ErrNoCurrentRuleToSupersede
+		return false, domain.ErrNoCurrentRuleToSupersede
 	}
 	newVersion.Version = current.Version + 1
 	newVersion.RuleID = ruleID
@@ -772,7 +1092,8 @@ func (s *stubStore) SupersedeAllocationRule(_ context.Context, ruleID string, ne
 	newVersion.Status = domain.AllocationRuleStatusDraft
 	cp := *newVersion
 	s.allocationRules[ruleID] = &cp
-	return nil
+	s.recordClaim(key, "SupersedeAllocationRule", hash, newVersion.RuleVersionID)
+	return false, nil
 }
 
 func (s *stubStore) ActivateAllocationRule(_ context.Context, ruleVersionID string) error {
@@ -825,11 +1146,11 @@ func (s *stubStore) MarkAllocationRunCalculated(_ context.Context, runID string,
 	return nil
 }
 
-func (s *stubStore) MarkAllocationRunPosted(_ context.Context, runID, journalID string, at time.Time) error {
+func (s *stubStore) MarkAllocationRunPosted(_ context.Context, r *domain.AllocationRun, journalID string, at time.Time, _, _ string) error {
 	if s.markPostedErr != nil {
 		return s.markPostedErr
 	}
-	run, ok := s.allocationRuns[runID]
+	run, ok := s.allocationRuns[r.RunID]
 	if !ok {
 		return domain.ErrAllocationRunNotFound
 	}
@@ -922,23 +1243,33 @@ func (s *stubStore) ListFXRevaluationRuns(_ context.Context, legalEntityID, fisc
 	return out, nil
 }
 
-func (s *stubStore) ApproveFXRevaluationRun(_ context.Context, runID, principalID string, at time.Time) error {
+func (s *stubStore) ApproveFXRevaluationRun(_ context.Context, run *domain.FXRevaluationRun, principalID, key, hash string, at time.Time) (bool, error) {
+	if id, replay, err := s.lookupClaim(key, "ApproveFXRevaluation", hash); err != nil || replay {
+		if replay {
+			if found := s.fxRuns[id]; found != nil {
+				*run = *found
+			}
+		}
+		return replay, err
+	}
 	if s.approveFXErr != nil {
-		return s.approveFXErr
+		return false, s.approveFXErr
 	}
-	run, ok := s.fxRuns[runID]
+	existing, ok := s.fxRuns[run.RunID]
 	if !ok {
-		return domain.ErrFXRevaluationRunNotFound
+		return false, domain.ErrFXRevaluationRunNotFound
 	}
-	if run.Status != domain.FXRevaluationStatusReview {
-		return domain.ErrInvalidFXRevaluationTransition
+	if existing.Status != domain.FXRevaluationStatusReview {
+		return false, domain.ErrInvalidFXRevaluationTransition
 	}
-	run.Status = domain.FXRevaluationStatusApproved
-	run.ApprovedAt, run.ApprovedByPrincipalID = &at, &principalID
-	return nil
+	existing.Status = domain.FXRevaluationStatusApproved
+	existing.ApprovedAt, existing.ApprovedByPrincipalID = &at, &principalID
+	*run = *existing
+	s.recordClaim(key, "ApproveFXRevaluation", hash, run.RunID)
+	return false, nil
 }
 
-func (s *stubStore) MarkFXRevaluationPosted(_ context.Context, runID, journalID, principalID string, at time.Time) error {
+func (s *stubStore) MarkFXRevaluationPosted(_ context.Context, runID, _, journalID, principalID string, at time.Time, _ string) error {
 	if s.markFXPostedErr != nil {
 		return s.markFXPostedErr
 	}
@@ -951,108 +1282,6 @@ func (s *stubStore) MarkFXRevaluationPosted(_ context.Context, runID, journalID,
 	}
 	run.Status, run.JournalID, run.PostedAt, run.PostedByPrincipalID = domain.FXRevaluationStatusPosted, &journalID, &at, &principalID
 	return nil
-}
-
-func (s *stubStore) CreateMigrationBatch(_ context.Context, b *domain.MigrationBatch) error {
-	if s.createMigrationErr != nil {
-		return s.createMigrationErr
-	}
-	cp := *b
-	s.migrationBatches[b.BatchID] = &cp
-	return nil
-}
-
-func (s *stubStore) GetMigrationBatchBySourceSystem(_ context.Context, legalEntityID, fiscalPeriod, sourceSystemName string) (*domain.MigrationBatch, error) {
-	for _, b := range s.migrationBatches {
-		if b.LegalEntityID == legalEntityID && b.FiscalPeriod == fiscalPeriod && b.SourceSystemName == sourceSystemName {
-			cp := *b
-			return &cp, nil
-		}
-	}
-	return nil, domain.ErrMigrationBatchNotFound
-}
-
-func (s *stubStore) GetMigrationBatch(_ context.Context, batchID string) (*domain.MigrationBatch, error) {
-	b, ok := s.migrationBatches[batchID]
-	if !ok {
-		return nil, domain.ErrMigrationBatchNotFound
-	}
-	cp := *b
-	return &cp, nil
-}
-
-func (s *stubStore) transitionMigration(batchID, fromStatus, toStatus string) error {
-	if s.transitionMigrationErr != nil {
-		return s.transitionMigrationErr
-	}
-	b, ok := s.migrationBatches[batchID]
-	if !ok {
-		return domain.ErrMigrationBatchNotFound
-	}
-	if b.Status != fromStatus {
-		return domain.ErrInvalidMigrationBatchTransition
-	}
-	b.Status = toStatus
-	return nil
-}
-
-func (s *stubStore) MarkMigrationBatchValidated(_ context.Context, batchID string, at time.Time) error {
-	if err := s.transitionMigration(batchID, domain.MigrationBatchStatusLoaded, domain.MigrationBatchStatusValidated); err != nil {
-		return err
-	}
-	s.migrationBatches[batchID].ValidatedAt = &at
-	return nil
-}
-
-func (s *stubStore) QuarantineMigrationBatch(_ context.Context, batchID, fromStatus, reason string) error {
-	if err := s.transitionMigration(batchID, fromStatus, domain.MigrationBatchStatusQuarantined); err != nil {
-		return err
-	}
-	s.migrationBatches[batchID].QuarantineReason = &reason
-	return nil
-}
-
-func (s *stubStore) ApproveMigrationBatch(_ context.Context, batchID, principalID string, at time.Time) error {
-	if err := s.transitionMigration(batchID, domain.MigrationBatchStatusValidated, domain.MigrationBatchStatusApproved); err != nil {
-		return err
-	}
-	s.migrationBatches[batchID].ApprovedAt, s.migrationBatches[batchID].ApprovedByPrincipalID = &at, &principalID
-	return nil
-}
-
-func (s *stubStore) MarkMigrationBatchPosted(_ context.Context, batchID, journalID string, at time.Time) error {
-	if err := s.transitionMigration(batchID, domain.MigrationBatchStatusApproved, domain.MigrationBatchStatusPosted); err != nil {
-		return err
-	}
-	s.migrationBatches[batchID].JournalID, s.migrationBatches[batchID].PostedAt = &journalID, &at
-	return nil
-}
-
-func (s *stubStore) MarkMigrationBatchReconciled(_ context.Context, batchID string, at time.Time) error {
-	if err := s.transitionMigration(batchID, domain.MigrationBatchStatusPosted, domain.MigrationBatchStatusReconciled); err != nil {
-		return err
-	}
-	s.migrationBatches[batchID].ReconciledAt = &at
-	return nil
-}
-
-func (s *stubStore) CertifyMigrationBatch(_ context.Context, batchID, principalID, reason string, at time.Time) error {
-	if err := s.transitionMigration(batchID, domain.MigrationBatchStatusReconciled, domain.MigrationBatchStatusCertified); err != nil {
-		return err
-	}
-	b := s.migrationBatches[batchID]
-	b.CertifiedAt, b.CertifiedByPrincipalID, b.CertificationReason = &at, &principalID, &reason
-	return nil
-}
-
-func (s *stubStore) ListQuarantinedMigrationBatches(_ context.Context, legalEntityID string) ([]domain.MigrationBatch, error) {
-	var out []domain.MigrationBatch
-	for _, b := range s.migrationBatches {
-		if b.LegalEntityID == legalEntityID && b.Status == domain.MigrationBatchStatusQuarantined {
-			out = append(out, *b)
-		}
-	}
-	return out, nil
 }
 
 func (s *stubStore) CreateFinancialSnapshot(_ context.Context, snap *domain.FinancialSnapshot) error {
@@ -1304,11 +1533,6 @@ type stubClients struct {
 	trialBalances                map[string]float64
 	trialBalErr                  error
 
-	checkARInvoiceErr  error
-	checkAPInvoiceErr  error
-	existingARInvoices map[string]bool // "customerID|invoiceNumber" -> exists
-	existingAPInvoices map[string]bool // "vendorID|invoiceNumber" -> exists
-
 	controlAccountCodes  map[string]string // mapping key -> account code
 	mappingErr           error
 	apSubledgerTotal     float64
@@ -1365,11 +1589,6 @@ type stubClients struct {
 	lastMultiLegalEntity string
 	lastMultiPeriod      string
 	postMultiLineCalls   int
-
-	// ACC-17 reconciliation read-back.
-	postedJournal   *domain.PostedJournal
-	getJournalErr   error
-	getJournalCalls int
 }
 
 func (c *stubClients) GetUnpostedJournalsCount(_ context.Context, _, _, _ string) (int, error) {
@@ -1399,7 +1618,7 @@ func (c *stubClients) CompileTrialBalanceDecimal(_ context.Context, _, _, _, _ s
 	}, nil
 }
 
-// ListChartOfAccounts is the one chart read ACC-09/10/17 now make. Without an
+// ListChartOfAccounts is the one chart read ACC-09/10 now make. Without an
 // explicit chartOfAccounts it is built from the per-account fixtures the
 // tests already declare (accountStatuses, accountTypes), and their error
 // fixtures become a failed listing — the GL outage they always simulated.
@@ -1430,21 +1649,6 @@ func (c *stubClients) ListChartOfAccounts(_ context.Context, _, _ string) ([]cli
 	return out, nil
 }
 
-// GetPostedJournal reads back postedJournal when a test sets one; otherwise
-// the journal exactly as the last PostMultiLineJournal sent it — what a
-// healthy ledger would hold.
-func (c *stubClients) GetPostedJournal(_ context.Context, _, journalID string) (*domain.PostedJournal, error) {
-	c.getJournalCalls++
-	if c.getJournalErr != nil {
-		return nil, c.getJournalErr
-	}
-	if c.postedJournal != nil {
-		return c.postedJournal, nil
-	}
-	return &domain.PostedJournal{JournalID: journalID, Status: domain.GLJournalStatusFinalized, LegalEntityID: c.lastMultiLegalEntity,
-		FiscalPeriod: c.lastMultiPeriod, Lines: c.lastMultiLines}, nil
-}
-
 func (c *stubClients) ListBankAccounts(_ context.Context, _, _, _ string) ([]domain.BankAccountRef, error) {
 	c.bankCalls++
 	return c.bankAccounts, c.bankAccountsErr
@@ -1461,19 +1665,6 @@ func (c *stubClients) GetPostingBacklog(_ context.Context, _, _, _ string, cutof
 	return c.backlog, c.backlogErr
 }
 
-func (c *stubClients) CheckARInvoiceExists(_ context.Context, _, _, customerID, invoiceNumber string) (bool, error) {
-	if c.checkARInvoiceErr != nil {
-		return false, c.checkARInvoiceErr
-	}
-	return c.existingARInvoices[customerID+"|"+invoiceNumber], nil
-}
-
-func (c *stubClients) CheckAPInvoiceExists(_ context.Context, _, _, vendorID, invoiceNumber string) (bool, error) {
-	if c.checkAPInvoiceErr != nil {
-		return false, c.checkAPInvoiceErr
-	}
-	return c.existingAPInvoices[vendorID+"|"+invoiceNumber], nil
-}
 func (c *stubClients) UploadCloseEvidence(_ context.Context, _, _, _ string, _ map[string]float64, _ string) (string, error) {
 	if c.uploadErr != nil {
 		return "", c.uploadErr
@@ -2626,6 +2817,82 @@ func TestAccrualLifecycle_CreateSubmitApprove(t *testing.T) {
 	}
 }
 
+// TestSubmitAccrual_RetryUnderSameKeyReplays proves SPEC_DEVIATIONS A11 for
+// the accrual lifecycle: a lost-response retry of Submit (or Approve, Amend,
+// Cancel) must return the schedule as it now stands, not a second attempt at
+// a transition that already happened (which would 422 since the schedule is
+// no longer DRAFT).
+func TestSubmitAccrual_RetryUnderSameKeyReplays(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+	req := domain.CreateAccrualRequest{
+		CurrencyCode: testCurrency, LegalEntityID: "le-1", Description: "x", PolicyVersion: "v1",
+		TotalAmount: 100, StartFiscalPeriod: "2026-01", PeriodCount: 2,
+		DebitAccountCode: "6100", CreditAccountCode: "2100",
+	}
+	createRR := doReq(r, http.MethodPost, "/v1/accruals/", req, "preparer-1")
+	var sch domain.AccrualSchedule
+	_ = json.NewDecoder(createRR.Body).Decode(&sch)
+
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/accruals/"+sch.ScheduleID+"/submit", nil, "preparer-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first submit: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/accruals/"+sch.ScheduleID+"/submit", nil, "preparer-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried submit under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+	var replayed domain.AccrualSchedule
+	if err := json.NewDecoder(retry.Body).Decode(&replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Status != domain.AccrualStatusPendingApproval {
+		t.Fatalf("replay status = %q, want PENDING_APPROVAL (not a failed re-transition)", replayed.Status)
+	}
+}
+
+// TestSubmitAccrual_NoIdempotencyKey_Returns400 proves the command is
+// mandatory, per ZS-SVC-B-001 §22.
+func TestSubmitAccrual_NoIdempotencyKey_Returns400(t *testing.T) {
+	s := newStubStore()
+	s.schedules["sch-1"] = &domain.AccrualSchedule{ScheduleID: "sch-1", LegalEntityID: "le-1", Status: domain.AccrualStatusDraft}
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+	rr := doReqKeyed(r, http.MethodPost, "/v1/accruals/sch-1/submit", nil, "preparer-1", testTenantID, "")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestCancelFutureAccrual_RetryAfterSuccess_Replays is the A11 regression
+// this pass's CancelAccrualSchedule rewrite exists for: before it, a retried
+// cancel under the same key would have reached a handler-side
+// COMPLETED/CANCELLED pre-check using the GET's stale snapshot and only then
+// the store, and either path risked 422ing a legitimate replay. The claim
+// lookup must short-circuit before either guard runs.
+func TestCancelFutureAccrual_RetryAfterSuccess_Replays(t *testing.T) {
+	s := newStubStore()
+	s.schedules["sch-1"] = &domain.AccrualSchedule{ScheduleID: "sch-1", LegalEntityID: "le-1", Status: domain.AccrualStatusApproved}
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/accruals/sch-1/cancel", nil, "preparer-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first cancel: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/accruals/sch-1/cancel", nil, "preparer-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried cancel under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+
+	// A genuinely new attempt (a different key) against the now-CANCELLED
+	// schedule must still be refused.
+	again := doReqKeyed(r, http.MethodPost, "/v1/accruals/sch-1/cancel", nil, "preparer-1", testTenantID, uuid.NewString())
+	if again.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("new cancel attempt on an already-cancelled schedule: want 422, got %d %s", again.Code, again.Body.String())
+	}
+}
+
 func TestApproveAccrual_UsesDistinctAuthorizationAction(t *testing.T) {
 	s := newStubStore()
 	s.schedules["sch-1"] = &domain.AccrualSchedule{ScheduleID: "sch-1", LegalEntityID: "le-1", Status: domain.AccrualStatusPendingApproval}
@@ -2869,6 +3136,63 @@ func TestPrepaymentLifecycle_CreateApprove(t *testing.T) {
 	}
 }
 
+// TestApprovePrepayment_RetryUnderSameKeyReplays and
+// TestTerminatePrepayment_RetryAfterSuccess_Replays are the ACC-08 mirror of
+// the ACC-07 accrual tests above (SPEC_DEVIATIONS A11).
+func TestApprovePrepayment_RetryUnderSameKeyReplays(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+	req := domain.CreatePrepaymentRequest{
+		CurrencyCode: testCurrency, LegalEntityID: "le-1", Description: "x",
+		TotalAmount: 1200, StartFiscalPeriod: "2026-01", PeriodCount: 12,
+		DebitAccountCode: "6200-Insurance", CreditAccountCode: "1400-PrepaidInsurance",
+	}
+	createRR := doReq(r, http.MethodPost, "/v1/prepayments/", req, "preparer-1")
+	var sch domain.PrepaymentSchedule
+	_ = json.NewDecoder(createRR.Body).Decode(&sch)
+
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/prepayments/"+sch.ScheduleID+"/approve", nil, "approver-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first approve: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/prepayments/"+sch.ScheduleID+"/approve", nil, "approver-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried approve under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+	var replayed domain.PrepaymentSchedule
+	if err := json.NewDecoder(retry.Body).Decode(&replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Status != domain.PrepaymentStatusApproved {
+		t.Fatalf("replay status = %q, want APPROVED", replayed.Status)
+	}
+}
+
+func TestTerminatePrepayment_RetryAfterSuccess_Replays(t *testing.T) {
+	s := newStubStore()
+	s.prepaymentSchedules["ppy-1"] = &domain.PrepaymentSchedule{ScheduleID: "ppy-1", LegalEntityID: "le-1", Status: domain.PrepaymentStatusActive}
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+
+	termReq := domain.TerminatePrepaymentRequest{Reason: "contract ended", FinalBalanceTreatment: domain.TerminationTreatmentWriteOff}
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/prepayments/ppy-1/terminate", termReq, "preparer-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first terminate: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/prepayments/ppy-1/terminate", termReq, "preparer-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried terminate under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+
+	// A genuinely new attempt (a different key) against the now-TERMINATED
+	// schedule must still be refused.
+	again := doReqKeyed(r, http.MethodPost, "/v1/prepayments/ppy-1/terminate", termReq, "preparer-1", testTenantID, uuid.NewString())
+	if again.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("new terminate attempt on an already-terminated schedule: want 422, got %d %s", again.Code, again.Body.String())
+	}
+}
+
 func TestApprovePrepayment_UsesDistinctAuthorizationAction(t *testing.T) {
 	s := newStubStore()
 	s.prepaymentSchedules["ppy-1"] = &domain.PrepaymentSchedule{ScheduleID: "ppy-1", LegalEntityID: "le-1", Status: domain.PrepaymentStatusDraft}
@@ -3065,6 +3389,79 @@ func createApprovedAllocationRule(t *testing.T, s *stubStore, cl *stubClients, r
 	return rule.RuleID
 }
 
+// TestApproveAllocationRule_RetryUnderSameKeyReplays and
+// TestSupersedeAllocationRule_RetryUnderSameKeyReplays are the ACC-09 mirror
+// of the ACC-07/ACC-08 lifecycle tests above (SPEC_DEVIATIONS A11).
+func TestApproveAllocationRule_RetryUnderSameKeyReplays(t *testing.T) {
+	s := newStubStore()
+	cl := &stubClients{accountStatuses: map[string]string{"6100-Sales": "ACTIVE", "6200-Ops": "ACTIVE"}}
+	r := newRouter(s, &stubAuthZ{}, cl)
+	req := domain.CreateAllocationRuleRequest{
+		CurrencyCode: testCurrency, LegalEntityID: "le-1", Name: "IT shared cost", SourceAccountCode: "5000-IT",
+		Drivers: []domain.AllocationDriver{{RecipientAccountCode: "6100-Sales", WeightPercentage: 60}, {RecipientAccountCode: "6200-Ops", WeightPercentage: 40}},
+	}
+	createRR := doReq(r, http.MethodPost, "/v1/allocation-rules/", req, "preparer-1")
+	var rule domain.AllocationRule
+	_ = json.NewDecoder(createRR.Body).Decode(&rule)
+
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/allocation-rules/"+rule.RuleID+"/approve", nil, "approver-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first approve: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/allocation-rules/"+rule.RuleID+"/approve", nil, "approver-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried approve under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+	var replayed domain.AllocationRule
+	if err := json.NewDecoder(retry.Body).Decode(&replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Status != domain.AllocationRuleStatusApproved {
+		t.Fatalf("replay status = %q, want APPROVED", replayed.Status)
+	}
+}
+
+func TestSupersedeAllocationRule_RetryUnderSameKeyReplays(t *testing.T) {
+	s := newStubStore()
+	cl := &stubClients{accountStatuses: map[string]string{"6100-Sales": "ACTIVE", "6200-Ops": "ACTIVE"}}
+	r := newRouter(s, &stubAuthZ{}, cl)
+	ruleID := createApprovedAllocationRule(t, s, cl, r, []domain.AllocationDriver{
+		{RecipientAccountCode: "6100-Sales", WeightPercentage: 60}, {RecipientAccountCode: "6200-Ops", WeightPercentage: 40},
+	})
+
+	req := domain.SupersedeAllocationRuleRequest{
+		CurrencyCode: testCurrency, Name: "IT shared cost (revised)", SourceAccountCode: "5000-ITSharedCost",
+		Drivers: []domain.AllocationDriver{{RecipientAccountCode: "6100-Sales", WeightPercentage: 50}, {RecipientAccountCode: "6200-Ops", WeightPercentage: 50}},
+	}
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/allocation-rules/"+ruleID+"/supersede", req, "preparer-1", testTenantID, key)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first supersede: %d %s", first.Code, first.Body.String())
+	}
+	var firstVersion domain.AllocationRule
+	_ = json.NewDecoder(first.Body).Decode(&firstVersion)
+
+	retry := doReqKeyed(r, http.MethodPost, "/v1/allocation-rules/"+ruleID+"/supersede", req, "preparer-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried supersede under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+	var replayed domain.AllocationRule
+	if err := json.NewDecoder(retry.Body).Decode(&replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.RuleVersionID != firstVersion.RuleVersionID {
+		t.Fatalf("retry minted a second version: first %s, retry %s", firstVersion.RuleVersionID, replayed.RuleVersionID)
+	}
+
+	// A genuinely new attempt (a different key) must mint its own, distinct
+	// version rather than ever colliding with the replay logic above.
+	other := doReqKeyed(r, http.MethodPost, "/v1/allocation-rules/"+ruleID+"/supersede", req, "preparer-1", testTenantID, uuid.NewString())
+	if other.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("second genuine supersede attempt (rule already superseded by the first): want 422, got %d %s", other.Code, other.Body.String())
+	}
+}
+
 func evenDrivers() []domain.AllocationDriver {
 	return []domain.AllocationDriver{
 		{RecipientAccountCode: "6100-Sales", WeightPercentage: 40},
@@ -3150,6 +3547,33 @@ func TestApproveAllocationRule_UsesDistinctAuthorizationAction(t *testing.T) {
 	}
 }
 
+// A7 (SPEC_DEVIATIONS): the run certifier (whoever executes the allocation)
+// must differ from the driver owner (the rule's creator) — unconditionally,
+// not only for a "high-risk" pool the spec never defines how to identify.
+func TestExecuteAllocation_SamePrincipalAsRuleCreator_Refused(t *testing.T) {
+	s := newStubStore()
+	cl := &stubClients{trialBalances: map[string]float64{"5000-ITSharedCost": 1000.00}}
+	r := newRouter(s, &stubAuthZ{}, cl)
+	ruleID := createApprovedAllocationRule(t, s, cl, r, evenDrivers()) // created by "preparer-1"
+
+	req := domain.ExecuteAllocationRequest{RuleID: ruleID, FiscalPeriod: "2026-01"}
+	rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "preparer-1")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("executor == rule creator: want 403, got %d %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "self_approval_forbidden") {
+		t.Fatalf("refusal must name self_approval_forbidden: %s", rr.Body.String())
+	}
+	if len(s.allocationRuns) != 0 {
+		t.Fatal("a refused execution must not create a run")
+	}
+
+	rr = doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "executor-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("an independent executor must succeed: %d %s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestExecuteAllocation_SplitsSourceAmountAcrossDrivers(t *testing.T) {
 	s := newStubStore()
 	cl := &stubClients{trialBalances: map[string]float64{"5000-ITSharedCost": 1000.00}}
@@ -3157,7 +3581,7 @@ func TestExecuteAllocation_SplitsSourceAmountAcrossDrivers(t *testing.T) {
 	ruleID := createApprovedAllocationRule(t, s, cl, r, evenDrivers())
 
 	req := domain.ExecuteAllocationRequest{RuleID: ruleID, FiscalPeriod: "2026-01"}
-	rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "preparer-1")
+	rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "executor-1")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -3195,7 +3619,7 @@ func TestExecuteAllocation_RoundingResidualAbsorbedByLastDriver(t *testing.T) {
 	ruleID := createApprovedAllocationRule(t, s, cl, r, drivers)
 
 	req := domain.ExecuteAllocationRequest{RuleID: ruleID, FiscalPeriod: "2026-01"}
-	rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "preparer-1")
+	rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "executor-1")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -3217,14 +3641,14 @@ func TestExecuteAllocation_Rerun_ReturnsSameRunWithoutReposting(t *testing.T) {
 	ruleID := createApprovedAllocationRule(t, s, cl, r, evenDrivers())
 
 	req := domain.ExecuteAllocationRequest{RuleID: ruleID, FiscalPeriod: "2026-01"}
-	first := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "preparer-1")
+	first := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "executor-1")
 	if first.Code != http.StatusCreated {
 		t.Fatalf("first execute failed: %d %s", first.Code, first.Body.String())
 	}
 	var firstRun domain.AllocationRun
 	_ = json.NewDecoder(first.Body).Decode(&firstRun)
 
-	rerun := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "preparer-1")
+	rerun := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "executor-1")
 	if rerun.Code != http.StatusOK {
 		t.Fatalf("expected 200 on rerun got %d: %s", rerun.Code, rerun.Body.String())
 	}
@@ -3245,7 +3669,7 @@ func TestExecuteAllocation_SourceBalanceNotFound_Returns422(t *testing.T) {
 	ruleID := createApprovedAllocationRule(t, s, cl, r, evenDrivers())
 
 	req := domain.ExecuteAllocationRequest{RuleID: ruleID, FiscalPeriod: "2026-01"}
-	rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "preparer-1")
+	rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "executor-1")
 	if rr.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -3258,7 +3682,7 @@ func TestExecuteAllocation_JournalPostingFails_RunMarkedFailedNotSilentlyLost(t 
 	ruleID := createApprovedAllocationRule(t, s, cl, r, evenDrivers())
 
 	req := domain.ExecuteAllocationRequest{RuleID: ruleID, FiscalPeriod: "2026-01"}
-	rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "preparer-1")
+	rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "executor-1")
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -3282,11 +3706,11 @@ func TestExecuteAllocation_ExistingFailedRun_MustUseReprocess(t *testing.T) {
 	ruleID := createApprovedAllocationRule(t, s, cl, r, evenDrivers())
 
 	req := domain.ExecuteAllocationRequest{RuleID: ruleID, FiscalPeriod: "2026-01"}
-	if rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "preparer-1"); rr.Code != http.StatusServiceUnavailable {
+	if rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "executor-1"); rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected first attempt to fail 503, got %d: %s", rr.Code, rr.Body.String())
 	}
 
-	rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "preparer-1")
+	rr := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "executor-1")
 	if rr.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 (use reprocess) got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -3299,7 +3723,7 @@ func TestReprocessAllocationRun_RetriesFailedRunWithSameAmounts(t *testing.T) {
 	ruleID := createApprovedAllocationRule(t, s, cl, r, evenDrivers())
 
 	req := domain.ExecuteAllocationRequest{RuleID: ruleID, FiscalPeriod: "2026-01"}
-	first := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "preparer-1")
+	first := doReq(r, http.MethodPost, "/v1/allocation-runs/", req, "executor-1")
 	if first.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected first attempt to fail: %d", first.Code)
 	}
@@ -3402,6 +3826,32 @@ func TestStartRevaluation_AssetGain_ComputesCorrectAdjustment(t *testing.T) {
 	_ = json.NewDecoder(rr.Body).Decode(&run)
 	if len(run.Items) != 1 || run.Items[0].AdjustmentAmount != 200.00 {
 		t.Fatalf("expected adjustment 200.00 (4600-4400), got %+v", run.Items)
+	}
+}
+
+// TestApproveRevaluation_RetryUnderSameKeyReplays is the ACC-10 mirror of
+// the ACC-07/08/09 lifecycle tests above (SPEC_DEVIATIONS A11).
+func TestApproveRevaluation_RetryUnderSameKeyReplays(t *testing.T) {
+	s := newStubStore()
+	s.fxRuns["run-1"] = &domain.FXRevaluationRun{CurrencyCode: testCurrency, RunID: "run-1", LegalEntityID: "le-1",
+		Status: domain.FXRevaluationStatusReview, CreatedByPrincipalID: "preparer-1"}
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
+
+	key := uuid.NewString()
+	first := doReqKeyed(r, http.MethodPost, "/v1/fx-revaluations/run-1/approve", nil, "approver-1", testTenantID, key)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first approve: %d %s", first.Code, first.Body.String())
+	}
+	retry := doReqKeyed(r, http.MethodPost, "/v1/fx-revaluations/run-1/approve", nil, "approver-1", testTenantID, key)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retried approve under the same key: want 200 (replay), got %d %s", retry.Code, retry.Body.String())
+	}
+	var replayed domain.FXRevaluationRun
+	if err := json.NewDecoder(retry.Body).Decode(&replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Status != domain.FXRevaluationStatusApproved {
+		t.Fatalf("replay status = %q, want APPROVED", replayed.Status)
 	}
 }
 
@@ -3517,264 +3967,6 @@ func TestReversePriorRevaluation_NegatesPriorAdjustments(t *testing.T) {
 	}
 	if len(reversal.Items) != 1 || reversal.Items[0].AdjustmentAmount != -200.00 {
 		t.Fatalf("expected negated adjustment -200.00, got %+v", reversal.Items)
-	}
-}
-
-// ── ACC-17 (Opening Balance & Migration) ────────────────────────────────────────
-
-func balancedMigrationEntries() []domain.MigrationCrosswalkEntry {
-	return []domain.MigrationCrosswalkEntry{
-		{SourceReferenceID: "SRC-1", SourceAccountCode: "LEGACY-CASH", TargetAccountCode: "1000-Cash", DebitAmount: 10000.00},
-		{SourceReferenceID: "SRC-2", SourceAccountCode: "LEGACY-EQUITY", TargetAccountCode: "3000-OpeningEquity", CreditAmount: 10000.00},
-	}
-}
-
-func createValidatedMigrationBatch(t *testing.T, s *stubStore, cl *stubClients, r chi.Router) string {
-	t.Helper()
-	if cl.accountStatuses == nil {
-		cl.accountStatuses = map[string]string{}
-	}
-	cl.accountStatuses["1000-Cash"] = "ACTIVE"
-	cl.accountStatuses["3000-OpeningEquity"] = "ACTIVE"
-
-	req := domain.CreateMigrationBatchRequest{
-		CurrencyCode:  testCurrency,
-		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:abc123",
-		ExpectedRowCount: 2, ExpectedTotalDebits: 10000.00, ExpectedTotalCredits: 10000.00,
-		Entries: balancedMigrationEntries(),
-	}
-	rr := doReq(r, http.MethodPost, "/v1/migration-batches/", req, "preparer-1")
-	if rr.Code != http.StatusCreated {
-		t.Fatalf("create failed: %d %s", rr.Code, rr.Body.String())
-	}
-	var batch domain.MigrationBatch
-	_ = json.NewDecoder(rr.Body).Decode(&batch)
-
-	if rr := doReq(r, http.MethodPost, "/v1/migration-batches/"+batch.BatchID+"/validate", nil, "preparer-1"); rr.Code != http.StatusOK {
-		t.Fatalf("validate failed: %d %s", rr.Code, rr.Body.String())
-	}
-	return batch.BatchID
-}
-
-func TestCreateMigrationBatch_DuplicateSourceReference_Returns400(t *testing.T) {
-	r := newRouter(newStubStore(), &stubAuthZ{}, &stubClients{})
-	req := domain.CreateMigrationBatchRequest{
-		CurrencyCode:  testCurrency,
-		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x",
-		ExpectedRowCount: 2, Entries: []domain.MigrationCrosswalkEntry{
-			{SourceReferenceID: "SRC-1", TargetAccountCode: "1000-Cash", DebitAmount: 100},
-			{SourceReferenceID: "SRC-1", TargetAccountCode: "3000-Equity", CreditAmount: 100},
-		},
-	}
-	rr := doReq(r, http.MethodPost, "/v1/migration-batches/", req, "preparer-1")
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
-	}
-}
-
-func TestCreateMigrationBatch_Idempotent_ReturnsSameBatch(t *testing.T) {
-	s := newStubStore()
-	cl := &stubClients{}
-	r := newRouter(s, &stubAuthZ{}, cl)
-	req := domain.CreateMigrationBatchRequest{
-		CurrencyCode:  testCurrency,
-		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:abc",
-		ExpectedRowCount: 2, ExpectedTotalDebits: 10000, ExpectedTotalCredits: 10000, Entries: balancedMigrationEntries(),
-	}
-	first := doReq(r, http.MethodPost, "/v1/migration-batches/", req, "preparer-1")
-	if first.Code != http.StatusCreated {
-		t.Fatalf("first create failed: %d %s", first.Code, first.Body.String())
-	}
-	var firstBatch domain.MigrationBatch
-	_ = json.NewDecoder(first.Body).Decode(&firstBatch)
-
-	replay := doReq(r, http.MethodPost, "/v1/migration-batches/", req, "preparer-1")
-	if replay.Code != http.StatusOK {
-		t.Fatalf("expected 200 on replay got %d: %s", replay.Code, replay.Body.String())
-	}
-	var replayBatch domain.MigrationBatch
-	_ = json.NewDecoder(replay.Body).Decode(&replayBatch)
-	if replayBatch.BatchID != firstBatch.BatchID {
-		t.Errorf("expected the same batch on replay, got a different batch_id")
-	}
-}
-
-func TestValidateOpeningBalances_UnbalancedTB_QuarantinesBatch(t *testing.T) {
-	s := newStubStore()
-	cl := &stubClients{accountStatuses: map[string]string{"1000-Cash": "ACTIVE", "3000-Equity": "ACTIVE"}}
-	r := newRouter(s, &stubAuthZ{}, cl)
-	req := domain.CreateMigrationBatchRequest{
-		CurrencyCode:  testCurrency,
-		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x",
-		ExpectedRowCount: 2, ExpectedTotalDebits: 10000, ExpectedTotalCredits: 9000,
-		Entries: []domain.MigrationCrosswalkEntry{
-			{SourceReferenceID: "SRC-1", TargetAccountCode: "1000-Cash", DebitAmount: 10000},
-			{SourceReferenceID: "SRC-2", TargetAccountCode: "3000-Equity", CreditAmount: 9000}, // does not balance
-		},
-	}
-	rr := doReq(r, http.MethodPost, "/v1/migration-batches/", req, "preparer-1")
-	var batch domain.MigrationBatch
-	_ = json.NewDecoder(rr.Body).Decode(&batch)
-
-	validateRR := doReq(r, http.MethodPost, "/v1/migration-batches/"+batch.BatchID+"/validate", nil, "preparer-1")
-	if validateRR.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("expected 422 got %d: %s", validateRR.Code, validateRR.Body.String())
-	}
-	stored, _ := s.GetMigrationBatch(context.Background(), batch.BatchID)
-	if stored.Status != domain.MigrationBatchStatusQuarantined {
-		t.Errorf("expected QUARANTINED, got %q", stored.Status)
-	}
-}
-
-func TestValidateOpeningBalances_SuspenseAccountTargeted_QuarantinesBatch(t *testing.T) {
-	s := newStubStore()
-	cl := &stubClients{accountStatuses: map[string]string{"1000-Cash": "ACTIVE", "9999-Suspense": "ACTIVE"}}
-	r := newRouter(s, &stubAuthZ{}, cl)
-	req := domain.CreateMigrationBatchRequest{
-		CurrencyCode:  testCurrency,
-		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x",
-		ExpectedRowCount: 2, ExpectedTotalDebits: 500, ExpectedTotalCredits: 500,
-		Entries: []domain.MigrationCrosswalkEntry{
-			{SourceReferenceID: "SRC-1", TargetAccountCode: "1000-Cash", DebitAmount: 500},
-			{SourceReferenceID: "SRC-2", TargetAccountCode: "9999-Suspense", CreditAmount: 500}, // forced plug
-		},
-	}
-	rr := doReq(r, http.MethodPost, "/v1/migration-batches/", req, "preparer-1")
-	var batch domain.MigrationBatch
-	_ = json.NewDecoder(rr.Body).Decode(&batch)
-
-	validateRR := doReq(r, http.MethodPost, "/v1/migration-batches/"+batch.BatchID+"/validate", nil, "preparer-1")
-	if validateRR.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("expected 422 got %d: %s", validateRR.Code, validateRR.Body.String())
-	}
-}
-
-func TestValidateOpeningBalances_ControlTotalsMismatch_QuarantinesBatch(t *testing.T) {
-	// Row counts and both sides balance internally, but the loaded totals
-	// don't match what the SOURCE system itself declared — the deeper
-	// version of "values differ."
-	s := newStubStore()
-	cl := &stubClients{accountStatuses: map[string]string{"1000-Cash": "ACTIVE", "3000-Equity": "ACTIVE"}}
-	r := newRouter(s, &stubAuthZ{}, cl)
-	req := domain.CreateMigrationBatchRequest{
-		CurrencyCode:  testCurrency,
-		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x",
-		ExpectedRowCount: 2, ExpectedTotalDebits: 99999.00, ExpectedTotalCredits: 99999.00, // source declared this
-		Entries: []domain.MigrationCrosswalkEntry{
-			{SourceReferenceID: "SRC-1", TargetAccountCode: "1000-Cash", DebitAmount: 10000},
-			{SourceReferenceID: "SRC-2", TargetAccountCode: "3000-Equity", CreditAmount: 10000}, // but this is what actually loaded
-		},
-	}
-	rr := doReq(r, http.MethodPost, "/v1/migration-batches/", req, "preparer-1")
-	var batch domain.MigrationBatch
-	_ = json.NewDecoder(rr.Body).Decode(&batch)
-
-	validateRR := doReq(r, http.MethodPost, "/v1/migration-batches/"+batch.BatchID+"/validate", nil, "preparer-1")
-	if validateRR.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("expected 422 got %d: %s", validateRR.Code, validateRR.Body.String())
-	}
-}
-
-func TestApproveMigrationBatch_UsesDistinctAuthorizationAction(t *testing.T) {
-	s := newStubStore()
-	s.migrationBatches["batch-1"] = &domain.MigrationBatch{BatchID: "batch-1", LegalEntityID: "le-1", Status: domain.MigrationBatchStatusValidated}
-	var seenAction string
-	authz := &recordingAuthZ{onCheck: func(_, _, action string) error {
-		seenAction = action
-		return domain.ErrAuthorizationDenied
-	}}
-	h := handler.New(s, authz, &stubClients{}, testSigningKey, zap.NewNop())
-	rt := chi.NewRouter()
-	rt.Use(middleware.TenantContext())
-	handler.RegisterRoutes(rt, h)
-	rr := doReq(rt, http.MethodPost, "/v1/migration-batches/batch-1/approve", nil, "approver-1")
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 got %d: %s", rr.Code, rr.Body.String())
-	}
-	if seenAction != "MIGRATION_BATCH_APPROVE" {
-		t.Errorf("expected MIGRATION_BATCH_APPROVE, got %q", seenAction)
-	}
-}
-
-func TestCommitOpeningPosting_Replay_DoesNotRepost(t *testing.T) {
-	s := newStubStore()
-	cl := &stubClients{}
-	r := newRouter(s, &stubAuthZ{}, cl)
-	batchID := createValidatedMigrationBatch(t, s, cl, r)
-	if rr := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/approve", nil, "approver-1"); rr.Code != http.StatusOK {
-		t.Fatalf("approve failed: %d %s", rr.Code, rr.Body.String())
-	}
-
-	first := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/commit", nil, "preparer-1")
-	if first.Code != http.StatusOK {
-		t.Fatalf("first commit failed: %d %s", first.Code, first.Body.String())
-	}
-	if cl.postMultiLineCalls != 1 {
-		t.Fatalf("expected 1 journal post, got %d", cl.postMultiLineCalls)
-	}
-
-	replay := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/commit", nil, "preparer-1")
-	if replay.Code != http.StatusOK {
-		t.Fatalf("expected 200 on replay got %d: %s", replay.Code, replay.Body.String())
-	}
-	if cl.postMultiLineCalls != 1 {
-		t.Fatalf("expected still only 1 journal post after replay, got %d", cl.postMultiLineCalls)
-	}
-	var posted domain.MigrationBatch
-	_ = json.NewDecoder(replay.Body).Decode(&posted)
-	if posted.Status != domain.MigrationBatchStatusReconciled {
-		t.Errorf("expected RECONCILED after commit, got %q", posted.Status)
-	}
-}
-
-func TestCommitOpeningPosting_LockedPeriod_Returns422AndDoesNotPost(t *testing.T) {
-	s := newStubStore()
-	cl := &stubClients{}
-	r := newRouter(s, &stubAuthZ{}, cl)
-	batchID := createValidatedMigrationBatch(t, s, cl, r)
-	if rr := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/approve", nil, "approver-1"); rr.Code != http.StatusOK {
-		t.Fatalf("approve failed: %d %s", rr.Code, rr.Body.String())
-	}
-	s.periods["fp-locked"] = &domain.FiscalPeriod{FiscalPeriodID: "fp-locked", TenantID: testTenantID, LegalEntityID: "le-1", PeriodName: "2026-01", CloseStatus: "LOCKED"}
-
-	rr := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/commit", nil, "preparer-1")
-	if rr.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("expected 422 got %d: %s", rr.Code, rr.Body.String())
-	}
-	if cl.postMultiLineCalls != 0 {
-		t.Errorf("expected no journal posted into a LOCKED period, got %d calls", cl.postMultiLineCalls)
-	}
-}
-
-func TestCertifyMigrationAccounting_RequiresReason(t *testing.T) {
-	s := newStubStore()
-	s.migrationBatches["batch-1"] = &domain.MigrationBatch{BatchID: "batch-1", LegalEntityID: "le-1", Status: domain.MigrationBatchStatusReconciled}
-	r := newRouter(s, &stubAuthZ{}, &stubClients{})
-	rr := doReq(r, http.MethodPost, "/v1/migration-batches/batch-1/certify", domain.CertifyMigrationBatchRequest{}, "certifier-1")
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
-	}
-}
-
-func TestFullMigrationLifecycle_ReachesCertified(t *testing.T) {
-	s := newStubStore()
-	cl := &stubClients{}
-	r := newRouter(s, &stubAuthZ{}, cl)
-	batchID := createValidatedMigrationBatch(t, s, cl, r)
-	if rr := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/approve", nil, "approver-1"); rr.Code != http.StatusOK {
-		t.Fatalf("approve failed: %d %s", rr.Code, rr.Body.String())
-	}
-	if rr := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/commit", nil, "preparer-1"); rr.Code != http.StatusOK {
-		t.Fatalf("commit failed: %d %s", rr.Code, rr.Body.String())
-	}
-	certifyRR := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/certify", domain.CertifyMigrationBatchRequest{Reason: "source-to-target reconciled and signed off"}, "certifier-1")
-	if certifyRR.Code != http.StatusOK {
-		t.Fatalf("certify failed: %d %s", certifyRR.Code, certifyRR.Body.String())
-	}
-	var final domain.MigrationBatch
-	_ = json.NewDecoder(certifyRR.Body).Decode(&final)
-	if final.Status != domain.MigrationBatchStatusCertified {
-		t.Errorf("expected CERTIFIED, got %q", final.Status)
 	}
 }
 

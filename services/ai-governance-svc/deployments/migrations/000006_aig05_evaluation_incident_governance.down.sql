@@ -1,6 +1,6 @@
-DROP TRIGGER IF EXISTS trigger_incident_lifecycle ON ai_incidents;
+DROP TRIGGER IF EXISTS trigger_incident_lifecycle ON ai_incident_records;
 DROP FUNCTION IF EXISTS aig05_enforce_incident_lifecycle() CASCADE;
-DROP TABLE IF EXISTS ai_incidents;
+DROP TABLE IF EXISTS ai_incident_records;
 
 DROP TRIGGER IF EXISTS trigger_evaluation_immutability ON ai_evaluations;
 DROP FUNCTION IF EXISTS aig05_reject_evaluation_mutation() CASCADE;

@@ -799,6 +799,11 @@ func (h *Handler) ConfirmClassification(w http.ResponseWriter, r *http.Request) 
 	if !h.authorize(w, r, actor, existing.LegalEntityID, authz.ActionConfirmClassification) {
 		return
 	}
+	// BIZ-02 SoD: a RESTRICTED classification also needs the security/privacy owner.
+	if existing.ClassificationValue == domain.ClassificationRestricted &&
+		!h.authorize(w, r, actor, existing.LegalEntityID, authz.ActionConfirmRestrictedClassification) {
+		return
+	}
 
 	updated, err := h.store.ConfirmClassification(r.Context(), domain.ConfirmClassificationParams{
 		ClassificationID: classificationID, ConfirmedByPrincipalID: actor,
@@ -918,6 +923,18 @@ func (h *Handler) SupersedeClassification(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if !h.authorize(w, r, actor, existing.LegalEntityID, authz.ActionSupersedeClassification) {
+		return
+	}
+	// BIZ-02 SoD: superseding a RESTRICTED classification, or confirming a RESTRICTED
+	// replacement, also needs the security/privacy owner. The replacement is looked up
+	// only to read its value; the store still validates it.
+	restricted := existing.ClassificationValue == domain.ClassificationRestricted
+	if !restricted && req.NewClassificationID != "" {
+		if replacement, err := h.store.FindClassificationByID(r.Context(), req.NewClassificationID); err == nil {
+			restricted = replacement.ClassificationValue == domain.ClassificationRestricted
+		}
+	}
+	if restricted && !h.authorize(w, r, actor, existing.LegalEntityID, authz.ActionConfirmRestrictedClassification) {
 		return
 	}
 

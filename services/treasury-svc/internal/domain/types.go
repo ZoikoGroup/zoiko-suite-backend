@@ -21,6 +21,8 @@ type BankAccount struct {
 	RequestedOperationalUse string `json:"requested_operational_use"`
 	TokenVersion            int    `json:"token_version"`
 	CreatedByPrincipalID    string `json:"created_by_principal_id,omitempty"`
+	SuspendReason           string `json:"suspend_reason,omitempty"`
+	CloseReason             string `json:"close_reason,omitempty"`
 	CorrelationID           string `json:"-"`
 
 	CreatedAt time.Time `json:"created_at"`
@@ -86,6 +88,8 @@ type AccountHistoryEntry struct {
 	RequestedOperationalUse string    `json:"requested_operational_use"`
 	TokenVersion            int       `json:"token_version"`
 	ChangedByPrincipalID    string    `json:"changed_by_principal_id"`
+	SuspendReason           string    `json:"suspend_reason,omitempty"`
+	CloseReason             string    `json:"close_reason,omitempty"`
 	EffectiveAt             time.Time `json:"effective_at"`
 	SupersededBy            *string   `json:"superseded_by,omitempty"`
 }
@@ -110,6 +114,7 @@ type VerifyOwnershipParams struct {
 	BankAccountID, TenantID         string
 	VerificationMethod, EvidenceRef string
 	VerifiedByPrincipalID           string
+	CorrelationID                   string
 }
 
 // AmendBankAccountMetadataParams: an empty field keeps its current value.
@@ -119,28 +124,34 @@ type AmendBankAccountMetadataParams struct {
 	BankAccountID, TenantID                      string
 	AccountName, BranchRef, Country, AccountType string
 	ActorPrincipalID                             string
+	CorrelationID                                string
 }
 
 type ChangeOperationalUseParams struct {
 	BankAccountID, TenantID, RequestedOperationalUse, ActorPrincipalID string
+	CorrelationID                                                     string
 }
 
 type SuspendAccountParams struct {
 	BankAccountID, TenantID, Reason, ActorPrincipalID string
+	CorrelationID                                     string
 }
 
 type ReactivateAccountParams struct {
 	BankAccountID, TenantID, ActorPrincipalID string
+	CorrelationID                             string
 }
 
 type CloseAccountParams struct {
 	BankAccountID, TenantID, Reason, ActorPrincipalID string
+	CorrelationID                                     string
 }
 
 type RotateAccountTokenParams struct {
 	BankAccountID, TenantID                   string
 	NewMaskedAccountNumber, NewBankIdentifier string
 	ActorPrincipalID                          string
+	CorrelationID                             string
 }
 
 // CashBalance represents a balance snapshot for a bank account.

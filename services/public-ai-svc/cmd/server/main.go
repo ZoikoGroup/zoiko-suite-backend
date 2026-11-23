@@ -15,8 +15,10 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
+	"zoiko.io/public-ai-svc/internal/metrics"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
@@ -30,6 +32,7 @@ import (
 	"zoiko.io/public-ai-svc/internal/limits"
 	"zoiko.io/public-ai-svc/internal/model"
 	"zoiko.io/public-ai-svc/internal/orchestrator"
+	"zoiko.io/public-ai-svc/internal/policy"
 	"zoiko.io/public-ai-svc/internal/release"
 	"zoiko.io/public-ai-svc/internal/session"
 	"zoiko.io/public-ai-svc/internal/store"
@@ -41,6 +44,45 @@ const refreshInterval = 5 * time.Second
 // gitSHA is the application artifact version, set at build time
 // (-ldflags "-X main.gitSHA=...") and recorded in the release manifest.
 var gitSHA = "unknown"
+
+// draining is set on SIGTERM: readiness turns false so the load balancer
+// stops routing new turns while in-flight ones finish (Doc 08 §11).
+var draining atomic.Bool
+
+// started is set once the first release and flag load completed.
+var started atomic.Bool
+
+// envKillSwitch folds PUBLIC_AI_ENABLED into public_ai_enabled, so a
+// deployment-level off is served as the typed KILL_SWITCH outcome exactly
+// like the runtime flag instead of failing readiness (Doc 08 §26, OPR-011).
+type envKillSwitch struct {
+	fl      *flags.Loader
+	enabled bool
+}
+
+func (e envKillSwitch) Values() flags.Values {
+	v := e.fl.Values()
+	if !e.enabled {
+		v.PublicAIEnabled = false
+	}
+	return v
+}
+
+// readiness is release-runtime readiness: not draining, verified releases
+// fresh and flags readable. The kill switch is deliberately absent.
+func readiness(releasesReady func() bool, flagsHealthy func() bool) func() bool {
+	return func() bool { return !draining.Load() && releasesReady() && flagsHealthy() }
+}
+
+// drainGrace is how long readiness reports false before the listener stops.
+const drainGrace = config.DrainGrace
+
+// shutdownTimeout always outlasts a turn's lease (2 x model timeout + 5 s,
+// httpapi), so an in-flight turn ends with a stored outcome (OPR-012).
+// config bounds the model timeout so drain + this fits the stop grace.
+func shutdownTimeout(cfg config.Config) time.Duration {
+	return 2*cfg.ModelTimeout + config.ShutdownSlack
+}
 
 func main() {
 	log, err := zap.NewProduction()
@@ -65,6 +107,10 @@ func main() {
 		_ = shutdownTracing(sctx)
 	}()
 	log.Info("tracing", zap.Bool("otlp_export", telemetry.Enabled()))
+	// Doc 06 §08: only the approved policy runs.
+	if err := policy.CheckSignedDigest(cfg.PolicyDigest, cfg.PolicySignature, cfg.SigningPublicKey, model.PromptTemplateVersion); err != nil {
+		log.Fatal("policy digest", zap.Error(err))
+	}
 
 	var (
 		st  store.Store
@@ -73,8 +119,11 @@ func main() {
 		pub events.Publisher = events.LogPublisher{Log: log}
 	)
 	if cfg.DatabaseURL == "" {
+		if cfg.Environment != "dev" && cfg.Environment != "test" {
+			log.Fatal("PUBLIC_AI_DATABASE_URL is required outside dev/test")
+		}
 		log.Warn("LOCAL DEV MODE: no PUBLIC_AI_DATABASE_URL; serving SYNTHETIC data from memory",
-			zap.String("dataset", cfg.Dataset), zap.String("model_provider", cfg.ModelProvider), zap.Bool("kb_allow_draft", cfg.KBAllowDraft),
+			zap.String("store", "memory"), zap.String("dataset", cfg.Dataset), zap.String("model_provider", cfg.ModelProvider), zap.Bool("kb_allow_draft", cfg.KBAllowDraft),
 			zap.String("retrieval", "lexical BM25 + aliases; no embeddings configured (ADR-002)"))
 		env, err := fixtureenv.NewFromDirWith(ctx, fixtureenv.DatasetDir(cfg.Dataset), store.NewMemory(), "dev-1", cfg.ModelTimeout, cfg.KBAllowDraft)
 		if err != nil {
@@ -98,9 +147,17 @@ func main() {
 		}
 		rt = release.New(st, cfg.SigningPublicKey)
 		rt.AllowDraft = cfg.KBAllowDraft // config refuses it outside dev/test
+		// OPR-004: a release names the policy versions it was evaluated with.
+		rt.PolicyVersion = cfg.PolicyVersion
+		rt.RequireCompatibility = cfg.Environment != "dev" && cfg.Environment != "test"
 		fl = flags.NewLoader(st)
 		if len(cfg.KafkaBrokers) > 0 {
-			pub = events.NewKafkaPublisher(cfg.KafkaBrokers)
+			kp, err := events.NewKafkaPublisher(cfg.KafkaBrokers, events.KafkaOptions{TLS: cfg.KafkaTLS, SASLMechanism: cfg.KafkaSASLMechanism,
+				Username: cfg.KafkaUsername, Password: cfg.KafkaPassword, SigningKey: cfg.EventSigningKey, SignerID: cfg.EventSignerID})
+			if err != nil {
+				log.Fatal("kafka publisher", zap.Error(err))
+			}
+			pub = kp
 		}
 	}
 	defer pub.Close() //nolint:errcheck
@@ -113,12 +170,15 @@ func main() {
 		log.Warn("structured responses on (dev): GET /menu and turn followups/cta/outcome")
 	}
 	// Initial load; failures leave the service not-ready (fail closed).
+	// /health/startup turns true once the first release and flag load has
+	// completed (Doc 08 §10), whatever its result: readiness reports health.
 	if err := rt.Refresh(ctx); err != nil {
 		log.Error("release load failed; service is not ready", zap.Error(err))
 	}
 	if err := fl.Refresh(ctx); err != nil {
 		log.Error("flag load failed; assistant disabled", zap.Error(err))
 	}
+	started.Store(true)
 	go rt.Run(ctx, refreshInterval, func(err error) { log.Error("release refresh failed", zap.Error(err)) })
 	go runEvery(ctx, refreshInterval, func() {
 		if err := fl.Refresh(ctx); err != nil {
@@ -136,8 +196,11 @@ func main() {
 	relay := &events.Relay{Store: st, Pub: pub, Log: log}
 	go relay.Run(ctx, time.Second)
 
+	kill := envKillSwitch{fl: fl, enabled: cfg.Enabled}
 	pipeline := &orchestrator.Pipeline{
-		Releases: rt, Flags: fl, Store: st, Log: log, MaxOutputTokens: cfg.TokenBudgetPerTurn / 4,
+		Releases: rt, Flags: kill, Store: st, Log: log, MaxOutputTokens: cfg.TokenBudgetPerTurn / 4,
+		// Release tuple on every decision record (Doc 08 §06).
+		PolicyVersion: cfg.PolicyVersion, ModelID: cfg.ModelID, AppVersion: gitSHA,
 		Model: model.Gateway{Provider: providerFor(log, cfg), Timeout: cfg.ModelTimeout, ModelID: cfg.ModelID, Breaker: &model.Breaker{
 			Threshold: 5, Cooldown: 30 * time.Second,
 			OnOpen: func() {
@@ -146,14 +209,21 @@ func main() {
 		}},
 	}
 	guard := limits.New(cfg, st, fl)
+	// SEC-T046: idle rate-limit buckets are dropped, so no visitor key lives
+	// past its window (Doc 06 §17).
+	go guard.RunSweeper(ctx, time.Minute)
+	sessions := session.New(st, cfg.SessionTTL).WithIdleTTL(cfg.SessionIdleTTL).WithIdempotencyTTL(cfg.IdempotencyTTL)
+	sessions.ReleaseID = rt.KBReleaseID // Doc 04 §16: the release each session started on
 	api := httpapi.New(cfg, log, httpapi.Deps{
-		Store: st, Sessions: session.New(st, cfg.SessionTTL), Answerer: guard.Wrap(pipeline), Config: rt, Routes: rt, Flags: fl,
-		Limiter: guard.Middleware,
-		Ready: func() bool {
-			return cfg.Enabled && rt.Ready(3*refreshInterval) && fl.Healthy() && fl.Values().PublicAIEnabled
-		},
+		Store: st, Sessions: sessions, Answerer: guard.Wrap(pipeline), Config: rt, Routes: rt, Flags: kill,
+		Limiter:      guard.Middleware,
+		Ready:        readiness(func() bool { return rt.Ready(3 * refreshInterval) }, fl.Healthy),
+		ReleaseReady: func() bool { return rt.Ready(3 * refreshInterval) },
+		Started:      started.Load,
+		ChatEnabled:  func() bool { return kill.Values().PublicAIEnabled },
 	})
-	serve(ctx, log, cfg, api.Router())
+	metrics.SetBuildInfo(gitSHA, cfg.ModelProfile)
+	serve(ctx, log, cfg, api.Router(), api.AdminRouter())
 }
 
 // providerFor returns the configured model provider behind the same
@@ -185,6 +255,7 @@ func openPostgres(ctx context.Context, log *zap.Logger, cfg config.Config) store
 	if err := store.Migrate(cctx, pool, migrations.FS); err != nil {
 		log.Fatal("migrations", zap.Error(err))
 	}
+	log.Info("storage ready", zap.String("store", "postgres"))
 	return store.NewPostgres(pool)
 }
 
@@ -201,7 +272,20 @@ func runEvery(ctx context.Context, d time.Duration, f func()) {
 	}
 }
 
-func serve(ctx context.Context, log *zap.Logger, cfg config.Config, h http.Handler) {
+func serve(ctx context.Context, log *zap.Logger, cfg config.Config, h, admin http.Handler) {
+	// Doc 06 §12: /metrics and /health/* on an internal listener when
+	// PUBLIC_AI_ADMIN_ADDR is set; the public listener then has none.
+	var adminSrv *http.Server
+	if cfg.AdminAddr != "" {
+		adminSrv = &http.Server{Addr: cfg.AdminAddr, Handler: admin, ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout: 5 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second}
+		go func() {
+			log.Info("admin listener (metrics, health)", zap.String("addr", cfg.AdminAddr))
+			if err := adminSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Fatal("admin server failed", zap.Error(err))
+			}
+		}()
+	}
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           h,
@@ -217,10 +301,16 @@ func serve(ctx context.Context, log *zap.Logger, cfg config.Config, h http.Handl
 		}
 	}()
 	<-ctx.Done()
-	sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	draining.Store(true)
+	log.Info("draining: readiness false", zap.Duration("grace", drainGrace))
+	time.Sleep(drainGrace)
+	sctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout(cfg))
 	defer cancel()
 	if err := srv.Shutdown(sctx); err != nil {
 		log.Error("forced shutdown", zap.Error(err))
+	}
+	if adminSrv != nil {
+		_ = adminSrv.Shutdown(sctx)
 	}
 	_ = os.Stdout.Sync()
 }

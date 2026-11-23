@@ -23,10 +23,17 @@ and never posts, waives or clears anything — and the tolerance gate is real.
 It now consumes bank-reconciliation (A1), detects duplicate entries within
 a run (A2), and proposes the book side of an UNMATCHED line: a FINALIZED
 general-ledger-svc journal, as an advisory AUTO_MATCH or DATE_SKEW (A2a,
-2026-10-26). It does not yet propose a banking-connector-svc canonical
-transaction (A2b). Two defects were fixed in this pass (B1, B2); a later pass
-closed A7 and the decimal half of A4; a third closed A1, A3 and A6; a fourth
-closed A8 and A9; a fifth closed A5; the latest closes A2a.
+2026-10-26) — or, when no journal matches, a NORMALIZED banking-connector-svc
+canonical transaction (A2b part 1, 2026-10-28). Two defects were fixed in
+this pass (B1, B2); a later pass closed A7 and the decimal half of A4; a
+third closed A1, A3 and A6; a fourth closed A8 and A9; a fifth closed A5; a
+sixth closed A2a; a seventh closed A2b part 1; an eighth closed A2b part 4
+(general-ledger-svc's QueryLedger keyset cursor, A15, and this service's
+internal/ledger client following it); a ninth closed A2b part 2
+(two-journal matches, requiring bank-reconciliation-svc's own A2 to gain
+many-to-one support first); the latest closes A2b part 3 (2026-11-01),
+requiring bank-reconciliation-svc to gain a lookup-by-journal-id capability
+first — A2b is now closed in full.
 
 ## A. Not implemented / weaker than the spec
 
@@ -216,23 +223,244 @@ closed A8 and A9; a fifth closed A5; the latest closes A2a.
     the CHECKs refusing inconsistent rows, and the down migration refusing
     while a result exists and succeeding once none does.
 - **A2b. No candidate match against a banking-connector-svc canonical
-  transaction, and the ledger search has known limits** (open, narrower than
-  A2a).
-  1. *The canonical side.* banking-connector-svc still exposes canonical
-     transactions only by id (`GET /v1/banking/canonical-transactions/{id}`).
-     Proposing one needs a scoped list route there: by tenant, bank account
-     or connection, currency and a date window, NORMALIZED only. Its
-     ZS-SVC-E-001 BNK-04 read contract has no such query yet.
-  2. *Multiple journals.* A journal is a candidate only if its own net
-     movement equals the line. One payment booked as two journals is not
-     found.
-  3. *Already-matched journals.* A journal already matched to another line
-     in an earlier run is still a candidate. bank-reconciliation-svc offers
-     no lookup by journal id, so this service cannot exclude it;
-     bank-reconciliation-svc's confirm step is where a double match would
-     have to be refused.
-  4. *No paging.* A cash account with 1000 or more entries in the window
-     cannot be read (general-ledger-svc A15).
+  transaction, and the ledger search has known limits** (part 1 closed
+  2026-10-28; part 4 closed 2026-10-30; part 2 closed 2026-11-01; part 3
+  closed 2026-11-01 — A2b is now closed in full).
+  1. *The canonical side* (closed 2026-10-28). banking-connector-svc serves
+     BNK-04 `ListTransactions` (`GET /v1/banking/canonical-transactions`, its
+     A20).
+     - **When.** Only on a line the journal search (A2a, including its
+       cross-line exclusivity pass) leaves `NO_CANDIDATE`. A line with a
+       journal proposal, a journal `AMBIGUOUS`, or `NO_CASH_ACCOUNT` keeps
+       that result and is never also searched here, so a line never carries
+       both kinds of candidate. `domain.CanonicalSearchLines` names those
+       lines; the handler reads banking-connector-svc only when there is at
+       least one, so a run whose lines all have a journal result never calls
+       it.
+     - **The read.** A new read-only `internal/banking` client, built like
+       `internal/ledger`: one `GET` per (bank account, currency, statement
+       date) — normally one per run — with `legal_entity_id`,
+       `bank_account_id` (the line's own, from bank-reconciliation-svc; both
+       services key it to treasury-svc's BNK-01 account), `currency`, the
+       same `[statement date ± horizon]` window as the ledger read, and
+       `limit=5000` (the route's cap). Every row is re-checked against the
+       tenant, entity, bank account, currency and window asked for, must be
+       NORMALIZED, have a UUID id, and carry its amount as a decimal *string*
+       held exactly (a bare JSON number is refused as a contract
+       regression). A non-empty `next_cursor` is refused as
+       `ErrWindowTooLarge`: cursor-following is not implemented, and a
+       partial page cannot prove there is no candidate.
+     - **The match rule.** bank-reconciliation-svc's `verifyCanonicalMatch`
+       accepts a NORMALIZED transaction of the same tenant and currency
+       whose amount equals the line's, compared signed, in cents. Both
+       services sign an amount the same way — banking-connector-svc copies
+       the raw posted amount (opening + Σ lines = closing), and a
+       bank-reconciliation-svc line is positive for money in — so the rule
+       here is a direct signed equality, as `big.Rat` (stricter than cents).
+       It also requires the line's legal entity and bank account, which that
+       check does not.
+     - **Outcomes.** As for journals, under the same governed date
+       tolerance: one within it is `AUTO_MATCH`, one only beyond it inside
+       the horizon is `DATE_SKEW` / `MANUAL_REVIEW`, more than one — or one
+       transaction claimed by two lines — is `AMBIGUOUS`, none is
+       `NO_CANDIDATE` (now stating that both services were searched). The
+       outcome values are reused; the rule names the source:
+       `CANDIDATE_TRANSACTION_WITHIN_DATE_TOLERANCE`,
+       `CANDIDATE_TRANSACTION_DATE_SKEW`, `CANDIDATE_TRANSACTION_AMBIGUOUS`.
+       The rationale names banking-connector-svc, the transaction and the
+       bank account, and says no journal matched first. Cross-line
+       exclusivity is per record kind: a journal and a transaction are never
+       treated as the same record, even with equal ids.
+     - **Storage.** Migration 000009 adds `counterpart_transaction_id` and
+       replaces 000008's counterpart CHECKs: exactly one of journal or
+       transaction is named exactly when the outcome is
+       WITHIN_DATE_TOLERANCE or DATE_SKEW, AUTO_MATCH names one, and a named
+       journal or transaction must sit under its own kind's rule. The
+       resolution event carries `counterpart_transaction_id`. The down
+       migration refuses while any row carries a canonical result.
+     - **Fail closed.** If the read is needed and fails, nothing is
+       analyzed: unreachable 503; a `next_cursor` 422; a refusal (including
+       403 while the principal lacks `bank.transaction.read`) or an
+       inconsistent row 502. The domain refuses too: a `NO_CANDIDATE` line
+       whose bank account was not read is an error, never "no candidate".
+     - **Deployment prerequisite.** This service's principal needs a role
+       bundle granting `bank.transaction.read` (access-control-svc migration
+       000022 registers the permission) on each legal entity it analyzes.
+       Until it is granted, analysis of any run with a `NO_CANDIDATE` line
+       is 502. `BANKING_CONNECTOR_SERVICE_URL` defaults to
+       `http://banking-connector-svc:8145`.
+     - **Not searched.** A `NO_CASH_ACCOUNT` line is not searched for a
+       canonical transaction, although bank-reconciliation-svc could verify
+       one for it. Widening the gate is a reviewer's call.
+
+     *Tests:* `internal/banking/client_test.go` (exact query, envelope,
+     scope/entity/account/currency/status/window/UTC rows refused, a
+     `next_cursor` page refused, an amount float64 cannot distinguish held
+     exactly, 400/403/503/unreachable); `internal/domain/canonical_candidates_test.go`
+     (AUTO_MATCH, DATE_SKEW, beyond horizon, NO_CANDIDATE naming both,
+     NO_CANDIDATE-only gating against journal AUTO_MATCH / DATE_SKEW /
+     AMBIGUOUS and NO_CASH_ACCOUNT, an unread account refused, signed and
+     exact amounts, out-of-scope rows, AMBIGUOUS, cross-line exclusivity
+     across both kinds); `internal/handler/canonical_candidate_match_test.go`
+     through the real analyze route (proposal on the wire, one read with its
+     exact parameters, no read when not needed, 503/422/502);
+     `internal/store/candidate_transaction_test.go` on real Postgres (round
+     trip, the CHECKs, the down migration).
+  2. *Multiple journals — closed 2026-11-01.* A journal used to be a
+     candidate only if its own net movement equaled the line; one payment
+     booked as two journals was never found. Closing this for real required
+     a change in bank-reconciliation-svc first: its match model only ever
+     accepted one journal per line (`matched_journal_id` is a scalar
+     column), so detecting a qualifying pair here would have had nothing to
+     confirm it against. bank-reconciliation-svc's own A2 now records "no
+     many-to-one, one-to-many or split matches" as partially closed on the
+     journal path (migration 000015): `ProposeMatch`/`ConfirmMatch` accept
+     `journal_ids` (2 or more, currently capped at 10), verify each one
+     independently and their combined net together, and record the
+     allocation as explicit evidence — satisfying ZS-CONTROL-001 section
+     10's "many-to-one / one-to-many ... with explicit allocation", which
+     this service's own governing-document citations already name.
+     - **The search.** `domain.searchJournalPairs` tries every distinct
+       pair of journals on the line's cash account — bounded to exactly
+       two, the case the gap names, not an open-ended combination search —
+       but only when the existing single-journal search (including its
+       cross-line exclusivity pass) finds nothing at all. A single matching
+       journal is always preferred over a pair. Each journal in a
+       candidate pair must individually be real, correctly scoped and
+       single-dated (the same per-journal checks as the single-journal
+       search), and both must be within the search horizon; their combined
+       net, not either alone, must equal the line's signed amount exactly.
+     - **Outcomes.** Reused, as for A2a/A2b part 1: one qualifying pair
+       within the governed date tolerance (the later of the two journals'
+       days from the statement date decides) is `AUTO_MATCH`; one only
+       beyond it but inside the horizon is `DATE_SKEW`/`MANUAL_REVIEW`;
+       more than one qualifying pair, or a journal shared with another
+       line's single or paired candidate, is `AMBIGUOUS`; none is
+       `NO_CANDIDATE` (now meaning both single journals and pairs were
+       tried). New rule names:
+       `CANDIDATE_MULTI_JOURNAL_WITHIN_DATE_TOLERANCE`,
+       `CANDIDATE_MULTI_JOURNAL_DATE_SKEW`,
+       `CANDIDATE_MULTI_JOURNAL_AMBIGUOUS`.
+     - **Cross-line exclusivity.** Extended, not reimplemented: the same
+       `proposedBy` journal-id map used for single-journal exclusivity now
+       also registers both halves of an accepted pair, so a journal shared
+       between a pair and a single match (or two pairs) demotes every line
+       that claimed it to `AMBIGUOUS`, exactly as for two lines sharing one
+       single journal.
+     - **Confidence — a judgment call (B-style interpretation).** A
+       two-journal proposal is scored below its single-journal counterpart
+       at the same date outcome (80 vs. 90 for AUTO_MATCH, 55 vs. 65 for
+       DATE_SKEW): it depends on two records being exactly right, not one.
+       Not spec-mandated; a reviewer may want these raised, lowered, or
+       equalized.
+     - **Storage.** Migration 000010 adds `counterpart_journal_ids`
+       (`UUID[]`, exactly 2 elements when set) alongside the existing
+       `counterpart_journal_id`/`counterpart_transaction_id`, replacing
+       000009's counterpart CHECKs with a three-way version: exactly one of
+       the three counterpart shapes is named exactly when the outcome is
+       `WITHIN_DATE_TOLERANCE` or `DATE_SKEW`, `AUTO_MATCH` names exactly
+       one, and each named shape must sit under its own kind's rule. The
+       down migration refuses while any row carries a multi-journal result.
+     - **Still not closed on the canonical-transaction path.** This
+       increment is the journal path only — the same path A2b part 1 and
+       the rest of A2a already use, and reconciliation-intelligence-svc's
+       own search order tries it first. banking-connector-svc's
+       `ListTransactions`/the canonical candidate search (A2b part 1) is
+       untouched: a canonical transaction is still matched one at a time.
+       bank-reconciliation-svc's own `journal_id`/`journal_ids` match path
+       is marked deprecated there in favor of `transaction_id` for a new
+       *single* match, so a reviewer may want many-to-one moved to (or
+       duplicated onto) the canonical-transaction path instead; this was a
+       deliberate scope decision, not an oversight.
+     - *Tests:* `internal/domain/multi_journal_candidates_test.go`
+       (AUTO_MATCH and DATE_SKEW via a pair; a single journal preferred
+       over a qualifying pair; multiple qualifying pairs are AMBIGUOUS; a
+       pair sharing a journal with another line's single match makes both
+       AMBIGUOUS; no single journal or pair still reaches NO_CANDIDATE);
+       `internal/store/candidate_multi_journal_test.go` on real Postgres
+       (round trip including the `UUID[]` column, every CHECK refusing an
+       inconsistent row — wrong counterpart combination, wrong rule, wrong
+       array length — and the down migration refusing while a result
+       exists, succeeding once none does). bank-reconciliation-svc's own
+       side is tested separately — see its SPEC_DEVIATIONS.md A2.
+  3. *Already-matched journals — closed 2026-11-01.* bank-reconciliation-svc
+     now offers the lookup this service needed: `GET /v1/statement-lines`
+     takes `journal_ids` (ANDs with its existing filters, exactly like
+     `bank_account_id`/`statement_date`/`status`; the expected caller sends
+     it alone) and returns every line, any status, that names one of the
+     given ids as its matched or proposed counterpart — scalar or, since A2b
+     part 2, recorded in `statement_line_matched_journals`. It is the only
+     service that knows a journal is claimed, because the claim is recorded
+     there, not on the journal itself.
+     (`services/bank-reconciliation-svc/internal/store/pg_store.go`'s
+     `ListStatementLines`, `internal/domain/types.go`'s
+     `ListStatementLinesFilter.JournalIDs`/`MaxJournalLookupIDs` (200),
+     `internal/handler/handler.go`'s `parseJournalIDsParam`.)
+
+     This service's `internal/bankrec.Client.LookupClaimedJournalIDs` calls
+     it once per candidate search, batched at 200 ids, after the ledger read
+     and before the journal/pair search run: every distinct journal id the
+     ledger returned is checked in one pass, not one call per line. A
+     claimed id is excluded from `searchCandidates` (the single-journal
+     search) and from `searchJournalPairs`'s pool (A2b part 2) alike — it
+     can never be proposed alone or as half of a pair. The lookup fails
+     CLOSED like every other upstream read here: a failed batch fails the
+     whole analyze call (502), never a partially-checked result. A journal
+     absent from the claimed set is simply unclaimed as of this read, not
+     guaranteed available — bank-reconciliation-svc's own verification at
+     propose/confirm time remains the real, authoritative check; this only
+     stops the suggestion from being produced in the first place.
+
+     *Tests:* bank-reconciliation-svc —
+     `internal/handler/handler_test.go` (`TestListStatementLines_JournalIDsFilter_*`:
+     distinct valid ids wired through, malformed/duplicate/empty ids
+     refused 400, no param leaves the filter nil);
+     `internal/store/journal_lookup_pg_smoke_test.go` on real Postgres
+     (scalar matched, scalar proposed, a multi-journal allocation found by
+     either of its two journal ids with both returned via
+     `ProposedJournalIDs`, no match is `[]` not an error, the filter ANDs
+     with an existing status filter rather than overriding it, and more
+     than `MaxJournalLookupIDs` ids is refused).
+     This service — `internal/bankrec/client_test.go`
+     (`TestLookupClaimedJournalIDs_*`: empty input makes no call, scalar and
+     array ids are all extracted including one the caller never asked
+     about, more than 200 ids are batched into separate requests, and a
+     failed batch fails the whole lookup);
+     `internal/domain/already_matched_journal_test.go` (a claimed journal is
+     excluded from the single-journal search, excluding it leaves a
+     genuinely unclaimed candidate usable, a claimed journal is excluded
+     from the pair pool entirely, and a nil map — every caller that predates
+     this change — excludes nothing);
+     `internal/handler/already_matched_journal_test.go` through the real
+     analyze route with a fake bank-reconciliation-svc that answers
+     `journal_ids` (`TestAnalyze_AlreadyMatchedJournal_IsExcludedFromProposal`,
+     `TestAnalyze_UnclaimedJournal_IsStillProposed`).
+  4. *No paging — closed 2026-10-30.* general-ledger-svc's A15 added a
+     keyset cursor to `QueryLedger` (`after_entry_seq` in,
+     `{"entries": [...], "next_cursor": ...}` out, replacing the old bare
+     array). `internal/ledger.ListCashAccountEntries` now follows
+     `next_cursor` to completion instead of refusing any page of exactly
+     `maxEntries` (1000) rows — that count is no longer ambiguous between
+     "exactly this many" and "truncated," so a cash account with exactly
+     1000 matching entries in the window is read in full, not refused.
+     `ErrWindowTooLarge` still exists, now bounded by `maxPages` (20): a
+     window needing more than 20 pages (20,000 rows) is still refused
+     rather than followed forever, so a pathological or adversarial
+     upstream cannot turn this into an unbounded loop — "could not read it
+     all" must still never become "no candidate."
+     *Tests:* `internal/ledger/client_test.go`
+     (`TestListCashAccountEntries_FollowsCursorAcrossPages`,
+     `TestListCashAccountEntries_RefusesBeyondMaxPages`);
+     `internal/handler/candidate_match_test.go`
+     (`TestAnalyze_LedgerUnavailableOrTruncated_FailsClosed`'s two
+     subtests: exactly one page's worth of rows now succeeds, and a window
+     past `maxPages` is still 422) through the real analyze route and a
+     fake general-ledger-svc that implements the real cursor contract
+     (`internal/handler/fakes_test.go`'s `newFakeLedgerServer`).
+     *At the time:* parts 2 and 3 below were unaffected by this — paging
+     finds every row in the window, but a multi-journal payment or an
+     already-matched journal was still not specially handled. Both are now
+     closed (2026-11-01, above).
 - **A3. One-directional** (closed — the framing no longer applies). Only side
   A was walked: a side-B item with no side-A counterpart was never reported,
   and `total_processed_count` and the rate counted side A only. Since A1 there

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/inventory-management-svc/internal/domain"
 	svcmiddleware "zoiko.io/inventory-management-svc/internal/middleware"
@@ -29,7 +30,7 @@ func newTestOffering(tenantID, legalEntityID, skuCode string) (*domain.Offering,
 
 func TestPgStore_CreateOffering_ThenGetOffering(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID := uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -66,7 +67,7 @@ func TestPgStore_CreateOffering_ThenGetOffering(t *testing.T) {
 
 func TestPgStore_CreateOffering_DuplicateSKU_Rejected(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID := uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -82,7 +83,7 @@ func TestPgStore_CreateOffering_DuplicateSKU_Rejected(t *testing.T) {
 
 func TestPgStore_CreateVersion_ThenApproveActivate_SupersedesPrior(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID := uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -94,6 +95,7 @@ func TestPgStore_CreateVersion_ThenApproveActivate_SupersedesPrior(t *testing.T)
 	if err := s.ApproveOfferingVersion(ctx, v1.VersionID, "reviewer-1", now); err != nil {
 		t.Fatalf("ApproveOfferingVersion failed: %v", err)
 	}
+	linkRequiredMappings(t, ctx, s, v1.VersionID)
 	if superseded, err := s.ActivateOfferingVersion(ctx, o.OfferingID, v1.VersionID, "reviewer-1", now); err != nil {
 		t.Fatalf("ActivateOfferingVersion failed: %v", err)
 	} else if superseded != nil {
@@ -117,6 +119,7 @@ func TestPgStore_CreateVersion_ThenApproveActivate_SupersedesPrior(t *testing.T)
 	if err := s.ApproveOfferingVersion(ctx, v2.VersionID, "reviewer-1", later); err != nil {
 		t.Fatalf("ApproveOfferingVersion v2 failed: %v", err)
 	}
+	linkRequiredMappings(t, ctx, s, v2.VersionID)
 	superseded, err := s.ActivateOfferingVersion(ctx, o.OfferingID, v2.VersionID, "reviewer-1", later)
 	if err != nil {
 		t.Fatalf("ActivateOfferingVersion v2 failed: %v", err)
@@ -149,7 +152,7 @@ func TestPgStore_CreateVersion_ThenApproveActivate_SupersedesPrior(t *testing.T)
 // on the very same row are legitimately mutable.
 func TestPgStore_OfferingVersionContent_IsImmutable(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID := uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -158,14 +161,14 @@ func TestPgStore_OfferingVersionContent_IsImmutable(t *testing.T) {
 		t.Fatalf("CreateOffering failed: %v", err)
 	}
 
-	if _, err := pool.Exec(context.Background(), `UPDATE inventory_catalog_offering_versions SET description = 'tampered' WHERE version_id = $1`, v.VersionID); err == nil {
+	if err := execAsTenant(t, pool, tenantID, `UPDATE inventory_catalog_offering_versions SET description = 'tampered' WHERE version_id = $1`, v.VersionID); err == nil {
 		t.Fatal("expected the append-only trigger to reject a direct content mutation, got no error")
 	}
 }
 
 func TestPgStore_ActivateOfferingVersion_RequiresApproved(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID := uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -180,7 +183,7 @@ func TestPgStore_ActivateOfferingVersion_RequiresApproved(t *testing.T) {
 
 func TestPgStore_SuspendThenRetireOfferingVersion(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID := uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -192,6 +195,7 @@ func TestPgStore_SuspendThenRetireOfferingVersion(t *testing.T) {
 	if err := s.ApproveOfferingVersion(ctx, v.VersionID, "reviewer-1", now); err != nil {
 		t.Fatalf("ApproveOfferingVersion failed: %v", err)
 	}
+	linkRequiredMappings(t, ctx, s, v.VersionID)
 	if _, err := s.ActivateOfferingVersion(ctx, o.OfferingID, v.VersionID, "reviewer-1", now); err != nil {
 		t.Fatalf("ActivateOfferingVersion failed: %v", err)
 	}
@@ -217,7 +221,7 @@ func TestPgStore_SuspendThenRetireOfferingVersion(t *testing.T) {
 
 func TestPgStore_GetVersionAsOf_PinsHistoricalVersion(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID := uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -229,6 +233,7 @@ func TestPgStore_GetVersionAsOf_PinsHistoricalVersion(t *testing.T) {
 	if err := s.ApproveOfferingVersion(ctx, v1.VersionID, "reviewer-1", t1); err != nil {
 		t.Fatalf("ApproveOfferingVersion v1 failed: %v", err)
 	}
+	linkRequiredMappings(t, ctx, s, v1.VersionID)
 	if _, err := s.ActivateOfferingVersion(ctx, o.OfferingID, v1.VersionID, "reviewer-1", t1); err != nil {
 		t.Fatalf("ActivateOfferingVersion v1 failed: %v", err)
 	}
@@ -247,6 +252,7 @@ func TestPgStore_GetVersionAsOf_PinsHistoricalVersion(t *testing.T) {
 	if err := s.ApproveOfferingVersion(ctx, v2.VersionID, "reviewer-1", t2); err != nil {
 		t.Fatalf("ApproveOfferingVersion v2 failed: %v", err)
 	}
+	linkRequiredMappings(t, ctx, s, v2.VersionID)
 	if _, err := s.ActivateOfferingVersion(ctx, o.OfferingID, v2.VersionID, "reviewer-1", t2); err != nil {
 		t.Fatalf("ActivateOfferingVersion v2 failed: %v", err)
 	}
@@ -277,7 +283,7 @@ func TestPgStore_GetVersionAsOf_PinsHistoricalVersion(t *testing.T) {
 // named stable error.
 func TestPgStore_GetVersionAsOf_NoVersionActive_ReturnsCatalogVersionInvalid(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID := uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -292,7 +298,7 @@ func TestPgStore_GetVersionAsOf_NoVersionActive_ReturnsCatalogVersionInvalid(t *
 
 func TestPgStore_SearchCatalog_FiltersByLegalEntityAndCategory(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID, otherEntity := uuid.New().String(), uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -332,7 +338,7 @@ func TestPgStore_SearchCatalog_FiltersByLegalEntityAndCategory(t *testing.T) {
 
 func TestPgStore_LinkMapping_ThenGetMappings(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID := uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -361,7 +367,7 @@ func TestPgStore_LinkMapping_ThenGetMappings(t *testing.T) {
 // transaction referenced a version must never silently change.
 func TestPgStore_CatalogMappings_AreAppendOnly(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID, legalEntityID := uuid.New().String(), uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -376,14 +382,14 @@ func TestPgStore_CatalogMappings_AreAppendOnly(t *testing.T) {
 	if err := s.LinkMapping(ctx, m); err != nil {
 		t.Fatalf("LinkMapping failed: %v", err)
 	}
-	if _, err := pool.Exec(context.Background(), `UPDATE inventory_catalog_mappings SET mapping_ref = 'GL-9999' WHERE mapping_id = $1`, m.MappingID); err == nil {
+	if err := execAsTenant(t, pool, tenantID, `UPDATE inventory_catalog_mappings SET mapping_ref = 'GL-9999' WHERE mapping_id = $1`, m.MappingID); err == nil {
 		t.Fatal("expected the append-only trigger to reject a direct mapping mutation, got no error")
 	}
 }
 
 func TestPgStore_LinkMapping_UnknownVersion_ReturnsNotFound(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -394,4 +400,37 @@ func TestPgStore_LinkMapping_UnknownVersion_ReturnsNotFound(t *testing.T) {
 	if err := s.LinkMapping(ctx, m); err != domain.ErrOfferingVersionNotFound {
 		t.Fatalf("expected ErrOfferingVersionNotFound, got %v", err)
 	}
+}
+
+// linkRequiredMappings links the TAX and ACCOUNTING mappings a version needs
+// before it may be activated (migration 000013).
+func linkRequiredMappings(t *testing.T, ctx context.Context, s *store.PgStore, versionID string) {
+	t.Helper()
+	for _, mt := range []string{"TAX", "ACCOUNTING"} {
+		m := &domain.CatalogMapping{
+			MappingID: uuid.New().String(), VersionID: versionID, MappingType: mt,
+			MappingRef: mt + "-REF", LinkedAt: time.Now().UTC(), LinkedByPrincipalID: "specialist-1",
+		}
+		if err := s.LinkMapping(ctx, m); err != nil {
+			t.Fatalf("link %s mapping failed: %v", mt, err)
+		}
+	}
+}
+
+// execAsTenant runs raw SQL in a transaction with app.tenant_id set, so the
+// target row is visible under RLS for any role (not only a superuser) and a
+// trigger — not row invisibility — is what must refuse the statement.
+func execAsTenant(t *testing.T, pool *pgxpool.Pool, tenantID, sql string, args ...any) error {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT set_config('app.tenant_id', $1, true)`, tenantID); err != nil {
+		t.Fatalf("set tenant: %v", err)
+	}
+	_, err = tx.Exec(ctx, sql, args...)
+	return err
 }

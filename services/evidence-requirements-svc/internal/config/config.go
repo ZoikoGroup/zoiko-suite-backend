@@ -1,6 +1,9 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -37,6 +40,20 @@ type Config struct {
 	// context.md §11.2 for why this decision went the strict way).
 	DocumentVaultServiceURL string
 
+	// EvidenceManifestServiceURL is evidence-manifest-svc's base URL.
+	// Artifacts asserted with evidence_type EVIDENCE_MANIFEST are verified
+	// against the real Manifest record before they count as evidence.
+	// Required outside local/dev; unset locally means the type is verified
+	// as unavailable (503). It never silently counts.
+	EvidenceManifestServiceURL string
+
+	// EsignatureServiceURL is esignature-integration-svc's base URL.
+	// Artifacts asserted with evidence_type SIGNATURE are verified against
+	// the real Envelope record before they count as evidence.
+	// Required outside local/dev; unset locally means the type is verified
+	// as unavailable (503). It never silently counts.
+	EsignatureServiceURL string
+
 	// TenantRegistryURL is tenant-entity-registry-svc's base URL: the legal
 	// entity an evaluation or requirement names is confirmed there (exists,
 	// in the caller's tenant), fail-closed. Required outside local/dev.
@@ -55,6 +72,13 @@ type Config struct {
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
+
+	// CursorSigningKey signs the next_cursor of every console list (API-4),
+	// binding it to the tenant, route and filter that minted it.
+	// CURSOR_SIGNING_KEY_HEX, at least 32 bytes; required outside local/dev.
+	// Local and dev generate one per process, which only means a cursor does
+	// not survive a restart. Same contract as identity-context-svc.
+	CursorSigningKey []byte
 }
 
 // DBConfig holds PostgreSQL connection parameters.
@@ -85,7 +109,7 @@ type KafkaConfig struct {
 
 // Load reads configuration from environment variables.
 func Load() (*Config, error) {
-	return &Config{
+	cfg := &Config{
 		Env: env("ENV", "local"),
 		// 8130: 8080-8129 are already claimed by every service built so far
 		// (purchase-order-svc took 8129) — see deployments/docker-compose.yml.
@@ -103,16 +127,49 @@ func Load() (*Config, error) {
 			GroupID: env("KAFKA_GROUP_ID", "evidence-requirements-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.evidence-requirements.events"),
 		},
-		AuthZServiceURL:          env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
-		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
-		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
-		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
-		DocumentVaultServiceURL:  env("DOCUMENT_VAULT_SERVICE_URL", "http://document-vault-svc:8094"),
-		TenantRegistryURL:        os.Getenv("TENANT_REGISTRY_URL"),
-		EvaluateAuthzMode:        strings.ToLower(env("EVIDENCE_EVALUATE_AUTHZ", "enforce")),
-		ReadAuthzMode:            strings.ToLower(env("EVIDENCE_READ_AUTHZ", "enforce")),
-		OTELExporterEndpoint:     env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
-	}, nil
+		AuthZServiceURL:            env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		AuthzMTLSEnabled:           env("AUTHZ_MTLS_ENABLED", "false") == "true",
+		AuthzMTLSURL:               env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
+		MTLSManagementServiceURL:   env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+		DocumentVaultServiceURL:    env("DOCUMENT_VAULT_SERVICE_URL", "http://document-vault-svc:8094"),
+		EvidenceManifestServiceURL: env("EVIDENCE_MANIFEST_SERVICE_URL", ""),
+		EsignatureServiceURL:       env("ESIGNATURE_SERVICE_URL", ""),
+		TenantRegistryURL:          os.Getenv("TENANT_REGISTRY_URL"),
+		EvaluateAuthzMode:          strings.ToLower(env("EVIDENCE_EVALUATE_AUTHZ", "enforce")),
+		ReadAuthzMode:              strings.ToLower(env("EVIDENCE_READ_AUTHZ", "enforce")),
+		OTELExporterEndpoint:       env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+	}
+
+	key, err := cursorKey(os.Getenv("CURSOR_SIGNING_KEY_HEX"), cfg.LocalEnv())
+	if err != nil {
+		return nil, err
+	}
+	cfg.CursorSigningKey = key
+	return cfg, nil
+}
+
+// cursorKey decodes CURSOR_SIGNING_KEY_HEX. Unset is an error outside
+// local/dev, where a per-process random key would make every next_cursor
+// fail after a restart or on another replica.
+func cursorKey(raw string, local bool) ([]byte, error) {
+	if raw == "" {
+		if !local {
+			return nil, fmt.Errorf("CURSOR_SIGNING_KEY_HEX is required outside local/dev")
+		}
+		key := make([]byte, 32)
+		if _, err := rand.Read(key); err != nil {
+			return nil, fmt.Errorf("generate cursor signing key: %w", err)
+		}
+		return key, nil
+	}
+	key, err := hex.DecodeString(strings.TrimSpace(raw))
+	if err != nil {
+		return nil, fmt.Errorf("CURSOR_SIGNING_KEY_HEX is not hex: %w", err)
+	}
+	if len(key) < 32 {
+		return nil, fmt.Errorf("CURSOR_SIGNING_KEY_HEX must be at least 32 bytes, got %d", len(key))
+	}
+	return key, nil
 }
 
 // LocalEnv reports whether Env names a developer tier.

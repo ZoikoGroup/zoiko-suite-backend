@@ -1,7 +1,9 @@
 package config
 
 import (
+	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -27,9 +29,32 @@ type Config struct {
 	// "accounts-receivable=http://accounts-receivable-svc:8101". Only registered
 	// systems can be read; a request can never supply a URL.
 	SourceEndpoints string
-	// Required ZS-EVENT-001 envelope attributes whose values are governed decisions; blank publishes UNSPECIFIED.
+	// EventResidencyRegion and EventClassification are the ZS-EVENT-001 §4
+	// envelope attributes whose values are governed, per-deployment decisions
+	// this service does not make. Both are required, with no default: the
+	// shared envelope rejects an empty or unrecognised value, so a missing one
+	// would fail every write at request time. Load refuses it at startup
+	// instead, and nothing is guessed.
 	EventResidencyRegion string
 	EventClassification  string
+}
+
+// residencyRegion is the envelope library's controlled-code shape.
+var residencyRegion = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+
+// validate reports configuration the service cannot run with.
+func (c *Config) validate() error {
+	if !residencyRegion.MatchString(c.EventResidencyRegion) {
+		return fmt.Errorf("EVENT_RESIDENCY_REGION is required and must be a lower-case region code (e.g. \"uk\", \"eu-west\"), got %q",
+			c.EventResidencyRegion)
+	}
+	switch c.EventClassification {
+	case "public", "internal", "confidential", "restricted":
+	default:
+		return fmt.Errorf("EVENT_CLASSIFICATION is required and must be one of public, internal, confidential, restricted, got %q",
+			c.EventClassification)
+	}
+	return nil
 }
 
 type DBConfig struct {
@@ -57,7 +82,7 @@ type KafkaConfig struct {
 }
 
 func Load() (*Config, error) {
-	return &Config{
+	c := &Config{
 		Env: env("ENV", "local"),
 		// 8171: next free port after comments-collaboration-svc (8170).
 		Port: envInt("PORT", 8171),
@@ -82,7 +107,11 @@ func Load() (*Config, error) {
 		SourceEndpoints:          env("SOURCE_ENDPOINTS", ""),
 		EventResidencyRegion:     env("EVENT_RESIDENCY_REGION", ""),
 		EventClassification:      env("EVENT_CLASSIFICATION", ""),
-	}, nil
+	}
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 func env(key, def string) string {

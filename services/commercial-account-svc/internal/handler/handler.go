@@ -13,7 +13,6 @@ import (
 
 	authzpkg "zoiko.io/commercial-account-svc/internal/authz"
 	"zoiko.io/commercial-account-svc/internal/domain"
-	"zoiko.io/commercial-account-svc/internal/events"
 	svcmiddleware "zoiko.io/commercial-account-svc/internal/middleware"
 	"zoiko.io/commercial-account-svc/internal/store"
 )
@@ -40,15 +39,17 @@ type AuthzChecker interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
 }
 
+// Handler has no event publisher: every write's event is enqueued by the
+// store in the write's own transaction (the shared transactional outbox), and
+// nothing publishes from a handler.
 type Handler struct {
-	store     store.Store
-	publisher events.Publisher
-	authz     AuthzChecker
-	logger    *zap.Logger
+	store  store.Store
+	authz  AuthzChecker
+	logger *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthzChecker, logger *zap.Logger) *Handler {
-	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+func New(st store.Store, az AuthzChecker, logger *zap.Logger) *Handler {
+	return &Handler{store: st, authz: az, logger: logger}
 }
 
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {

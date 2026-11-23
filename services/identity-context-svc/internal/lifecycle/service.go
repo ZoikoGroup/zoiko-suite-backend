@@ -19,6 +19,7 @@ import (
 	"zoiko.io/identity-context-svc/internal/credential"
 	"zoiko.io/identity-context-svc/internal/domain"
 	"zoiko.io/identity-context-svc/internal/events"
+	"zoiko.io/identity-context-svc/internal/metrics"
 	"zoiko.io/identity-context-svc/internal/outbox"
 	"zoiko.io/identity-context-svc/internal/store"
 )
@@ -44,6 +45,14 @@ type Store interface {
 	CompleteResetRequestTx(ctx context.Context, tx pgx.Tx, requestID string) error
 	InsertCredentialTokenTx(ctx context.Context, tx pgx.Tx, t domain.CredentialToken) error
 	FindActiveCredentialByEmail(ctx context.Context, email, tenantID string) (*domain.Principal, *domain.PrincipalCredential, error)
+	// MergeSubjects backs Merge (POST /v1/subjects/{id}/merge: If-Match and
+	// step-up); MergeIdentities backs MergeDuplicate (POST
+	// /v1/identities/{id}/merge: idempotent). Each refuses a duplicate the
+	// other has already merged away.
+	MergeSubjects(ctx context.Context, tenantID, survivorID, duplicateID, actor, reason, correlationID string,
+		duplicateVersion int64, recs ...outbox.Record) (*store.MergeResult, error)
+	MergeIdentities(ctx context.Context, tenantID, survivorID, duplicateID, reason, actor, correlationID string,
+		build func(m store.IdentityMerge) ([]outbox.Record, error)) (*store.IdentityMerge, bool, error)
 }
 
 // SessionEnder ends every session a principal holds (login sessions, their
@@ -119,6 +128,7 @@ var (
 	ErrStepUp        = errors.New("a recent second-factor authentication is required")
 	ErrBadCredential = errors.New("current password is incorrect")
 	ErrLinkInvalid   = errors.New("link invalid, expired or already used")
+	ErrStale         = errors.New("the record changed since it was read")
 )
 
 // CreateSubjectRequest is POST /v1/principals.
@@ -424,8 +434,18 @@ func (s *Service) RequestReset(ctx context.Context, a Actor, principalID, reason
 // DecideReset records an approver's decision. The approver is neither the
 // requester nor the subject and holds a recent second-factor authentication;
 // the link is issued and delivered when the approvals are complete.
-func (s *Service) DecideReset(ctx context.Context, a Actor, requestID, decision string) (*domain.PasswordResetRequest, error) {
+//
+// IC-13 (S1-13 K-7):
+// - Metric incremented AFTER commit
+// - Store outages map to 503 (service unavailable)
+// - Expiry committed before refusing (handled in store)
+// - Event emitted for every decision (handled in store)
+// - Link delivery failure returns 502/503
+func (s *Service) DecideReset(ctx context.Context, a Actor, requestID, decision, reason string) (*domain.PasswordResetRequest, error) {
 	decision = strings.ToUpper(strings.TrimSpace(decision))
+	if reason = strings.TrimSpace(reason); len(reason) > 500 {
+		return nil, fmt.Errorf("%w: reason is at most 500 characters", ErrInvalid)
+	}
 	if decision != "APPROVE" && decision != "REJECT" {
 		return nil, fmt.Errorf("%w: decision must be APPROVE or REJECT", ErrInvalid)
 	}
@@ -444,12 +464,13 @@ func (s *Service) DecideReset(ctx context.Context, a Actor, requestID, decision 
 	}
 	var issued string
 	rec, err := events.Render(events.EventPasswordResetDecided, a.TenantID, "", a.PrincipalID, a.CorrelationID, requestID,
-		map[string]any{"request_id": requestID, "principal_id": r.PrincipalID, "decided_by": a.PrincipalID, "decision": decision})
+		map[string]any{"request_id": requestID, "principal_id": r.PrincipalID, "decided_by": a.PrincipalID, "decision": decision,
+			"reason": reason})
 	if err != nil {
 		return nil, err
 	}
 	out, err := s.store.DecideResetRequest(ctx, a.TenantID, requestID,
-		domain.ResetApproval{ApproverID: a.PrincipalID, At: s.now(), Decision: decision},
+		domain.ResetApproval{ApproverID: a.PrincipalID, At: s.now(), Decision: decision, Reason: reason},
 		func(ctx context.Context, tx pgx.Tx, rr *domain.PasswordResetRequest) error {
 			issued = randomToken()
 			return s.store.InsertCredentialTokenTx(ctx, tx, domain.CredentialToken{TokenHash: hashToken(issued),
@@ -457,16 +478,25 @@ func (s *Service) DecideReset(ctx context.Context, a Actor, requestID, decision 
 				RequestID: rr.RequestID, ExpiresAt: s.now().Add(s.cfg.ResetTTL)})
 		}, rec)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrConflict, err)
+		// IC-13: Map store outages to service unavailable (503), not conflict (409)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("password reset decision unavailable: %w", err)
+	}
+	// IC-13: Metric incremented AFTER successful commit
+	if ic8 := metrics.Default(); ic8 != nil {
+		ic8.PasswordResets.WithLabelValues(decision).Inc()
 	}
 	if out != nil && out.Status == "ISSUED" && issued != "" {
 		if s.notifier == nil {
 			return out, ErrNotifierUnconfigured
 		}
+		// IC-13: Link delivery failure returns error (502/503), not silent warn
 		if err := s.notifier.Notify(ctx, Notice{TenantID: out.TenantID, PrincipalID: out.PrincipalID, Intent: s.cfg.IntentReset,
 			Link: s.linkFor(domain.CredentialTokenReset, issued), ExpiresAt: s.now().Add(s.cfg.ResetTTL),
 			SourceEventID: "reset-" + out.RequestID, CorrelationID: a.CorrelationID}); err != nil {
-			s.log.Warn("approved reset link not delivered", zap.String("request_id", requestID), zap.Error(err))
+			return nil, fmt.Errorf("password reset link delivery failed: %w", err)
 		}
 	}
 	return out, nil
@@ -537,4 +567,118 @@ func randomToken() string {
 func hashToken(t string) string {
 	sum := sha256.Sum256([]byte(t))
 	return hex.EncodeToString(sum[:])
+}
+
+// Merge retires duplicateID into survivorID (ORG-1 MergeDuplicateIdentity).
+// The actor is neither subject and holds a recent second factor; reason is
+// mandatory. duplicateVersion is the If-Match the caller read. After the merge
+// commits, every session the duplicate holds is ended, so its envelopes stop
+// verifying within the revocation TTL.
+func (s *Service) Merge(ctx context.Context, a Actor, survivorID, duplicateID, reason string, duplicateVersion int64) (*store.MergeResult, error) {
+	reason = strings.TrimSpace(reason)
+	switch {
+	case survivorID == "" || duplicateID == "":
+		return nil, fmt.Errorf("%w: survivor and duplicate_id are required", ErrInvalid)
+	case survivorID == duplicateID:
+		return nil, fmt.Errorf("%w: a subject cannot be merged into itself", ErrInvalid)
+	case reason == "":
+		return nil, fmt.Errorf("%w: a reason is required", ErrInvalid)
+	case a.PrincipalID == survivorID || a.PrincipalID == duplicateID:
+		return nil, fmt.Errorf("%w: you cannot merge a subject you are", ErrForbidden)
+	}
+	if !a.MFAVerified || a.AuthTime.IsZero() || s.now().Sub(a.AuthTime) > s.cfg.StepUpMaxAge {
+		return nil, ErrStepUp
+	}
+	payload := map[string]any{"survivor_id": survivorID, "duplicate_id": duplicateID, "principal_id": duplicateID,
+		"tenant_id": a.TenantID, "new_status": string(domain.PrincipalStatusDisabled), "actor": a.PrincipalID,
+		"reason": "merged into " + survivorID + ": " + reason, "correlation_id": a.CorrelationID}
+	recs := []outbox.Record{}
+	for _, et := range []string{events.EventSubjectMerged, events.EventPrincipalStatusChanged, events.EventSubjectDisabled} {
+		rec, err := events.Render(et, a.TenantID, "", a.PrincipalID, a.CorrelationID, duplicateID, payload)
+		if err != nil {
+			return nil, err
+		}
+		recs = append(recs, rec)
+	}
+	res, err := s.store.MergeSubjects(ctx, a.TenantID, survivorID, duplicateID, a.PrincipalID, reason, a.CorrelationID,
+		duplicateVersion, recs...)
+	switch {
+	case errors.Is(err, store.ErrMergeNotFound):
+		return nil, fmt.Errorf("%w: %v", ErrNotFound, err)
+	case errors.Is(err, store.ErrMergeConflict):
+		return nil, fmt.Errorf("%w: %v", ErrConflict, err)
+	case errors.Is(err, store.ErrMergeStale):
+		return nil, ErrStale
+	case err != nil:
+		return nil, err
+	}
+	if s.end != nil {
+		if _, err := s.end(ctx, a.TenantID, duplicateID, domain.SessionEndDeprovisioned, a.PrincipalID, a.CorrelationID); err != nil {
+			s.log.Error("sessions not ended after a merge", zap.String("principal_id", duplicateID), zap.Error(err))
+		}
+	}
+	return res, nil
+}
+
+// MergeDuplicate merges duplicateID into survivorID (ORG-01 MergeDuplicateIdentity). The survivor keeps its id;
+// the duplicate keeps its row, disabled, and its id becomes an alias that is never issued again. Its provider
+// links move to the survivor, every session it held ends, and identity.subject.merged tells the holders of its
+// role assignments and delegations (authorization-svc) to re-point them: this service does not own those.
+//
+// Idempotent: the second identical call returns the recorded merge with created=false and ends nothing.
+// The actor may be neither identity (an administrator does not merge their own account), which is the recovery
+// separation: nobody approves their own identity recovery.
+func (s *Service) MergeDuplicate(ctx context.Context, a Actor, survivorID, duplicateID, reason string) (*store.IdentityMerge, bool, error) {
+	survivorID, duplicateID, reason = strings.TrimSpace(survivorID), strings.TrimSpace(duplicateID), strings.TrimSpace(reason)
+	switch {
+	case survivorID == "" || duplicateID == "":
+		return nil, false, fmt.Errorf("%w: a survivor and a duplicate are required", ErrInvalid)
+	case survivorID == duplicateID:
+		return nil, false, fmt.Errorf("%w: an identity cannot be merged into itself", ErrInvalid)
+	case reason == "":
+		return nil, false, fmt.Errorf("%w: a reason is required", ErrInvalid)
+	case a.PrincipalID == survivorID || a.PrincipalID == duplicateID:
+		return nil, false, fmt.Errorf("%w: you cannot merge your own identity", ErrForbidden)
+	}
+	m, created, err := s.store.MergeIdentities(ctx, a.TenantID, survivorID, duplicateID, reason, a.PrincipalID, a.CorrelationID,
+		func(m store.IdentityMerge) ([]outbox.Record, error) {
+			// IC-14 (S1-14 merge route parity): emit the same three events as Merge (POST /v1/subjects/{id}/merge).
+			merged, err := events.Render(events.EventSubjectMerged, a.TenantID, "", a.PrincipalID, a.CorrelationID, m.SurvivorID,
+				map[string]any{"merge_id": m.MergeID, "tenant_id": m.TenantID, "survivor_id": m.SurvivorID,
+					"duplicate_id": m.DuplicateID, "actor": a.PrincipalID, "reason": m.Reason, "link_outcomes": m.LinkOutcomes,
+					"merged_at": m.MergedAt, "correlation_id": a.CorrelationID})
+			if err != nil {
+				return nil, err
+			}
+			recs := []outbox.Record{merged}
+			// The status pair is about the duplicate, which is now disabled. authorization-svc projects
+			// principal.status.changed from principal_id and new_status and skips an event without them, so
+			// without these fields the duplicate would stay ACTIVE there.
+			status := map[string]any{"principal_id": m.DuplicateID, "tenant_id": m.TenantID,
+				"new_status": string(domain.PrincipalStatusDisabled), "merge_id": m.MergeID, "survivor_id": m.SurvivorID,
+				"duplicate_id": m.DuplicateID, "actor": a.PrincipalID, "reason": "merged into " + m.SurvivorID + ": " + m.Reason,
+				"correlation_id": a.CorrelationID}
+			for _, et := range []string{events.EventPrincipalStatusChanged, events.EventSubjectDisabled} {
+				rec, err := events.Render(et, a.TenantID, "", a.PrincipalID, a.CorrelationID, m.DuplicateID, status)
+				if err != nil {
+					return nil, err
+				}
+				recs = append(recs, rec)
+			}
+			return recs, nil
+		})
+	switch {
+	case errors.Is(err, store.ErrMergeConflict):
+		return nil, false, fmt.Errorf("%w: %v", ErrConflict, err)
+	case errors.Is(err, domain.ErrPrincipalNotFound):
+		return nil, false, fmt.Errorf("%w: %v", ErrNotFound, err)
+	case err != nil:
+		return nil, false, err
+	}
+	if created && s.end != nil {
+		if _, err := s.end(ctx, a.TenantID, duplicateID, domain.SessionEndMerged, a.PrincipalID, a.CorrelationID); err != nil {
+			s.log.Error("sessions not ended after a merge", zap.String("principal_id", duplicateID), zap.Error(err))
+		}
+	}
+	return m, created, nil
 }

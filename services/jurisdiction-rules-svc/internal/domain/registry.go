@@ -182,6 +182,14 @@ var (
 	ErrSourceNotReady           = errorString("every source of the interpretation must be independently reviewed and not superseded")
 	ErrInvalidReference         = errorString("a referenced record does not exist")
 	ErrManifestInvalid          = errorString("pack manifest is invalid")
+
+	// ErrProvenanceIncomplete: nothing cited where a source is required (a
+	// calendar version), or an obligation rule without its regime,
+	// interpretation or sources. Apart from ErrSourceNotReady, which is a
+	// cited source that is not yet reviewed or is superseded.
+	ErrProvenanceIncomplete = errorString("the provenance is incomplete")
+	// ErrRingOrdinalTaken: another ring already holds that rollout order.
+	ErrRingOrdinalTaken = errorString("the ring ordinal is taken")
 )
 
 // ── Pack manifest (s5) ──────────────────────────────────────────────────────

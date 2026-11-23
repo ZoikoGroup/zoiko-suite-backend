@@ -251,7 +251,10 @@ func (s *PgStore) GetStatementLine(ctx context.Context, statementLineID string) 
 		row := tx.QueryRow(ctx, `SELECT `+selectColumns+`
 			FROM statement_lines WHERE statement_line_id = $1 AND tenant_id = $2
 		`, statementLineID, tenantID)
-		return scanLine(row, &l)
+		if err := scanLine(row, &l); err != nil {
+			return err
+		}
+		return attachMatchedJournalIDs(ctx, tx, &l)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -260,6 +263,46 @@ func (s *PgStore) GetStatementLine(ctx context.Context, statementLineID string) 
 		return nil, mapPgError(err)
 	}
 	return &l, nil
+}
+
+// loadMatchedJournalIDs returns every journal_id recorded against
+// statementLineID in statement_line_matched_journals (A2b part 2's
+// many-to-one path), in a deterministic order — nil when there are none, so
+// a single-journal or canonical match leaves the slice unset rather than an
+// empty non-nil one.
+func loadMatchedJournalIDs(ctx context.Context, tx pgx.Tx, statementLineID string) ([]string, error) {
+	rows, err := tx.Query(ctx, `SELECT journal_id FROM statement_line_matched_journals WHERE statement_line_id = $1 ORDER BY journal_id`, statementLineID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// attachMatchedJournalIDs loads l's many-to-one allocation, if any, into
+// ProposedJournalIDs (while PENDING_CONFIRMATION) or MatchedJournalIDs
+// (once MATCHED) — the same phase distinction the scalar
+// proposed_journal_id/matched_journal_id columns already carry.
+func attachMatchedJournalIDs(ctx context.Context, tx pgx.Tx, l *domain.StatementLine) error {
+	ids, err := loadMatchedJournalIDs(ctx, tx, l.StatementLineID)
+	if err != nil {
+		return err
+	}
+	switch l.Status {
+	case domain.StatementLineStatusPendingConfirmation:
+		l.ProposedJournalIDs = ids
+	case domain.StatementLineStatusMatched:
+		l.MatchedJournalIDs = ids
+	}
+	return nil
 }
 
 // ListStatementLines returns statement lines matching the given filter.
@@ -276,12 +319,22 @@ func (s *PgStore) ListStatementLines(ctx context.Context, filter domain.ListStat
 	if filter.TenantID == "" {
 		return nil, domain.ErrTenantScopeMissing
 	}
+	if len(filter.JournalIDs) > domain.MaxJournalLookupIDs {
+		return nil, domain.ErrTooManyJournalIDs
+	}
 	limit := filter.Limit
 	if limit <= 0 {
 		limit = domain.DefaultListLimit
 	}
 	if limit > domain.MaxListLimit {
 		limit = domain.MaxListLimit
+	}
+	// nil, not an empty slice, so the SQL's "$6::uuid[] IS NULL" skips the
+	// journal filter entirely for every caller that does not use it — the
+	// overwhelmingly common case.
+	var journalIDs []string
+	if len(filter.JournalIDs) > 0 {
+		journalIDs = filter.JournalIDs
 	}
 
 	out := make([]domain.StatementLine, 0)
@@ -292,21 +345,47 @@ func (s *PgStore) ListStatementLines(ctx context.Context, filter domain.ListStat
 			  AND ($2 = '' OR bank_account_id::text = $2)
 			  AND ($3 = '' OR statement_date = $3::date)
 			  AND ($4 = '' OR status = $4)
+			  AND (
+			    $6::uuid[] IS NULL
+			    OR matched_journal_id = ANY($6)
+			    OR proposed_journal_id = ANY($6)
+			    OR EXISTS (
+			      SELECT 1 FROM statement_line_matched_journals smj
+			      WHERE smj.statement_line_id = statement_lines.statement_line_id
+			        AND smj.journal_id = ANY($6)
+			    )
+			  )
 			ORDER BY created_at DESC
 			LIMIT $5
-		`, filter.TenantID, filter.BankAccountID, filter.StatementDate, filter.Status, limit)
+		`, filter.TenantID, filter.BankAccountID, filter.StatementDate, filter.Status, limit, journalIDs)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
+		var lines []domain.StatementLine
 		for rows.Next() {
 			var l domain.StatementLine
 			if err := scanLine(rows, &l); err != nil {
 				return err
 			}
-			out = append(out, l)
+			lines = append(lines, l)
 		}
-		return rows.Err()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		// Only the journal-lookup path needs the many-to-one allocation: an
+		// ordinary list (filter.JournalIDs empty, the common case) stays one
+		// query, and a line's scalar matched_journal_id/proposed_journal_id
+		// already answers the single-journal case.
+		if len(filter.JournalIDs) > 0 {
+			for i := range lines {
+				if err := attachMatchedJournalIDs(ctx, tx, &lines[i]); err != nil {
+					return err
+				}
+			}
+		}
+		out = append(out, lines...)
+		return nil
 	})
 	if err != nil {
 		return nil, mapPgError(err)
@@ -511,6 +590,49 @@ func (s *PgStore) ProposeMatch(ctx context.Context, tenantID, statementLineID, j
 	return nil
 }
 
+// ProposeMultiMatch is ProposeMatch's many-to-one form (A2b part 2):
+// UNMATCHED/EXCEPTION -> PENDING_CONFIRMATION, with allocations (one row
+// per journal, already verified by the caller against general-ledger-svc)
+// recorded in statement_line_matched_journals instead of the scalar
+// proposed_journal_id column, which stays NULL for a multi-journal
+// proposal.
+func (s *PgStore) ProposeMultiMatch(ctx context.Context, tenantID, statementLineID string, allocations []domain.JournalAllocation, proposedByPrincipalID string) error {
+	if len(allocations) < 2 {
+		return domain.ErrInvalidJournalIDs
+	}
+	var affected int64
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE statement_lines
+			SET status = 'PENDING_CONFIRMATION', proposed_by_principal_id = $1, proposed_at = $2
+			WHERE statement_line_id = $3 AND status IN ('UNMATCHED', 'EXCEPTION') AND tenant_id = $4
+		`, proposedByPrincipalID, time.Now().UTC(), statementLineID, tenantID)
+		if err != nil {
+			return err
+		}
+		affected = tag.RowsAffected()
+		if affected == 0 {
+			return nil
+		}
+		for _, a := range allocations {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO statement_line_matched_journals (tenant_id, statement_line_id, journal_id, net_amount_cents)
+				VALUES ($1, $2, $3, $4)
+			`, tenantID, statementLineID, a.JournalID, a.NetCents); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return mapPgError(err)
+	}
+	if affected == 0 {
+		return domain.ErrInvalidTransition
+	}
+	return nil
+}
+
 // ConfirmMatch is the "checker" step: PENDING_CONFIRMATION -> MATCHED,
 // only if confirmingPrincipalID differs from the principal who proposed
 // it — fetched and compared before the CAS update runs, the same
@@ -531,6 +653,11 @@ func (s *PgStore) ConfirmMatch(ctx context.Context, tenantID, statementLineID, c
 		if l.ProposedByPrincipalID != nil && *l.ProposedByPrincipalID == confirmingPrincipalID {
 			return domain.ErrMatchSelfConfirmation
 		}
+		proposedJournalIDs, err := loadMatchedJournalIDs(ctx, tx, statementLineID)
+		if err != nil {
+			return err
+		}
+		l.ProposedJournalIDs = proposedJournalIDs
 		journalID := ""
 		if l.ProposedJournalID != nil {
 			journalID = *l.ProposedJournalID
@@ -558,11 +685,16 @@ func (s *PgStore) ConfirmMatch(ctx context.Context, tenantID, statementLineID, c
 		l.MatchedTransactionID = matchedTxnID
 		l.MatchedByPrincipalID = &confirmingPrincipalID
 		l.MatchedAt = &now
+		eventPayload := map[string]any{
+			"statement_line_id":  statementLineID,
+			"matched_journal_id": journalID,
+		}
+		if len(proposedJournalIDs) > 0 {
+			l.MatchedJournalIDs = proposedJournalIDs
+			eventPayload["matched_journal_ids"] = proposedJournalIDs
+		}
 		return s.enqueueReconciliationEvent(ctx, tx, "matched", "reconciliation.matched",
-			tenantID, l.LegalEntityID, statementLineID, confirmingPrincipalID, l.CorrelationID, map[string]any{
-				"statement_line_id":  statementLineID,
-				"matched_journal_id": journalID,
-			})
+			tenantID, l.LegalEntityID, statementLineID, confirmingPrincipalID, l.CorrelationID, eventPayload)
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -594,6 +726,15 @@ func (s *PgStore) RejectProposedMatch(ctx context.Context, tenantID, statementLi
 			return domain.ErrInvalidTransition
 		}
 		if err != nil {
+			return err
+		}
+		// A withdrawn many-to-one proposal (A2b part 2) is cleared the same
+		// way the scalar proposed_journal_id just was. The UPDATE above
+		// already moved the parent to EXCEPTION, so the append-only trigger
+		// (migration 000015, which only freezes a MATCHED parent's rows)
+		// permits this delete.
+		if _, err := tx.Exec(ctx, `DELETE FROM statement_line_matched_journals WHERE statement_line_id = $1 AND tenant_id = $2`,
+			statementLineID, tenantID); err != nil {
 			return err
 		}
 		return s.enqueueReconciliationEvent(ctx, tx, "exception.raised", "reconciliation.exception.raised",

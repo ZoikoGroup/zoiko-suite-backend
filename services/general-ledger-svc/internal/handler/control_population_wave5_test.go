@@ -22,6 +22,7 @@ type wave5Stub struct {
 	aging      []domain.ClearingBalanceAgingQuery
 	postSeal   []domain.PostSealEntriesQuery
 	fxRates    []domain.FXRateObservationsQuery
+	tieout     []domain.MigrationBatchTieoutQuery
 	tenantSeen []string
 }
 

@@ -20,12 +20,18 @@ func TestT12_NoRouteToPrivateSystems(t *testing.T) {
 	endpointish := regexp.MustCompile(`(?i)(url|uri|endpoint|host|addr|broker|token|secret|key|password|credential)`)
 	allowedOther := map[string]bool{
 		"HTTPAddr": true, "AllowedOrigins": true, "AllowedHosts": true, // its own listener and allowlists
+		"AdminAddr":        true,                     // its own internal metrics/health listener (Doc 06 §12)
 		"SigningPublicKey": true, "SigningKey": true, // release signatures, not access to other systems
 		"LogRawPrompt": true, // a refused switch, not a route
 		// Model token budgets, not access tokens.
-		"TokenBudgetPerTurn": true, "DailyTokenCeiling": true, "MonthlyTokenCeiling": true,
+		"TokenBudgetPerTurn": true, "DailyTokenCeiling": true, "MonthlyTokenCeiling": true, "SessionTokenCap": true,
 		// The approved model provider's key: egress to Groq only, not a private ZoikoSuite system.
 		"GroqAPIKey": true,
+		// The HMAC salt for shared rate-limit keys: a local secret, not a route (Doc 06 §13).
+		"RateKeySalt": true,
+		// Its own event broker's TLS/SASL credentials and its event signing key.
+		"KafkaTLS": true, "KafkaSASLMechanism": true, "KafkaUsername": true, "KafkaPassword": true,
+		"EventSigningKey": true, "EventSignerID": true,
 	}
 	ct := reflect.TypeOf(config.Config{})
 	for i := 0; i < ct.NumField(); i++ {

@@ -61,6 +61,29 @@ func NewRouterWithReadiness(h *Handler, readyz http.HandlerFunc) http.Handler {
 		r.Get("/{id}", h.GetJobByID)
 		r.Post("/{id}/audit/{entryId}/remediate", h.RemediateEntry)
 		r.Delete("/{id}", h.ArchiveJob)
+
+		// Control plane: ties a validated job to a real general-ledger-svc
+		// batch, the permanent legacy<->canonical identity crosswalk, and
+		// the certificate issued once GL's own Post+Reconcile succeed.
+		r.Post("/crosswalk", h.UpsertCrosswalk)
+		r.Get("/crosswalk", h.GetCrosswalkEntry)
+		r.Post("/{id}/promote", h.PromoteBatch)
+		r.Get("/{id}/batch-ref", h.GetBatchRef)
+		r.Post("/{id}/certificate", h.IssueCertificate)
+		r.Get("/{id}/certificate", h.GetCertificate)
+
+		// MigrationProgram: the top-level tracking object a batch/extract
+		// may optionally belong to.
+		r.Post("/programs", h.CreateProgram)
+		r.Get("/programs/{id}", h.GetProgram)
+		r.Post("/programs/{id}/status", h.UpdateProgramStatus)
+
+		// SourceExtract: immutable, versioned landing of source data. No
+		// update route exists anywhere for it -- a correction is a new
+		// version, registered via the same POST.
+		r.Post("/extracts", h.RegisterExtract)
+		r.Get("/extracts/{id}", h.GetExtract)
+		r.Get("/extracts", h.ListExtractVersions)
 	})
 
 	return r

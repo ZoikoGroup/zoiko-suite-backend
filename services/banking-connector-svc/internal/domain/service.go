@@ -2,6 +2,7 @@ package domain
 
 import (
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -48,6 +49,40 @@ type BankConnection struct {
 	// even a reference has no legitimate reason to leave this service.
 	// Kept unexported from JSON via the field below only for internal use.
 	TokenLeaseRef string `json:"-"`
+
+	// AccountNumberToken and AccountNumberMasked come from
+	// bank_connection_account_tokens (migration 010). Neither is ever
+	// serialized. A non-empty AccountNumberToken is the ONE signal that this
+	// connection is tokenized: AccountNumber then holds no usable bank
+	// number, the masked form is AccountNumberMasked, and the full number
+	// is only ever obtained by detokenizing AccountNumberToken. Empty means
+	// a legacy raw row: AccountNumber is the raw number, as before.
+	AccountNumberToken  string `json:"-"`
+	AccountNumberMasked string `json:"-"`
+}
+
+// Tokenized reports whether this connection's account number is held as a
+// token (see AccountNumberToken). It is decided by the token row's presence,
+// never by what AccountNumber looks like.
+func (c *BankConnection) Tokenized() bool {
+	return c != nil && c.AccountNumberToken != ""
+}
+
+// MaskAccountNumber is the masked display form of a bank identifier: the
+// last 4 characters visible, everything before them "*". A value of 4
+// characters or fewer is masked entirely rather than left in the clear.
+//
+// It is computed from the RAW number — by the handler for a legacy row, and
+// once at write/backfill time for a tokenized row, whose stored masked form
+// (AccountNumberMasked) is then shown without ever touching the vault.
+func MaskAccountNumber(s string) string {
+	if s == "" {
+		return s
+	}
+	if len(s) <= 4 {
+		return strings.Repeat("*", len(s))
+	}
+	return strings.Repeat("*", len(s)-4) + s[len(s)-4:]
 }
 
 // BNK-02 consent state machine. REQUESTED is the initial state (an

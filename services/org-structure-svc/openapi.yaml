@@ -1,0 +1,848 @@
+openapi: 3.0.3
+
+info:
+  title: Org Structure Service
+  version: "1.0.0"
+  description: |
+    Organizational structure inside a legal entity: the ORG-05 organizational
+    units of ZS-SVC-I-001 s4.5 (hierarchy, managers, approval of structural
+    changes), and the older departments, positions and assignments.
+
+    ## Conventions
+
+    * Every call carries `X-Tenant-Id` and `X-Principal-Id`; `X-Correlation-ID`
+      is optional (one is generated). The principal is authorised against the
+      legal entity the call touches.
+    * A mutation of an existing org unit takes the version the caller read in
+      `If-Match` (the unit's `record_version`, quoted or bare). A missing header
+      is 428; a stale one is 409 `version_conflict`.
+    * Dates are `YYYY-MM-DD`. A unit's parent, manager and cost/profit-center
+      mapping are effective-dated and history is kept, never rewritten, so any
+      read can be made `as_of` a date.
+    * Errors are `{error_code, error_message}`. (This service predates RFC 9457
+      problem+json and still uses its own shape; moving it is a service-wide
+      change, not an ORG-05 one.)
+
+    ## Maker-checker
+
+    A reparent that reaches a unit with a cost or profit-center mapping is not
+    applied by its maker. `POST /v1/org/units/{id}/reparent` answers 202 with a
+    change request, and a different principal holding
+    `ORG_UNIT_APPROVE_STRUCTURE` approves or rejects it. Approving the proposer's
+    own request is refused (403 `sod_denied`), by the service and by the database.
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+tags:
+  - name: Org units
+  - name: Hierarchy
+  - name: Change requests
+  - name: Departments
+  - name: Positions
+  - name: Assignments
+
+paths:
+  /v1/org/units:
+    post:
+      tags: [Org units]
+      operationId: createOrgUnit
+      summary: Create an org unit (DRAFT)
+      description: |
+        Action ORG_UNIT_CREATE. The unit is placed under `parent_unit_id` (same
+        legal entity) from `effective_from`. A manager, if given, is resolved
+        against employee-master-svc and the call fails closed if that service
+        cannot be reached. Idempotent on `correlation_id`: a retry returns the
+        original unit with 200.
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/PrincipalID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateOrgUnitRequest" }
+      responses:
+        "201": { description: Created., content: { application/json: { schema: { $ref: "#/components/schemas/OrgUnit" } } } }
+        "200": { description: The same request was already processed; the original unit., content: { application/json: { schema: { $ref: "#/components/schemas/OrgUnit" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+    get:
+      tags: [Org units]
+      operationId: listOrgUnits
+      summary: List a legal entity's units, or the units a person manages
+      description: |
+        Action ORG_UNIT_VIEW. Give `legal_entity_id`, or `manager_employee_id` to
+        find the units an employee manages across legal entities (view access is
+        checked per entity; entities the caller may not view are left out, and a
+        caller who may view none gets 403). Retired units are left out of the
+        by-manager answer.
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/PrincipalID"
+        - name: legal_entity_id
+          in: query
+          schema: { type: string }
+        - name: manager_employee_id
+          in: query
+          schema: { type: string }
+        - $ref: "#/components/parameters/AsOf"
+      responses:
+        "200": { description: Units., content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/OrgUnit" } } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/org/units/{id}:
+    get:
+      tags: [Org units]
+      operationId: getOrgUnit
+      summary: Read a unit, current or as of a date
+      description: Action ORG_UNIT_VIEW.
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/PrincipalID"
+        - $ref: "#/components/parameters/UnitID"
+        - $ref: "#/components/parameters/AsOf"
+      responses:
+        "200": { description: The unit., content: { application/json: { schema: { $ref: "#/components/schemas/OrgUnit" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/org/units/{id}/activate:
+    post:
+      tags: [Org units]
+      operationId: activateOrgUnit
+      summary: Activate a DRAFT unit
+      description: |
+        Action ORG_UNIT_ACTIVATE. Needs the parent, if any, to be ACTIVE
+        (409 `parent_not_active`). Draft, then Active, then Inactive: a unit is
+        never re-activated.
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/PrincipalID"
+        - $ref: "#/components/parameters/UnitID"
+        - $ref: "#/components/parameters/IfMatch"
+      responses:
+        "200": { description: The activated unit., content: { application/json: { schema: { $ref: "#/components/schemas/OrgUnit" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "428": { $ref: "#/components/responses/PreconditionRequired" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/org/units/{id}/deactivate:
+    post:
+      tags: [Org units]
+      operationId: deactivateOrgUnit
+      summary: Deactivate (retire) an ACTIVE unit
+      description: |
+        Action ORG_UNIT_DEACTIVATE. Refused with 409 `has_active_children` while
+        any child unit is not itself INACTIVE: reparent or retire the children first.
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/PrincipalID"
+        - $ref: "#/components/parameters/UnitID"
+        - $ref: "#/components/parameters/IfMatch"
+      responses:
+        "200": { description: The retired unit., content: { application/json: { schema: { $ref: "#/components/schemas/OrgUnit" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "428": { $ref: "#/components/responses/PreconditionRequired" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/org/units/{id}/reparent:
+    post:
+      tags: [Org units]
+      operationId: reparentOrgUnit
+      summary: Move a unit under a new parent from a date
+      description: |
+        Action ORG_UNIT_REPARENT. The old placement is closed and a new one
+        opened; nothing is rewritten. A move that would make a unit its own
+        ancestor is refused (422 `hierarchy_loop`), including through changes
+        already scheduled for later. `effective_at` must be after the start of the
+        unit's current placement.
+
+        If the move reaches a unit that carries a cost or profit-center mapping it
+        is not applied: 202 returns a change request awaiting an independent
+        approver. Proposing the same move again returns that request with 200; a
+        different move for the same unit is 409 `change_pending`. Every rule is
+        checked at proposal time, so an impossible move is refused to its maker
+        immediately.
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/PrincipalID"
+        - $ref: "#/components/parameters/UnitID"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReparentRequest" }
+      responses:
+        "200":
+          description: The move was applied (the updated unit), or the same move was already awaiting approval (the pending proposal).
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/OrgUnit"
+                  - $ref: "#/components/schemas/ProposedChange"
+        "202": { description: Proposed; awaiting an independent approver. Nothing has moved., content: { application/json: { schema: { $ref: "#/components/schemas/ProposedChange" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+        "428": { $ref: "#/components/responses/PreconditionRequired" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/org/units/{id}/reparent-impact:
+    get:
+      tags: [Org units]
+      operationId: getReparentImpact
+      summary: Preview what a reparent would reach
+      description: |
+        Action ORG_UNIT_REPARENT (the preview names the mapped units beneath the
+        unit, so it needs the same right as proposing). Changes nothing.
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/PrincipalID"
+        - $ref: "#/components/parameters/UnitID"
+        - name: effective_at
+          in: query
+          required: true
+          schema: { type: string, format: date }
+      responses:
+        "200": { description: The impact., content: { application/json: { schema: { $ref: "#/components/schemas/ImpactReport" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/org/units/{id}/change-manager:
+    post:
+      tags: [Org units]
+      operationId: changeOrgUnitManager
+      summary: Name a new manager from a date
+      description: |
+        Action ORG_UNIT_CHANGE_MANAGER. The manager is resolved against
+        employee-master-svc after authorisation; an unknown or terminated employee
+        is 400 `manager_invalid`, and an unreachable service is 503 (nothing is
+        written). The previous manager stays in history.
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/PrincipalID"
+        - $ref: "#/components/parameters/UnitID"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ChangeManagerRequest" }
+      responses:
+        "200": { description: The updated unit., content: { application/json: { schema: { $ref: "#/components/schemas/OrgUnit" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+        "428": { $ref: "#/components/responses/PreconditionRequired" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/org/hierarchy:
+    get:
+      tags: [Hierarchy]
+      operationId: getHierarchy
+      summary: The operating hierarchy of a legal entity
+      description: |
+        Action ORG_UNIT_VIEW. With no dates this is the current tree. `as_of`
+        gives the tree that applied on a date; `recorded_as_of` gives it as known
+        at an earlier moment, so a past report can be reproduced exactly as it was
+        produced (a change recorded later does not appear, even if it applies
+        earlier).
+
+        `include_inactive` defaults to false for a current read and true for a
+        dated one, because a past tree had the units that are retired today. A
+        unit's `status` is its current status. A unit whose parent is not in the
+        answer appears as a root.
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/PrincipalID"
+        - name: legal_entity_id
+          in: query
+          required: true
+          schema: { type: string }
+        - $ref: "#/components/parameters/AsOf"
+        - name: recorded_as_of
+          in: query
+          schema: { type: string, format: date-time }
+        - name: include_inactive
+          in: query
+          schema: { type: boolean }
+      responses:
+        "200": { description: The hierarchy., content: { application/json: { schema: { $ref: "#/components/schemas/HierarchyResponse" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { description: The stored hierarchy contains a cycle (error_code hierarchy_inconsistent)., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/org/change-requests:
+    get:
+      tags: [Change requests]
+      operationId: listChangeRequests
+      summary: A legal entity's change requests, newest first
+      description: Action ORG_UNIT_VIEW.
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/PrincipalID"
+        - name: legal_entity_id
+          in: query
+          required: true
+          schema: { type: string }
+        - name: status
+          in: query
+          schema: { $ref: "#/components/schemas/ChangeStatus" }
+      responses:
+        "200": { description: Change requests., content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/ChangeRequest" } } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/org/change-requests/{id}:
+    get:
+      tags: [Change requests]
+      operationId: getChangeRequest
+      summary: Read a change request
+      description: Action ORG_UNIT_VIEW.
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/PrincipalID"
+        - $ref: "#/components/parameters/RequestID"
+      responses:
+        "200": { description: The request., content: { application/json: { schema: { $ref: "#/components/schemas/ChangeRequest" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/org/change-requests/{id}/approve:
+    post:
+      tags: [Change requests]
+      operationId: approveChangeRequest
+      summary: Approve a pending change and apply it
+      description: |
+        Action ORG_UNIT_APPROVE_STRUCTURE. The approver must not be the person who
+        proposed the change (403 `sod_denied`). The move is applied and the
+        approval recorded in one transaction, after re-checking every rule against
+        the unit as it is now. If it can no longer be applied as written (the unit
+        changed since, a loop appeared, the parent was retired) the request is
+        closed as FAILED and the reason is returned (409 `version_conflict`, 422
+        `hierarchy_loop`, ...): a stale proposal cannot be forced through.
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/PrincipalID"
+        - $ref: "#/components/parameters/RequestID"
+      responses:
+        "200": { description: Approved and applied., content: { application/json: { schema: { $ref: "#/components/schemas/DecidedChange" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/org/change-requests/{id}/reject:
+    post:
+      tags: [Change requests]
+      operationId: rejectChangeRequest
+      summary: Reject a pending change
+      description: Action ORG_UNIT_APPROVE_STRUCTURE. A reason is required. Nothing moves.
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/PrincipalID"
+        - $ref: "#/components/parameters/RequestID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DecideRequest" }
+      responses:
+        "200": { description: Rejected., content: { application/json: { schema: { $ref: "#/components/schemas/ChangeRequest" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/org/departments:
+    post:
+      tags: [Departments]
+      operationId: createDepartment
+      summary: Create a department
+      description: Action ORG_DEPT_CREATE. Idempotent on `correlation_id` (a retry returns 200).
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/PrincipalID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateDepartmentRequest" }
+      responses:
+        "201": { description: Created., content: { application/json: { schema: { $ref: "#/components/schemas/Department" } } } }
+        "200": { description: Replay; the original department., content: { application/json: { schema: { $ref: "#/components/schemas/Department" } } } }
+        default: { $ref: "#/components/responses/Error" }
+    get:
+      tags: [Departments]
+      operationId: listDepartments
+      summary: List departments of a legal entity
+      description: Action ORG_DEPT_VIEW.
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/PrincipalID"
+        - name: legal_entity_id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Departments., content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Department" } } } } }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/org/departments/{id}:
+    get:
+      tags: [Departments]
+      operationId: getDepartment
+      summary: Read a department
+      description: Action ORG_DEPT_VIEW.
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/PrincipalID"
+        - $ref: "#/components/parameters/UnitID"
+      responses:
+        "200": { description: The department., content: { application/json: { schema: { $ref: "#/components/schemas/Department" } } } }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/org/positions:
+    post:
+      tags: [Positions]
+      operationId: createPosition
+      summary: Create a position
+      description: Action ORG_POSITION_CREATE. Idempotent on `correlation_id` (a retry returns 200).
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/PrincipalID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreatePositionRequest" }
+      responses:
+        "201": { description: Created., content: { application/json: { schema: { $ref: "#/components/schemas/Position" } } } }
+        "200": { description: Replay; the original position., content: { application/json: { schema: { $ref: "#/components/schemas/Position" } } } }
+        default: { $ref: "#/components/responses/Error" }
+    get:
+      tags: [Positions]
+      operationId: listPositions
+      summary: List positions of a department
+      description: Action ORG_POSITION_VIEW.
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/PrincipalID"
+        - name: department_id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Positions., content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Position" } } } } }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/org/positions/{id}:
+    get:
+      tags: [Positions]
+      operationId: getPosition
+      summary: Read a position
+      description: Action ORG_POSITION_VIEW.
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/PrincipalID"
+        - $ref: "#/components/parameters/UnitID"
+      responses:
+        "200": { description: The position., content: { application/json: { schema: { $ref: "#/components/schemas/Position" } } } }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/org/assignments:
+    post:
+      tags: [Assignments]
+      operationId: assignEmployee
+      summary: Assign an employee to a department and position
+      description: Action ORG_ASSIGNMENT_CREATE. Idempotent on `correlation_id`; a retry returns the original assignment, still with 201.
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/PrincipalID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AssignEmployeeRequest" }
+      responses:
+        "201": { description: The assignment (or the original one for a retry)., content: { application/json: { schema: { $ref: "#/components/schemas/OrgAssignment" } } } }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/org/assignments/employee/{employee_id}:
+    get:
+      tags: [Assignments]
+      operationId: getEmployeeAssignment
+      summary: An employee's current assignment
+      description: Action ORG_ASSIGNMENT_VIEW.
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/PrincipalID"
+        - name: employee_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: The assignment., content: { application/json: { schema: { $ref: "#/components/schemas/OrgAssignment" } } } }
+        default: { $ref: "#/components/responses/Error" }
+
+components:
+  parameters:
+    TenantID:
+      name: X-Tenant-Id
+      in: header
+      required: true
+      schema: { type: string }
+    PrincipalID:
+      name: X-Principal-Id
+      in: header
+      required: true
+      description: The caller. Authorised against the legal entity the call touches.
+      schema: { type: string }
+    CorrelationID:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      description: Carried onto every event the call causes. One is generated if absent.
+      schema: { type: string }
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      description: The unit's `record_version` as the caller read it, quoted or bare.
+      schema: { type: string }
+    UnitID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    RequestID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    AsOf:
+      name: as_of
+      in: query
+      required: false
+      schema: { type: string, format: date }
+
+  responses:
+    Error:
+      description: An error.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    BadRequest:
+      description: Malformed or incomplete request (invalid_json, missing_fields, invalid_unit_type, invalid_effective_from, invalid_effective_at, invalid_as_of, invalid_recorded_as_of, invalid_include_inactive, invalid_status, invalid_if_match, manager_invalid).
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Unauthorized:
+      description: No caller identity (identity_missing).
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Forbidden:
+      description: The caller may not do this (forbidden), or tried to approve their own proposal (sod_denied).
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    NotFound:
+      description: No such unit or change request (org_unit_not_found, change_request_not_found).
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Conflict:
+      description: The request conflicts with the current state (code_taken, version_conflict, invalid_transition, parent_not_active, has_active_children, no_change, change_pending, change_request_decided).
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Unprocessable:
+      description: The request is well-formed but the structure refuses it (parent_invalid, hierarchy_loop, invalid_effective_date).
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    PreconditionRequired:
+      description: If-Match is required (if_match_required).
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Unavailable:
+      description: A dependency is unavailable (store_unavailable, authz_unavailable, employee_validation_failed). Nothing was written.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  schemas:
+    Error:
+      type: object
+      required: [error_code, error_message]
+      properties:
+        error_code: { type: string }
+        error_message: { type: string }
+
+    UnitType:
+      type: string
+      enum: [DEPARTMENT, BUSINESS_UNIT, FUNCTION, DIVISION, TEAM]
+
+    UnitStatus:
+      type: string
+      enum: [DRAFT, ACTIVE, INACTIVE]
+
+    ChangeStatus:
+      type: string
+      enum: [PENDING, APPROVED, REJECTED, FAILED]
+
+    OrgUnit:
+      type: object
+      required: [unit_id, tenant_id, legal_entity_id, code, name, unit_type, status, record_version, correlation_id, created_by, created_at, updated_at]
+      properties:
+        unit_id: { type: string }
+        tenant_id: { type: string }
+        legal_entity_id: { type: string }
+        code: { type: string }
+        name: { type: string }
+        unit_type: { $ref: "#/components/schemas/UnitType" }
+        status: { $ref: "#/components/schemas/UnitStatus" }
+        location_ref: { type: string }
+        record_version: { type: integer, format: int64, minimum: 1 }
+        correlation_id: { type: string }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        parent_unit_id: { type: string, description: The parent on the read date; absent for a root. }
+        manager_employee_id: { type: string, description: The manager on the read date; absent if none. }
+        cost_center_code: { type: string }
+        profit_center_code: { type: string }
+
+    OrgUnitNode:
+      allOf:
+        - $ref: "#/components/schemas/OrgUnit"
+        - type: object
+          required: [children]
+          properties:
+            children:
+              type: array
+              items: { $ref: "#/components/schemas/OrgUnitNode" }
+
+    HierarchyResponse:
+      type: object
+      required: [legal_entity_id, as_of, include_inactive, roots]
+      properties:
+        legal_entity_id: { type: string }
+        as_of: { type: string, format: date }
+        recorded_as_of: { type: string, format: date-time }
+        include_inactive: { type: boolean }
+        roots:
+          type: array
+          items: { $ref: "#/components/schemas/OrgUnitNode" }
+
+    CreateOrgUnitRequest:
+      type: object
+      required: [legal_entity_id, code, name, unit_type, effective_from, correlation_id]
+      properties:
+        legal_entity_id: { type: string }
+        code: { type: string, maxLength: 50 }
+        name: { type: string }
+        unit_type: { $ref: "#/components/schemas/UnitType" }
+        parent_unit_id: { type: string, nullable: true }
+        manager_employee_id: { type: string, nullable: true }
+        location_ref: { type: string }
+        cost_center_code: { type: string }
+        profit_center_code: { type: string }
+        effective_from: { type: string, format: date }
+        reason: { type: string }
+        correlation_id: { type: string, description: The client's idempotency key for this create. }
+
+    ReparentRequest:
+      type: object
+      required: [effective_at, reason]
+      properties:
+        new_parent_unit_id: { type: string, nullable: true, description: Null or absent makes the unit a root. }
+        effective_at: { type: string, format: date }
+        reason: { type: string }
+
+    ChangeManagerRequest:
+      type: object
+      required: [manager_employee_id, effective_at, reason]
+      properties:
+        manager_employee_id: { type: string }
+        effective_at: { type: string, format: date }
+        reason: { type: string }
+
+    DecideRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason: { type: string }
+
+    MappedUnit:
+      type: object
+      required: [unit_id, code]
+      properties:
+        unit_id: { type: string }
+        code: { type: string }
+        cost_center_code: { type: string }
+        profit_center_code: { type: string }
+
+    ImpactReport:
+      type: object
+      required: [unit_id, units_affected, mapped_units, requires_approval, notes]
+      properties:
+        unit_id: { type: string }
+        units_affected: { type: integer, description: The unit itself plus its descendants on the effective date. }
+        mapped_units:
+          type: array
+          items: { $ref: "#/components/schemas/MappedUnit" }
+        requires_approval: { type: boolean }
+        notes: { type: array, items: { type: string } }
+
+    ChangeRequest:
+      type: object
+      required: [request_id, tenant_id, legal_entity_id, unit_id, command, new_parent_unit_id, effective_at, reason, unit_version, impact, status, requested_by, requested_at]
+      properties:
+        request_id: { type: string }
+        tenant_id: { type: string }
+        legal_entity_id: { type: string }
+        unit_id: { type: string }
+        command: { type: string, enum: [REPARENT] }
+        new_parent_unit_id: { type: string, nullable: true }
+        effective_at: { type: string, format: date }
+        reason: { type: string }
+        unit_version: { type: integer, format: int64, description: The unit version the maker read. }
+        impact: { $ref: "#/components/schemas/ImpactReport" }
+        status: { $ref: "#/components/schemas/ChangeStatus" }
+        requested_by: { type: string }
+        requested_at: { type: string, format: date-time }
+        decided_by: { type: string }
+        decided_at: { type: string, format: date-time }
+        decision_reason: { type: string }
+        failure_code: { type: string }
+
+    ProposedChange:
+      type: object
+      required: [status, change_request, impact]
+      properties:
+        status: { type: string, enum: [PENDING_APPROVAL] }
+        change_request: { $ref: "#/components/schemas/ChangeRequest" }
+        impact: { $ref: "#/components/schemas/ImpactReport" }
+
+    DecidedChange:
+      type: object
+      required: [change_request]
+      properties:
+        change_request: { $ref: "#/components/schemas/ChangeRequest" }
+        unit: { $ref: "#/components/schemas/OrgUnit" }
+
+    Department:
+      type: object
+      required: [department_id, tenant_id, legal_entity_id, name, code, cost_center_code, status, correlation_id, created_at, updated_at]
+      properties:
+        department_id: { type: string }
+        tenant_id: { type: string }
+        legal_entity_id: { type: string }
+        name: { type: string }
+        code: { type: string }
+        cost_center_code: { type: string }
+        parent_department_id: { type: string }
+        status: { type: string, enum: [ACTIVE, INACTIVE] }
+        correlation_id: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    CreateDepartmentRequest:
+      type: object
+      required: [legal_entity_id, name, code, cost_center_code, correlation_id]
+      properties:
+        legal_entity_id: { type: string }
+        name: { type: string }
+        code: { type: string }
+        cost_center_code: { type: string }
+        parent_department_id: { type: string, nullable: true }
+        correlation_id: { type: string }
+
+    Position:
+      type: object
+      required: [position_id, tenant_id, legal_entity_id, department_id, title, code, job_level, max_headcount, current_headcount, status, correlation_id, created_at, updated_at]
+      properties:
+        position_id: { type: string }
+        tenant_id: { type: string }
+        legal_entity_id: { type: string }
+        department_id: { type: string }
+        department_name: { type: string }
+        title: { type: string }
+        code: { type: string }
+        job_level: { type: string }
+        max_headcount: { type: integer }
+        current_headcount: { type: integer }
+        status: { type: string, enum: [ACTIVE, INACTIVE] }
+        correlation_id: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    CreatePositionRequest:
+      type: object
+      required: [legal_entity_id, department_id, title, code, job_level, max_headcount, correlation_id]
+      properties:
+        legal_entity_id: { type: string }
+        department_id: { type: string }
+        title: { type: string }
+        code: { type: string }
+        job_level: { type: string }
+        max_headcount: { type: integer }
+        correlation_id: { type: string }
+
+    OrgAssignment:
+      type: object
+      required: [assignment_id, tenant_id, employee_id, department_id, legal_entity_id, position_id, effective_from, status, correlation_id, created_at, updated_at]
+      properties:
+        assignment_id: { type: string }
+        tenant_id: { type: string }
+        employee_id: { type: string }
+        department_id: { type: string }
+        department_name: { type: string }
+        legal_entity_id: { type: string }
+        position_id: { type: string }
+        position_title: { type: string }
+        manager_employee_id: { type: string }
+        effective_from: { type: string }
+        effective_to: { type: string }
+        status: { type: string, enum: [ACTIVE, SUPERSEDED] }
+        correlation_id: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    AssignEmployeeRequest:
+      type: object
+      required: [employee_id, department_id, position_id, effective_from, correlation_id]
+      properties:
+        employee_id: { type: string }
+        department_id: { type: string }
+        position_id: { type: string }
+        manager_employee_id: { type: string, nullable: true }
+        effective_from: { type: string }
+        correlation_id: { type: string }

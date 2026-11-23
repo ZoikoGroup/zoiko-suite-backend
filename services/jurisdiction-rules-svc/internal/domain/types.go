@@ -53,6 +53,12 @@ type Jurisdiction struct {
 	// RowVersion increases on every update (000020): the aggregate version
 	// events carry and the ETag If-Match asserts.
 	RowVersion int64 `json:"row_version"`
+
+	// Retirement evidence (000027): why a retired jurisdiction was retired, the
+	// source that said so, and what replaces it. Empty until it is retired.
+	RetirementReason           *string `json:"retirement_reason,omitempty"`
+	RetirementEvidenceRef      *string `json:"retirement_evidence_ref,omitempty"`
+	SupersededByJurisdictionID *string `json:"superseded_by_jurisdiction_id,omitempty"`
 }
 
 // JurisdictionRule is an effective-dated applicability rule record.
@@ -311,6 +317,10 @@ var ErrParentNotFound = errorString("parent jurisdiction not found")
 // jurisdiction its own ancestor. The self-referential FK cannot express
 // this, so it is enforced in the store.
 var ErrCyclicHierarchy = errorString("parent assignment would create a cycle in the jurisdiction hierarchy")
+
+// ErrVersionConflict is returned when an If-Match header specifies a row_version
+// that no longer matches the current aggregate version.
+var ErrVersionConflict = errorString("version conflict: the object has been modified since the expected version")
 
 // ErrOverlappingRule is returned when a new rule's effective period overlaps
 // an existing non-retired rule with the same (jurisdiction_id, rule_domain,

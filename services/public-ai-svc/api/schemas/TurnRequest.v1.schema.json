@@ -1,0 +1,46 @@
+{
+  "$id": "https://schemas.zoikosuite.com/public-ai/TurnRequest.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "client_turn_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "locale": {
+      "type": "string"
+    },
+    "market_code": {
+      "pattern": "^[A-Z]{2}$",
+      "type": "string"
+    },
+    "message": {
+      "maxLength": 2000,
+      "minLength": 1,
+      "type": "string"
+    },
+    "page_context": {
+      "$ref": "PageContext.v1.schema.json"
+    },
+    "requested_response_mode": {
+      "enum": [
+        "json"
+      ],
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "1.0"
+    },
+    "session_id": {
+      "minLength": 12,
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "session_id",
+    "client_turn_id",
+    "message"
+  ],
+  "type": "object"
+}

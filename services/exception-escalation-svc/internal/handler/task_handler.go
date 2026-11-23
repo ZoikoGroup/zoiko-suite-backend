@@ -158,6 +158,7 @@ func (h *taskHandler) CloseCase(w http.ResponseWriter, r *http.Request) {
 
 	closed, err := h.store.CloseCase(r.Context(), domain.CloseCaseParams{
 		CaseID: caseID, TenantID: middleware.GetTenantID(r.Context()), ActorPrincipalID: principalID, ClosureReason: req.ClosureReason,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
 	})
 	if err != nil {
 		h.writeTaskErr(w, err)
@@ -209,7 +210,7 @@ func (h *taskHandler) CreateTask(w http.ResponseWriter, r *http.Request) {
 		TaskType: req.TaskType, Priority: req.Priority, BusinessTrigger: req.BusinessTrigger,
 		LinkedObjectType: req.LinkedObjectType, LinkedObjectID: req.LinkedObjectID, RequiredEvidence: req.RequiredEvidence,
 		SLADeadline: req.SLADeadline, AssignedToRole: req.AssignedToRole, AssignedToUser: req.AssignedToUser,
-		CreatedByPrincipalID: principalID,
+		CreatedByPrincipalID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
 	})
 	if err != nil {
 		h.writeTaskErr(w, err)
@@ -261,6 +262,7 @@ func (h *taskHandler) AssignTask(w http.ResponseWriter, r *http.Request) {
 	t, err := h.store.AssignTask(r.Context(), domain.AssignTaskParams{
 		TaskID: taskID, TenantID: middleware.GetTenantID(r.Context()), ActorPrincipalID: principalID,
 		AssignedToRole: req.AssignedToRole, AssignedToUser: req.AssignedToUser,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
 	})
 	if err != nil {
 		h.writeTaskErr(w, err)
@@ -368,6 +370,7 @@ func (h *taskHandler) EscalateTask(w http.ResponseWriter, r *http.Request) {
 	t, err := h.store.EscalateTask(r.Context(), domain.EscalateTaskParams{
 		TaskID: taskID, TenantID: middleware.GetTenantID(r.Context()), ActorPrincipalID: principalID,
 		EscalatedToRole: req.EscalatedToRole, Reason: req.Reason,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
 	})
 	if err != nil {
 		h.writeTaskErr(w, err)
@@ -410,6 +413,7 @@ func (h *taskHandler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 
 	t, err := h.store.CompleteTask(r.Context(), domain.CompleteTaskParams{
 		TaskID: taskID, TenantID: middleware.GetTenantID(r.Context()), ActorPrincipalID: principalID, CompletionNotes: req.CompletionNotes,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
 	})
 	if err != nil {
 		h.writeTaskErr(w, err)
@@ -446,6 +450,7 @@ func (h *taskHandler) ReopenTask(w http.ResponseWriter, r *http.Request) {
 
 	t, err := h.store.ReopenTask(r.Context(), domain.ReopenTaskParams{
 		TaskID: taskID, TenantID: middleware.GetTenantID(r.Context()), ActorPrincipalID: principalID, Reason: req.Reason,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
 	})
 	if err != nil {
 		h.writeTaskErr(w, err)
@@ -584,6 +589,8 @@ func (h *taskHandler) writeTaskErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "case not found")
 	case errors.Is(err, domain.ErrCaseAlreadyClosedWC):
 		writeError(w, http.StatusConflict, "case is already closed")
+	case errors.Is(err, domain.ErrCaseEntityMismatch):
+		writeError(w, http.StatusUnprocessableEntity, "task legal entity does not match the case legal entity")
 	case errors.Is(err, domain.ErrTaskNotFound):
 		writeError(w, http.StatusNotFound, "task not found")
 	case errors.Is(err, domain.ErrTaskInvalidState):

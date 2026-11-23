@@ -30,7 +30,7 @@ func newVersionFor(label string) *domain.DocumentVersion {
 }
 
 func TestReservation_CreateAndIdempotency(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	doc, _ := createTestDocument(t, s, "res-idem")
 
 	first, replayed, err := reserveFor(t, s, tenantCtx(), doc.DocumentID, "p1", "k1", 100)
@@ -55,7 +55,7 @@ func TestReservation_CreateAndIdempotency(t *testing.T) {
 }
 
 func TestReservation_ConcurrentIdenticalRequests_CreateOne(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	doc, _ := createTestDocument(t, s, "res-concurrent-create")
 
 	const n = 12
@@ -84,7 +84,7 @@ func TestReservation_ConcurrentIdenticalRequests_CreateOne(t *testing.T) {
 }
 
 func TestReservation_IsTenantScoped(t *testing.T) {
-	s := store.New(requireTestDB(t), zap.NewNop())
+	s := store.New(requireTestDB(t), zap.NewNop(), store.WithEventRegion("local"))
 	doc, _ := createTestDocument(t, s, "res-tenant")
 	res, _, err := reserveFor(t, s, tenantCtx(), doc.DocumentID, "p1", "k1", 100)
 	require.NoError(t, err)
@@ -110,7 +110,7 @@ func TestReservation_IsTenantScoped(t *testing.T) {
 
 func TestReservation_Complete_CommitsTheVersionAtomically(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc, v1 := createTestDocument(t, s, "res-commit")
 	res, _, err := reserveFor(t, s, tenantCtx(), doc.DocumentID, "p1", "k1", 7)
 	require.NoError(t, err)
@@ -141,7 +141,7 @@ func TestReservation_Complete_CommitsTheVersionAtomically(t *testing.T) {
 
 func TestReservation_RetriedCompletion_CommitsExactlyOneVersion(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc, _ := createTestDocument(t, s, "res-retry")
 	res, _, err := reserveFor(t, s, tenantCtx(), doc.DocumentID, "p1", "k1", 7)
 	require.NoError(t, err)
@@ -163,7 +163,7 @@ func TestReservation_RetriedCompletion_CommitsExactlyOneVersion(t *testing.T) {
 
 func TestReservation_ConcurrentCompletions_CommitExactlyOneVersion(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc, _ := createTestDocument(t, s, "res-concurrent-complete")
 	res, _, err := reserveFor(t, s, tenantCtx(), doc.DocumentID, "p1", "k1", 7)
 	require.NoError(t, err)
@@ -205,7 +205,7 @@ func TestReservation_ConcurrentCompletions_CommitExactlyOneVersion(t *testing.T)
 
 func TestReservation_FailedCommit_RollsBackEverything(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc, _ := createTestDocument(t, s, "res-rollback")
 	res, _, err := reserveFor(t, s, tenantCtx(), doc.DocumentID, "p1", "k1", 7)
 	require.NoError(t, err)
@@ -236,7 +236,7 @@ func TestReservation_FailedCommit_RollsBackEverything(t *testing.T) {
 
 func TestReservation_TerminalStates_AreImmutable(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc, _ := createTestDocument(t, s, "res-terminal")
 
 	failed, _, err := reserveFor(t, s, tenantCtx(), doc.DocumentID, "p1", "kf", 7)
@@ -279,7 +279,7 @@ func TestReservation_TerminalStates_AreImmutable(t *testing.T) {
 
 func TestReservation_DatabaseGuards(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc, _ := createTestDocument(t, s, "res-guards")
 	res, _, err := reserveFor(t, s, tenantCtx(), doc.DocumentID, "p1", "k1", 7)
 	require.NoError(t, err)

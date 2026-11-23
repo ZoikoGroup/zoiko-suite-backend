@@ -285,7 +285,9 @@ func (p *Provider) LoginPasskeyFinish(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if p.o.Passkeys == nil || !pend.PasswordOK {
+	// The same step-order rule as begin: a pending login that was never
+	// offered a passkey (no passkey at password time) cannot finish with one.
+	if p.o.Passkeys == nil || !pend.PasswordOK || !containsString(pend.SecondFactors, "passkey") {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "passkey_not_available"})
 		return
 	}
@@ -302,8 +304,21 @@ func (p *Provider) LoginPasskeyFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := p.o.Passkeys.FinishLogin(ctx, pr, r.Header.Get("X-Passkey-Session"), []byte(r.PostFormValue("assertion"))); err != nil {
+		if isUnavailable(err) {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "temporarily_unavailable"})
+			return
+		}
 		p.o.Limiter.Failure(ctx, ip, pend.TenantID)
 		p.o.Metrics.Login("passkey", "failed")
+		// The TOTP step's bound: a pending login gets maxSecondFails tries
+		// across both factors, then must start again.
+		pend.FailedSecond++
+		if pend.FailedSecond >= maxSecondFails {
+			_ = p.o.Pending.Delete(ctx, pend.ID)
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "too_many_attempts"})
+			return
+		}
+		_ = p.o.Pending.Put(ctx, pend, pendingTTL)
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "passkey_rejected"})
 		return
 	}

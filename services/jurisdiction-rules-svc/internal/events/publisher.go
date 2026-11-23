@@ -209,7 +209,7 @@ func buildEnvelope(ctx context.Context, eventType, jurisdictionID, actorID, corr
 	return data, nil
 }
 
-func (p *OutboxPublisher) emitToOutbox(ctx context.Context, q store.Querier, eventType, correlationID, jurisdictionID, actorID string, payload map[string]any) error {
+func (p *OutboxPublisher) emitToOutbox(ctx context.Context, q store.Querier, eventType, correlationID, jurisdictionID, actorID string, aggregateVersion int64, payload map[string]any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("event %q: marshal payload: %w", eventType, err)
@@ -218,7 +218,7 @@ func (p *OutboxPublisher) emitToOutbox(ctx context.Context, q store.Querier, eve
 	if classification == "" {
 		classification = "INTERNAL"
 	}
-	data, err := buildEnvelope(ctx, eventType, jurisdictionID, actorID, correlationID, classification, 0, raw)
+	data, err := buildEnvelope(ctx, eventType, jurisdictionID, actorID, correlationID, classification, aggregateVersion, raw)
 	if err != nil {
 		return err
 	}
@@ -283,6 +283,11 @@ func (p *OutboxPublisher) marshalJurisdictionDeactivated(j domain.Jurisdiction) 
 		"effective_to":            j.EffectiveTo,
 		"updated_at":              j.UpdatedAt,
 		"updated_by_principal_id": j.UpdatedByPrincipalID,
+		// REF-01 RetireJurisdiction evidence (000027): a consumer holding its own
+		// copy of the registry learns why, on what source, and what replaces it.
+		"retirement_reason":             j.RetirementReason,
+		"retirement_evidence_ref":       j.RetirementEvidenceRef,
+		"superseded_by_jurisdiction_id": j.SupersededByJurisdictionID,
 	})
 	return data
 }
@@ -329,11 +334,16 @@ func (p *OutboxPublisher) marshalDrift(r domain.JurisdictionRule, e domain.Drift
 	return data
 }
 
+// MessageWriter is what the relay writes to: a *kafka.Writer in production.
+type MessageWriter interface {
+	WriteMessages(ctx context.Context, msgs ...kafka.Message) error
+}
+
 // OutboxWorker publishes events from the outbox to Kafka.
 type OutboxWorker struct {
 	log       *zap.Logger
 	store     *store.PgStore
-	producer  *kafka.Writer
+	producer  MessageWriter
 	topic     string
 	metrics   *telemetry.Metrics
 	interval  time.Duration
@@ -342,7 +352,7 @@ type OutboxWorker struct {
 	wg        sync.WaitGroup
 }
 
-func NewOutboxWorker(log *zap.Logger, store *store.PgStore, producer *kafka.Writer, topic string, metrics *telemetry.Metrics) *OutboxWorker {
+func NewOutboxWorker(log *zap.Logger, store *store.PgStore, producer MessageWriter, topic string, metrics *telemetry.Metrics) *OutboxWorker {
 	return &OutboxWorker{
 		log:       log,
 		store:     store,
@@ -382,15 +392,41 @@ func (w *OutboxWorker) run() {
 	}
 }
 
-func (w *OutboxWorker) processBatch() {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+// RelayOnce publishes one batch now (the ticker's work; tests call it directly).
+func (w *OutboxWorker) RelayOnce() { w.processBatch() }
 
-	events, err := w.store.GetPendingOutboxEvents(ctx, w.batchSize)
+// processBatch relays one batch inside one transaction (J-15): the rows are
+// claimed with FOR UPDATE SKIP LOCKED, published, and marked published or
+// failed in the same transaction, so another replica's relay never sees a
+// claimed row and no event is published twice by two relays. A transaction
+// advisory lock lets one relay run at a time, which keeps the events of an
+// aggregate in the order they were written. If the commit fails after a
+// publish, the rows are published again next tick: delivery stays
+// at-least-once, and consumers dedupe on event_id.
+func (w *OutboxWorker) processBatch() {
+	bg, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	ctx, unit := w.store.BeginUnit(bg, "")
+	defer unit.Rollback(ctx)
+
+	locked, err := w.store.TryLockOutboxRelay(ctx)
 	if err != nil {
-		w.log.Error("outbox: failed to fetch pending events", zap.Error(err))
+		w.log.Error("outbox: relay lock failed", zap.Error(err))
 		return
 	}
+	if !locked {
+		return // another replica's relay is publishing
+	}
+	events, err := w.store.ClaimOutboxEvents(ctx, w.batchSize)
+	if err != nil {
+		w.log.Error("outbox: failed to claim pending events", zap.Error(err))
+		return
+	}
+	defer func() {
+		if err := unit.Finish(ctx); err != nil {
+			w.log.Error("outbox: relay transaction not committed; the batch is retried", zap.Error(err))
+		}
+	}()
 	if w.metrics != nil {
 		w.metrics.OutboxPendingEvents.Set(float64(len(events)))
 	}
@@ -405,10 +441,11 @@ func (w *OutboxWorker) processBatch() {
 		if e.PartitionKey != nil {
 			key = []byte(*e.PartitionKey)
 		}
+		// The writer names the topic: kafka-go refuses a message that names one
+		// too ("Topic must not be specified for both Writer and Message").
 		msg := kafka.Message{
 			Key:   key,
 			Value: e.EventPayload,
-			Topic: w.topic,
 		}
 		if err := w.producer.WriteMessages(ctx, msg); err != nil {
 			w.log.Error("outbox: kafka write failed",
@@ -422,7 +459,7 @@ func (w *OutboxWorker) processBatch() {
 			if markErr := w.store.MarkOutboxEventFailed(ctx, e.OutboxID, err.Error()); markErr != nil {
 				w.log.Error("outbox: failed to mark event failed", zap.Error(markErr))
 			} else if e.PublishAttempts+1 >= store.MaxOutboxAttempts {
-				// GetPendingOutboxEvents skips it from now on, so the events
+				// ClaimOutboxEvents skips it from now on, so the events
 				// behind it flow again; it stays in event_outbox for a person.
 				w.log.Error("outbox: event parked after repeated publish failures",
 					zap.String("outbox_id", e.OutboxID), zap.String("event_type", e.EventType),

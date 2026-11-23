@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -64,6 +65,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/control-populations/{population}", h.GetControlPopulation)
 	r.Route("/bnk06/attempts", func(r chi.Router) {
 		r.Post("/", h.PrepareAttempt)
+		r.Get("/", h.ListPaymentAttempts)
 		r.Get("/{attemptID}", h.GetPaymentAttempt)
 		r.Get("/{attemptID}/receipt", h.GetProviderReceipt)
 		r.Get("/{attemptID}/state", h.GetSubmissionState)
@@ -313,6 +315,51 @@ func (h *Handler) GetPaymentAttempt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, a)
+}
+
+// ListPaymentAttempts (SPEC_DEVIATIONS A1) — GET /bnk06/attempts?legal_entity_id=...
+// legal_entity_id is mandatory: there is no tenant-wide list, the same
+// scoping every other BNK-06 read already requires. status is optional;
+// after/limit are a keyset cursor, not an offset — see
+// domain.ListPaymentAttemptsFilter's doc comment.
+func (h *Handler) ListPaymentAttempts(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	if legalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "legal_entity_id is required")
+		return
+	}
+	if !h.authorize(w, r, principalID, legalEntityID, PaymentAttemptRead) {
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	items, err := h.store.ListPaymentAttempts(r.Context(), domain.ListPaymentAttemptsFilter{
+		LegalEntityID: legalEntityID, Status: r.URL.Query().Get("status"),
+		AfterID: r.URL.Query().Get("after"), Limit: limit,
+	})
+	if err != nil {
+		h.log.Error("ListPaymentAttempts: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		return
+	}
+	if items == nil {
+		items = []domain.PaymentAttemptSummary{}
+	}
+	resp := map[string]interface{}{"items": items}
+	if n := len(items); n > 0 && n == effectiveListLimit(limit) {
+		resp["next_after"] = items[n-1].AttemptID
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func effectiveListLimit(l int) int {
+	if l <= 0 || l > 500 {
+		return 100
+	}
+	return l
 }
 
 func (h *Handler) GetProviderReceipt(w http.ResponseWriter, r *http.Request) {

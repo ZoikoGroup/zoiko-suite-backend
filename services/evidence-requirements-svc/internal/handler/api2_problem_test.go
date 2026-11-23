@@ -25,7 +25,7 @@ func TestAPI2_ErrorResponsesAreProblemDetails(t *testing.T) {
 	noCorrelation.CorrelationID = ""
 	denied := completionRouter(&stubStore{evalCreated: true},
 		&recordingAuthz{deny: map[string]error{"EVIDENCE_EVALUATE": domain.ErrAuthorizationDenied}},
-		&stubDocs{}, stubRegistry{}, handler.GateEnforce, handler.GateEnforce)
+		&stubDocs{}, &stubManifest{}, &stubEsignature{}, stubRegistry{}, handler.GateEnforce, handler.GateEnforce)
 	replayed := &stubStore{evalCreated: false, evaluation: &domain.EvidenceEvaluation{
 		EvaluationID: "eval-original", TenantID: testTenant, LegalEntityID: testEntity,
 		DomainCode: "FINANCE", ActionType: "PAYMENT_RELEASE", Outcome: domain.OutcomeMissing,

@@ -22,6 +22,8 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
+	"zoiko.io/eventing/kafkaout"
+	eventingoutbox "zoiko.io/eventing/outbox"
 	"zoiko.io/inventory-management-svc/internal/clients"
 	"zoiko.io/inventory-management-svc/internal/config"
 	"zoiko.io/inventory-management-svc/internal/domain"
@@ -205,7 +207,11 @@ func main() {
 	log.Info("db pool connected")
 
 	// ── 4. Store, Kafka producer, clients ─────────────────────────────────────
-	pgStore := store.New(pool)
+	// The shared eventing outbox table must exist before the first write tries to enqueue into it.
+	if err := eventingoutbox.VerifySchema(pingCtx, pool); err != nil {
+		log.Fatal("eventing outbox schema missing", zap.Error(err))
+	}
+	pgStore := store.New(pool, store.WithEventRegion(cfg.EventResidencyRegion))
 
 	kafkaWriter := &kafka.Writer{
 		Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
@@ -216,6 +222,35 @@ func main() {
 	defer func() { _ = kafkaWriter.Close() }()
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
+
+	// Relay for the BIZ-07 offering events on the shared eventing outbox. The other events keep the
+	// direct publisher. With no brokers configured the relay is not started: events queue in
+	// eventing_outbox and none are lost.
+	relayCtx, cancelRelay := context.WithCancel(context.Background())
+	defer cancelRelay()
+	eventingRelayDone := make(chan struct{}, 1)
+	if len(cfg.Kafka.Brokers) == 0 || cfg.Kafka.Brokers[0] == "" {
+		log.Warn("no KAFKA_BROKERS configured: the eventing outbox relay is not running; BIZ-07 offering events will queue in eventing_outbox")
+		eventingRelayDone <- struct{}{}
+	} else {
+		eventingWriter, err := kafkaout.New(kafkaout.Config{
+			Brokers:                cfg.Kafka.Brokers,
+			Topic:                  cfg.Kafka.Topic,
+			AllowAutoTopicCreation: cfg.Env == "local",
+		})
+		if err != nil {
+			log.Fatal("eventing outbox kafka writer", zap.Error(err))
+		}
+		defer func() { _ = eventingWriter.Close() }()
+		eventingRelay, err := eventingoutbox.NewRelay(pool, eventingWriter, eventingoutbox.DefaultConfig(), log)
+		if err != nil {
+			log.Fatal("eventing outbox relay", zap.Error(err))
+		}
+		go func() {
+			eventingRelay.Run(relayCtx)
+			eventingRelayDone <- struct{}{}
+		}()
+	}
 
 	var httpClientForAuthz *http.Client
 	if cfg.AuthzMTLSEnabled {
@@ -248,7 +283,10 @@ func main() {
 	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, authzClient, log).WithPeriodChecker(platformClients).WithLedgerClient(platformClients).WithGRNIReclassMappingKey(cfg.GRNIReclassMappingKey)
+	h := handler.New(pgStore, publisher, authzClient, log).WithPeriodChecker(platformClients).WithLedgerClient(platformClients).
+		WithGRNIReclassMappingKey(cfg.GRNIReclassMappingKey).
+		WithValuationMappingKeys(cfg.InventoryMappingKey, cfg.COGSMappingKey, cfg.WriteDownExpenseMappingKey).
+		WithLandedCostOffsetMappingKey(cfg.LandedCostOffsetMappingKey)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
@@ -288,6 +326,14 @@ func main() {
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed", zap.Error(err))
+	}
+	// Stop the relay after the server: requests finishing during Shutdown may still commit events.
+	// Anything not delivered stays in the outbox for the next process.
+	cancelRelay()
+	select {
+	case <-eventingRelayDone:
+	case <-shutdownCtx.Done():
+		log.Warn("eventing outbox relay did not stop before the shutdown deadline")
 	}
 	log.Info("server stopped")
 }

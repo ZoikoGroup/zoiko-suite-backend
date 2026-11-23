@@ -108,10 +108,16 @@ type Metrics struct {
 	TenantContextTotal *prometheus.CounterVec
 
 	// CartaDecisionsTotal counts continuous-risk assessments by decision.
-	// STEP_UP_MFA is counted but deliberately not enforced — there is no
-	// step-up flow downstream to redirect to — so this counter is the only
-	// place that signal is visible at all.
+	// STEP_UP_MFA is both counted and enforced — the answer is 401
+	// step_up_required, which the console turns into a step-up prompt and a
+	// retry (AU-23) — so this counter also tracks how often the step-up flow
+	// is being demanded.
 	CartaDecisionsTotal *prometheus.CounterVec
+
+	// ExchangeFailuresTotal counts token exchange failures by target audience.
+	// A failure results in a 503 response (fail closed) so the request is not
+	// forwarded with the wrong audience.
+	ExchangeFailuresTotal *prometheus.CounterVec
 }
 
 func NewMetrics(serviceName string) *Metrics {
@@ -152,11 +158,17 @@ func NewMetrics(serviceName string) *Metrics {
 			Help:        "Continuous risk assessment decisions, by decision.",
 			ConstLabels: prometheus.Labels{"service": serviceName},
 		}, []string{"decision"}),
+		ExchangeFailuresTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name:        "gateway_auth_exchange_failures_total",
+			Help:        "Token exchange failures, by target audience.",
+			ConstLabels: prometheus.Labels{"service": serviceName},
+		}, []string{"audience"}),
 	}
 	prometheus.MustRegister(
 		m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp,
 		m.VerifyDecisionsTotal, m.JWKSErrorsTotal,
 		m.TenantContextTotal, m.CartaDecisionsTotal,
+		m.ExchangeFailuresTotal,
 	)
 	// Counters are invisible in Prometheus until first incremented, so an alert
 	// written against rate(...) over a label that has never been hit evaluates
@@ -173,7 +185,7 @@ func NewMetrics(serviceName string) *Metrics {
 		OutcomeTenantContextDenied, OutcomeTenantContextUnresolved,
 		OutcomeSessionRevoked, OutcomeSessionStatusUnavailable, OutcomeStepUpRequired, OutcomeCartaUnavailable,
 		OutcomeRateLimited, OutcomeOverloaded, OutcomeRequestTooLarge, OutcomeRequestEncodingRefused,
-		OutcomeMalformedRequest, OutcomeVersionUnsupported,
+		OutcomeMalformedRequest, OutcomeVersionUnsupported, OutcomeResidencyDenied, OutcomeResidencyUnresolved,
 	} {
 		m.VerifyDecisionsTotal.WithLabelValues(outcome)
 	}
@@ -244,6 +256,12 @@ const (
 	OutcomeMalformedRequest = "malformed_request"
 	// OutcomeVersionUnsupported — an API version that is not routed (INT-VERS-012).
 	OutcomeVersionUnsupported = "version_unsupported"
+	// OutcomeResidencyDenied — a STRICT_REGION residency policy whose region
+	// disagrees with the edge-resolved region, or an unknown policy on a write.
+	OutcomeResidencyDenied = "residency_denied"
+	// OutcomeResidencyUnresolved — the residency policy could not be resolved
+	// (registry unreachable) on a material write.
+	OutcomeResidencyUnresolved = "residency_unresolved"
 )
 
 // ── handler.DomainMetrics implementation ─────────────────────────────────────
@@ -266,6 +284,10 @@ func (m *Metrics) TenantContext(outcome string) {
 
 func (m *Metrics) CartaDecision(decision string) {
 	m.CartaDecisionsTotal.WithLabelValues(decision).Inc()
+}
+
+func (m *Metrics) ExchangeFailure(audience string) {
+	m.ExchangeFailuresTotal.WithLabelValues(audience).Inc()
 }
 
 type statusRecorder struct {

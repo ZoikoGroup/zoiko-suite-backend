@@ -173,9 +173,9 @@ func TestPgStore_ListOpenEvidenceRequests_EmptyEntityFilter(t *testing.T) {
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	req := createSentRequest(t, s, ctx, tenantID, "empty-filter")
-	open, err := s.ListOpenEvidenceRequests(ctx, tenantID, "")
+	open, err := s.ListEvidenceRequestsPage(ctx, tenantID, domain.ListEvidenceRequestsFilter{OpenOnly: true}, 0, 100)
 	if err != nil {
-		t.Fatalf("ListOpenEvidenceRequests: %v", err)
+		t.Fatalf("ListEvidenceRequestsPage: %v", err)
 	}
 	if len(open) != 1 || open[0].RequestID != req.RequestID {
 		t.Fatalf("got %d open requests, want the seeded one", len(open))

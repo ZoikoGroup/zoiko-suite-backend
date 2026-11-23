@@ -33,12 +33,13 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("failed to connect to postgres: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	verifyEventContracts(t, pool)
 
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS
-		inventory_catalog_mappings, inventory_catalog_variants,
+		eventing_outbox, inventory_catalog_mappings, inventory_catalog_variants,
 		inventory_catalog_offering_versions, inventory_catalog_offerings,
 		inventory_stock_count_lines, inventory_stock_count_locations, inventory_stock_counts,
 		inventory_write_downs, inventory_layer_consumptions, inventory_valuation_entries,
@@ -80,7 +81,7 @@ func newTestItem(tenantID, legalEntityID, sku string) *domain.InventoryItem {
 
 func TestPgStore_CreateItem_And_GetItem(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -103,7 +104,7 @@ func TestPgStore_CreateItem_And_GetItem(t *testing.T) {
 // refused by the real UNIQUE(tenant_id, legal_entity_id, sku) constraint.
 func TestPgStore_CreateItem_DuplicateSKU_Refused(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -121,7 +122,7 @@ func TestPgStore_CreateItem_DuplicateSKU_Refused(t *testing.T) {
 
 func TestPgStore_ActivateItem_RequiresDraft(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -146,7 +147,7 @@ func TestPgStore_ActivateItem_RequiresDraft(t *testing.T) {
 // documents.
 func TestPgStore_SetTrackingPolicy_Versions(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -191,7 +192,7 @@ func TestPgStore_SetTrackingPolicy_Versions(t *testing.T) {
 // the FIRST version, never the current one.
 func TestPgStore_GetProfileAsOf_ReturnsHistoricalVersion(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()

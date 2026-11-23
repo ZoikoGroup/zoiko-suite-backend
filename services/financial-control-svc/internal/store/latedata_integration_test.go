@@ -212,7 +212,7 @@ func TestLateData_MovedWatermarkOpensOneExceptionAndBlocksTheGate(t *testing.T) 
 		WHERE exception_id = $1 AND to_state = 'OPEN'`, e.ExceptionID).Scan(&actor, &reason))
 	assert.Equal(t, engine.LateDataActor, actor)
 	var payload map[string]any
-	require.NoError(t, testPool.QueryRow(ctx, `SELECT payload FROM outbox_events
+	require.NoError(t, testPool.QueryRow(ctx, `SELECT payload FROM `+legacyEvents+`
 		WHERE aggregate_id = $1 AND event_type = 'control.exception.opened'`, e.ExceptionID).Scan(&payload))
 	assert.Equal(t, "wm", payload["frozen_watermark"])
 	assert.Equal(t, "wm-2", payload["observed_watermark"])

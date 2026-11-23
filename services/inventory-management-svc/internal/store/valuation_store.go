@@ -449,9 +449,11 @@ func (s *PgStore) CreateValuationRun(ctx context.Context, r *domain.ValuationRun
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO inventory_valuation_runs (
-				run_id, tenant_id, legal_entity_id, fiscal_period, inventory_account_code, cogs_account_code, status, created_at, created_by_principal_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-		`, r.RunID, tenantID, r.LegalEntityID, r.FiscalPeriod, r.InventoryAccountCode, r.COGSAccountCode, domain.ValuationRunStatusPopulationFrozen, r.CreatedAt, r.CreatedByPrincipalID)
+				run_id, tenant_id, legal_entity_id, fiscal_period, inventory_account_code, cogs_account_code,
+				inventory_mapping_key, cogs_mapping_key, status, created_at, created_by_principal_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		`, r.RunID, tenantID, r.LegalEntityID, r.FiscalPeriod, "", "",
+			r.InventoryMappingKey, r.COGSMappingKey, domain.ValuationRunStatusPopulationFrozen, r.CreatedAt, r.CreatedByPrincipalID)
 		if err != nil {
 			if isUniqueViolation(err) {
 				return domain.ErrValuationRunAlreadyExistsForPeriod
@@ -479,7 +481,8 @@ func (s *PgStore) GetValuationRun(ctx context.Context, runID string) (*domain.Va
 	var r *domain.ValuationRun
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
-			SELECT run_id, legal_entity_id, fiscal_period, inventory_account_code, cogs_account_code, status, journal_id,
+			SELECT run_id, legal_entity_id, fiscal_period, inventory_account_code, cogs_account_code,
+				COALESCE(inventory_mapping_key, ''), COALESCE(cogs_mapping_key, ''), status, journal_id,
 				created_at, created_by_principal_id, approved_at, approved_by_principal_id, emitted_at, ledger_journal_ids
 			FROM inventory_valuation_runs WHERE run_id = $1 AND tenant_id = $2
 		`, runID, tenantID)
@@ -519,7 +522,8 @@ func scanValuationRun(row pgx.Row) (*domain.ValuationRun, error) {
 	var r domain.ValuationRun
 	var ids []byte
 	if err := row.Scan(
-		&r.RunID, &r.LegalEntityID, &r.FiscalPeriod, &r.InventoryAccountCode, &r.COGSAccountCode, &r.Status, &r.JournalID,
+		&r.RunID, &r.LegalEntityID, &r.FiscalPeriod, &r.InventoryAccountCode, &r.COGSAccountCode,
+		&r.InventoryMappingKey, &r.COGSMappingKey, &r.Status, &r.JournalID,
 		&r.CreatedAt, &r.CreatedByPrincipalID, &r.ApprovedAt, &r.ApprovedByPrincipalID, &r.EmittedAt, &ids,
 	); err != nil {
 		return nil, err
@@ -562,10 +566,12 @@ func (s *PgStore) CreateWriteDown(ctx context.Context, w *domain.WriteDown, jour
 		_, err := tx.Exec(ctx, `
 			INSERT INTO inventory_write_downs (
 				write_down_id, tenant_id, legal_entity_id, item_id, location_id, amount, valuation_evidence_ref,
-				expense_account_code, inventory_account_code, journal_id, status, created_at, created_by_principal_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+				expense_account_code, inventory_account_code, expense_mapping_key, inventory_mapping_key,
+				journal_id, status, created_at, created_by_principal_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		`, w.WriteDownID, tenantID, w.LegalEntityID, w.ItemID, w.LocationID, w.Amount, w.ValuationEvidenceRef,
-			w.ExpenseAccountCode, w.InventoryAccountCode, journalID, domain.WriteDownStatusAccountingEventEmitted, w.CreatedAt, w.CreatedByPrincipalID)
+			"", "", w.ExpenseMappingKey, w.InventoryMappingKey,
+			journalID, domain.WriteDownStatusAccountingEventEmitted, w.CreatedAt, w.CreatedByPrincipalID)
 		return err
 	})
 }
@@ -579,7 +585,9 @@ func (s *PgStore) GetWriteDown(ctx context.Context, writeDownID string) (*domain
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
 			SELECT write_down_id, legal_entity_id, item_id, location_id, amount, valuation_evidence_ref,
-				expense_account_code, inventory_account_code, journal_id, status, created_at, created_by_principal_id,
+				expense_account_code, inventory_account_code,
+				COALESCE(expense_mapping_key, ''), COALESCE(inventory_mapping_key, ''),
+				journal_id, status, created_at, created_by_principal_id,
 				reversed_at, reversed_by_principal_id, reversal_reason
 			FROM inventory_write_downs WHERE write_down_id = $1 AND tenant_id = $2
 		`, writeDownID, tenantID)
@@ -600,7 +608,8 @@ func scanWriteDown(row pgx.Row) (*domain.WriteDown, error) {
 	var w domain.WriteDown
 	if err := row.Scan(
 		&w.WriteDownID, &w.LegalEntityID, &w.ItemID, &w.LocationID, &w.Amount, &w.ValuationEvidenceRef,
-		&w.ExpenseAccountCode, &w.InventoryAccountCode, &w.JournalID, &w.Status, &w.CreatedAt, &w.CreatedByPrincipalID,
+		&w.ExpenseAccountCode, &w.InventoryAccountCode, &w.ExpenseMappingKey, &w.InventoryMappingKey,
+		&w.JournalID, &w.Status, &w.CreatedAt, &w.CreatedByPrincipalID,
 		&w.ReversedAt, &w.ReversedByPrincipalID, &w.ReversalReason,
 	); err != nil {
 		return nil, err

@@ -147,6 +147,11 @@ func (h *Handler) CreateRecognitionRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "contract_value_required", domain.ErrContractValueRequired.Error())
 		return
 	}
+	if h.revenueMappingKey == "" || h.wipMappingKey == "" {
+		writeError(w, http.StatusUnprocessableEntity, "mapping_key_not_configured",
+			"recognition requires configured revenue and WIP ACC-02 mapping keys")
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -166,7 +171,7 @@ func (h *Handler) CreateRecognitionRun(w http.ResponseWriter, r *http.Request) {
 	run := &domain.RecognitionRun{
 		RunID: uuid.NewString(), LegalEntityID: p.LegalEntityID, ProjectID: req.ProjectID, FiscalPeriod: req.FiscalPeriod,
 		Status: domain.RecognitionRunStatusDraft, ContractValue: &req.ContractValue, BilledToDate: &req.BilledToDate,
-		RevenueAccountCode: req.RevenueAccountCode, WIPAccountCode: req.WIPAccountCode,
+		RevenueMappingKey: h.revenueMappingKey, WIPMappingKey: h.wipMappingKey,
 		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
 	}
 	if err := h.store.CreateRecognitionRun(r.Context(), run); err != nil {
@@ -535,8 +540,19 @@ func (h *Handler) EmitRecognitionAccountingEvent(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusUnprocessableEntity, "no_revenue_to_emit", "this run's own period_recognized_revenue is zero")
 		return
 	}
-	if run.RevenueAccountCode == "" || run.WIPAccountCode == "" {
-		writeError(w, http.StatusUnprocessableEntity, "account_codes_required", "this run has no revenue_account_code/wip_account_code configured")
+	revenueMappingKey, wipMappingKey := run.RevenueMappingKey, run.WIPMappingKey
+	// Runs created before the ACC-02 migration have no mapping keys; they are
+	// still postable with the deployment's configured keys. A deployment with
+	// no configuration fails closed instead of using the legacy raw codes.
+	if revenueMappingKey == "" {
+		revenueMappingKey = h.revenueMappingKey
+	}
+	if wipMappingKey == "" {
+		wipMappingKey = h.wipMappingKey
+	}
+	if revenueMappingKey == "" || wipMappingKey == "" {
+		writeError(w, http.StatusUnprocessableEntity, "mapping_key_not_configured",
+			"this run has no revenue/WIP ACC-02 mapping keys and none are configured")
 		return
 	}
 
@@ -544,13 +560,13 @@ func (h *Handler) EmitRecognitionAccountingEvent(w http.ResponseWriter, r *http.
 	var lines []clients.LedgerLine
 	if revenue > 0 {
 		lines = []clients.LedgerLine{
-			{AccountCode: run.WIPAccountCode, DebitAmount: revenue},
-			{AccountCode: run.RevenueAccountCode, CreditAmount: revenue},
+			{MappingKey: wipMappingKey, DebitAmount: revenue},
+			{MappingKey: revenueMappingKey, CreditAmount: revenue},
 		}
 	} else {
 		lines = []clients.LedgerLine{
-			{AccountCode: run.RevenueAccountCode, DebitAmount: -revenue},
-			{AccountCode: run.WIPAccountCode, CreditAmount: -revenue},
+			{MappingKey: revenueMappingKey, DebitAmount: -revenue},
+			{MappingKey: wipMappingKey, CreditAmount: -revenue},
 		}
 	}
 

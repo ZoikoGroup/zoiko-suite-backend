@@ -1,0 +1,43 @@
+{
+  "$id": "https://schemas.zoikosuite.com/public-ai/Citation.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "claim_ids": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "reviewed_at": {
+      "description": "Date the cited source was last approved (else its effective date), so the visitor can judge currency (Doc 01 FR-03, AT-01).",
+      "format": "date",
+      "type": "string"
+    },
+    "route_key": {
+      "description": "Structured responses only: set when the citation is an official route.",
+      "type": "string"
+    },
+    "source_version_id": {
+      "type": "string"
+    },
+    "title": {
+      "description": "Structured responses only (ADR-008): approved source or official page title.",
+      "type": "string"
+    },
+    "url": {
+      "description": "Structured responses only: omitted until a real, allowlisted page exists.",
+      "format": "uri",
+      "type": "string"
+    },
+    "url_key": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "source_version_id",
+    "claim_ids",
+    "url_key"
+  ],
+  "type": "object"
+}

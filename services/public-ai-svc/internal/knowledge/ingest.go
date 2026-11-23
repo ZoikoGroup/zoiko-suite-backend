@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -64,6 +65,11 @@ type IngestConfig struct {
 	// (Doc 03 §05). Unmapped or inconsistent entries block publication.
 	Crosswalk []CrosswalkEntry `json:"capability_crosswalk,omitempty"`
 	Synthetic bool             `json:"synthetic,omitempty"`
+	// PlanCodes is the plan registry a source's plan_codes must come from
+	// (Doc 03 §06).
+	PlanCodes []string `json:"plan_codes,omitempty"`
+	// CompatiblePolicyVersions is copied into the signed manifest (OPR-004).
+	CompatiblePolicyVersions []string `json:"compatible_policy_versions,omitempty"`
 }
 
 // CrosswalkEntry is one module in the capability crosswalk.
@@ -72,6 +78,10 @@ type CrosswalkEntry struct {
 	CapabilityID   string `json:"capability_id"`
 	Domain         string `json:"domain"`
 	PublicRouteKey string `json:"public_route_key"`
+	// DomainViewID and SidebarRouteID complete the Doc 03 §03 crosswalk
+	// (homepage theme and console sidebar); optional until v2.1 (DEC-02).
+	DomainViewID   string `json:"domain_view_id,omitempty"`
+	SidebarRouteID string `json:"sidebar_route_id,omitempty"`
 	Synthetic      bool   `json:"synthetic,omitempty"`
 }
 
@@ -119,9 +129,12 @@ var liveStatusMarkers = regexp.MustCompile(`(?i)\b\d+\s*/\s*\d+\s+(?:services?|t
 const ApprovalDraft = "DRAFT_PENDING_REVIEW"
 
 // IngestOptions adjust the pipeline. AllowDraft admits DRAFT_PENDING_REVIEW
-// sources (marked Draft) and is for local/dev only.
+// sources (marked Draft) and is for local/dev only. AllowSynthetic admits a
+// release whose config, sources, routes or crosswalk are synthetic: local/dev
+// only.
 type IngestOptions struct {
-	AllowDraft bool
+	AllowDraft     bool
+	AllowSynthetic bool
 }
 
 // publicLicences may be published and indexed (KB-017).
@@ -130,7 +143,14 @@ var publicLicences = map[string]bool{"OWNED_PUBLIC": true, "PUBLIC_REUSE": true,
 // highImpactSubjects need an in-date review (KB-028).
 var highImpactSubjects = map[string]bool{"PRICING": true, "TRUST": true}
 
-var hiddenContent = regexp.MustCompile(`(?i)<!--|<script|<style|<iframe|javascript:|[\x{200B}-\x{200F}\x{2060}\x{FEFF}]`)
+// hiddenContent is text a reader would not see but a model would (Doc 06
+// §09, SEC-T020): comments, scripts, CSS-hidden or zero-size text, the
+// hidden attribute, zero-width characters and bidirectional overrides that
+// reorder what is displayed.
+var hiddenContent = regexp.MustCompile(`(?i)<!--|<script|<style|<iframe|<object|<embed|javascript:|data:text/html` +
+	`|display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0(?:px|pt|em|rem)?\b|opacity\s*:\s*0(?:\.0+)?\b` +
+	`|<[a-z][^>]*\shidden(?:\s|=|>)|aria-hidden\s*=\s*["']?true` +
+	`|[\x{200B}-\x{200F}\x{202A}-\x{202E}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{FEFF}]`)
 
 // IngestDir runs every *.source.json in dir/sources through the pipeline and
 // returns a release manifest of the STAGED sources plus a report per file.
@@ -200,15 +220,20 @@ func Ingest(cfg IngestConfig, inputs []namedSource, releaseID string, now time.T
 func IngestWith(cfg IngestConfig, inputs []namedSource, releaseID string, now time.Time, opts IngestOptions) (Manifest, []Report) {
 	m := Manifest{
 		ReleaseID: releaseID, Kind: KindKB, IndexSchemaVersion: SchemaVersion, CreatedAt: now.UTC(),
+		EmbeddingModel: "none", Tokenizer: TokenizerVersion,
 		ApprovedBy: cfg.ApprovedBy, EvalRunID: cfg.EvalRunID, ChunkPolicy: fmt.Sprintf("section-boundaries; tokens<=%d overlap=%d min=%d; tokenizer=estimate(%.2f words/token)", chunkMaxTokens, chunkOverlapTokens, chunkMinTokens, wordsPerToken),
 		RedactionPolicy: "public-only-v1", AllowedHosts: cfg.AllowedHosts, Routes: validRoutes(cfg),
-		Sources: []Source{}, Chunks: []Chunk{}, Synonyms: cfg.Synonyms,
+		Sources: []Source{}, Chunks: []Chunk{}, Synonyms: screenSynonyms(cfg.Synonyms), Synthetic: cfg.Synthetic,
+		CompatiblePolicyVersions: cfg.CompatiblePolicyVersions,
+		// Doc 03 §11: the public assistant serves one product to one audience.
+		ProductID: "zoikosuite", Audience: Audience,
 	}
 	caps := map[string]bool{}
 	for _, c := range cfg.CapabilityIDs {
 		caps[c] = true
 	}
 	seenHash := map[string]string{}
+	stagedAt := map[string]int{} // source_version_id -> its report index
 	var reports []Report
 	for _, in := range inputs {
 		src, body := in.sf.Source, in.sf.Body
@@ -221,6 +246,10 @@ func IngestWith(cfg IngestConfig, inputs []namedSource, releaseID string, now ti
 				state, reason = StateQuarantineSchema, "content_sha256 does not match body"
 			} else if other, dup := seenHash[h]; dup {
 				state, reason = StateReviewConflict, "duplicate content of "+other
+			} else if _, again := stagedAt[src.SourceVersionID]; again {
+				// KB-020: one version is published once; a second delivery
+				// with other content is a conflict for review.
+				state, reason = StateReviewConflict, "version "+src.SourceVersionID+" already published"
 			} else {
 				seenHash[h] = src.SourceID
 				src.ContentSHA256 = h
@@ -231,13 +260,80 @@ func IngestWith(cfg IngestConfig, inputs []namedSource, releaseID string, now ti
 				} else {
 					m.Sources = append(m.Sources, src)
 					m.Chunks = append(m.Chunks, chunks...)
+					stagedAt[src.SourceVersionID] = len(reports)
 				}
 			}
 		}
 		rep.State, rep.Reason = state, reason
 		reports = append(reports, rep)
 	}
-	return m, reports
+	return withoutOverlaps(endSuperseded(m), reports, stagedAt), reports
+}
+
+// endSuperseded applies supersedes (Doc 03 §06): a version that names an
+// earlier one ends it at its own effective_from, so the two never overlap
+// and the replacement takes over exactly then. Without it, overlapping
+// versions are a review conflict (withoutOverlaps).
+func endSuperseded(m Manifest) Manifest {
+	ends := map[string]time.Time{}
+	for _, s := range m.Sources {
+		if s.Supersedes != "" && s.Supersedes != s.SourceVersionID && s.EffectiveFrom != nil {
+			ends[s.Supersedes] = *s.EffectiveFrom
+		}
+	}
+	for i, s := range m.Sources {
+		if end, ok := ends[s.SourceVersionID]; ok && end.Before(validUntil(s)) {
+			e := end
+			m.Sources[i].EffectiveUntil = &e
+		}
+	}
+	for i, c := range m.Chunks {
+		if end, ok := ends[c.SourceVersionID]; ok && end.Before(c.ValidUntil) {
+			m.Chunks[i].ValidUntil = end
+		}
+	}
+	return m
+}
+
+// withoutOverlaps removes versions of one source whose validity windows
+// overlap: two versions true at once are a conflict for review, not two
+// truths (KB-023). Back-to-back versions (one ends as the next starts)
+// both stay.
+func withoutOverlaps(m Manifest, reports []Report, stagedAt map[string]int) Manifest {
+	bySource := map[string][]Source{}
+	for _, s := range m.Sources {
+		bySource[s.SourceID] = append(bySource[s.SourceID], s)
+	}
+	drop := map[string]bool{}
+	for _, vs := range bySource {
+		for i := range vs {
+			for j := i + 1; j < len(vs); j++ {
+				a, b := vs[i], vs[j]
+				if a.EffectiveFrom.Before(validUntil(b)) && b.EffectiveFrom.Before(validUntil(a)) {
+					drop[a.SourceVersionID], drop[b.SourceVersionID] = true, true
+				}
+			}
+		}
+	}
+	if len(drop) == 0 {
+		return m
+	}
+	sources, chunks := []Source{}, []Chunk{}
+	for _, s := range m.Sources {
+		if drop[s.SourceVersionID] {
+			reports[stagedAt[s.SourceVersionID]].State = StateReviewConflict
+			reports[stagedAt[s.SourceVersionID]].Reason = "validity window overlaps another version of " + s.SourceID
+			continue
+		}
+		sources = append(sources, s)
+	}
+	for _, c := range m.Chunks {
+		if !drop[c.SourceVersionID] {
+			chunks = append(chunks, c)
+		}
+	}
+	m.Sources, m.Chunks = sources, chunks
+	return m
 }
 
 // check runs REGISTER → ACQUIRE → SENSITIVE SCAN → TAXONOMY MAP → REVIEW →
@@ -250,7 +346,7 @@ func check(cfg IngestConfig, caps map[string]bool, s Source, body string, now ti
 		"origin_uri": s.OriginURI, "url_key": s.URLKey, "title": s.Title, "product_id": s.ProductID,
 		"audience": s.Audience, "classification": s.Classification, "pii_state": s.PIIState,
 		"authority_tier": s.AuthorityTier, "subject_type": s.SubjectType, "owner_id": s.OwnerID,
-		"locale": s.Locale, "approval_state": s.ApprovalState, "license": s.License,
+		"locale": s.Locale, "approval_state": s.ApprovalState, "license": s.License, "signing_ref": s.SigningRef,
 	} {
 		if strings.TrimSpace(v) == "" {
 			missing = append(missing, name)
@@ -262,6 +358,9 @@ func check(cfg IngestConfig, caps map[string]bool, s Source, body string, now ti
 	if len(missing) > 0 {
 		sort.Strings(missing)
 		return StateRejectUnregistered, "missing " + strings.Join(missing, ", ")
+	}
+	if bad := badScope(s); bad != "" {
+		return StateRejectUnregistered, bad
 	}
 	u, err := url.Parse(s.OriginURI)
 	if err != nil || u.Scheme != "https" || !hostAllowed(cfg.AllowedHosts, u.Hostname()) {
@@ -287,6 +386,15 @@ func check(cfg IngestConfig, caps map[string]bool, s Source, body string, now ti
 			return StateReviewUnmapped, "capability_id not in taxonomy: " + c
 		}
 	}
+	// Doc 03 §06: plan scope names registered plans only.
+	for _, pc := range s.PlanCodes {
+		if !slices.Contains(cfg.PlanCodes, pc) {
+			return StateReviewUnmapped, "plan_code not in the plan registry: " + pc
+		}
+	}
+	if s.ApprovalState == "REVOKED" && strings.TrimSpace(s.RevocationReason) == "" {
+		return StateRejectUnregistered, "a revoked source needs a revocation_reason"
+	}
 	switch {
 	case draft && !opts.AllowDraft:
 		return StateHoldApproval, "draft pending review (KB_ALLOW_DRAFT admits drafts in local/dev only)"
@@ -302,16 +410,59 @@ func check(cfg IngestConfig, caps map[string]bool, s Source, body string, now ti
 			return StateHoldApproval, "owner may not approve own source"
 		}
 	}
-	if !draft && s.AuthorityTier == "P1" && len(s.ApproverIDs) < 2 {
+	if !draft && s.AuthorityTier == "P1" && distinctIDs(s.ApproverIDs) < 2 {
 		return StateHoldApproval, "P1 sources need two approvers"
 	}
-	if !draft && (s.AuthorityTier == "P1" || highImpactSubjects[s.SubjectType]) && s.ReviewDueAt != nil && s.ReviewDueAt.Before(now) {
-		return StateHoldApproval, "high-impact review overdue"
+	if !draft && (s.AuthorityTier == "P1" || highImpactSubjects[s.SubjectType]) && (s.ReviewDueAt == nil || s.ReviewDueAt.Before(now)) {
+		// KB-028: high-impact content needs a review deadline, and is held
+		// once it passes.
+		return StateHoldApproval, "high-impact review missing or overdue"
 	}
-	if hiddenContent.MatchString(body) || policy.LooksLikeInjection(body) {
-		return StateQuarantineIndex, "hidden content or instruction injection"
+	// KB-012: an instruction in the title or a heading counts as much as one
+	// in the body; keyword stuffing that games retrieval is quarantined too.
+	if hiddenContent.MatchString(body) || policy.LooksLikeInjection(s.Title+"\n"+body) || keywordStuffed(body) {
+		return StateQuarantineIndex, "hidden content, instruction injection or keyword stuffing"
 	}
 	return StateStaged, ""
+}
+
+// screenSynonyms drops any synonym entry that carries an instruction: they
+// are query expansions, so a smuggled instruction must never reach the
+// release (KB-012).
+func screenSynonyms(in map[string][]string) map[string][]string {
+	out := map[string][]string{}
+	for k, vs := range in {
+		ok := !policy.LooksLikeInjection(k)
+		for _, v := range vs {
+			ok = ok && !policy.LooksLikeInjection(v)
+		}
+		if ok {
+			out[k] = vs
+		}
+	}
+	return out
+}
+
+// keywordStuffed reports text dominated by one repeated word (at least 20
+// repeats making up a fifth of 40+ words): written to rank, not to read.
+func keywordStuffed(text string) bool {
+	words := strings.Fields(strings.ToLower(text))
+	if len(words) < 40 {
+		return false
+	}
+	counts := map[string]int{}
+	for _, w := range words {
+		w = strings.Trim(w, ".,;:!?\"'()")
+		if len(w) > 3 {
+			counts[w]++
+		}
+	}
+	for _, n := range counts {
+		if n >= 20 && n*5 >= len(words) {
+			return true
+		}
+	}
+	return false
 }
 
 func hostAllowed(hosts []string, h string) bool {
@@ -410,13 +561,19 @@ func chunkSource(src Source, text, releaseID string) []Chunk {
 			}
 			seg++
 			body := strings.Join(words[start:end], " ")
+			if start == 0 && end == len(words) {
+				// A section that fits keeps its line breaks, so a numbered
+				// list of steps is still a list when it is answered from.
+				body = keepLines(sec.text)
+			}
 			out = append(out, Chunk{
 				ChunkID: fmt.Sprintf("%s#%03d", src.SourceVersionID, seg), SourceID: src.SourceID, SourceVersionID: src.SourceVersionID,
 				SegmentNumber: seg, DocumentAnchor: sec.anchor, DisplayTitle: sec.title, URLKey: src.URLKey,
 				PlainText: body, TextSHA256: sha256Hex(body), Classification: src.Classification, Audience: src.Audience,
 				AuthorityTier: src.AuthorityTier, MarketCodes: src.MarketCodes, Locale: src.Locale, PlanCodes: src.PlanCodes,
 				IntentIDs: src.IntentIDs, ValidFrom: *src.EffectiveFrom, ValidUntil: validUntil(src), ReleaseID: releaseID,
-				Draft: src.Draft,
+				Draft: src.Draft, SubjectType: src.SubjectType, CapabilityIDs: src.CapabilityIDs,
+				HighImpact: src.AuthorityTier == "P1" || highImpactSubjects[src.SubjectType], ReviewDueAt: src.ReviewDueAt,
 			})
 			if end == len(words) {
 				break
@@ -443,4 +600,49 @@ func readJSON(path string, v any) error {
 	dec := json.NewDecoder(strings.NewReader(string(b)))
 	dec.DisallowUnknownFields()
 	return dec.Decode(v)
+}
+
+// distinctIDs counts different non-blank approvers: the same person twice
+// is one approval, not two-person control (Doc 03 §10).
+func distinctIDs(ids []string) int {
+	seen := map[string]bool{}
+	for _, id := range ids {
+		if id = strings.ToLower(strings.TrimSpace(id)); id != "" {
+			seen[id] = true
+		}
+	}
+	return len(seen)
+}
+
+var (
+	marketCodeRe = regexp.MustCompile(`^[A-Z]{2}$`)
+	// localeRe is the BCP-47 shape used here: language, optional script,
+	// optional region (en, en-US, zh-Hant-TW, es-419).
+	localeRe = regexp.MustCompile(`^[a-z]{2,3}(?:-[A-Z][a-z]{3})?(?:-(?:[A-Z]{2}|\d{3}))?$`)
+)
+
+// badScope rejects scope labels a filter could not match reliably (Doc 03
+// §6): market codes are ISO 3166-1 alpha-2 or ALL, the locale is BCP-47.
+func badScope(s Source) string {
+	for _, m := range s.MarketCodes {
+		if m != MarketAll && !marketCodeRe.MatchString(m) {
+			return "market_codes must be ISO 3166-1 alpha-2 or ALL: " + m
+		}
+	}
+	if !localeRe.MatchString(s.Locale) {
+		return "locale is not a BCP-47 tag: " + s.Locale
+	}
+	return ""
+}
+
+// keepLines is section text with blank lines and repeated spaces removed and
+// line breaks kept.
+func keepLines(s string) string {
+	var lines []string
+	for _, l := range strings.Split(s, "\n") {
+		if l = strings.Join(strings.Fields(l), " "); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	return strings.Join(lines, "\n")
 }

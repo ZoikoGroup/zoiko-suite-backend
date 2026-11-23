@@ -13,6 +13,9 @@ with front matter (`source_id`, `title`, `domain`, `module_id`, `audience: PUBLI
 - Text is rewritten from the product's area descriptions as public capability descriptions. It
   never contains live counters, readiness, latency, cluster or container state, user names or
   anything from `/admin`; ingest quarantines such text (`QUARANTINE_PRIVATE`).
+- Articles were expanded (2026-11-04) to about 150-215 words in short `##` sections so a default
+  answer can combine sections of one article; text comes from the frontend `DOMAINS` purposes and
+  `docs/architecture/03-microservices.md` service purposes, rewritten as public capability language.
 - Prices, trials, markets, certifications, residency and connector status come only from the
   typed claims in `claims.json` (synthetic placeholders), never from these articles.
 - No real public URLs exist yet, so `release.json` has no routes and articles have no

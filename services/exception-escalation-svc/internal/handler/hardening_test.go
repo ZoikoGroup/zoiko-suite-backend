@@ -17,14 +17,14 @@ import (
 	"zoiko.io/exception-escalation-svc/internal/store"
 )
 
-// recordingAuthz returns err for every check and records what was asked.
-type recordingAuthz struct {
+// scopeRecordingAuthz returns err for every check and records what was asked.
+type scopeRecordingAuthz struct {
 	err     error
 	actions []string
 	scopes  []string
 }
 
-func (a *recordingAuthz) CheckAllowed(_ context.Context, _, scope, action string) error {
+func (a *scopeRecordingAuthz) CheckAllowed(_ context.Context, _, scope, action string) error {
 	a.actions = append(a.actions, action)
 	a.scopes = append(a.scopes, scope)
 	return a.err
@@ -93,9 +93,9 @@ var unauthorizedReads = []struct {
 	{"/v1/tasks/task-1/history", actionTaskRead, "le-task"},
 	{"/v1/tasks/task-1/sla-state", actionTaskRead, "le-task"},
 	{"/v1/tasks/task-1/linked-object-status", actionTaskRead, "le-task"},
-	{"/v1/deadlines/dl-1", actionDeadlineRead, "le-deadline"},
-	{"/v1/deadlines/dl-1/source", actionDeadlineRead, "le-deadline"},
-	{"/v1/deadlines/dl-1/explain", actionDeadlineRead, "le-deadline"},
+	{"/v1/deadlines/dl-1", actionDeadlineManage, "le-deadline"},         // origin/main: deadline reads require DEADLINE_MANAGE
+	{"/v1/deadlines/dl-1/source", actionDeadlineManage, "le-deadline"},  // origin/main: deadline reads require DEADLINE_MANAGE
+	{"/v1/deadlines/dl-1/explain", actionDeadlineManage, "le-deadline"}, // origin/main: deadline reads require DEADLINE_MANAGE
 	{"/v1/audit-findings/finding-1", actionAuditFindingRead, "le"},
 	{"/v1/audit-findings/finding-1/misstatement-summary", actionAuditFindingRead, "le"},
 	{"/v1/audit-findings/finding-1/scope-limitations/open", actionAuditFindingRead, "le"},
@@ -113,7 +113,7 @@ func get(h http.Handler, path, principal string) *httptest.ResponseRecorder {
 }
 
 func TestReads_WithoutPrincipalAre401(t *testing.T) {
-	az := &recordingAuthz{}
+	az := &scopeRecordingAuthz{}
 	h := fullRouter(seededExceptions(), az)
 	for _, rd := range unauthorizedReads {
 		if w := get(h, rd.path, ""); w.Code != http.StatusUnauthorized {
@@ -131,7 +131,7 @@ func TestReads_DenyIs403_UnavailableIs503(t *testing.T) {
 		want int
 	}{{authz.ErrAuthorizationDenied, http.StatusForbidden}, {authz.ErrAuthzServiceUnavailable, http.StatusServiceUnavailable}} {
 		for _, rd := range unauthorizedReads {
-			if w := get(fullRouter(seededExceptions(), &recordingAuthz{err: tc.err}), rd.path, "reader"); w.Code != tc.want {
+			if w := get(fullRouter(seededExceptions(), &scopeRecordingAuthz{err: tc.err}), rd.path, "reader"); w.Code != tc.want {
 				t.Errorf("GET %s with %v: expected %d, got %d (%s)", rd.path, tc.err, tc.want, w.Code, w.Body.String())
 			}
 		}
@@ -140,7 +140,7 @@ func TestReads_DenyIs403_UnavailableIs503(t *testing.T) {
 
 func TestReads_AllowedCheckTheReadActionAndScope(t *testing.T) {
 	for _, rd := range unauthorizedReads {
-		az := &recordingAuthz{}
+		az := &scopeRecordingAuthz{}
 		if w := get(fullRouter(seededExceptions(), az), rd.path, "reader"); w.Code != http.StatusOK {
 			t.Errorf("GET %s granted: expected 200, got %d (%s)", rd.path, w.Code, w.Body.String())
 			continue
@@ -168,7 +168,7 @@ func codeOf(w *httptest.ResponseRecorder) string {
 
 func TestEscalate_ActorRule(t *testing.T) {
 	st := seededExceptions()
-	h := fullRouter(st, &recordingAuthz{})
+	h := fullRouter(st, &scopeRecordingAuthz{})
 	w := post(h, "/v1/exception-escalation/exceptions/case-1/escalate", "escalator",
 		`{"escalated_to_role":"HEAD","escalation_reason":"r","escalated_by":"forged"}`)
 	if w.Code != http.StatusForbidden || codeOf(w) != codeActorMismatch {
@@ -193,7 +193,7 @@ func TestEscalate_ActorRule(t *testing.T) {
 
 func TestResolve_ActorRuleAndClosedByOptional(t *testing.T) {
 	st := seededExceptions()
-	h := fullRouter(st, &recordingAuthz{})
+	h := fullRouter(st, &scopeRecordingAuthz{})
 	w := post(h, "/v1/exception-escalation/exceptions/case-1/resolve", "checker", `{"closed_by":"forged","closure_reason":"x"}`)
 	if w.Code != http.StatusForbidden || codeOf(w) != codeActorMismatch {
 		t.Fatalf("differing closed_by: expected 403 actor_mismatch, got %d %s", w.Code, w.Body.String())
@@ -212,7 +212,7 @@ func TestResolve_ActorRuleAndClosedByOptional(t *testing.T) {
 }
 
 func TestResolve_SegregationOfDutiesCode(t *testing.T) {
-	h := fullRouter(seededExceptions(), &recordingAuthz{})
+	h := fullRouter(seededExceptions(), &scopeRecordingAuthz{})
 	w := post(h, "/v1/exception-escalation/exceptions/case-1/resolve", "maker", `{"closure_reason":"x"}`)
 	if w.Code != http.StatusForbidden || codeOf(w) != codeSegregationOfDuties {
 		t.Fatalf("creator resolving: expected 403 segregation_of_duties, got %d %s", w.Code, w.Body.String())
@@ -229,7 +229,7 @@ func (sodStore) ResolveException(context.Context, string, *domain.ResolveCaseReq
 func TestResolve_StoreSoDIs403(t *testing.T) {
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContextMiddleware)
-	RegisterRoutes(r, New(sodStore{seededExceptions()}, &recordingAuthz{}, zap.NewNop()))
+	RegisterRoutes(r, New(sodStore{seededExceptions()}, &scopeRecordingAuthz{}, zap.NewNop()))
 	w := post(r, "/v1/exception-escalation/exceptions/case-1/resolve", "checker", `{}`)
 	if w.Code != http.StatusForbidden || codeOf(w) != codeSegregationOfDuties {
 		t.Fatalf("expected 403 segregation_of_duties, got %d %s", w.Code, w.Body.String())
@@ -237,7 +237,7 @@ func TestResolve_StoreSoDIs403(t *testing.T) {
 }
 
 func TestCreate_ActorMismatchCode(t *testing.T) {
-	h := fullRouter(newMockStore(), &recordingAuthz{})
+	h := fullRouter(newMockStore(), &scopeRecordingAuthz{})
 	w := post(h, "/v1/exception-escalation/exceptions", "maker",
 		`{"legal_entity_id":"le","jurisdiction_id":"GB","exception_type":"X","linked_object_type":"Y","linked_object_id":"z","created_by":"forged"}`)
 	if w.Code != http.StatusForbidden || codeOf(w) != codeActorMismatch {

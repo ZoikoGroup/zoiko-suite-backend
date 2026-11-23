@@ -17,7 +17,7 @@ import (
 
 func TestWebhookStore_AttemptLookup_PlatformScope(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := context.Background()
 
 	tenantID := "tenant-lookup-test"
@@ -90,7 +90,7 @@ func TestWebhookStore_AttemptLookup_PlatformScope(t *testing.T) {
 
 func TestWebhookStore_RecordDeliveryEventIdempotent_RLS(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := context.Background()
 
 	tenantID := "tenant-event-test"
@@ -168,7 +168,7 @@ func TestWebhookStore_RecordDeliveryEventIdempotent_RLS(t *testing.T) {
 
 func TestWebhookStore_DLQ_Routing_And_RLS(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := context.Background()
 
 	tenantA := "tenant-dlq-a"
@@ -239,7 +239,7 @@ func seedLedgerAttempt(t *testing.T, s *store.PgStore, tenantID, dedup, provider
 // ambiguous. The lookup refuses to choose, so a bounce can never be applied to the wrong
 // tenant's recipient.
 func TestWebhookStore_AmbiguousProviderMessageIDIsRefused(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openTestPool(t), store.WithEventRegion("local"))
 	const id = "<shared-id-4242@zoikosuite.com>"
 
 	only := seedLedgerAttempt(t, s, "tenant-amb-a", "dedup-amb-a", id)

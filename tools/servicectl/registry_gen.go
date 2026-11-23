@@ -21,7 +21,7 @@
 
 package main
 
-// generatedServices is the authoritative service table: 86 services.
+// generatedServices is the authoritative service table: 87 services.
 var generatedServices = []Service{
 	{
 		Name:   "access-control-svc",
@@ -135,8 +135,9 @@ var generatedServices = []Service{
 		Port:   8145,
 		DBName: "capability_registry",
 		Env: map[string]string{
-			"AUTHZ_SERVICE_URL":  "http://127.0.0.1:8089",
-			"KAFKA_EVENTS_TOPIC": "zoiko.capability-registry.events",
+			"AUTHZ_SERVICE_URL":      "http://127.0.0.1:8089",
+			"EVENT_RESIDENCY_REGION": "local",
+			"KAFKA_EVENTS_TOPIC":     "zoiko.capability-registry.events",
 		},
 	},
 	{
@@ -162,8 +163,10 @@ var generatedServices = []Service{
 		Port:   8144,
 		DBName: "commercial_account",
 		Env: map[string]string{
-			"AUTHZ_SERVICE_URL":  "http://127.0.0.1:8089",
-			"KAFKA_EVENTS_TOPIC": "zoiko.commercial-account.events",
+			"AUTHZ_SERVICE_URL":      "http://127.0.0.1:8089",
+			"EVENT_CLASSIFICATION":   "confidential",
+			"EVENT_RESIDENCY_REGION": "local",
+			"KAFKA_EVENTS_TOPIC":     "zoiko.commercial-account.events",
 		},
 	},
 	{
@@ -667,6 +670,18 @@ var generatedServices = []Service{
 			"GOVERNANCE_DECISION_LOG_SERVICE_URL": "http://127.0.0.1:8083",
 			"KAFKA_EVENTS_TOPIC":                  "zoiko.policy.events",
 			"KAFKA_GROUP_ID":                      "policy-svc",
+		},
+	},
+	{
+		Name: "public-ai-svc",
+		Port: 8001,
+		Env: map[string]string{
+			"PUBLIC_AI_ALLOWED_ORIGINS": "http://localhost:3000",
+			"PUBLIC_AI_DATABASE_URL":    "",
+			"PUBLIC_AI_ENABLED":         "true",
+			"PUBLIC_AI_ENVIRONMENT":     "dev",
+			"PUBLIC_AI_HTTP_ADDR":       "127.0.0.1:8001",
+			"PUBLIC_AI_MODEL_PROVIDER":  "mock",
 		},
 	},
 	{

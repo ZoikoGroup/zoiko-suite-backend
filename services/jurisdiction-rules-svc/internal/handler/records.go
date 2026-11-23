@@ -227,11 +227,10 @@ func (h *Handler) finishRecordDecision(w http.ResponseWriter, r *http.Request, k
 	status := http.StatusOK
 	switch stored.Outcome {
 	case domain.OutcomeUnsupported, domain.CalcNoParameters, domain.RetentionTenantTooShort, domain.RetentionTriggerMismatch, domain.MappingEntryNotFound,
-		domain.DependencyUnknown, domain.DependencyExpired, domain.ApprovalMissing:
+		domain.DependencyUnknown, domain.DependencyExpired, domain.ApprovalMissing, domain.CalcInvalidFacts, domain.LicenceTermExceeded:
 		status = http.StatusUnprocessableEntity
 	case domain.OutcomeAmbiguous:
 		status = http.StatusConflict
 	}
 	writeJSON(w, status, map[string]any{"decision_id": stored.DecisionID, "replayed": replayed, key: json.RawMessage(stored.Response)})
 }
-

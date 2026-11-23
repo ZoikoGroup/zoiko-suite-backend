@@ -970,7 +970,7 @@ func (h *Handler) GetNotification(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, notification)
+	writeJSONWithETag(w, http.StatusOK, notification, notification.RecordVersion)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -1027,6 +1027,11 @@ func (h *Handler) MarkRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// No If-Match here (API-3): marking read is not an edit of the notification
+	// that a concurrent writer could lose. Only the recipient may do it, it keeps
+	// the first read_at, and repeating it changes nothing. The delivery worker
+	// updates the same row, so a required ETag would refuse a recipient's click
+	// whenever a delivery attempt landed after their last fetch.
 	readAt := time.Now().UTC()
 	if err := h.store.MarkRead(r.Context(), id, principalID, readAt); err != nil {
 		if errors.Is(err, domain.ErrNotificationNotFound) {
@@ -1171,6 +1176,11 @@ func (h *Handler) ResolveDeliveryOutcome(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Check If-Match for optimistic concurrency (API-3).
+	if !h.requireIfMatch(w, r, notification.RecordVersion) {
+		return
+	}
+
 	resolvedAt := time.Now().UTC()
 	err = h.store.ResolveDeliveryOutcome(r.Context(), domain.ResolveDeliveryOutcomeParams{
 		NotificationID: id, TenantID: tenantID, ActorPrincipalID: principalID,
@@ -1200,7 +1210,7 @@ func (h *Handler) ResolveDeliveryOutcome(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, updated)
+	writeJSONWithETag(w, http.StatusOK, updated, updated.RecordVersion)
 }
 
 // UnreadCount answers how many in-app notices the calling principal has not
@@ -1305,7 +1315,7 @@ func (h *Handler) GetTemplate(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, tmpl)
+	writeJSONWithETag(w, http.StatusOK, tmpl, tmpl.RecordVersion)
 }
 
 type createVersionRequest struct {
@@ -1361,7 +1371,7 @@ func (h *Handler) CreateVersion(w http.ResponseWriter, r *http.Request) {
 		h.handleTemplateError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, version)
+	writeJSONWithETag(w, http.StatusCreated, version, version.RecordVersion)
 }
 
 // ValidateTemplate — BIZ-03's own ValidateTemplate command. Moves a
@@ -1386,12 +1396,17 @@ func (h *Handler) ValidateTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check If-Match for optimistic concurrency (API-3).
+	if !h.requireIfMatch(w, r, existing.RecordVersion) {
+		return
+	}
+
 	version, err := h.store.ValidateTemplate(r.Context(), versionID)
 	if err != nil {
 		h.handleTemplateError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, version)
+	writeJSONWithETag(w, http.StatusOK, version, version.RecordVersion)
 }
 
 // ApproveTemplate — BIZ-03's own ApproveTemplate command. Fetched
@@ -1418,6 +1433,11 @@ func (h *Handler) ApproveTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check If-Match for optimistic concurrency (API-3).
+	if !h.requireIfMatch(w, r, existing.RecordVersion) {
+		return
+	}
+
 	version, err := h.store.ApproveTemplate(r.Context(), domain.ApproveVersionParams{
 		VersionID: versionID, ApprovedByPrincipalID: principalID, CorrelationID: getCorrelationID(r),
 	})
@@ -1425,7 +1445,7 @@ func (h *Handler) ApproveTemplate(w http.ResponseWriter, r *http.Request) {
 		h.handleTemplateError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, version)
+	writeJSONWithETag(w, http.StatusOK, version, version.RecordVersion)
 }
 
 // PublishTemplate — BIZ-03's own PublishTemplate command.
@@ -1448,6 +1468,11 @@ func (h *Handler) PublishTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check If-Match for optimistic concurrency (API-3).
+	if !h.requireIfMatch(w, r, existing.RecordVersion) {
+		return
+	}
+
 	version, err := h.store.PublishTemplate(r.Context(), domain.PublishVersionParams{
 		VersionID: versionID, PublishedByPrincipalID: principalID, CorrelationID: getCorrelationID(r),
 	})
@@ -1455,7 +1480,7 @@ func (h *Handler) PublishTemplate(w http.ResponseWriter, r *http.Request) {
 		h.handleTemplateError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, version)
+	writeJSONWithETag(w, http.StatusOK, version, version.RecordVersion)
 }
 
 // GetPublishedVersion — BIZ-03's own GetPublishedVersion query.
@@ -1488,7 +1513,7 @@ func (h *Handler) GetPublishedVersion(w http.ResponseWriter, r *http.Request) {
 		h.handleTemplateError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, version)
+	writeJSONWithETag(w, http.StatusOK, version, version.RecordVersion)
 }
 
 // RetireTemplate — BIZ-03's own RetireTemplate command.
@@ -1511,6 +1536,11 @@ func (h *Handler) RetireTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check If-Match for optimistic concurrency (API-3).
+	if !h.requireIfMatch(w, r, tmpl.RecordVersion) {
+		return
+	}
+
 	retired, err := h.store.RetireTemplate(r.Context(), domain.RetireTemplateParams{
 		TemplateID: templateID, RetiredByPrincipalID: principalID, CorrelationID: getCorrelationID(r),
 	})
@@ -1518,7 +1548,7 @@ func (h *Handler) RetireTemplate(w http.ResponseWriter, r *http.Request) {
 		h.handleTemplateError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, retired)
+	writeJSONWithETag(w, http.StatusOK, retired, retired.RecordVersion)
 }
 
 type renderPreviewRequest struct {
@@ -1556,7 +1586,7 @@ func (h *Handler) RenderPreview(w http.ResponseWriter, r *http.Request) {
 		h.handleTemplateError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, result)
+	writeJSONWithETag(w, http.StatusOK, result, existing.RecordVersion)
 }
 
 // CompareVersions — BIZ-03's own CompareVersions query. Both version ids
@@ -1592,6 +1622,8 @@ func (h *Handler) CompareVersions(w http.ResponseWriter, r *http.Request) {
 		h.handleTemplateError(w, r, err)
 		return
 	}
+	// No ETag: a comparison of two versions is not an aggregate a caller can
+	// mutate, and "v0" is not a version If-Match accepts.
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -1658,6 +1690,11 @@ func (h *Handler) handleTemplateError(w http.ResponseWriter, r *http.Request, er
 		var missing domain.ErrTemplateVariablesMissing
 		if errors.As(err, &missing) {
 			writeError(w, r, http.StatusBadRequest, "missing_variables", missing.Error())
+			return
+		}
+		var undeclared domain.ErrTemplateVariablesUndeclared
+		if errors.As(err, &undeclared) {
+			writeError(w, r, http.StatusBadRequest, "template_variable_invalid", undeclared.Error())
 			return
 		}
 		var unexpected domain.ErrTemplateVariablesUnexpected
@@ -1787,6 +1824,17 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// writeJSONWithETag writes a JSON response with an ETag header.
+func writeJSONWithETag(w http.ResponseWriter, status int, body any, version int64) {
+	apicontract.WriteETag(w, version)
+	writeJSON(w, status, body)
+}
+
+// requireIfMatch checks the If-Match header and returns false if the request should be rejected.
+func (h *Handler) requireIfMatch(w http.ResponseWriter, r *http.Request, currentVersion int64) bool {
+	return apicontract.CheckIfMatch(w, r, currentVersion)
+}
+
 // ── POST /v1/notifications/events/ingest ────────────────────────────────────
 
 // IngestEvent ingests a business domain event and coordinates the Phase 1 communications
@@ -1834,11 +1882,14 @@ func (h *Handler) IngestEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Authorization check
-	if h.authz != nil {
-		if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionSend); err != nil {
-			h.writeAuthzErr(w, r, err)
-			return
-		}
+	// Fail closed: an unset authorizer must refuse, never skip the check.
+	if h.authz == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "service_unavailable", "authorization not configured")
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionSend); err != nil {
+		h.writeAuthzErr(w, r, err)
+		return
 	}
 
 	res, err := h.orchestrator.IngestEvent(r.Context(), req, principalID)
@@ -1913,11 +1964,21 @@ func (h *Handler) GetIntent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.authz != nil && intent.LegalEntityID != "" {
-		if err := h.authz.CheckAllowed(r.Context(), principalID, intent.LegalEntityID, actionView); err != nil {
-			h.writeAuthzErr(w, r, err)
-			return
-		}
+	// Fail closed. This check used to be skipped when the authorizer was unset or the
+	// intent carried no legal entity, so such an intent (and its render) was readable by any
+	// principal in the tenant. An intent with no legal entity cannot be authorized against
+	// anything, so it is refused rather than served.
+	if h.authz == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "service_unavailable", "authorization not configured")
+		return
+	}
+	if intent.LegalEntityID == "" {
+		writeError(w, r, http.StatusForbidden, "forbidden", "the intent has no legal entity to authorize against")
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, intent.LegalEntityID, actionView); err != nil {
+		h.writeAuthzErr(w, r, err)
+		return
 	}
 
 	render, rErr := h.ledgerStore.GetRenderByIntent(r.Context(), tenantID, id)

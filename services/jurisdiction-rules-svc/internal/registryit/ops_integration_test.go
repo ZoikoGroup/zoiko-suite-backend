@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -65,7 +64,7 @@ func newEnvOps(signer domain.Signer, ring, region string) *env {
 	if err != nil {
 		panic(err)
 	}
-	r := chi.NewRouter()
+	r := newRouter()
 	h := handler.New(st, auth, pub, "platform-scope", zap.NewNop()).WithRegistry(st, pub).WithCertificationPolicy(1).
 		WithResolver(res).WithOperations(handler.OpsPolicy{HotfixRetroSLA: 72 * time.Hour})
 	if signer != nil {
@@ -126,7 +125,7 @@ func resolveOutcome(t *testing.T, c *certFixture) (string, map[string]any) {
 
 // ── lifecycle ───────────────────────────────────────────────────────────────
 
-func TestRelease_PublishWithdrawBlock_AreRecordedAndGuarded(t *testing.T) {
+func TestJURNEG28_Release_PublishWithdrawBlock_AreRecordedAndGuarded(t *testing.T) {
 	c := opsPack(t, "", "")
 	e := c.e
 
@@ -174,7 +173,7 @@ func TestRelease_PublishWithdrawBlock_AreRecordedAndGuarded(t *testing.T) {
 	require.Error(t, err, "release history is append-only")
 }
 
-func TestRelease_DependenciesMustBeReleased_AndDeployedInTheSameScope(t *testing.T) {
+func TestJURNEG15_Release_DependenciesMustBeReleased_AndDeployedInTheSameScope(t *testing.T) {
 	a := opsPack(t, "", "")
 	a.certifyVersion(t, a.version) // pack A: CERTIFIED
 
@@ -186,6 +185,9 @@ func TestRelease_DependenciesMustBeReleased_AndDeployedInTheSameScope(t *testing
 	mustStatus(t, 201, code, p)
 	m := f2.manifest("2026.08.1", f2.ruleID)
 	m["dependencies"] = []map[string]string{{"ref": a.packRef, "version": a.version}}
+	// Both packs carry the same rule for the same jurisdiction. Released together over the same period they would be ambiguous at runtime (JUR-NEG-24)
+	// and the release check refuses that, so this pack's window ends before the rule takes effect: the test is about dependency gates, not rule overlap.
+	m["effective_to"] = "2026-08-02"
 	code, v := a.e.do("POST", "/v1/admin/packs/"+f2.packRef+"/versions", "author", m)
 	mustStatus(t, 201, code, v)
 	code, r := a.e.do("POST", f2.path("2026.08.1", "/submit-review"), "author", nil)
@@ -288,11 +290,16 @@ func TestDeployment_RingOrderSoakAndHealthGates(t *testing.T) {
 	assert.GreaterOrEqual(t, len(rings["rings"].([]any)), 3)
 	code, r = c.e.do("POST", "/v1/admin/deployment-rings", "platform-ops", map[string]any{"ring_code": ringCanary, "ordinal": 9})
 	mustStatus(t, 409, code, r)
+	// Another code on a taken order: named, with the ring that holds it.
+	code, r = c.e.do("POST", "/v1/admin/deployment-rings", "platform-ops", map[string]any{"ring_code": "canary-two", "ordinal": 1})
+	mustStatus(t, 409, code, r)
+	assert.Equal(t, "ring_ordinal_taken", r["code"])
+	assert.Contains(t, r["detail"], "ordinal 1 is already ring "+ringCanary)
 	code, r = c.e.do("POST", "/v1/admin/deployment-rings", "platform-ops", map[string]any{"ring_code": "Bad Code", "ordinal": 1})
 	mustStatus(t, 400, code, r)
 }
 
-func TestResolver_UsesOnlyWhatIsDeployedToItsRingAndRegion(t *testing.T) {
+func TestJURNEG29_Resolver_UsesOnlyWhatIsDeployedToItsRingAndRegion(t *testing.T) {
 	c := opsPack(t, ringCanary, regionEU) // this resolver instance serves canary / eu-west
 	c.certifyVersion(t, c.version)
 	c.lifecycle(t, c.version, "publish", nil, 200)
@@ -329,7 +336,7 @@ func TestResolver_UsesOnlyWhatIsDeployedToItsRingAndRegion(t *testing.T) {
 
 // ── rollback ────────────────────────────────────────────────────────────────
 
-func TestRollback_RestoresAnOlderRelease_AndStatesWhatItCannotUndo(t *testing.T) {
+func TestJURNEG19_Rollback_RestoresAnOlderRelease_AndStatesWhatItCannotUndo(t *testing.T) {
 	c := opsPack(t, ringCanary, regionEU)
 	c.certifyVersion(t, c.version)
 	c.lifecycle(t, c.version, "publish", nil, 200)
@@ -358,7 +365,18 @@ func TestRollback_RestoresAnOlderRelease_AndStatesWhatItCannotUndo(t *testing.T)
 
 	r = c.lifecycle(t, "2026.09.1", "rollback", body(nil), 200)
 	assert.EqualValues(t, 1, r["decisions_made_with_rolled_back_version"], "JUR-NEG-19: decisions already made are counted, not rewritten")
-	assert.Contains(t, mustString(r["remediation_note"]), "remediation workflow")
+	assert.Contains(t, mustString(r["remediation_note"]), "remediation case", "the note points at the case that tracks the decisions")
+	caseID := mustString(r["remediation_case_id"])
+	require.NotEmpty(t, caseID, "rolling back with decisions in scope opens a remediation case in the same transaction")
+	assert.Equal(t, true, r["remediation_opened"])
+	assert.EqualValues(t, 1, r["remediation_decisions"])
+	code, rc := c.e.do("GET", "/v1/admin/remediation-cases/"+caseID, "auditor", nil)
+	mustStatus(t, 200, code, rc)
+	assert.Equal(t, "ROLLBACK", rc["trigger"])
+	assert.Equal(t, ringCanary, rc["ring_code"])
+	assert.Equal(t, regionEU, rc["region_code"])
+	assert.EqualValues(t, 1, rc["progress"].(map[string]any)["pending"])
+	assert.Equal(t, 1, c.e.pub.count(events.EventRemediationOpened))
 	assert.Contains(t, mustString(r["reconciliation"]), "not performed")
 	assert.Equal(t, "ROLLED_BACK", r["rolled_back"].(map[string]any)["status"])
 	assert.Equal(t, c.version, r["restored"].(map[string]any)["version"])
@@ -382,7 +400,7 @@ func TestRollback_RestoresAnOlderRelease_AndStatesWhatItCannotUndo(t *testing.T)
 
 // ── emergency hotfix ────────────────────────────────────────────────────────
 
-func TestHotfix_EnhancedReviewRingExceptionAndRetrospective(t *testing.T) {
+func TestJURNEG14_Hotfix_EnhancedReviewRingExceptionAndRetrospective(t *testing.T) {
 	c := opsPack(t, ringEarly, regionEU)
 	c.certifyVersion(t, c.version)
 	c.lifecycle(t, c.version, "publish", nil, 200)
@@ -557,7 +575,7 @@ func TestSourceChangeIntake_OpensReviewButNeverTouchesRules(t *testing.T) {
 
 // ── metrics ─────────────────────────────────────────────────────────────────
 
-func TestOpsMetrics_ReportsSkewAgeUpcomingAndWhatItDoesNotMeasure(t *testing.T) {
+func TestJURNEG29_OpsMetrics_ReportsSkewAgeUpcomingAndWhatItDoesNotMeasure(t *testing.T) {
 	c := opsPack(t, ringCanary, regionEU)
 	c.certifyVersion(t, c.version)
 	c.lifecycle(t, c.version, "publish", nil, 200)

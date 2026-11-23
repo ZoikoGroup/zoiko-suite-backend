@@ -15,6 +15,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/eventing/contracttest"
+
 	"zoiko.io/treasury-svc/internal/domain"
 	svcmiddleware "zoiko.io/treasury-svc/internal/middleware"
 	"zoiko.io/treasury-svc/internal/store"
@@ -104,6 +106,7 @@ func TestMain(m *testing.M) {
 		"000010_add_bnk09_authorization_and_events.up.sql",
 		"000011_add_eventing_outbox.up.sql",
 		"000012_eventing_outbox_rls.up.sql",
+		"000013_bnk01_history_reason_columns.up.sql",
 	} {
 		sql, err := os.ReadFile("../../deployments/migrations/" + migration)
 		if err != nil {
@@ -126,7 +129,7 @@ func TestMain(m *testing.M) {
 
 	testStore = store.New(testPool, zap.NewNop(), store.WithEventRegion("uk"))
 
-	code := m.Run()
+	code := contracttest.FinishSuite(testPool, "../../contracts/events", m.Run())
 
 	testPool.Close()
 	if pg != nil {

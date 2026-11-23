@@ -37,6 +37,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("failed to connect to postgres: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	verifyEventContracts(t, pool)
 
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
@@ -44,7 +45,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS
 		close_workflow_refs, close_evidences, fiscal_periods, period_reopen_events,
 		period_reopen_requests, period_state_transitions,
-		subledger_control_runs,
+		control_exceptions, subledger_control_runs,
 		close_requirements,
 		accrual_recognition_reversals, accrual_recognition_instances, accrual_schedules,
 		prepayment_recognition_instances, prepayment_schedules,

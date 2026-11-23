@@ -273,6 +273,14 @@ func (c *Config) ValidateInbound() error {
 	if !c.MTLSIdentityCheck {
 		return fmt.Errorf("refusing to start in %s with MTLS_IDENTITY_CHECK=false: a client certificate must bind the identity the broker authorizes", c.Env)
 	}
+	// Security s9 / S4-C1: a workload certificate is short-lived and bound to an environment and service. The issuer
+	// (mtls-management-svc) stamps spiffe://zoiko/<env>/<service>, so both limits can be enforced and are mandatory here.
+	if c.MTLSMaxClientCertLifetime <= 0 {
+		return fmt.Errorf("refusing to start in %s without MTLS_MAX_CLIENT_CERT_LIFETIME (24h recommended): workload certificates must be short-lived", c.Env)
+	}
+	if !strings.HasPrefix(c.MTLSRequiredURIPrefix, "spiffe://zoiko/") || !strings.HasSuffix(c.MTLSRequiredURIPrefix, "/") {
+		return fmt.Errorf("refusing to start in %s without MTLS_REQUIRED_URI_PREFIX of the form spiffe://zoiko/<env>/: a workload identity must be bound to its environment", c.Env)
+	}
 	return nil
 }
 

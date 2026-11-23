@@ -51,6 +51,7 @@ func (f *fakeSupportStore) InsertSupportContextWithEvent(_ context.Context, sc d
 		return domain.ErrSupportSelfApproval
 	}
 	cp := sc
+	cp.RecordVersion = 1 // Set initial version for optimistic concurrency
 	f.contexts[sc.SupportContextID] = &cp
 	if rec.EventID != "" {
 		f.events = append(f.events, rec)
@@ -66,6 +67,7 @@ func (f *fakeSupportStore) ApproveSupportContextWithEvent(_ context.Context, id,
 		return false, nil
 	}
 	sc.ApprovalStatus, sc.ApprovedAt, sc.GrantedAt, sc.ExpiresAt = domain.SupportApproved, &grantedAt, grantedAt, expiresAt
+	sc.RecordVersion++ // Increment version on mutation
 	f.events = append(f.events, rec)
 	return true, nil
 }
@@ -94,6 +96,7 @@ func (f *fakeSupportStore) RevokeSupportContextWithEvent(_ context.Context, id, 
 	}
 	sc.RevokedAt = &at
 	sc.RevocationReason = &reason
+	sc.RecordVersion++ // Increment version on mutation
 	f.events = append(f.events, rec)
 	return true, nil
 }

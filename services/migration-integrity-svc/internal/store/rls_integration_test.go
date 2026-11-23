@@ -1,6 +1,6 @@
 //go:build integration
 
-// Row-level security on the evidence tables (hardened by migration 000006):
+// Row-level security on the evidence tables (hardened by migration 000012):
 // ENABLE + FORCE, an explicit WITH CHECK, and isolation proved as the
 // NOSUPERUSER NOBYPASSRLS application role.
 package store_test

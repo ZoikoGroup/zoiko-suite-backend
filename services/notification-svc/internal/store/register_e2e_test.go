@@ -47,7 +47,7 @@ func registerRequest(event string) ledger.EventIngestRequest {
 // guarantees about a register row holds for it.
 func TestRegister_E2E_OneCommunicationOneIdentity(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenant := "tenant-reg-e2e"
 	ctx := svcmiddleware.WithTenant(context.Background(), tenant)
 	del := &e2eDeliverer{delivered: true, response: "smtp mail.example.com:587 accepted; message-id=<reg-e2e-1@example.com>"}
@@ -107,7 +107,7 @@ func TestRegister_E2E_OneCommunicationOneIdentity(t *testing.T) {
 
 func TestRegister_E2E_FailedDeliveryIsConcludedAndNeverRetriedByTheDirectWorker(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenant := "tenant-reg-fail"
 	ctx := svcmiddleware.WithTenant(context.Background(), tenant)
 	del := &e2eDeliverer{delivered: false} // a retryable failure
@@ -166,7 +166,7 @@ func outboxFor(t *testing.T, pool interface {
 // the intent it came from, so a consumer sees one identity.
 func TestRegister_E2E_EventsCarryOneCommunicationIdentity(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenant := "tenant-events-identity"
 	ctx := svcmiddleware.WithTenant(context.Background(), tenant)
 	del := &e2eDeliverer{delivered: true, response: "smtp h accepted; message-id=<events-identity@example.com>"}
@@ -189,7 +189,7 @@ func TestRegister_E2E_EventsCarryOneCommunicationIdentity(t *testing.T) {
 // A direct send has no intent: its events say so by omitting the field.
 func TestRegister_E2E_DirectSendEventsOmitTheIntent(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	n := classed(t, s, "tenant-events-direct", "corr-events-direct", "T0")
 	require.NoError(t, complete(t, s, "tenant-events-direct", n.NotificationID, "SENT", "", receiptFor("<events-direct@example.com>")))
 	evs := outboxFor(t, pool, n.NotificationID)

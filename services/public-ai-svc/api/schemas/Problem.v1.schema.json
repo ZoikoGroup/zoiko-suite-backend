@@ -1,0 +1,59 @@
+{
+  "$id": "https://schemas.zoikosuite.com/public-ai/Problem.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "code": {
+      "enum": [
+        "publicai.invalid_request",
+        "publicai.unsupported_schema",
+        "publicai.idempotency_header_mismatch",
+        "publicai.session_expired",
+        "publicai.origin_denied",
+        "publicai.scope_denied",
+        "publicai.not_found",
+        "publicai.turn_conflict",
+        "publicai.payload_too_large",
+        "publicai.unsupported_media_type",
+        "publicai.validation_failed",
+        "publicai.idempotency_mismatch",
+        "publicai.rate_limited",
+        "publicai.dependency_failed",
+        "publicai.service_unavailable",
+        "publicai.timeout",
+        "publicai.internal_error"
+      ],
+      "type": "string"
+    },
+    "detail": {
+      "type": "string"
+    },
+    "instance": {
+      "type": "string"
+    },
+    "request_id": {
+      "type": "string"
+    },
+    "retryable": {
+      "type": "boolean"
+    },
+    "status": {
+      "type": "integer"
+    },
+    "title": {
+      "type": "string"
+    },
+    "type": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "type",
+    "title",
+    "status",
+    "instance",
+    "code",
+    "request_id",
+    "retryable"
+  ],
+  "type": "object"
+}

@@ -43,7 +43,7 @@ func TestAPI2_ErrorResponsesAreProblemDetails(t *testing.T) {
 		{"403 denied", newRig(lifecycleStore(nil), nil, &stubAuthz{err: domain.ErrAuthorizationDenied}).do(http.MethodPost, lifecyclePath("activate"), "", ifm), 403, "AUTHORIZATION_DENIED", ""},
 		{"404 version of another policy", newRig(lifecycleStore(otherPolicy), nil, nil).do(http.MethodPost, lifecyclePath("activate"), "", ifm), 404, "NOT_FOUND", "policy_version_not_found"},
 		{"409 stale version", newRig(stale, nil, nil).do(http.MethodPost, lifecyclePath("activate"), "", ifm), 409, "CONCURRENCY_CONFLICT", "concurrency_conflict"},
-		{"428 no expected version", newRig(lifecycleStore(nil), nil, nil).do(http.MethodPost, lifecyclePath("activate"), ""), 428, "INVALID_REQUEST", "expected_version_required"},
+		{"428 no If-Match header", newRig(lifecycleStore(nil), nil, nil).do(http.MethodPost, lifecyclePath("activate"), ""), 428, "precondition_required", ""},
 		{"503 store unavailable", newRig(unavailable, nil, nil).do(http.MethodPost, lifecyclePath("activate"), "", ifm), 503, "SERVICE_UNAVAILABLE", "store_unavailable"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

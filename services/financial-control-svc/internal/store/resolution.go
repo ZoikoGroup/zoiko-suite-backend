@@ -10,7 +10,6 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/financial-control-svc/internal/domain"
-	"zoiko.io/financial-control-svc/internal/events"
 )
 
 // ResolveException moves an exception along its governed lifecycle with optimistic
@@ -80,7 +79,7 @@ func (s *PgStore) ResolveException(ctx context.Context, tenantID, exceptionID, a
 			return err
 		}
 		if et := resolutionEvent(to); et != "" {
-			if err := emitException(ctx, tx, run, exceptionID, et, actor, correlationID, map[string]any{
+			if err := s.emitException(ctx, tx, run, exceptionID, et, actor, correlationID, map[string]any{
 				"exception_id": exceptionID, "run_id": out.RunID, "from_state": string(cur.State), "to_state": req.ToState,
 				"reason": req.Reason, "authority_ref": req.AuthorityRef, "evidence_ref": req.EvidenceRef,
 				"carry_to_period": req.CarryToPeriod, "severity": string(out.Severity),
@@ -89,7 +88,7 @@ func (s *PgStore) ResolveException(ctx context.Context, tenantID, exceptionID, a
 			}
 		}
 		if isTerminalException(to) && run.ResultState == domain.ResultFail {
-			_, err := rollupTx(ctx, tx, tenantID, out.RunID, actor, correlationID, "all exceptions resolved", false)
+			_, err := s.rollupTx(ctx, tx, tenantID, out.RunID, actor, correlationID, "all exceptions resolved", false)
 			return err
 		}
 		return nil
@@ -128,15 +127,15 @@ func isTerminalException(s domain.ExceptionState) bool {
 func resolutionEvent(to domain.ExceptionState) string {
 	switch to {
 	case domain.ExRemediated:
-		return events.RemediationRecorded
+		return RemediationRecorded
 	case domain.ExReperformed:
-		return events.ExceptionReperformed
+		return ExceptionReperformed
 	case domain.ExClosed:
-		return events.ExceptionClosed
+		return ExceptionClosed
 	case domain.ExWaived:
-		return events.ExceptionWaived
+		return ExceptionWaived
 	case domain.ExCarriedForward:
-		return events.ExceptionCarried
+		return ExceptionCarried
 	}
 	return ""
 }
@@ -146,7 +145,7 @@ func resolutionEvent(to domain.ExceptionState) string {
 // explicit=true is the operator's own resubmission after a rejection; without it only a
 // FAIL result rolls up, so a rejected run cannot bounce back to the certifier with
 // nothing having changed. It returns nil, nil when there is nothing to do.
-func rollupTx(ctx context.Context, tx pgx.Tx, tenantID, runID, actor, correlationID, reason string, explicit bool) (*domain.ControlRun, error) {
+func (s *PgStore) rollupTx(ctx context.Context, tx pgx.Tx, tenantID, runID, actor, correlationID, reason string, explicit bool) (*domain.ControlRun, error) {
 	var cur domain.ControlRun
 	if err := scanRun(tx.QueryRow(ctx, `SELECT `+runColumns+` FROM control_runs
 		WHERE tenant_id = $1 AND run_id = $2 FOR UPDATE`, tenantID, runID), &cur); err != nil {
@@ -187,7 +186,7 @@ func rollupTx(ctx context.Context, tx pgx.Tx, tenantID, runID, actor, correlatio
 		pending := domain.CertPending
 		p.ToCert = &pending
 	}
-	return advanceTx(ctx, tx, tenantID, runID, p)
+	return s.advanceTx(ctx, tx, tenantID, runID, p)
 }
 
 // SubmitForCertification is the operator's resubmission of a run that is in
@@ -211,7 +210,7 @@ func (s *PgStore) SubmitForCertification(ctx context.Context, tenantID, runID, a
 			return fmt.Errorf("%w: run is at version %d, caller expected %d", domain.ErrConflict, v, expectedVersion)
 		}
 		var err error
-		out, err = rollupTx(ctx, tx, tenantID, runID, actor, correlationID, reason, true)
+		out, err = s.rollupTx(ctx, tx, tenantID, runID, actor, correlationID, reason, true)
 		return err
 	}
 	replay := false
@@ -361,7 +360,7 @@ func (s *PgStore) markSLABreach(ctx context.Context, tenantID, exceptionID strin
 			return err
 		}
 		done = true
-		return emitException(ctx, tx, run, exceptionID, events.ExceptionSLABreached, "system:sweeper", "sweep", map[string]any{
+		return s.emitException(ctx, tx, run, exceptionID, ExceptionSLABreached, "system:sweeper", "sweep", map[string]any{
 			"exception_id": exceptionID, "run_id": e.RunID, "severity": string(e.Severity), "state": string(e.State),
 			"owner_role": e.OwnerRole, "due_at": e.DueAt.UTC().Format(time.RFC3339),
 		})
@@ -374,7 +373,7 @@ func (s *PgStore) markSLABreach(ctx context.Context, tenantID, exceptionID strin
 // legal entity and period and is READY_TO_CERTIFY or CERTIFIED; any other prior run is
 // merely linked. A certified run's certification is marked SUPERSEDED, and the earlier run
 // records which run replaced it.
-func supersedePrior(ctx context.Context, tx pgx.Tx, tenantID, priorID string, next domain.ControlRun, actor, correlationID, reason string) error {
+func (s *PgStore) supersedePrior(ctx context.Context, tx pgx.Tx, tenantID, priorID string, next domain.ControlRun, actor, correlationID, reason string) error {
 	var pr domain.ControlRun
 	if err := scanRun(tx.QueryRow(ctx, `SELECT `+runColumns+` FROM control_runs
 		WHERE tenant_id = $1 AND run_id = $2 FOR UPDATE`, tenantID, priorID), &pr); err != nil {
@@ -392,7 +391,7 @@ func supersedePrior(ctx context.Context, tx pgx.Tx, tenantID, priorID string, ne
 		c := domain.CertSuperseded
 		p.ToCert = &c
 	}
-	if _, err := advanceTx(ctx, tx, tenantID, priorID, p); err != nil {
+	if _, err := s.advanceTx(ctx, tx, tenantID, priorID, p); err != nil {
 		return err
 	}
 	_, err := tx.Exec(ctx, `UPDATE control_runs SET superseded_by_run_id = $3

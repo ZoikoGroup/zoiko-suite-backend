@@ -19,6 +19,7 @@ import (
 	"zoiko.io/public-ai-svc/internal/orchestrator"
 	"zoiko.io/public-ai-svc/internal/policy"
 	"zoiko.io/public-ai-svc/internal/release"
+	"zoiko.io/public-ai-svc/internal/validate"
 )
 
 type kb struct {
@@ -57,7 +58,7 @@ func answered(t *testing.T, r orchestrator.Result, source string) {
 	if !r.Draft {
 		t.Fatal("answers from DRAFT_PENDING_REVIEW articles must be flagged draft")
 	}
-	if n := len(strings.Fields(r.Text)); n > 120 || len(r.Citations) > 3 || len(r.Actions) > 1 {
+	if n := len(strings.Fields(r.Text)); n > validate.MaxFullWords || len(r.Citations) > 3 || len(r.Actions) > 1 {
 		t.Fatalf("format: %d words, %d sources, %d actions", n, len(r.Citations), len(r.Actions))
 	}
 }
@@ -160,8 +161,10 @@ func TestK9_LiveStatusQuarantined(t *testing.T) {
 	must(t, os.MkdirAll(filepath.Join(dir, "sources"), 0o755))
 	must(t, os.WriteFile(filepath.Join(dir, "release.json"), []byte(`{"allowed_hosts":["pending-review.invalid"],"capability_ids":[],"approved_by":["a","b"],"eval_run_id":"x","routes":[]}`), 0o644))
 	article := func(id, body string) string {
-		return "---\nsource_id: " + id + "\ntitle: Status\ndomain: Platform\nmodule_id: status\naudience: PUBLIC_ANONYMOUS\nstatus: DRAFT_PENDING_REVIEW\nowner: o\neffective_from: 2026-01-01\nexpires_at: 2027-12-31\nlocale: en-US\n---\n\n## Status\n\n" + body + "\n"
+		return "---\nsource_id: " + id + "\ntitle: Status\ndomain: Platform\nmodule_id: status\naudience: PUBLIC_ANONYMOUS\nstatus: DRAFT_PENDING_REVIEW\nowner: o\neffective_from: 2026-01-01\nexpires_at: 2027-12-31\nlocale: en-US\nmarket_codes: ALL\nclassification: PUBLIC_APPROVED\npii_state: CLEAR\nlicense: OWNED_PUBLIC\nsigning_ref: kbctl-dev\n---\n\n## Status\n\n" + body + "\n"
 	}
+	// Doc 03 §06: scope is never defaulted; an article without market_codes is not parsed.
+	must(t, os.WriteFile(filepath.Join(dir, "sources", "d.md"), []byte(strings.Replace(article("no-market", "A capability."), "market_codes: ALL\n", "", 1)), 0o644))
 	must(t, os.WriteFile(filepath.Join(dir, "sources", "a.md"), []byte(article("live-a", "0/55 services ready across the estate.")), 0o644))
 	must(t, os.WriteFile(filepath.Join(dir, "sources", "b.md"), []byte(article("live-b", "Legal and Contracts: Action required on two services.")), 0o644))
 	must(t, os.WriteFile(filepath.Join(dir, "sources", "c.md"), []byte(article("ok-c", "A public description of a capability.")), 0o644))
@@ -172,6 +175,15 @@ func TestK9_LiveStatusQuarantined(t *testing.T) {
 	states := map[string]string{}
 	for _, r := range reports {
 		states[r.SourceID] = r.State
+	}
+	parseFailed := 0
+	for _, r := range reports {
+		if r.State == knowledge.StateQuarantineParse {
+			parseFailed++
+		}
+	}
+	if parseFailed != 1 {
+		t.Fatalf("an article without market_codes must fail parsing: %+v", reports)
 	}
 	if states["live-a"] != knowledge.StateQuarantinePrivate || states["live-b"] != knowledge.StateQuarantinePrivate || states["ok-c"] != knowledge.StateStaged {
 		t.Fatalf("states %v", states)
@@ -302,6 +314,72 @@ func TestK12_ExpiredMarketOffersNextSteps(t *testing.T) {
 	}
 }
 
+// Doc 02 §10, T1 (frontend assistant.spec.ts): a bare country answering
+// "Which country?" resumes the open question. The public KB's Tax article
+// mentions "United States (IRS)", which once rerouted the reply to a Tax
+// how-to instead of the plans and trial answer.
+func TestK12b_CountryReplyResumesOpenQuestion(t *testing.T) {
+	k := newKB(t)
+	in := func(msg, market string, pd *orchestrator.Pending) orchestrator.Result {
+		return k.env.Pipeline.Answer(ctx, orchestrator.Input{RequestID: "req_kb", Message: msg, MarketCode: market, Locale: "en-US", Pending: pd})
+	}
+	for _, q := range []string{"Is there a free trial?", "What plans are available, and is there a free trial?", "How much does ZoikoSuite cost?"} {
+		ask := in(q, "", nil)
+		if ask.Status != contract.Clarify || ask.Pending == nil {
+			t.Fatalf("%q: %s %+v", q, ask.Status, ask.Pending)
+		}
+		for _, market := range []string{"", "US"} { // typed, or the widget's country button
+			r := in("United States", market, ask.Pending)
+			if r.IntentID != ask.Pending.Intent || strings.Contains(strings.ToLower(r.Text), "tax rule") {
+				t.Errorf("%q then United States (market %q): %s %s, want intent %s: %q", q, market, r.Status, r.IntentID, ask.Pending.Intent, r.Text)
+			}
+		}
+	}
+	// With nothing open, a module question that names a country still reaches the module.
+	if r := in("How do I create a tax rule for the United States?", "", nil); r.IntentID == "I05" || r.IntentID == "I06" {
+		t.Fatalf("tax-rule question misread as pricing/trial: %s", r.IntentID)
+	}
+}
+
+// Doc 02 §17 T05/T06 and §18 S01, Doc 01 AT-01: the plans-and-trial
+// exchange as the documents write it. A trial question asks for the country
+// in trial words; the country's answer carries the T06 qualifier and S01's
+// sign-up line, and its source shows a review date. A price-only question
+// keeps T05.
+func TestS01_TrialPathAsDocumented(t *testing.T) {
+	k := newKB(t)
+	in := func(msg, market string, pd *orchestrator.Pending) orchestrator.Result {
+		return k.env.Pipeline.Answer(ctx, orchestrator.Input{RequestID: "req_kb", Message: msg, MarketCode: market, Locale: "en-US", Pending: pd})
+	}
+	for _, q := range []string{"Do you have a free trial?", "What plans are available, and is there a free trial?"} {
+		ask := in(q, "", nil)
+		if ask.Text != policy.TplClarifyTrialMarket.Text {
+			t.Fatalf("%q: market question %q, want the T06/S01 wording", q, ask.Text)
+		}
+		us := in("United States", "US", ask.Pending)
+		if us.Status != contract.Answered || us.IntentID != "I06" || us.MarketCode != "US" {
+			t.Fatalf("%q then United States: %s %s %s", q, us.Status, us.IntentID, us.MarketCode)
+		}
+		if !strings.Contains(us.Text, "post-trial conditions depend on your market") || !strings.Contains(us.Text, "The sign-up page will present the applicable terms before you decide to proceed.") {
+			t.Errorf("%q then United States: missing the T06 qualifier or the S01 sign-up line: %q", q, us.Text)
+		}
+		if len(us.Citations) == 0 || us.Citations[0].ReviewedAt == "" {
+			t.Errorf("%q then United States: source has no review date: %+v", q, us.Citations)
+		}
+		// Same length as the question before it; no dev marker on screen;
+		// the T06 button opens the documented pricing page (Doc 03 S03).
+		if !strings.Contains(us.Text, "30 days") || strings.Contains(us.Text, "SYNTHETIC") {
+			t.Errorf("%q then United States: want the 30-day trial and no SYNTHETIC marker: %q", q, us.Text)
+		}
+		if len(us.Actions) != 1 || us.Actions[0].RouteKey != "pricing" {
+			t.Errorf("%q then United States: actions %+v, want the pricing page", q, us.Actions)
+		}
+	}
+	if price := in("How much does ZoikoSuite cost?", "", nil); price.Text != policy.TplClarifyMarket.Text {
+		t.Fatalf("price question: %q, want T05", price.Text)
+	}
+}
+
 // Doc 02 golden cases found in manual testing (2026-10-30), as conversations.
 func TestK13_GoldenConversations(t *testing.T) {
 	k := newKB(t)
@@ -376,4 +454,56 @@ func TestK14_RegionalCoverageAndBillingFollowUp(t *testing.T) {
 	if r.Reason != contract.ReasonMarketNotCovered || len(r.Suggestions) != 1 || r.Suggestions[0].Label != "Book a demo" {
 		t.Fatalf("regional coverage: %s %+v", r.Reason, r.Suggestions)
 	}
+}
+
+// Doc 09 §12: data-rights requests are route-only and claim no action.
+func TestDataRightsRequestsRouteOnly(t *testing.T) {
+	k := newKB(t)
+	for _, q := range []string{"Please delete my data", "I want to export my personal data", "This is a subject access request", "Right to be forgotten please"} {
+		r := k.env.Pipeline.Answer(ctx, orchestrator.Input{RequestID: "req_kb", Message: q, Locale: "en-US"})
+		if r.Status != contract.Handoff || r.Reason != contract.ReasonRouteOnly || !strings.Contains(r.Text, "Nothing has been recorded, exported or deleted") {
+			t.Fatalf("%q: %s %s %q", q, r.Status, r.Reason, r.Text)
+		}
+	}
+}
+
+// Doc 10 §21: contact details are masked, the question is still answered,
+// and the reply says they were not kept.
+func TestContactDetailsNotKept(t *testing.T) {
+	k := newKB(t)
+	r := k.env.Pipeline.Answer(ctx, orchestrator.Input{RequestID: "req_kb", Message: "What does Legal and Contracts do? my email is jane.roe@example.com", Locale: "en-US"})
+	if r.Status != contract.Answered || !strings.Contains(r.Text, "I didn't keep the contact details") || strings.Contains(r.Text, "jane.roe") {
+		t.Fatalf("contact masking: %s %q", r.Status, r.Text)
+	}
+}
+
+// T2 on the public KB: picking "United States" continues the open
+// plans-and-trial question. The tax console article lists "United States
+// (IRS)", so the reply must not be taken for a question about that article.
+func TestT2_UnitedStatesContinuesOpenQuestionOnPublicKB(t *testing.T) {
+	x := publicKBServer(t)
+	c := &conversation{x: x, s: x.session("00000000-0000-4000-8000-0000000000c2")}
+	clarifyPlansAndTrial(t, c)
+	e := c.sayIn("United States", "US")
+	want(t, e, contract.Answered)
+	if !strings.Contains(e.Text, "Starter, Growth and Enterprise plans are available in the United States") || e.MarketCode != "US" {
+		t.Fatalf("got %s %s %q", e.Status, e.MarketCode, e.Text)
+	}
+	without(t, e, "tax rule")
+}
+
+// A full question that names a market is still a new question while the
+// clarifying question is open: it gets the same reply as in a new session.
+func TestT2_QuestionNamingAMarketIsNewWhileClarifying(t *testing.T) {
+	const q = "How do I create a tax rule in the US?"
+	x := publicKBServer(t)
+	fresh := (&conversation{x: x, s: x.session("00000000-0000-4000-8000-0000000000c3")}).say(q)
+	c := &conversation{x: x, s: x.session("00000000-0000-4000-8000-0000000000c4")}
+	clarifyPlansAndTrial(t, c)
+	e := c.say(q)
+	if e.Status != fresh.Status || e.Reason != fresh.Reason || e.IntentID != fresh.IntentID || e.Text != fresh.Text {
+		t.Fatalf("while clarifying: %s %s %s %q; new session: %s %s %s %q",
+			e.Status, e.Reason, e.IntentID, e.Text, fresh.Status, fresh.Reason, fresh.IntentID, fresh.Text)
+	}
+	without(t, e, "Starter, Growth and Enterprise")
 }

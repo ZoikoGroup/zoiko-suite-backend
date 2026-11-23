@@ -32,6 +32,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("failed to connect to postgres: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	verifyEventContracts(t, pool)
 
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
@@ -51,9 +52,11 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		"000007_force_rls.up.sql",
 		"000007_suggestion_authoritative_ref.up.sql",
 		"000008_suggestion_candidate_match.up.sql",
-		"000009_rls_force_with_check.up.sql",
-		"000010_idempotency_keys.up.sql",
-		"000011_job_version_requester_decisions.up.sql",
+		"000009_suggestion_candidate_transaction.up.sql",
+		"000010_suggestion_candidate_multi_journal.up.sql",
+		"000011_rls_force_with_check.up.sql",
+		"000012_idempotency_keys.up.sql",
+		"000013_job_version_requester_decisions.up.sql",
 	} {
 		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
 		if err != nil {

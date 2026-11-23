@@ -761,6 +761,10 @@ func newRouterWithLedger(s *stubStore, pub *stubPublisher, authz *stubAuthZ, led
 }
 
 func newRouterFull(s *stubStore, pub *stubPublisher, authz *stubAuthZ, pc *stubPeriodChecker, ledger *stubLedger) chi.Router {
+	return newRouterWithMappingKeys(s, pub, authz, pc, ledger, "PROJECT_REVENUE", "PROJECT_WIP")
+}
+
+func newRouterWithMappingKeys(s *stubStore, pub *stubPublisher, authz *stubAuthZ, pc *stubPeriodChecker, ledger *stubLedger, revenueKey, wipKey string) chi.Router {
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -768,7 +772,8 @@ func newRouterFull(s *stubStore, pub *stubPublisher, authz *stubAuthZ, pc *stubP
 			next.ServeHTTP(w, req)
 		})
 	})
-	h := handler.New(s, pub, authz, zap.NewNop()).WithPeriodChecker(pc).WithLedgerClient(ledger)
+	h := handler.New(s, pub, authz, zap.NewNop()).WithPeriodChecker(pc).WithLedgerClient(ledger).
+		WithMappingKeys(revenueKey, wipKey)
 	handler.RegisterRoutes(r, h)
 	return r
 }

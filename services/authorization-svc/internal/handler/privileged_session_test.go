@@ -177,12 +177,21 @@ func TestPrivilegedSession_List(t *testing.T) {
 }
 
 func TestPrivilegedSession_Revoke(t *testing.T) {
-	store := &stubStore{}
+	store := &stubStore{
+		privilegedSession: &domain.PrivilegedSession{
+			SessionID:      "ps-uuid-1",
+			TenantID:       testPAMTenantID,
+			PrincipalID:    testPAMElevatedUser,
+			Status:         domain.PrivilegedSessionStatusActive,
+			RecordVersion:  99, // Use unique value to verify store is used
+		},
+	}
 	r := newTestRouterFull(store, &stubPublisher{}, &stubValidator{})
 
 	req := httptest.NewRequest(http.MethodPost, "/admin/v1/privileged-sessions/ps-uuid-1/revoke", nil)
 	req.Header.Set("X-Tenant-Id", testPAMTenantID)
 	req.Header.Set("X-Principal-Id", testPAMCaller)
+	req.Header.Set("If-Match", `"v99"`)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -203,6 +212,7 @@ func TestPrivilegedSession_Revoke(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/admin/v1/privileged-sessions/nonexistent/revoke", nil)
 	req.Header.Set("X-Tenant-Id", testPAMTenantID)
 	req.Header.Set("X-Principal-Id", testPAMCaller)
+	req.Header.Set("If-Match", `"v99"`)
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {

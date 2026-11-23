@@ -64,53 +64,114 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	dbPort := uint32(16601 + uint32(os.Getpid()%499))
-	dbName := "access_control_isolation_test"
-
-	pg := embeddedpostgres.NewDatabase(
-		embeddedpostgres.DefaultConfig().
-			Version(embeddedpostgres.V16).
-			Port(dbPort).
-			Database(dbName).
-			Username("postgres").
-			Password("postgres").
-			// Isolated so this suite cannot collide with another service's
-			// embedded instance over the shared default extraction directory.
-			RuntimePath(filepath.Join(os.TempDir(), fmt.Sprintf("epg-access-control-%d", dbPort))),
-	)
-	if err := pg.Start(); err != nil {
-		fmt.Printf("embedded postgres failed to start: %v\n", err)
-		os.Exit(1)
-	}
-	defer func() { _ = pg.Stop() }()
-
 	ctx := context.Background()
-	ownerDSN := fmt.Sprintf("postgres://postgres:postgres@localhost:%d/%s?sslmode=disable", dbPort, dbName)
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	var pg *embeddedpostgres.EmbeddedPostgres
+	dbName := "access_control_isolation_test"
+	var dbPort uint32
+
+	if dsn == "" {
+		dbPort = uint32(16601 + uint32(os.Getpid()%499))
+		pg = embeddedpostgres.NewDatabase(
+			embeddedpostgres.DefaultConfig().
+				Version(embeddedpostgres.V16).
+				Port(dbPort).
+				Database(dbName).
+				Username("postgres").
+				Password("postgres").
+				// Isolated so this suite cannot collide with another service's
+				// embedded instance over the shared default extraction directory.
+				RuntimePath(filepath.Join(os.TempDir(), fmt.Sprintf("epg-access-control-%d", dbPort))),
+		)
+		if err := pg.Start(); err != nil {
+			fmt.Printf("embedded postgres failed to start: %v\n", err)
+			os.Exit(1)
+		}
+		defer func() { _ = pg.Stop() }()
+
+		dsn = fmt.Sprintf("postgres://postgres:postgres@localhost:%d/%s?sslmode=disable", dbPort, dbName)
+	}
 
 	var err error
-	ownerPool, err = pgxpool.New(ctx, ownerDSN)
+	ownerPool, err = pgxpool.New(ctx, dsn)
 	if err != nil {
 		fmt.Printf("owner pool: %v\n", err)
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
 
 	if err := waitReady(ctx, ownerPool); err != nil {
 		fmt.Printf("postgres never became ready: %v\n", err)
-		os.Exit(1)
-	}
-	if err := applyMigrations(ctx, ownerPool); err != nil {
-		fmt.Printf("migrations: %v\n", err)
-		os.Exit(1)
-	}
-	if err := createAppRole(ctx, ownerPool, dbName); err != nil {
-		fmt.Printf("app role: %v\n", err)
+		ownerPool.Close()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
 
-	appDSN := fmt.Sprintf("postgres://%s:%s@localhost:%d/%s?sslmode=disable", appRole, appPass, dbPort, dbName)
-	appPool, err = pgxpool.New(ctx, appDSN)
+	// A TEST_DATABASE_URL does not mean the schema is there. CI points this
+	// suite at a bare postgres:16 service container, so assuming migrations had
+	// already run made every assertion fail with `relation "role_definitions"
+	// does not exist` -- and the job burned its 600s timeout instead of telling
+	// anyone why. Provision whenever the schema is absent, whichever way the
+	// DSN arrived. Provisioning is skipped when the schema is present because
+	// the migrations are not written to be re-runnable.
+	if err := ownerPool.QueryRow(ctx, "SELECT current_database()").Scan(&dbName); err != nil {
+		fmt.Printf("resolve database name: %v\n", err)
+		ownerPool.Close()
+		if pg != nil {
+			_ = pg.Stop()
+		}
+		os.Exit(1)
+	}
+	var haveSchema bool
+	if err := ownerPool.QueryRow(ctx, "SELECT to_regclass('public.role_definitions') IS NOT NULL").Scan(&haveSchema); err != nil {
+		fmt.Printf("schema probe: %v\n", err)
+		ownerPool.Close()
+		if pg != nil {
+			_ = pg.Stop()
+		}
+		os.Exit(1)
+	}
+	if !haveSchema {
+		if err := applyMigrations(ctx, ownerPool); err != nil {
+			fmt.Printf("migrations: %v\n", err)
+			ownerPool.Close()
+			if pg != nil {
+				_ = pg.Stop()
+			}
+			os.Exit(1)
+		}
+	}
+	// Grants are refreshed even when the role already exists: migrations above
+	// may have created tables after the last run's grant list was applied.
+	if err := createAppRole(ctx, ownerPool, dbName); err != nil {
+		fmt.Printf("app role: %v\n", err)
+		ownerPool.Close()
+		if pg != nil {
+			_ = pg.Stop()
+		}
+		os.Exit(1)
+	}
+
+	// The app pool always connects as the ordinary role. Connecting it as the
+	// superuser (as an external DSN would do) bypasses row security, so every
+	// policy assertion below would pass without a policy existing at all.
+	appCfg, err := pgxpool.ParseConfig(dsn)
+	if err == nil {
+		appCfg.ConnConfig.User = appRole
+		appCfg.ConnConfig.Password = appPass
+		appCfg.ConnConfig.Database = dbName
+		appPool, err = pgxpool.NewWithConfig(ctx, appCfg)
+	}
 	if err != nil {
 		fmt.Printf("app pool: %v\n", err)
+		ownerPool.Close()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
 
@@ -120,7 +181,9 @@ func TestMain(m *testing.M) {
 
 	appPool.Close()
 	ownerPool.Close()
-	_ = pg.Stop()
+	if pg != nil {
+		_ = pg.Stop()
+	}
 	os.Exit(code)
 }
 
@@ -157,17 +220,165 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		if err != nil {
 			return fmt.Errorf("read %s: %w", p, err)
 		}
-		if _, err := pool.Exec(ctx, string(sqlBytes)); err != nil {
-			return fmt.Errorf("apply %s: %w", filepath.Base(p), err)
+		stmts := splitSQL(string(sqlBytes))
+		for _, stmt := range stmts {
+			stmt = strings.TrimSpace(stmt)
+			if stmt == "" {
+				continue
+			}
+			if _, err := pool.Exec(ctx, stmt); err != nil {
+				return fmt.Errorf("apply %s: %w", filepath.Base(p), err)
+			}
 		}
 	}
 	return nil
 }
 
+// splitSQL splits a SQL string into individual statements.
+// It handles single-quoted strings ('...' with '' escapes),
+// PostgreSQL dollar-quoted strings ($tag$...$tag$),
+// single-line comments (-- ...), and block comments (/* ... */).
+// This is a best-effort splitter; the project's migrations are written
+// to avoid semicolons inside strings.
+func splitSQL(sql string) []string {
+	var stmts []string
+	var current strings.Builder
+	inSingleQuote := false
+	inDollarQuote := false
+	inLineComment := false
+	inBlockComment := false
+	dollarTag := ""
+
+	for i := 0; i < len(sql); i++ {
+		c := sql[i]
+
+		// Handle block comment end
+		if inBlockComment {
+			current.WriteByte(c)
+			if c == '*' && i+1 < len(sql) && sql[i+1] == '/' {
+				current.WriteByte('/')
+				i++
+				inBlockComment = false
+			}
+			continue
+		}
+
+		// Handle line comment end
+		if inLineComment {
+			if c == '\n' {
+				current.WriteByte(c)
+				inLineComment = false
+			} else {
+				current.WriteByte(c)
+			}
+			continue
+		}
+
+		if inDollarQuote {
+			// Compare the whole end marker ($tag$) before writing anything. The
+			// previous version wrote the first '$', then compared
+			// `sql[i:i+len(dollarTag)]` after clearing dollarTag, and advanced
+			// i by len(dollarTag)-1 == -1. The end marker was then re-read as
+			// an opening marker, so every migration with a dollar-quoted
+			// function body failed to split.
+			if c == '$' && strings.HasPrefix(sql[i:], dollarTag) {
+				current.WriteString(dollarTag)
+				i += len(dollarTag) - 1
+				inDollarQuote = false
+				dollarTag = ""
+				continue
+			}
+			current.WriteByte(c)
+			continue
+		}
+
+		if inSingleQuote {
+			current.WriteByte(c)
+			if c == '\'' {
+				// Check for escaped quote ''
+				if i+1 < len(sql) && sql[i+1] == '\'' {
+					current.WriteByte('\'')
+					i++
+				} else {
+					inSingleQuote = false
+				}
+			}
+			continue
+		}
+
+		// Not in any quoted string or comment
+		if c == '-' && i+1 < len(sql) && sql[i+1] == '-' {
+			inLineComment = true
+			current.WriteByte(c)
+			current.WriteByte('-')
+			i++
+			continue
+		}
+
+		if c == '/' && i+1 < len(sql) && sql[i+1] == '*' {
+			inBlockComment = true
+			current.WriteByte(c)
+			current.WriteByte('*')
+			i++
+			continue
+		}
+
+		if c == '\'' {
+			inSingleQuote = true
+			current.WriteByte(c)
+		} else if c == '$' && i+1 < len(sql) {
+			// Check for dollar quote start ($tag$ or $$)
+			j := i + 1
+			tag := ""
+			// Allow empty tag ($$) or tagged ($tag$)
+			for j < len(sql) && (sql[j] >= 'a' && sql[j] <= 'z' || sql[j] >= 'A' && sql[j] <= 'Z' || sql[j] >= '0' && sql[j] <= '9' || sql[j] == '_') {
+				tag += string(sql[j])
+				j++
+			}
+			if j < len(sql) && sql[j] == '$' {
+				inDollarQuote = true
+				dollarTag = sql[i : j+1] // $tag$ including both dollars
+				// Write the whole opening marker: the leading '$' was not
+				// written by any earlier branch.
+				current.WriteString(dollarTag)
+				i = j
+				continue
+			} else {
+				current.WriteByte(c)
+			}
+		} else if c == ';' {
+			// End of statement
+			stmts = append(stmts, current.String())
+			current.Reset()
+		} else {
+			current.WriteByte(c)
+		}
+	}
+
+	// Add any remaining
+	if current.Len() > 0 {
+		stmts = append(stmts, current.String())
+	}
+
+	return stmts
+}
+
 func createAppRole(ctx context.Context, pool *pgxpool.Pool, dbName string) error {
-	stmts := []string{
-		fmt.Sprintf("DROP ROLE IF EXISTS %s", appRole),
-		fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS", appRole, appPass),
+	// Only CREATE when absent. DROP ROLE is not an option once the role holds
+	// grants: Postgres refuses to drop a role that owns dependencies, so a
+	// second run against the same database would fail here instead of testing.
+	var exists bool
+	if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)`, appRole).Scan(&exists); err != nil {
+		return fmt.Errorf("look up role %s: %w", appRole, err)
+	}
+
+	var stmts []string
+	if !exists {
+		stmts = append(stmts,
+			fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS", appRole, appPass),
+		)
+	}
+	stmts = append(stmts,
 		fmt.Sprintf("GRANT CONNECT ON DATABASE %s TO %s", dbName, appRole),
 		fmt.Sprintf("GRANT USAGE ON SCHEMA public TO %s", appRole),
 		fmt.Sprintf("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO %s", appRole),
@@ -178,7 +389,7 @@ func createAppRole(ctx context.Context, pool *pgxpool.Pool, dbName string) error
 		// sequences is a grant list that breaks the moment a table gets an
 		// identity column.
 		fmt.Sprintf("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO %s", appRole),
-	}
+	)
 	for _, s := range stmts {
 		if _, err := pool.Exec(ctx, s); err != nil {
 			return fmt.Errorf("%s: %w", s, err)
@@ -348,7 +559,7 @@ func TestStoreUpdateCannotCrossTenants(t *testing.T) {
 	idB := seedRole(t, tenantB, "UPD_B_"+uuid.NewString()[:8])
 
 	ctxA := svcmiddleware.WithTenant(context.Background(), tenantA)
-	_, err := testStore.UpdateRole(ctxA, idB, "Renamed By Other Tenant", "RETIRED", "admin-seed")
+	_, err := testStore.UpdateRole(ctxA, idB, "Renamed By Other Tenant", "RETIRED", "admin-seed", 0)
 	require.ErrorIs(t, err, domain.ErrRoleNotFound,
 		"tenant %s retired tenant %s's role", tenantA, tenantB)
 
@@ -441,7 +652,7 @@ func TestUpdateRoleEnqueuesRoleUpdatedWithRoleID(t *testing.T) {
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantA)
 	id := seedRole(t, tenantA, "RETIRE_"+uuid.NewString()[:8])
 
-	_, err := testStore.UpdateRole(ctx, id, "", "RETIRED", "admin-seed")
+	_, err := testStore.UpdateRole(ctx, id, "", "RETIRED", "admin-seed", 0)
 	require.NoError(t, err)
 
 	var payload []byte
@@ -507,7 +718,7 @@ func TestMalformedIDsAreNotFoundNotOutages(t *testing.T) {
 	_, err = testStore.GetBundle(ctx, "not-a-uuid", "also-not-a-uuid")
 	require.ErrorIs(t, err, domain.ErrBundleNotFound)
 
-	_, err = testStore.UpdateRole(ctx, "not-a-uuid", "x", "RETIRED", "admin-seed")
+	_, err = testStore.UpdateRole(ctx, "not-a-uuid", "x", "RETIRED", "admin-seed", 0)
 	require.ErrorIs(t, err, domain.ErrRoleNotFound)
 
 	// Collection reads narrow to nothing rather than refusing.

@@ -152,11 +152,12 @@ func TestEvaluateJobStatus(t *testing.T) {
 func TestIntegrity_EntriesCarrySeverityFamilyAndOwner(t *testing.T) {
 	req := &ValidateMigrationRequest{LegalEntityID: "le", MigrationName: "m", SourceSystem: "s", TargetService: "t",
 		ExceptionOwnerID: " owner-7 ", RequiredFields: []string{"cost_centre"}, Records: []MigrationRecord{
-			rec("", map[string]string{"cost_centre": "CC"}),                   // no identity
-			rec("D", map[string]string{"cost_centre": "CC"}),                  // duplicate
-			rec("D", map[string]string{"cost_centre": "CC"}),                  // duplicate
-			rec("M", map[string]string{}),                                     // missing required
-			rec("T", map[string]string{"cost_centre": "CC", "amount": "N/A"}), // bad amount
+			rec("", map[string]string{"cost_centre": "CC"}),                          // no identity
+			rec("D", map[string]string{"cost_centre": "CC"}),                         // duplicate
+			rec("D", map[string]string{"cost_centre": "CC"}),                         // duplicate
+			rec("M", map[string]string{}),                                            // missing required
+			rec("T", map[string]string{"cost_centre": "CC", "amount": "N/A"}),        // bad amount
+			rec("C", map[string]string{"cost_centre": "CC", "currency_code": "ZZZ"}), // bad currency
 		}}
 	checks, entries, _, _, _ := PerformIntegrityValidation(req, "job", "tenant")
 
@@ -168,6 +169,7 @@ func TestIntegrity_EntriesCarrySeverityFamilyAndOwner(t *testing.T) {
 		ViolationDuplicate:             {SeverityMQ1, ReasonIdentity},
 		ViolationTypeMismatch:          {SeverityMQ1, ReasonSchema},
 		ViolationMissingRequired:       {SeverityMQ2, ReasonSchema},
+		ViolationOrphanedRef:           {SeverityMQ1, ReasonReference},
 	}
 	seen := map[ViolationType]bool{}
 	for _, e := range entries {
@@ -229,8 +231,33 @@ func TestSeverity_OnlyMQ0Blocks(t *testing.T) {
 	}
 }
 
+// MIG-C12/MIG-N12: an unrecognized currency code is quarantined, never
+// silently substituted. A blank or absent currency_code is a presence
+// question for the required-fields check, not this one.
+func TestIntegrity_CurrencyCodeValidity(t *testing.T) {
+	for _, v := range []string{"USD", "EUR", "gbp", " JPY ", "XXX"} {
+		if _, invalid, _, _ := validate(rec("R", map[string]string{"amount": "1", "currency_code": v})); invalid != 0 {
+			t.Fatalf("%q should be accepted as a valid ISO 4217 code", v)
+		}
+	}
+	for _, v := range []string{"ZZZ", "USDOLLAR", "123", "£"} {
+		if _, invalid, _, _ := validate(rec("R", map[string]string{"amount": "1", "currency_code": v})); invalid != 1 {
+			t.Fatalf("%q should be refused as an unrecognized currency code", v)
+		}
+	}
+	// Absent or blank currency_code is not this check's concern.
+	for _, recs := range [][]MigrationRecord{
+		{rec("R", map[string]string{"amount": "1"})},
+		{rec("R", map[string]string{"amount": "1", "currency_code": "  "})},
+	} {
+		if _, invalid, _, _ := validate(recs[0]); invalid != 0 {
+			t.Fatalf("missing/blank currency_code must not fail this check, got invalid=%d", invalid)
+		}
+	}
+}
+
 func TestValidateRequest_ExceptionOwnerRequired(t *testing.T) {
-	// control_totals has been required since migration 000006 (ZS-MIG-001
+	// control_totals has been required since migration 000012 (ZS-MIG-001
 	// §17, MIG-INV-15), so the request declares a valid manifest; this test
 	// is only about the owner.
 	count := 1

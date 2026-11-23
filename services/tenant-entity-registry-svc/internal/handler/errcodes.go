@@ -39,7 +39,14 @@ const (
 	// ORG-02 §4.2 server-resolved context refusals (000013).
 	CodeJurisdictionRestricted = "JURISDICTION_RESTRICTED"
 	CodeNotEntitled            = "NOT_ENTITLED"
-	CodeInternal               = "INTERNAL_ERROR"
+	// ORG-07 MDM-05: a merge the matching rules forbid.
+	CodeMergeProhibited = "MERGE_PROHIBITED"
+	// REF-03: no approved rate, and no fallback to another one.
+	CodeRateMissing = "FX_RATE_MISSING"
+	// REF-09: units of different dimensions, or no approved conversion in force.
+	CodeDimensionMismatch = "DIMENSION_MISMATCH"
+	CodeConversionMissing = "CONVERSION_MISSING"
+	CodeInternal        = "INTERNAL_ERROR"
 )
 
 // errorCodes is checked in order: the specific kinds before the broad
@@ -53,6 +60,12 @@ var errorCodes = []struct {
 	{registry.ErrVersionConflict, CodeVersionConflict},
 	{registry.ErrApprovalFingerprintMismatch, CodeVersionConflict},
 	{registry.ErrOnboardingKeyMismatch, CodeIdempotencyMismatch},
+	{registry.ErrCreateRequestMismatch, CodeIdempotencyMismatch},
+	{registry.ErrIdempotencyKeyMismatch, CodeIdempotencyMismatch},
+	{registry.ErrMergeProhibited, CodeMergeProhibited},
+	{registry.ErrRateMissing, CodeRateMissing},
+	{registry.ErrDimensionMismatch, CodeDimensionMismatch},
+	{registry.ErrConversionMissing, CodeConversionMissing},
 	{registry.ErrRegistryConflict, CodeDuplicateCandidate},
 	{registry.ErrApprovalPending, CodeDuplicateCandidate},
 	{registry.ErrJurisdictionRestricted, CodeJurisdictionRestricted},

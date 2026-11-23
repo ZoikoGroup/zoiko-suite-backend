@@ -309,7 +309,7 @@ func newRouter(s *stubStore, authz *stubAuthZ, sod handler.SoDClient) chi.Router
 	return r
 }
 
-func doReq(r chi.Router, method, path string, body any, principalID string) *httptest.ResponseRecorder {
+func doReq(r chi.Router, method, path string, body any, principalID string, ifMatch string) *httptest.ResponseRecorder {
 	var buf bytes.Buffer
 	if body != nil {
 		_ = json.NewEncoder(&buf).Encode(body)
@@ -318,6 +318,9 @@ func doReq(r chi.Router, method, path string, body any, principalID string) *htt
 	req.Header.Set("Content-Type", "application/json")
 	if principalID != "" {
 		req.Header.Set("X-Principal-Id", principalID)
+	}
+	if ifMatch != "" {
+		req.Header.Set("If-Match", ifMatch)
 	}
 	rr := httptest.NewRecorder()
 	r.ServeHTTP(rr, req)
@@ -341,7 +344,7 @@ func delegationBody(delegator, correlationID string, from, to time.Time) map[str
 
 func TestCreateDelegation_MissingPrincipal(t *testing.T) {
 	r := newRouter(newStubStore(), &stubAuthZ{}, nil)
-	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(24*time.Hour)), "")
+	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(24*time.Hour)), "", "")
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 got %d", rr.Code)
 	}
@@ -350,7 +353,7 @@ func TestCreateDelegation_MissingPrincipal(t *testing.T) {
 func TestCreateDelegation_InvalidTimeWindow(t *testing.T) {
 	r := newRouter(newStubStore(), &stubAuthZ{}, nil)
 	now := time.Now()
-	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), now, now), "caller-1")
+	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), now, now), "caller-1", "")
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 got %d", rr.Code)
 	}
@@ -358,7 +361,7 @@ func TestCreateDelegation_InvalidTimeWindow(t *testing.T) {
 
 func TestCreateDelegation_DelegatorLacksAuthority(t *testing.T) {
 	r := newRouter(newStubStore(), &stubAuthZ{delegatorDenied: "delegator-1"}, nil)
-	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(24*time.Hour)), "caller-1")
+	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(24*time.Hour)), "caller-1", "")
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -368,7 +371,7 @@ func TestCreateDelegation_DelegatorLacksAuthority(t *testing.T) {
 func TestCreateDelegation_HappyPath(t *testing.T) {
 	store := newStubStore()
 	r := newRouter(store, &stubAuthZ{}, nil)
-	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(24*time.Hour)), "delegator-1")
+	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(24*time.Hour)), "delegator-1", "")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -390,7 +393,7 @@ func TestCreateDelegation_HappyPath(t *testing.T) {
 func TestCreateDelegation_OnBehalfIsProposed(t *testing.T) {
 	store := newStubStore()
 	r := newRouter(store, &stubAuthZ{}, nil)
-	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(24*time.Hour)), "caller-1")
+	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(24*time.Hour)), "caller-1", "")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -408,11 +411,11 @@ func TestCreateDelegation_IdempotentReplay(t *testing.T) {
 	correlationID := uuid.NewString()
 	r := newRouter(newStubStore(), &stubAuthZ{}, nil)
 
-	rr1 := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", correlationID, time.Now(), time.Now().Add(24*time.Hour)), "caller-1")
+	rr1 := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", correlationID, time.Now(), time.Now().Add(24*time.Hour)), "caller-1", "")
 	var d1 domain.DelegationGrant
 	_ = json.NewDecoder(rr1.Body).Decode(&d1)
 
-	rr2 := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", correlationID, time.Now(), time.Now().Add(24*time.Hour)), "caller-1")
+	rr2 := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", correlationID, time.Now(), time.Now().Add(24*time.Hour)), "caller-1", "")
 	var d2 domain.DelegationGrant
 	_ = json.NewDecoder(rr2.Body).Decode(&d2)
 
@@ -426,7 +429,7 @@ func TestCreateDelegation_IdempotentReplay(t *testing.T) {
 // createActiveDelegation has the delegator delegate their own authority,
 // which is the one path that is ACTIVE at once.
 func createActiveDelegation(t *testing.T, r chi.Router) domain.DelegationGrant {
-	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(24*time.Hour)), "delegator-1")
+	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(24*time.Hour)), "delegator-1", "")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("delegation setup failed: %d %s", rr.Code, rr.Body.String())
 	}
@@ -453,8 +456,8 @@ func seedLapsed(s *stubStore, delegator string) domain.DelegationGrant {
 // revokeReq revokes with the version the caller read and a reason, as every
 // protected change now must.
 func revokeReq(r chi.Router, id string, version int64, caller string) *httptest.ResponseRecorder {
-	return doReq(r, http.MethodPost, fmt.Sprintf("/v1/delegations/%s/revoke?expected_version=%d", id, version),
-		map[string]any{"reason": "no longer needed"}, caller)
+	return doReq(r, http.MethodPost, fmt.Sprintf("/v1/delegations/%s/revoke", id),
+		map[string]any{"reason": "no longer needed"}, caller, fmt.Sprintf(`"v%d"`, version))
 }
 
 func TestRevokeDelegation_HappyPath(t *testing.T) {
@@ -497,7 +500,7 @@ func TestListDelegations_LazilyExpiresDueGrants(t *testing.T) {
 	r := newRouter(store, &stubAuthZ{}, nil)
 	d := seedLapsed(store, "caller-1")
 
-	listRR := doReq(r, http.MethodGet, "/v1/delegations/", nil, "caller-1")
+	listRR := doReq(r, http.MethodGet, "/v1/delegations/", nil, "caller-1", "")
 	if listRR.Code != http.StatusOK {
 		t.Fatalf("expected 200 got %d", listRR.Code)
 	}
@@ -505,7 +508,7 @@ func TestListDelegations_LazilyExpiresDueGrants(t *testing.T) {
 		t.Errorf("expected 1 authority.expired event from the lazy sweep, got %d", store.countEvents(events.EventExpired))
 	}
 
-	getRR := doReq(r, http.MethodGet, "/v1/delegations/"+d.DelegationID, nil, "caller-1")
+	getRR := doReq(r, http.MethodGet, "/v1/delegations/"+d.DelegationID, nil, "caller-1", "")
 	var fetched domain.DelegationGrant
 	_ = json.NewDecoder(getRR.Body).Decode(&fetched)
 	if fetched.Status != domain.DelegationStatusExpired {

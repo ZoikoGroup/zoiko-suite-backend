@@ -14,6 +14,8 @@ package clients
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,21 +24,50 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	svcenvelope "zoiko.io/decision-support-svc/internal/envelope"
 )
 
 // GovernanceLogClient talks to governance-decision-log-svc.
+//
+// How the decision log is read (D2-2.F07, 11 Nov 2026). The read used to
+// carry X-Tenant-Id alone and decoded the answer as a bare array, which the
+// decision log has not returned since it gained paging ({"records": [...]}),
+// so every recommendation silently degraded to NO_HISTORY. It now:
+//   - decodes the page's records;
+//   - reads as this service's own principal (GOVERNANCE_DECISION_LOG_PRINCIPAL_ID,
+//     default svc-decision-support, granted GOVERNANCE_DECISION_READ): the
+//     sample is an aggregate precedent count, not a person's read of the ledger;
+//   - presents this service's workload certificate to the decision log's
+//     :8450 listener (GOVERNANCE_DECISION_LOG_MTLS_URL), where the identity gate
+//     admits it as a peer workload (IDENTITY_PEERS);
+//   - sends the full input envelope with a read purpose (register D-04, D-06).
 type GovernanceLogClient struct {
-	baseURL string
-	http    *http.Client
+	baseURL     string
+	http        *http.Client
+	principalID string
 }
 
-// NewGovernanceLogClient builds a client for baseURL, e.g.
+// DefaultGovernanceLogPrincipalID is the principal this service reads as.
+const DefaultGovernanceLogPrincipalID = "svc-decision-support"
+
+// GovernanceLogPurpose is the purpose sent on every read.
+const GovernanceLogPurpose = "decision_support_precedent"
+
+// NewGovernanceLogClient is the plain-HTTP client (local runs where the
+// decision log does not require a verified identity), e.g.
 // "http://governance-decision-log-svc:8083".
 func NewGovernanceLogClient(baseURL string) *GovernanceLogClient {
-	return &GovernanceLogClient{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		http:    &http.Client{Timeout: 5 * time.Second},
+	return NewGovernanceLogClientWithHTTPClient(baseURL, &http.Client{Timeout: 5 * time.Second}, DefaultGovernanceLogPrincipalID)
+}
+
+// NewGovernanceLogClientWithHTTPClient uses httpClient — the mTLS client
+// presenting this service's workload certificate — and reads as principalID.
+func NewGovernanceLogClientWithHTTPClient(baseURL string, httpClient *http.Client, principalID string) *GovernanceLogClient {
+	if strings.TrimSpace(principalID) == "" {
+		principalID = DefaultGovernanceLogPrincipalID
 	}
+	return &GovernanceLogClient{baseURL: strings.TrimRight(baseURL, "/"), http: httpClient, principalID: principalID}
 }
 
 // PriorDecision is the one field of a governance decision the precedent
@@ -45,12 +76,11 @@ type PriorDecision struct {
 	Outcome string `json:"outcome"` // GRANTED, DENIED, ESCALATED, ...
 }
 
-// HistoryQuery identifies the caller and the precedent being asked for.
+// HistoryQuery identifies the request and the precedent being asked for.
 //
-// The caller's principal and trace are forwarded: governance-decision-log-svc
-// authorizes ledger reads on GOVERNANCE_DECISION_READ and refuses a read
-// with no X-Principal-Id once DECISION_LOG_READ_AUTHZ=enforce (its config
-// names this service as one of the callers that used to send none).
+// The read is made as this service's own principal (see GovernanceLogClient);
+// PrincipalID records the human caller for the service's own audit trail and
+// is not sent. CorrelationID and RequestID carry the caller's trace.
 type HistoryQuery struct {
 	TenantID      string
 	PrincipalID   string
@@ -61,9 +91,23 @@ type HistoryQuery struct {
 	Limit         int
 }
 
-// ListPriorDecisions returns up to q.Limit most-recent governance decisions
-// for the given legal entity + action type.
-func (c *GovernanceLogClient) ListPriorDecisions(ctx context.Context, q HistoryQuery) ([]PriorDecision, error) {
+func newRequestID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// ListPriorDecisions returns up to limit most-recent governance decisions
+// for the given legal entity + action type. The correlation id comes from the
+// request's envelope when there is one.
+func (c *GovernanceLogClient) ListPriorDecisions(ctx context.Context, tenantID, legalEntityID, actionType string, limit int) ([]PriorDecision, error) {
+	return c.ListPriorDecisionsFor(ctx, HistoryQuery{
+		TenantID: tenantID, LegalEntityID: legalEntityID, ActionType: actionType, Limit: limit,
+	})
+}
+
+// ListPriorDecisionsFor is ListPriorDecisions carrying the caller's trace.
+func (c *GovernanceLogClient) ListPriorDecisionsFor(ctx context.Context, q HistoryQuery) ([]PriorDecision, error) {
 	query := url.Values{}
 	query.Set("entity", q.LegalEntityID)
 	query.Set("action", q.ActionType)
@@ -73,13 +117,30 @@ func (c *GovernanceLogClient) ListPriorDecisions(ctx context.Context, q HistoryQ
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("X-Tenant-Id", q.TenantID)
-	req.Header.Set("X-Principal-Id", q.PrincipalID)
-	req.Header.Set("X-Legal-Entity-Id", q.LegalEntityID)
-	req.Header.Set("X-Correlation-ID", q.CorrelationID)
-	req.Header.Set("X-Request-Id", q.RequestID)
-	req.Header.Set("X-Source-Channel", "system")
+	correlation := q.CorrelationID
+	if correlation == "" {
+		if env, ok := svcenvelope.FromContext(ctx); ok {
+			correlation = env.CorrelationID
+		}
+	}
+	if correlation == "" {
+		correlation = newRequestID()
+	}
+	requestID := q.RequestID
+	if requestID == "" {
+		requestID = newRequestID()
+	}
+	h := req.Header
+	h.Set("Accept", "application/json")
+	h.Set("X-Tenant-Id", q.TenantID)
+	h.Set("X-Principal-Id", c.principalID)
+	h.Set("X-Request-Id", requestID)
+	h.Set("X-Correlation-ID", correlation)
+	h.Set("X-Source-Channel", "system")
+	h.Set("X-Purpose-Context", GovernanceLogPurpose)
+	if q.LegalEntityID != "" {
+		h.Set("X-Legal-Entity-Id", q.LegalEntityID)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -91,11 +152,16 @@ func (c *GovernanceLogClient) ListPriorDecisions(ctx context.Context, q HistoryQ
 		return nil, fmt.Errorf("governance-decision-log-svc returned %d for GET /v1/decisions", resp.StatusCode)
 	}
 
-	var decisions []PriorDecision
-	if err := json.NewDecoder(resp.Body).Decode(&decisions); err != nil {
+	var page struct {
+		Records *[]PriorDecision `json:"records"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
 		return nil, fmt.Errorf("decode governance-decision-log-svc response: %w", err)
 	}
-	return decisions, nil
+	if page.Records == nil {
+		return nil, fmt.Errorf("decode governance-decision-log-svc response: no records array")
+	}
+	return *page.Records, nil
 }
 
 // ErrDecisionRefusedPermanently means the ledger answered 4xx: the record

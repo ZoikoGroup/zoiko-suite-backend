@@ -47,6 +47,11 @@ var (
 	// ErrUnavailable means the registry could not be consulted, so no decision
 	// exists. Never collapse this into ErrDenied — and never into an allow.
 	ErrUnavailable = errors.New("tenant context unavailable")
+
+	// ErrResidencyUnknown means the registry answered, and it holds no such
+	// residency policy (or the policy names no region it can state). A gap, not
+	// an outage: on a material write the gateway fails closed on it.
+	ErrResidencyUnknown = errors.New("residency policy not resolvable")
 )
 
 // Context is the authoritative context resolved for one request.
@@ -75,11 +80,29 @@ type Resolver struct {
 
 	mu    sync.RWMutex
 	cache map[string]entry
+
+	// resCache holds residency lookups keyed by policy id, under the same
+	// mutex and ttl as cache. Unlike context, residency is never served stale:
+	// the write it gates must act on a policy the registry confirmed now, and
+	// an unreachable registry leaves the gate undecided (503), not guessed.
+	resCache map[string]residencyEntry
 }
 
 type entry struct {
 	ctx      envelope.ResolvedContext
 	resolved time.Time
+}
+
+type residencyEntry struct {
+	res      Residency
+	resolved time.Time
+}
+
+// Residency is the residency posture the registry holds for one policy id:
+// how strict it is, and the region code it pins.
+type Residency struct {
+	Mode       string
+	RegionCode string
 }
 
 // New builds a Resolver against tenant-entity-registry-svc.
@@ -209,4 +232,58 @@ func (r *Resolver) Invalidate(tenantID, legalEntityID string) {
 		return
 	}
 	r.invalidate(tenantID + "\x00" + legalEntityID)
+}
+
+// Residency resolves one residency policy to its mode and pinned region code,
+// composing the registry's two reads (GET /v1/residency-policies/{id} then
+// GET /v1/residency-regions/{id}) into the pair the gateway's gate compares
+// against X-Zoiko-Resolved-Region.
+//
+// A policy naming no region, or one the registry does not hold, is
+// ErrResidencyUnknown; an unreachable registry is ErrUnavailable. The two are
+// never collapsed: the first fails a write closed, the second is an outage.
+// Reads are never blocked by either — mirroring Resolve, where only writes
+// demand a confirmed context.
+func (r *Resolver) Residency(ctx context.Context, tenantID, policyID string) (Residency, error) {
+	if r == nil {
+		return Residency{}, ErrUnavailable
+	}
+	if policyID == "" {
+		return Residency{}, ErrResidencyUnknown
+	}
+
+	r.mu.RLock()
+	e, ok := r.resCache[policyID]
+	r.mu.RUnlock()
+	if ok && time.Since(e.resolved) <= r.ttl {
+		return e.res, nil
+	}
+
+	pol, err := r.inner.ResolveResidencyPolicy(ctx, tenantID, policyID)
+	if err != nil {
+		if errors.Is(err, envelope.ErrResidencyUnknown) {
+			return Residency{}, ErrResidencyUnknown
+		}
+		return Residency{}, ErrUnavailable
+	}
+
+	out := Residency{Mode: pol.Mode}
+	if pol.RegionID != "" {
+		code, rerr := r.inner.ResolveResidencyRegion(ctx, tenantID, pol.RegionID)
+		if rerr != nil {
+			if errors.Is(rerr, envelope.ErrResidencyUnknown) {
+				return Residency{}, ErrResidencyUnknown
+			}
+			return Residency{}, ErrUnavailable
+		}
+		out.RegionCode = code
+	}
+
+	r.mu.Lock()
+	if r.resCache == nil {
+		r.resCache = make(map[string]residencyEntry)
+	}
+	r.resCache[policyID] = residencyEntry{res: out, resolved: time.Now()}
+	r.mu.Unlock()
+	return out, nil
 }

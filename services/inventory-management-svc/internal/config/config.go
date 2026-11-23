@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -9,6 +10,11 @@ import (
 type Config struct {
 	Env  string
 	Port int
+
+	// EventResidencyRegion (EVENT_RESIDENCY_REGION, e.g. uk or eu-west) is stamped on every event
+	// written to the shared eventing outbox (the BIZ-07 offering events). Required: an event with a
+	// guessed region is worse than a service that refuses to start.
+	EventResidencyRegion string
 
 	DB DBConfig
 
@@ -31,6 +37,13 @@ type Config struct {
 	// accrues a receipt (its GRNI_DEBIT_MAPPING_KEY); INV-04 credits it
 	// when it reclasses that cost into inventory. Must match AP-03.
 	GRNIReclassMappingKey string
+	// ACC-02 mapping keys for the legacy (non-kernel) posting path. The
+	// ledger owns account resolution; this service never sends a raw GL
+	// account code on the posting path.
+	InventoryMappingKey        string
+	COGSMappingKey             string
+	WriteDownExpenseMappingKey string
+	LandedCostOffsetMappingKey string
 
 	// AuthzMTLSEnabled turns on the mTLS pilot for calls to authorization-svc.
 	// OFF by default — when false, nothing about the existing authz call
@@ -74,7 +87,12 @@ type KafkaConfig struct {
 }
 
 func Load() (*Config, error) {
+	region := strings.TrimSpace(os.Getenv("EVENT_RESIDENCY_REGION"))
+	if region == "" {
+		return nil, fmt.Errorf("EVENT_RESIDENCY_REGION is required (the residency region stamped on every shared-outbox event)")
+	}
 	return &Config{
+		EventResidencyRegion: region,
 		Env:  env("ENV", "local"),
 		Port: envInt("PORT", 8168),
 		DB: DBConfig{
@@ -90,13 +108,18 @@ func Load() (*Config, error) {
 			GroupID: env("KAFKA_GROUP_ID", "inventory-management-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.inventory.events"),
 		},
-		AuthZServiceURL:  env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
-		CloseServiceURL:  env("CLOSE_SERVICE_URL", "http://financial-close-svc:8104"),
-		LedgerServiceURL: env("LEDGER_SERVICE_URL", "http://general-ledger-svc:8098"),
+		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		CloseServiceURL:      env("CLOSE_SERVICE_URL", "http://financial-close-svc:8104"),
+		LedgerServiceURL:     env("LEDGER_SERVICE_URL", "http://general-ledger-svc:8098"),
 		LedgerKernelBookID:   env("LEDGER_KERNEL_BOOK_ID", ""),
 		LedgerKernelCurrency: env("LEDGER_KERNEL_CURRENCY", ""),
 
 		GRNIReclassMappingKey: env("GRNI_RECLASS_MAPPING_KEY", "AP_GRNI_EXPENSE"),
+
+		InventoryMappingKey:        env("INVENTORY_MAPPING_KEY", "INVENTORY"),
+		COGSMappingKey:             env("COGS_MAPPING_KEY", "COGS"),
+		WriteDownExpenseMappingKey: env("WRITE_DOWN_EXPENSE_MAPPING_KEY", "INVENTORY_WRITE_DOWN_EXPENSE"),
+		LandedCostOffsetMappingKey: env("LANDED_COST_OFFSET_MAPPING_KEY", "LANDED_COST_PAYABLE"),
 
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),

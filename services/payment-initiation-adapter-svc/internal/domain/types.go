@@ -140,6 +140,43 @@ type PaymentInitiationAttempt struct {
 	UpdatedAt            time.Time
 }
 
+// PaymentAttemptSummary is ListPaymentAttempts' list-row shape
+// (SPEC_DEVIATIONS A1) — deliberately narrower than
+// PaymentInitiationAttempt. payer_account_ref, payee_ref,
+// authorization_fingerprint, idempotency_key, payment_reference and the
+// free-text resolution notes are excluded: bulk-enumerating them across
+// every attempt for a legal entity is a materially larger exposure than a
+// caller already authorized to read one attempt at a time seeing them via
+// GetPaymentAttempt, which is exactly Invariant 2's "raw values never
+// appear in list APIs" concern. Everything an operator needs to answer
+// "which attempts are PENDING_UNKNOWN/SUBMITTING for this entity" is here.
+type PaymentAttemptSummary struct {
+	AttemptID            string
+	LegalEntityID        string
+	SourceReference      string
+	Amount               Decimal
+	Currency             string
+	Status               AttemptStatus
+	ExecutionDate        time.Time
+	CreatedByPrincipalID string
+	SubmittedAt          *time.Time
+	ResolvedAt           *time.Time
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
+}
+
+// ListPaymentAttemptsFilter: LegalEntityID is mandatory (there is no
+// tenant-wide list — the same scoping GetPaymentAttempt's authorization
+// already requires). Status is optional; AfterID/Limit are a keyset cursor
+// over (created_at, attempt_id) DESC, not plain offset pagination, so a
+// concurrent insert/update never shifts a page's contents.
+type ListPaymentAttemptsFilter struct {
+	LegalEntityID string
+	Status        string
+	AfterID       string
+	Limit         int
+}
+
 type AttemptEvent struct {
 	EventID          string
 	TenantID         *string

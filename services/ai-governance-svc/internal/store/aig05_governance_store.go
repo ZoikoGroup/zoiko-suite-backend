@@ -194,7 +194,7 @@ func (s *PgStore) ReportIncident(ctx context.Context, req domain.ReportIncidentR
 	}
 
 	in, err := scanIncident(tx.QueryRow(ctx, `
-		INSERT INTO ai_incidents (severity, model_release_id, use_case_id, exception_case_ref, description, reported_by_principal_id)
+		INSERT INTO ai_incident_records (severity, model_release_id, use_case_id, exception_case_ref, description, reported_by_principal_id)
 		VALUES ($1, $2, $3, $4, $5, $6)
 		RETURNING `+incidentColumns,
 		req.Severity, modelReleaseIDPtr, useCaseIDPtr, exceptionCaseRefPtr, req.Description, actor))
@@ -229,7 +229,7 @@ func severityAction(s domain.IncidentSeverity) string {
 }
 
 func (s *PgStore) GetIncident(ctx context.Context, incidentID string) (*domain.AIIncident, error) {
-	in, err := scanIncident(s.pool.QueryRow(ctx, `SELECT `+incidentColumns+` FROM ai_incidents WHERE incident_id = $1`, incidentID))
+	in, err := scanIncident(s.pool.QueryRow(ctx, `SELECT `+incidentColumns+` FROM ai_incident_records WHERE incident_id = $1`, incidentID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrIncidentNotFound
 	}
@@ -237,7 +237,7 @@ func (s *PgStore) GetIncident(ctx context.Context, incidentID string) (*domain.A
 }
 
 func loadIncidentForUpdate(ctx context.Context, tx pgx.Tx, incidentID string) (*domain.AIIncident, error) {
-	in, err := scanIncident(tx.QueryRow(ctx, `SELECT `+incidentColumns+` FROM ai_incidents WHERE incident_id = $1 FOR UPDATE`, incidentID))
+	in, err := scanIncident(tx.QueryRow(ctx, `SELECT `+incidentColumns+` FROM ai_incident_records WHERE incident_id = $1 FOR UPDATE`, incidentID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrIncidentNotFound
 	}
@@ -262,7 +262,7 @@ func (s *PgStore) ContainIncident(ctx context.Context, incidentID string, req do
 		return nil, domain.ErrIncidentNotOpen
 	}
 	updated, err := scanIncident(tx.QueryRow(ctx, `
-		UPDATE ai_incidents SET incident_state = 'CONTAINED', containment_action = $2, contained_at = now()
+		UPDATE ai_incident_records SET incident_state = 'CONTAINED', containment_action = $2, contained_at = now()
 		WHERE incident_id = $1 RETURNING `+incidentColumns,
 		incidentID, req.ContainmentAction))
 	if err != nil {
@@ -289,7 +289,7 @@ func (s *PgStore) ResolveIncident(ctx context.Context, incidentID string, req do
 		return nil, domain.ErrIncidentNotContained
 	}
 	updated, err := scanIncident(tx.QueryRow(ctx, `
-		UPDATE ai_incidents SET incident_state = 'RESOLVED', root_cause = $2, corrective_actions = $3, resolved_at = now()
+		UPDATE ai_incident_records SET incident_state = 'RESOLVED', root_cause = $2, corrective_actions = $3, resolved_at = now()
 		WHERE incident_id = $1 RETURNING `+incidentColumns,
 		incidentID, req.RootCause, req.CorrectiveActions))
 	if err != nil {
@@ -316,7 +316,7 @@ func (s *PgStore) CloseIncident(ctx context.Context, incidentID string, req doma
 		return nil, domain.ErrIncidentNotResolved
 	}
 	updated, err := scanIncident(tx.QueryRow(ctx, `
-		UPDATE ai_incidents SET incident_state = 'CLOSED', closure_evidence = $2, closed_at = now(), closed_by_principal_id = $3
+		UPDATE ai_incident_records SET incident_state = 'CLOSED', closure_evidence = $2, closed_at = now(), closed_by_principal_id = $3
 		WHERE incident_id = $1 RETURNING `+incidentColumns,
 		incidentID, req.ClosureEvidence, actor))
 	if err != nil {
@@ -347,7 +347,7 @@ func (s *PgStore) ReactivateRelease(ctx context.Context, modelReleaseID string, 
 		return nil, domain.ErrInvalidReleaseTransition
 	}
 
-	incident, err := scanIncident(tx.QueryRow(ctx, `SELECT `+incidentColumns+` FROM ai_incidents WHERE incident_id = $1`, req.IncidentID))
+	incident, err := scanIncident(tx.QueryRow(ctx, `SELECT `+incidentColumns+` FROM ai_incident_records WHERE incident_id = $1`, req.IncidentID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrReactivationIncidentNotFound
 	}

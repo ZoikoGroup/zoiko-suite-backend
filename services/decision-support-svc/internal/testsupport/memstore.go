@@ -212,8 +212,8 @@ type History struct {
 	Queries   []clients.HistoryQuery
 }
 
-// ListPriorDecisions implements service.HistorySource.
-func (h *History) ListPriorDecisions(_ context.Context, q clients.HistoryQuery) ([]clients.PriorDecision, error) {
+// ListPriorDecisionsFor implements service.HistorySource.
+func (h *History) ListPriorDecisionsFor(_ context.Context, q clients.HistoryQuery) ([]clients.PriorDecision, error) {
 	h.Queries = append(h.Queries, q)
 	if h.Err != nil {
 		return nil, h.Err

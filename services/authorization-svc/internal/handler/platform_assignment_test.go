@@ -44,6 +44,7 @@ func platformPost(s *stubStore, path, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "tenant-admin")
 	req.Header.Set("X-Tenant-Id", platformTenant)
+	req.Header.Set("If-Match", "*") // required on assignment mutations (AZ-1)
 	w := httptest.NewRecorder()
 	platformRouter(s).ServeHTTP(w, req)
 	return w

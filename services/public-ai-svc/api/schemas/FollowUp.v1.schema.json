@@ -1,0 +1,29 @@
+{
+  "$id": "https://schemas.zoikosuite.com/public-ai/FollowUp.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "An approved question from the Doc 02 menu and follow-up map (ADR-008). Never chosen by the model.",
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "intent_id": {
+      "pattern": "^(I(0[1-9]|[12][0-9]|30)|X(0[1-9]|10))$",
+      "type": "string"
+    },
+    "label": {
+      "type": "string"
+    },
+    "message": {
+      "description": "Fixed message the widget sends; it classifies to intent_id.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "label",
+    "intent_id",
+    "message"
+  ],
+  "type": "object"
+}

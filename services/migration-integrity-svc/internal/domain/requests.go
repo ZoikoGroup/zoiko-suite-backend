@@ -43,6 +43,18 @@ type ValidateMigrationRequest struct {
 	// ControlTotals is the source manifest's declaration the batch is
 	// reconciled against (§17, MIG-INV-15). Required.
 	ControlTotals *ControlTotalsDeclaration `json:"control_totals"`
+
+	// SourceExtractID, when provided, is a registered, immutable
+	// SourceExtract's id (not its business extract_id) this validation run
+	// checks against (MIG-INV-03). Optional, for backward compatibility: a
+	// caller that omits it validates the submitted records directly, exactly
+	// as this endpoint behaved before SourceExtract existed. When provided,
+	// the handler requires the extract's legal_entity_id to match
+	// LegalEntityID and its RecordCount to match len(Records) -- the frozen
+	// extract and what is being validated against it must be the same
+	// population, or a retry could silently validate different records under
+	// the same extract's name.
+	SourceExtractID string `json:"source_extract_id,omitempty"`
 }
 
 // ControlTotalsDeclaration is what the source manifest says the batch holds.

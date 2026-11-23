@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"zoiko.io/commercial-account-svc/internal/domain"
-	"zoiko.io/commercial-account-svc/internal/outbox"
+	svcmiddleware "zoiko.io/commercial-account-svc/internal/middleware"
 )
 
 func (s *PgStore) CreatePriceCatalog(ctx context.Context, c *domain.PriceCatalog) error {
@@ -167,14 +167,7 @@ func (s *PgStore) CreateSubscription(ctx context.Context, sub *domain.Commercial
 		return fmt.Errorf("insert subscription: %w", err)
 	}
 
-	tenantID := sub.CommercialAccountID
-	if err := outbox.Insert(ctx, tx, outbox.Event{
-		AggregateType: "commercial_subscription",
-		AggregateID:   sub.SubscriptionID,
-		EventType:     "commercial_subscription.created",
-		Payload:       sub,
-		TenantID:      &tenantID,
-	}); err != nil {
+	if err := s.emit(ctx, tx, "commercial_subscription.created", "commercial_subscription", sub.SubscriptionID, svcmiddleware.TenantFromContext(ctx), sub.CreatedByPrincipalID, sub); err != nil {
 		return err
 	}
 
@@ -282,13 +275,8 @@ func (s *PgStore) TransitionSubscriptionStatus(ctx context.Context, subscription
 		return fmt.Errorf("insert status event: %w", err)
 	}
 
-	if err := outbox.Insert(ctx, tx, outbox.Event{
-		AggregateType: "commercial_subscription", AggregateID: subscriptionID,
-		EventType: "commercial_subscription.status_changed",
-		Payload: map[string]any{
-			"subscription_id": subscriptionID, "previous_status": currentStatus, "new_status": string(newStatus),
-		},
-		TenantID: &commercialAccountID,
+	if err := s.emit(ctx, tx, "commercial_subscription.status_changed", "commercial_subscription", subscriptionID, svcmiddleware.TenantFromContext(ctx), principalID, map[string]any{
+		"subscription_id": subscriptionID, "previous_status": currentStatus, "new_status": string(newStatus),
 	}); err != nil {
 		return err
 	}
@@ -367,11 +355,7 @@ func (s *PgStore) CreateBillingSourceTransfer(ctx context.Context, transfer *dom
 		return fmt.Errorf("insert billing source transfer: %w", err)
 	}
 
-	tenantID := transfer.CommercialAccountID
-	if err := outbox.Insert(ctx, tx, outbox.Event{
-		AggregateType: "billing_source_transfer", AggregateID: transfer.TransferID,
-		EventType: "commercial_subscription.billing_source_transferred", Payload: transfer, TenantID: &tenantID,
-	}); err != nil {
+	if err := s.emit(ctx, tx, "commercial_subscription.billing_source_transferred", "billing_source_transfer", transfer.TransferID, svcmiddleware.TenantFromContext(ctx), transfer.CreatedByPrincipalID, transfer); err != nil {
 		return err
 	}
 
@@ -696,13 +680,8 @@ func (s *PgStore) ApplyChangeRequest(ctx context.Context, changeRequestID string
 		return nil, fmt.Errorf("update change request: %w", err)
 	}
 
-	if err := outbox.Insert(ctx, tx, outbox.Event{
-		AggregateType: "commercial_subscription", AggregateID: subscriptionID,
-		EventType: "commercial_subscription.plan_changed",
-		Payload: map[string]any{
-			"subscription_id": subscriptionID, "target_plan_id": targetPlanID, "change_request_id": changeRequestID,
-		},
-		TenantID: &commercialAccountID,
+	if err := s.emit(ctx, tx, "commercial_subscription.plan_changed", "commercial_subscription", subscriptionID, svcmiddleware.TenantFromContext(ctx), "", map[string]any{
+		"subscription_id": subscriptionID, "target_plan_id": targetPlanID, "change_request_id": changeRequestID,
 	}); err != nil {
 		return nil, err
 	}

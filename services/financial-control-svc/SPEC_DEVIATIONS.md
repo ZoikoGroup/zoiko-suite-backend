@@ -56,27 +56,50 @@ policies a run pins.
   the target as it now stands) instead of a 409/412. The same key used for
   another target or decision is a 409. Migration 000008 adds the
   `exception_id` an exception transition needs, and widens `command`.
-- **A4. Tolerance and materiality approval is self-declared.**
-  `CreateTolerancePolicy` / `CreateMaterialityPolicy` take `approved_by` as a
-  free-text body field; the only check is `approved_by != caller`. No second
-  authenticated actor ever approves, so one principal can create and "approve"
-  a wider tolerance by typing a colleague's id. §11 ("policy change requires
-  governed configuration change") and §27 ("Finance Control Policy authority")
-  require a real approval; rule versions already do it properly
-  (`…/rule-versions/{version}/approve`). Scope: create policies in a pending
-  state, add an approve endpoint with its own action, and make run creation
-  resolve only approved versions. Also missing: any read endpoint for
-  materiality policies (create only).
-- **A5. No manual match (§10).** Matching is fully automatic; there is no
-  command to pair two records manually with permission, reason and evidence.
-  Consequences: an unmatched pair that a human can explain can only be
-  resolved through remediation + reperformance, waiver or carry-forward;
-  reconciliation-intelligence-svc's suggestions have no command here to act
-  through; and the §28 manual-match-rate metric is reported as unavailable
-  (`internal/domain/monitoring.go`). Scope: `POST /controls/v1/runs/{id}/manual-matches`
-  with the §10/§27 rules — explicit permission, reason, evidence reference,
-  amounts must agree within the run's pinned tolerance (scenario 06), blocked
-  where an own-transaction rule applies.
+- **A4. Tolerance and materiality approval is self-declared. — Closed (B10).**
+  `CreateTolerancePolicy` / `CreateMaterialityPolicy` no longer accept
+  `approved_by` at all: a policy is created pending (`approved_by`/
+  `approved_at` both NULL) and independently approved through
+  `POST …/tolerance-policies/{id}/approve` and
+  `…/materiality-policies/{id}/approve`, gated by a new `FINCTRL_APPROVE_POLICY`
+  action (migration 000010 here; access-control-svc migration 000023 registers
+  it, the same deployment prerequisite A1/B6 needed for `FINCTRL_REVOKE`). The
+  creator cannot approve their own policy (`ErrSelfApproval`, mirroring
+  `ApproveRuleVersion`), an approved policy cannot be re-approved, and the
+  approval triggers (`trg_immutable_tolerance`/`trg_immutable_materiality`,
+  previously blanket-append-only) were replaced with
+  `guard_tolerance_policy`/`guard_materiality_policy`, mirroring
+  `control_rule_versions`' own `guard_rule_version`: only an unapproved row
+  may be updated, and only its approval columns may change. `CreateRun`'s
+  tolerance/materiality resolution — both the named-id path and the
+  latest-effective fallback — now requires `approved_by IS NOT NULL`, the
+  same condition the rule-version resolution already enforced; a pending
+  policy is never pinned to a run, named or not. `ListMaterialityPolicies`
+  (`GET /controls/v1/materiality-policies`) closes the missing read endpoint.
+- **A5. No manual match (§10). — Closed (B11), one sub-item not enforced.**
+  `POST /controls/v1/runs/{run_id}/manual-matches` (`FINCTRL_MANUAL_MATCH`,
+  access-control-svc migration 000024) records a human-asserted pairing of
+  records a run's automatic matching left unmatched: explicit permission,
+  mandatory `reason` and `evidence_ref`, amounts summed from the run's own
+  frozen side A/B populations and compared against the run's pinned
+  tolerance exactly as the engine does (absolute only — the engine itself
+  does not yet combine a percentage tolerance into execution, a pre-existing
+  gap this does not invent a fix for). A difference beyond that tolerance is
+  refused outright, never recorded (§10 "cannot hide amount difference"), a
+  different currency on each side is refused (no FX without an approved
+  basis), an unknown record id is refused, and a certified run's manual
+  matches are refused (Invariant 2/9: sealed evidence). Rows live in their
+  own `manual_matches` table, not `match_results` — a manual match has no
+  algorithm version to record (Invariant 16), and conflating the two would
+  misrepresent a human decision as an algorithmic one. `GET
+  .../manual-matches` lists them. The §28 `manual_match_rate` signal is now
+  computed (`internal/domain/monitoring.go`), not reported unavailable.
+  **Not enforced:** §27's "blocked if own-transaction rule applies" — no
+  population record this service receives carries who created or posted it
+  (`control-population-contract.md` defines no such field, confirmed by
+  re-reading it for this change), so there is no input to enforce that rule
+  against. This is the same class of gap as A8 (cross-currency, blocked on
+  an FX-rate capability this service lacks), not an oversight.
 - **A6. Run-level reperformance is not implemented.** The `REMEDIATION` and
   `REPERFORMANCE` lifecycle states exist but nothing enters them, and §25's
   `POST /runs/{id}:reperform` has no equivalent. Reperformance is recorded per
@@ -176,9 +199,9 @@ policies a run pins.
   certification (the certifier cannot have created or acted on the run) and
   every waiver (not by the exception owner). There is no per-control policy to
   relax it.
-- **B5. ZS-EVENT-001 CloudEvents naming is not used.** Events use the
-  platform's shared envelope with ZS-EVENT attributes as extra fields; a
-  platform-wide decision is needed (closure §5).
+- **B5. ZS-EVENT-001 CloudEvents naming is not used.** *Superseded by B10.*
+  Events now use the shared CloudEvents-aligned envelope (`services/eventing`),
+  which still carries the legacy fields the audit store reads.
 - **B6. How certification revocation works (A1).**
   - *State.* Only the certification dimension moves, CERTIFIED → REVOKED.
     `domain.ValidateCertificationRevocation` admits it only on a lifecycle
@@ -387,3 +410,88 @@ policies a run pins.
     resolved one being reported again after a re-apply. Otherwise it drops
     the table. The same `DO $$ … RAISE EXCEPTION` guard as 000006/000007,
     with a table check so it can be re-run.
+- **B10. Events go through the shared transactional outbox (tracker #63).**
+  `internal/outbox` and `internal/events` are retired.
+  - *One helper.* `enqueueEvent` (`internal/store/eventing.go`) builds every
+    event. `emit` (aggregate `control-run`) and `emitException` (aggregate
+    `control-exception`) are one-line wrappers over it.
+    - It runs `outbox.Enqueue` on the command's own transaction, which is
+      still one INSERT.
+    - The shared relay in `cmd/server` delivers the events. It uses leased
+      claims, bounded backoff, a broker probe, quarantine and `acks=all`.
+    - Migration 000012 adds `eventing_outbox` as `outbox.SchemaSQL` plus
+      `outbox.HardeningSQL`, both verbatim. `VerifySchema` gates startup.
+  - *Event names.* ZS-CONTROL-001 §26 ("Domain Event Contract") names the
+    events `control.run.certified`, `control.exception.sla_breached` and so
+    on. ZS-EVENT-001 §5.1 requires
+    `com.zoikosuite.<domain>.<aggregate>.<past-tense-fact>` in lower-case
+    kebab form. The Event Catalogue's §19 inventory lists no family for this
+    producer: its "Governance & Control" family is `governance.*` platform
+    events.
+    - So the canonical type keeps §26's own words, prefixed and kebab-cased:
+      `com.zoikosuite.control.run.ready-for-certification`.
+    - Every §26 name is still emitted as the legacy `event_type`.
+    - `TestEventingOutbox_CanonicalTypes` lists all 21 types.
+  - *Aggregate version.* Run events carry the run's post-change version as
+    `aggregateversion`. The old publisher read the same value from the
+    payload's `version`.
+  - *Classification and region.* `EVENT_RESIDENCY_REGION` and
+    `EVENT_CLASSIFICATION` are now required at startup, with no default.
+    - Before, a blank value was published as `UNSPECIFIED`, which the shared
+      envelope rejects.
+    - Both stay per-deployment decisions; the service does not pick a
+      classification.
+  - *RLS on the outbox (a change to 000001's design).* 000001 left
+    `outbox_events` without RLS because its relay polled every tenant with
+    no tenant scope set. The shared relay marks its transactions with
+    `app.outbox_relay`, so `eventing_outbox` now has the same isolation as
+    every tenant table: own tenant, or the relay.
+    - Every event write runs in `withRLS`, which sets `app.tenant_id`. That
+      includes the sweeper and the late-data check, which apply each change
+      under that row's tenant. So the policy refuses no legitimate writer.
+    - The policy casts only the setting:
+      `tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid::text`.
+      The policies in 000001 compare as UUID, so a request may spell its
+      tenant in upper case. A plain text comparison would refuse that
+      request's event write and fail the command.
+    - The stored `tenant_id` is always canonical text, and the column is
+      never cast, so no row can make the relay's scan raise.
+  - *Carry-over.* Undelivered `outbox_events` rows are carried over, rebuilt
+    as the body the old publisher sent.
+    - `event_id` is the old `outbox_event_id`, which was already the stable
+      `X-Event-ID`.
+    - `tenant_id` and `legal_entity_id` are cast explicitly from UUID to
+      text.
+    - The old relay's dead letters (`publish_attempts >= 10`) arrive
+      `quarantined`.
+    - An unmapped aggregate type fails the migration atomically.
+    - `published_at`, `residency_region` and `classification` are left out
+      of the rebuilt body. The old publisher stamped them at publish time.
+    - `outbox_events` is kept as delivery evidence (ZS-EVENT-001 §6.1).
+  - *Ordering.* The partition key is the library's
+    `sha256(tenant 0x00 aggregate 0x00 id)`. The old one was
+    `sha256(tenant ":" id)`. Ordering is still per aggregate, as before.
+  - *Consumer-visible body changes.*
+    - The legacy fields the audit store reads are kept: `event_type`,
+      `emitted_at`, `schema_version`, `source_service`, `payload`, plus the
+      tenant, entity, actor and correlation.
+    - The old extra attributes now use their canonical names:
+      `aggregate_id` becomes `aggregateid`, `payload_hash` becomes
+      `payloadhash`, `residency_region` becomes `residencyregion`.
+    - `event_version` and `aggregate_type` are no longer in the body.
+    - The SLA sweep's events keep their existing correlation id `sweep`.
+  - *Verification* (`internal/store/eventing_outbox_integration_test.go`,
+    `-tags integration`):
+    - all seven call sites, each step's exact events, keys, actor,
+      correlation, entity and version;
+    - a forced rollback, and a failed enqueue that rolls back the run and
+      its idempotency record;
+    - a replay adds nothing;
+    - isolation as a NOSUPERUSER NOBYPASSRLS role, including an upper-case
+      tenant;
+    - the shared relay delivers both tenants' events and retries under the
+      same id;
+    - the carry-over, including casts, quarantine and relay delivery;
+    - an unmapped aggregate fails the migration.
+    - Three deliberate breakages were each caught: dropped correlation,
+      exception events keyed on the run, and a text-compare policy.

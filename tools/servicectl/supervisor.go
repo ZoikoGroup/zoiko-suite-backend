@@ -93,7 +93,7 @@ type Supervisor struct {
 	// IdleTTL stops a service that nothing has asked for in this long. Zero
 	// disables reaping. This is the half of "only runs when I am on that page"
 	// that is easy to forget: without it, visiting every page once leaves all
-	// 86 running.
+	// 87 running.
 	IdleTTL time.Duration
 
 	// StartTimeout bounds build-plus-boot for one service.
@@ -281,10 +281,11 @@ func portBusy(port int) bool {
 	return true
 }
 
-// healthPaths are probed in order. 75 services expose /healthz and
-// identity-context-svc exposes /health, so both are tried rather than making
-// the registry carry a per-service path that is right 75 times out of 76.
-var healthPaths = []string{"/healthz", "/health"}
+// healthPaths are probed in order. Most services expose /healthz,
+// identity-context-svc exposes /health, and public-ai-svc exposes
+// /health/ready, so all three are tried rather than making the registry carry
+// a per-service path.
+var healthPaths = []string{"/healthz", "/health", "/health/ready"}
 
 // waitHealthy polls until the service answers, the context expires, or dead is
 // closed. dead may be nil when there is no child of ours to watch, which is the
@@ -684,7 +685,7 @@ func (s *Supervisor) Running() []string {
 }
 
 // ReapLoop stops services nothing has asked for in IdleTTL. This is the other
-// half of starting on demand: without it, visiting every page once leaves all 86
+// half of starting on demand: without it, visiting every page once leaves all 87
 // services running for the rest of the session.
 func (s *Supervisor) ReapLoop(ctx context.Context, onReap func(string, time.Duration)) {
 	if s.IdleTTL <= 0 {

@@ -24,10 +24,16 @@
 // What IS real, not fabricated:
 //   - ProposePayeeDestination verifies the named party against
 //     counterparty-management-svc's real GET /v1/counterparties/{id} —
-//     confirms it exists and belongs to the right legal entity. The client
-//     also returns Status and ComplianceStatus, but this service does not
-//     yet enforce them; that is a real gap against the spec's
-//     "Server-resolved context" line (see SPEC_DEVIATIONS A3).
+//     confirms it exists, belongs to the right legal entity, and is in
+//     eligible standing (PartyEligibleForDestination: not SUSPENDED/
+//     TERMINATED, not REJECTED compliance). It also validates the account
+//     identifier's format against its stated country (ValidateAccountFormat
+//     — a real IBAN mod-97 checksum for IBAN-using countries), and
+//     classifies the candidate's change risk against the party/scope's
+//     current active destination, if any (ChangeRiskClassification,
+//     PriorDestinationID). Sanctions/fraud screening is still not wired —
+//     see SPEC_DEVIATIONS A3 for why this session did not force an
+//     integration with vendor-due-diligence-svc.
 //   - The literal enforcement of the spec's own "Minimum service
 //     acceptance" #1 ("invoice-supplied bank data never activates
 //     destination"): a destination candidate whose SourceType is
@@ -139,6 +145,40 @@ func CanProposeVerification(s DestinationStatus) bool {
 	return s == StatusCandidate || s == StatusVerificationPending
 }
 
+// Change-risk classification — the literal fix for §4.10's "server-resolved
+// context" line's "change-risk classification; prior version." Computed at
+// propose time by comparing the new candidate against the party/scope's
+// current ACTIVE destination, if any: a party/scope with no active
+// destination gets a first-time NEW_DESTINATION classification; a
+// party/scope that already has one gets DESTINATION_CHANGE, and
+// PriorDestinationID records exactly which prior version it is being
+// compared against — the spec's own "prior version" context, named
+// alongside change-risk classification for this reason. This is a
+// classification on the existing payee_destinations row (migration 000010),
+// not a separate ChangeRiskRecord object (see SPEC_DEVIATIONS A2, still
+// open).
+const (
+	ChangeRiskNewDestination    = "NEW_DESTINATION"
+	ChangeRiskDestinationChange = "DESTINATION_CHANGE"
+)
+
+// PartyEligibleForDestination is the literal fix for §4.10's "server-resolved
+// context" line's "party status" clause: a destination candidate is refused
+// for a party that is not in reasonable standing with counterparty-
+// management-svc (ORG-07). SUSPENDED/TERMINATED are blocked/inactive;
+// REJECTED compliance is non-compliant. ONBOARDING status and PENDING
+// compliance are NOT refused here — neither is "blocked/inactive" or
+// "non-compliant" in ORG-07's own status model, and refusing them would
+// block the normal onboarding flow a new counterparty goes through before
+// its compliance review concludes.
+func PartyEligibleForDestination(status, complianceStatus string) bool {
+	switch status {
+	case "SUSPENDED", "TERMINATED":
+		return false
+	}
+	return complianceStatus != "REJECTED"
+}
+
 // CanApprove/ApprovePayeeDestination moves VERIFIED -> APPROVAL_PENDING.
 // The spec's own state model names APPROVAL_PENDING but its command list
 // has no separate command to reach it before Approve, and no distinct
@@ -163,10 +203,18 @@ type PayeeDestination struct {
 	FinancialInstitution string
 	AccountIdentifier    string // full value — see package doc's honest gap on at-rest encryption
 	AccountLast4         string // masked display value, always safe to return
-	CountryCode          string
-	Currency             string
-	PayeeName            string
-	SourceType           SourceType
+
+	// AccountIdentifierToken is this destination's row in
+	// payee_destination_identifier_tokens (migration 000007), or "" when it
+	// has none. Never serialized. Non-empty is the ONE signal that the
+	// destination is tokenized: AccountIdentifier then holds no usable
+	// identifier, and the full value is only ever obtained by detokenizing
+	// this token. Empty means a legacy raw row, as before.
+	AccountIdentifierToken string `json:"-"`
+	CountryCode            string
+	Currency               string
+	PayeeName              string
+	SourceType             SourceType
 
 	Fingerprint string // SHA-256(institution|account|currency) — duplicate detection
 
@@ -182,6 +230,13 @@ type PayeeDestination struct {
 
 	SupersededByDestinationID string
 	SuspendReason             string
+
+	// ChangeRiskClassification and PriorDestinationID: see the consts'
+	// doc comment. Set once at propose time; never changes afterward
+	// (migration 000010 extends the row's own immutability trigger to
+	// cover both).
+	ChangeRiskClassification string
+	PriorDestinationID       string
 
 	ProposedByPrincipalID string
 	CreatedAt             time.Time
@@ -278,4 +333,12 @@ const (
 	ErrStoreUnavailable           = sentinel("store unavailable")
 	ErrIdempotencyKeyRequired     = sentinel("Idempotency-Key header is required")
 	ErrIdempotencyKeyConflict     = sentinel("idempotency key was already used for a different command, destination or request")
+	ErrPartyNotEligible           = sentinel("party is blocked, inactive, or not compliance-verified; cannot propose a destination for it")
 )
+
+// Tokenized reports whether this destination's account identifier is held as
+// a token (see AccountIdentifierToken). It is decided by the token row's
+// presence, never by what AccountIdentifier looks like.
+func (d *PayeeDestination) Tokenized() bool {
+	return d != nil && d.AccountIdentifierToken != ""
+}

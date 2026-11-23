@@ -70,6 +70,15 @@ const (
 	StatusRejected  ExecutionStatus = "REJECTED"
 	StatusReturned  ExecutionStatus = "RETURNED"
 	StatusCancelled ExecutionStatus = "CANCELLED"
+	// StatusPendingUnknown is §7's "PendingUnknown may occur" and invariant
+	// 15 ("a provider timeout or missing response is Pending/Unknown, never
+	// automatically Failed") — A4. Reachable only through the BNK-06 event
+	// consumer (internal/paymentinit): BNK-06 itself produces this when it
+	// has no evidence at all (a submission attempt timed out or the
+	// provider's response was ambiguous), never from a provider callback,
+	// which by definition reports a concrete observed status. That is why
+	// ValidCallbackStatus below does not include it.
+	StatusPendingUnknown ExecutionStatus = "PENDING_UNKNOWN"
 )
 
 // finalStates are governed final states — see package doc. Once reached,
@@ -91,7 +100,15 @@ func ValidCallbackStatus(s ExecutionStatus) bool {
 	}
 }
 
-func CanCancel(s ExecutionStatus) bool { return s == StatusPrepared || s == StatusSubmitted }
+// CanCancel includes PENDING_UNKNOWN (A4): BNK-06's own ambiguous-submission
+// state is explicitly something "the operator decides" (its own
+// ResolveAmbiguous command), and the spec names no automatic resolution for
+// it on this side either. An operator who decides a stuck, unresolvable
+// attempt should not be retried or awaited any further must be able to
+// cancel it here, the same as a PREPARED or SUBMITTED one.
+func CanCancel(s ExecutionStatus) bool {
+	return s == StatusPrepared || s == StatusSubmitted || s == StatusPendingUnknown
+}
 func CanReturn(s ExecutionStatus) bool { return s == StatusSettled }
 
 // CanConfirmFinality reports whether a manual finality command may act on s.
@@ -168,6 +185,12 @@ const (
 	EventCallbackRejectedForgery       = "PAYMENT_CALLBACK_REJECTED_FORGERY"
 	EventCallbackRejectedRegression    = "PAYMENT_CALLBACK_REJECTED_REGRESSION"
 	EventCallbackDuplicateIgnored      = "PAYMENT_CALLBACK_DUPLICATE_IGNORED"
+	// EventPaymentSubmitted/EventPaymentPendingUnknown (A4) are written by the
+	// BNK-06 event consumer (internal/paymentinit), not a provider callback —
+	// this service's own record of having observed BNK-06's PAYMENT_SUBMITTED
+	// / PAYMENT_SUBMISSION_AMBIGUOUS fact.
+	EventPaymentSubmitted      = "PAYMENT_SUBMITTED"
+	EventPaymentPendingUnknown = "PAYMENT_PENDING_UNKNOWN"
 )
 
 // Manual finality command identities, persisted with their evidence and used
@@ -375,4 +398,12 @@ const (
 	// but insufficient alone — a principal holding both roles could
 	// otherwise create then resolve the same payment themselves.
 	ErrSelfResolutionForbidden = sentinel("the principal who created this payment cannot also resolve its finality")
+	// ErrUnresolvedPaymentNotFound is ApplySubmissionEvent's (A4) own
+	// not-found: no not-yet-resolved execution state exists for this
+	// (tenant_id, source_reference) yet. Distinct from ErrPaymentNotFound
+	// (looked up by payment_id) because the caller here is a BNK-06 event
+	// consumer, which treats this as worth retrying — RecordPaymentStatus for
+	// this instruction may simply not have run yet — rather than as a final
+	// refusal.
+	ErrUnresolvedPaymentNotFound = sentinel("no unresolved payment execution state found for this source reference")
 )

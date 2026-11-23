@@ -17,6 +17,7 @@
       "claim_id": "c-price-us-growth-m",
       "claim_revision": 1,
       "claim_type": "PRICE",
+      "owner_id": "commercial-ops",
       "subject_id": "TEST_GROWTH",
       "predicate": "list_price",
       "normalized_value": "XTS 49.00/user/month",
@@ -37,6 +38,7 @@
         "src-pricing-v1"
       ],
       "citation_url_key": "pricing",
+      "taxes_fees_caveat": "Before tax.",
       "approval_refs": [
         "approval-commercial",
         "approval-finance"
@@ -47,6 +49,7 @@
       "claim_id": "c-price-us-starter-m",
       "claim_revision": 1,
       "claim_type": "PRICE",
+      "owner_id": "commercial-ops",
       "subject_id": "TEST_STARTER",
       "predicate": "list_price",
       "normalized_value": "XTS 19.00/user/month",
@@ -67,6 +70,7 @@
         "src-pricing-v1"
       ],
       "citation_url_key": "pricing",
+      "taxes_fees_caveat": "Before tax.",
       "approval_refs": [
         "approval-commercial",
         "approval-finance"
@@ -77,6 +81,7 @@
       "claim_id": "c-price-gb-growth-m",
       "claim_revision": 1,
       "claim_type": "PRICE",
+      "owner_id": "commercial-ops",
       "subject_id": "TEST_GROWTH",
       "predicate": "list_price",
       "normalized_value": "XTS 39.00/user/month",
@@ -97,6 +102,7 @@
         "src-pricing-v1"
       ],
       "citation_url_key": "pricing",
+      "taxes_fees_caveat": "Before tax.",
       "approval_refs": [
         "approval-commercial",
         "approval-finance"
@@ -107,6 +113,7 @@
       "claim_id": "c-price-gb-starter-m",
       "claim_revision": 1,
       "claim_type": "PRICE",
+      "owner_id": "commercial-ops",
       "subject_id": "TEST_STARTER",
       "predicate": "list_price",
       "normalized_value": "XTS 15.00/user/month",
@@ -127,6 +134,7 @@
         "src-pricing-v1"
       ],
       "citation_url_key": "pricing",
+      "taxes_fees_caveat": "Before tax.",
       "approval_refs": [
         "approval-commercial",
         "approval-finance"
@@ -137,6 +145,7 @@
       "claim_id": "c-price-ie-growth-m-a",
       "claim_revision": 1,
       "claim_type": "PRICE",
+      "owner_id": "commercial-ops",
       "subject_id": "TEST_GROWTH",
       "predicate": "list_price",
       "normalized_value": "XTS 44.00/user/month",
@@ -157,6 +166,7 @@
         "src-pricing-v1"
       ],
       "citation_url_key": "pricing",
+      "taxes_fees_caveat": "Before tax.",
       "approval_refs": [
         "approval-commercial",
         "approval-finance"
@@ -167,6 +177,7 @@
       "claim_id": "c-price-ie-growth-m-b",
       "claim_revision": 1,
       "claim_type": "PRICE",
+      "owner_id": "commercial-ops",
       "subject_id": "TEST_GROWTH",
       "predicate": "list_price",
       "normalized_value": "XTS 46.00/user/month",
@@ -187,6 +198,7 @@
         "src-pricing-v1"
       ],
       "citation_url_key": "pricing",
+      "taxes_fees_caveat": "Before tax.",
       "approval_refs": [
         "approval-commercial",
         "approval-finance"
@@ -197,6 +209,7 @@
       "claim_id": "c-price-us-growth-a",
       "claim_revision": 1,
       "claim_type": "PRICE",
+      "owner_id": "commercial-ops",
       "subject_id": "TEST_GROWTH",
       "predicate": "list_price",
       "normalized_value": "XTS 470.00/user/year",
@@ -217,6 +230,7 @@
         "src-pricing-v1"
       ],
       "citation_url_key": "pricing",
+      "taxes_fees_caveat": "Before tax.",
       "approval_refs": [
         "approval-commercial",
         "approval-finance"
@@ -225,8 +239,14 @@
     },
     {
       "claim_id": "c-trial-us-starter",
+      "trial_cohort": "self-serve",
+      "trial_duration_days": 30,
+      "trial_card_required": false,
+      "trial_end_state": "convert_or_expire",
+      "trial_authorization_policy": "standard",
       "claim_revision": 1,
       "claim_type": "TRIAL",
+      "owner_id": "commercial-ops",
       "subject_id": "TEST_STARTER",
       "predicate": "trial_available",
       "normalized_value": "true",
@@ -247,6 +267,7 @@
         "src-pricing-v1"
       ],
       "citation_url_key": "pricing",
+      "taxes_fees_caveat": "Before tax.",
       "approval_refs": [
         "approval-commercial",
         "approval-finance"
@@ -255,8 +276,14 @@
     },
     {
       "claim_id": "c-trial-us-growth",
+      "trial_cohort": "self-serve",
+      "trial_duration_days": 30,
+      "trial_card_required": false,
+      "trial_end_state": "convert_or_expire",
+      "trial_authorization_policy": "standard",
       "claim_revision": 1,
       "claim_type": "TRIAL",
+      "owner_id": "commercial-ops",
       "subject_id": "TEST_GROWTH",
       "predicate": "trial_available",
       "normalized_value": "true",
@@ -277,6 +304,7 @@
         "src-pricing-v1"
       ],
       "citation_url_key": "pricing",
+      "taxes_fees_caveat": "Before tax.",
       "approval_refs": [
         "approval-commercial",
         "approval-finance"
@@ -285,8 +313,14 @@
     },
     {
       "claim_id": "c-trial-gb-starter",
+      "trial_cohort": "self-serve",
+      "trial_duration_days": 30,
+      "trial_card_required": false,
+      "trial_end_state": "convert_or_expire",
+      "trial_authorization_policy": "standard",
       "claim_revision": 1,
       "claim_type": "TRIAL",
+      "owner_id": "commercial-ops",
       "subject_id": "TEST_STARTER",
       "predicate": "trial_available",
       "normalized_value": "true",
@@ -307,6 +341,7 @@
         "src-pricing-v1"
       ],
       "citation_url_key": "pricing",
+      "taxes_fees_caveat": "Before tax.",
       "approval_refs": [
         "approval-commercial",
         "approval-finance"
@@ -315,8 +350,14 @@
     },
     {
       "claim_id": "c-trial-ie-starter",
+      "trial_cohort": "self-serve",
+      "trial_duration_days": 30,
+      "trial_card_required": false,
+      "trial_end_state": "convert_or_expire",
+      "trial_authorization_policy": "standard",
       "claim_revision": 1,
       "claim_type": "TRIAL",
+      "owner_id": "commercial-ops",
       "subject_id": "TEST_STARTER",
       "predicate": "trial_available",
       "normalized_value": "true",
@@ -337,6 +378,7 @@
         "src-pricing-v1"
       ],
       "citation_url_key": "pricing",
+      "taxes_fees_caveat": "Before tax.",
       "approval_refs": [
         "approval-commercial",
         "approval-finance"
@@ -347,6 +389,7 @@
       "claim_id": "c-integration-ledgerlink",
       "claim_revision": 1,
       "claim_type": "INTEGRATION_STATUS",
+      "owner_id": "integration-owner",
       "subject_id": "LedgerLink",
       "predicate": "status",
       "normalized_value": "planned",
@@ -377,6 +420,7 @@
       "claim_id": "c-cert-soc2",
       "claim_revision": 1,
       "claim_type": "CERTIFICATION",
+      "owner_id": "security-trust",
       "subject_id": "SOC2",
       "predicate": "status",
       "normalized_value": "readiness",
@@ -407,6 +451,7 @@
       "claim_id": "c-cert-iso27001",
       "claim_revision": 1,
       "claim_type": "CERTIFICATION",
+      "owner_id": "security-trust",
       "subject_id": "ISO27001",
       "predicate": "status",
       "normalized_value": "certified",
@@ -437,6 +482,7 @@
       "claim_id": "c-market-us",
       "claim_revision": 1,
       "claim_type": "MARKET_AVAILABILITY",
+      "owner_id": "regional-product",
       "subject_id": "zoikosuite",
       "predicate": "offered",
       "normalized_value": "true",
@@ -467,6 +513,7 @@
       "claim_id": "c-market-gb",
       "claim_revision": 1,
       "claim_type": "MARKET_AVAILABILITY",
+      "owner_id": "regional-product",
       "subject_id": "zoikosuite",
       "predicate": "offered",
       "normalized_value": "true",
@@ -497,6 +544,7 @@
       "claim_id": "c-integration-fixturebooks",
       "claim_revision": 1,
       "claim_type": "INTEGRATION_STATUS",
+      "owner_id": "integration-owner",
       "subject_id": "FixtureBooks",
       "predicate": "status",
       "normalized_value": "built",

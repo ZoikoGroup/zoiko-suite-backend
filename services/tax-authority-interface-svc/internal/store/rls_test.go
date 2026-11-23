@@ -40,6 +40,7 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("connect to TEST_DATABASE_URL: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	verifyEventContracts(t, pool)
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS tax_filing_submissions, tax_interfaces CASCADE;`)
 

@@ -25,6 +25,7 @@ func pendingInstance() *domain.WorkflowInstance {
 		WorkflowStatus:     "PENDING",
 		CurrentStage:       1,
 		InitiatedBy:        "requester-1",
+		RowVersion:         1,
 	}
 }
 

@@ -23,6 +23,21 @@ type Config struct {
 	// accounting book and in its functional currency, instead of the legacy posting command. Empty keeps the legacy path.
 	LedgerKernelBookID   string
 	LedgerKernelCurrency string
+	// ACC-02 mapping keys. The ledger owns account resolution; this service
+	// never sends a raw GL account code on the posting path.
+	DepreciationExpenseMappingKey     string
+	AccumulatedDepreciationMappingKey string
+	// Asset-event mapping keys. Request-level mapping keys take precedence;
+	// these are the governed deployment defaults, with per-event-type
+	// overrides for the material event types.
+	AssetEventDebitMappingKey             string
+	AssetEventCreditMappingKey            string
+	AssetEventImpairmentDebitMappingKey   string
+	AssetEventImpairmentCreditMappingKey  string
+	AssetEventRevaluationDebitMappingKey  string
+	AssetEventRevaluationCreditMappingKey string
+	AssetEventDisposalDebitMappingKey     string
+	AssetEventDisposalCreditMappingKey    string
 	// CloseServiceURL is financial-close-svc's own base URL — AST-02
 	// depends on its ACC-06 subledger control per the spec's own
 	// Dependencies field.
@@ -86,11 +101,22 @@ func Load() (*Config, error) {
 			GroupID: env("KAFKA_GROUP_ID", "asset-management-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.asset.events"),
 		},
-		AuthZServiceURL:  env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
-		LedgerServiceURL: env("LEDGER_SERVICE_URL", "http://general-ledger-svc:8098"),
+		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		LedgerServiceURL:     env("LEDGER_SERVICE_URL", "http://general-ledger-svc:8098"),
 		LedgerKernelBookID:   env("LEDGER_KERNEL_BOOK_ID", ""),
 		LedgerKernelCurrency: env("LEDGER_KERNEL_CURRENCY", ""),
-		CloseServiceURL:  env("CLOSE_SERVICE_URL", "http://financial-close-svc:8104"),
+
+		DepreciationExpenseMappingKey:         env("DEPRECIATION_EXPENSE_MAPPING_KEY", "DEPRECIATION_EXPENSE"),
+		AccumulatedDepreciationMappingKey:     env("ACCUMULATED_DEPRECIATION_MAPPING_KEY", "ACCUMULATED_DEPRECIATION"),
+		AssetEventDebitMappingKey:             env("ASSET_EVENT_DEBIT_MAPPING_KEY", ""),
+		AssetEventCreditMappingKey:            env("ASSET_EVENT_CREDIT_MAPPING_KEY", ""),
+		AssetEventImpairmentDebitMappingKey:   env("ASSET_IMPAIRMENT_DEBIT_MAPPING_KEY", "IMPAIRMENT_LOSS"),
+		AssetEventImpairmentCreditMappingKey:  env("ASSET_IMPAIRMENT_CREDIT_MAPPING_KEY", "ACCUMULATED_DEPRECIATION"),
+		AssetEventRevaluationDebitMappingKey:  env("ASSET_REVALUATION_DEBIT_MAPPING_KEY", "FIXED_ASSET_COST"),
+		AssetEventRevaluationCreditMappingKey: env("ASSET_REVALUATION_CREDIT_MAPPING_KEY", "REVALUATION_SURPLUS"),
+		AssetEventDisposalDebitMappingKey:     env("ASSET_DISPOSAL_DEBIT_MAPPING_KEY", "ASSET_CLEARING"),
+		AssetEventDisposalCreditMappingKey:    env("ASSET_DISPOSAL_CREDIT_MAPPING_KEY", "FIXED_ASSET_COST"),
+		CloseServiceURL:                       env("CLOSE_SERVICE_URL", "http://financial-close-svc:8104"),
 
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),

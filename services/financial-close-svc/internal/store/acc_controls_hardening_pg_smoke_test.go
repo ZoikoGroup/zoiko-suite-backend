@@ -58,15 +58,15 @@ func TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB(t *testing.T) {
 	if _, err := s.CreateAccrualSchedule(ctx, sch, uuid.NewString(), testRequestHash); err != nil {
 		t.Fatalf("CreateAccrualSchedule: %v", err)
 	}
-	if err := s.SubmitAccrualSchedule(ctx, sch.ScheduleID, "submitter-1", now); err != nil {
+	if _, err := s.SubmitAccrualSchedule(ctx, sch, "submitter-1", uuid.NewString(), testRequestHash, now); err != nil {
 		t.Fatalf("SubmitAccrualSchedule: %v", err)
 	}
 	for _, self := range []string{"preparer-1", "submitter-1"} {
-		if err := s.ApproveAccrualSchedule(ctx, sch.ScheduleID, self, now); !errors.Is(err, domain.ErrSelfApproval) {
+		if _, err := s.ApproveAccrualSchedule(ctx, sch, self, uuid.NewString(), testRequestHash, now); !errors.Is(err, domain.ErrSelfApproval) {
 			t.Fatalf("accrual approved by its %s: want ErrSelfApproval, got %v", self, err)
 		}
 	}
-	if err := s.ApproveAccrualSchedule(ctx, sch.ScheduleID, "approver-1", now); err != nil {
+	if _, err := s.ApproveAccrualSchedule(ctx, sch, "approver-1", uuid.NewString(), testRequestHash, now); err != nil {
 		t.Fatalf("independent accrual approval refused: %v", err)
 	}
 
@@ -80,7 +80,7 @@ func TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB(t *testing.T) {
 	if _, err := s.CreatePrepaymentSchedule(ctx, ppy, uuid.NewString(), testRequestHash); err != nil {
 		t.Fatalf("CreatePrepaymentSchedule: %v", err)
 	}
-	if err := s.ApprovePrepaymentSchedule(ctx, ppy.ScheduleID, "preparer-1", now); !errors.Is(err, domain.ErrSelfApproval) {
+	if _, err := s.ApprovePrepaymentSchedule(ctx, ppy, "preparer-1", uuid.NewString(), testRequestHash, now); !errors.Is(err, domain.ErrSelfApproval) {
 		t.Fatalf("prepayment self-approval: want ErrSelfApproval, got %v", err)
 	}
 
@@ -94,7 +94,7 @@ func TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB(t *testing.T) {
 	if _, err := s.CreateAllocationRule(ctx, rule, uuid.NewString(), testRequestHash); err != nil {
 		t.Fatalf("CreateAllocationRule: %v", err)
 	}
-	if err := s.ApproveAllocationRule(ctx, ruleID, "preparer-1", now); !errors.Is(err, domain.ErrSelfApproval) {
+	if _, err := s.ApproveAllocationRule(ctx, rule, "preparer-1", uuid.NewString(), testRequestHash, now); !errors.Is(err, domain.ErrSelfApproval) {
 		t.Fatalf("allocation rule self-approval: want ErrSelfApproval, got %v", err)
 	}
 
@@ -106,41 +106,13 @@ func TestPgStore_SoD_SelfApprovalRefusedByDatabase_RealDB(t *testing.T) {
 	if _, err := s.CreateFXRevaluationRun(ctx, fx, uuid.NewString(), testRequestHash); err != nil {
 		t.Fatalf("CreateFXRevaluationRun: %v", err)
 	}
-	if err := s.ApproveFXRevaluationRun(ctx, fx.RunID, "preparer-1", now); !errors.Is(err, domain.ErrSelfApproval) {
+	if _, err := s.ApproveFXRevaluationRun(ctx, fx, "preparer-1", uuid.NewString(), testRequestHash, now); !errors.Is(err, domain.ErrSelfApproval) {
 		t.Fatalf("FX revaluation self-approval: want ErrSelfApproval, got %v", err)
 	}
 
-	batch := &domain.MigrationBatch{
-		CurrencyCode: storeTestCurrency,
-		BatchID:      uuid.New().String(), LegalEntityID: "le-1", FiscalPeriod: "2026-01",
-		SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x", ExpectedRowCount: 1,
-		Status: domain.MigrationBatchStatusLoaded, CreatedAt: now, CreatedByPrincipalID: "preparer-1",
-		Entries: []domain.MigrationCrosswalkEntry{{EntryID: uuid.New().String(), SourceReferenceID: "R1", TargetAccountCode: "1000-Cash"}},
-	}
-	if err := s.CreateMigrationBatch(ctx, batch); err != nil {
-		t.Fatalf("CreateMigrationBatch: %v", err)
-	}
-	if err := s.MarkMigrationBatchValidated(ctx, batch.BatchID, now); err != nil {
-		t.Fatalf("MarkMigrationBatchValidated: %v", err)
-	}
-	if err := s.ApproveMigrationBatch(ctx, batch.BatchID, "preparer-1", now); !errors.Is(err, domain.ErrSelfApproval) {
-		t.Fatalf("migration self-approval: want ErrSelfApproval, got %v", err)
-	}
-	if err := s.ApproveMigrationBatch(ctx, batch.BatchID, "approver-1", now); err != nil {
-		t.Fatalf("ApproveMigrationBatch: %v", err)
-	}
-	if err := s.MarkMigrationBatchPosted(ctx, batch.BatchID, "journal-1", now); err != nil {
-		t.Fatalf("MarkMigrationBatchPosted: %v", err)
-	}
-	if err := s.MarkMigrationBatchReconciled(ctx, batch.BatchID, now); err != nil {
-		t.Fatalf("MarkMigrationBatchReconciled: %v", err)
-	}
-	if err := s.CertifyMigrationBatch(ctx, batch.BatchID, "preparer-1", "cutover signed", now); !errors.Is(err, domain.ErrSelfApproval) {
-		t.Fatalf("migration self-certification: want ErrSelfApproval, got %v", err)
-	}
-	if err := s.CertifyMigrationBatch(ctx, batch.BatchID, "certifier-1", "cutover signed", now); err != nil {
-		t.Fatalf("independent certification refused: %v", err)
-	}
+	// ACC-17's migration-batch self-approval/self-certification coverage
+	// (CreateMigrationBatch/ApproveMigrationBatch/CertifyMigrationBatch) was
+	// retired along with its store methods — see SPEC_DEVIATIONS.md A9.
 }
 
 // Every guarded transition that also sets columns used to bind its id to the
@@ -155,15 +127,17 @@ func TestPgStore_TransitionsWithSetClause_ApplyAgainstRealDB(t *testing.T) {
 	if _, err := s.CreateAccrualSchedule(ctx, sch, uuid.NewString(), testRequestHash); err != nil {
 		t.Fatalf("CreateAccrualSchedule: %v", err)
 	}
-	if err := s.CancelAccrualSchedule(ctx, sch.ScheduleID, domain.AccrualStatusDraft, "canceller-1", now); err != nil {
+	if _, err := s.CancelAccrualSchedule(ctx, sch, "canceller-1", uuid.NewString(), testRequestHash, now); err != nil {
 		t.Fatalf("CancelAccrualSchedule: %v", err)
 	}
 	got, err := s.GetAccrualSchedule(ctx, sch.ScheduleID)
 	if err != nil || got.Status != domain.AccrualStatusCancelled || derefStr(got.CancelledByPrincipalID) != "canceller-1" {
 		t.Fatalf("cancel did not land: %+v (err %v)", got, err)
 	}
-	if err := s.CancelAccrualSchedule(ctx, sch.ScheduleID, domain.AccrualStatusDraft, "canceller-1", now); !errors.Is(err, domain.ErrInvalidAccrualTransition) {
-		t.Fatalf("second cancel from DRAFT: want ErrInvalidAccrualTransition, got %v", err)
+	// A second cancel attempt under a NEW key (not a replay of the first) must
+	// still be refused: the schedule is already CANCELLED.
+	if _, err := s.CancelAccrualSchedule(ctx, sch, "canceller-1", uuid.NewString(), testRequestHash, now); !errors.Is(err, domain.ErrInvalidAccrualTransition) {
+		t.Fatalf("second cancel of an already-cancelled schedule: want ErrInvalidAccrualTransition, got %v", err)
 	}
 
 	ppy := &domain.PrepaymentSchedule{
@@ -175,8 +149,8 @@ func TestPgStore_TransitionsWithSetClause_ApplyAgainstRealDB(t *testing.T) {
 	if _, err := s.CreatePrepaymentSchedule(ctx, ppy, uuid.NewString(), testRequestHash); err != nil {
 		t.Fatalf("CreatePrepaymentSchedule: %v", err)
 	}
-	if err := s.TerminatePrepaymentSchedule(ctx, ppy.ScheduleID, domain.PrepaymentStatusDraft, "terminator-1", "contract ended",
-		domain.TerminationTreatmentWriteOff, now); err != nil {
+	if _, err := s.TerminatePrepaymentSchedule(ctx, ppy, "terminator-1", "contract ended",
+		domain.TerminationTreatmentWriteOff, uuid.NewString(), testRequestHash, now); err != nil {
 		t.Fatalf("TerminatePrepaymentSchedule: %v", err)
 	}
 	gotP, err := s.GetPrepaymentSchedule(ctx, ppy.ScheduleID)
@@ -421,7 +395,7 @@ func TestPgStore_FiscalPeriodGuard_RefusesIllegalTransitionsAtTheDataLayer_RealD
 // ── ACC-18 set-based coverage ────────────────────────────────────────────────
 
 func TestPgStore_ListPostedJournalLineage_ClassifiesInOneQuery_RealDB(t *testing.T) {
-	_, s, ctx, _ := newHardeningStore(t)
+	pool, s, ctx, tenantID := newHardeningStore(t)
 	now := time.Now().UTC()
 
 	sch := draftAccrual("lineage accrual")
@@ -454,27 +428,26 @@ func TestPgStore_ListPostedJournalLineage_ClassifiesInOneQuery_RealDB(t *testing
 	}
 
 	// A migration batch quarantined after posting still has a journal on the
-	// ledger, so it stays in the population.
-	batch := &domain.MigrationBatch{
-		CurrencyCode: storeTestCurrency,
-		BatchID:      uuid.New().String(), LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP",
-		SourceExtractHash: "sha256:x", ExpectedRowCount: 1, Status: domain.MigrationBatchStatusLoaded, CreatedAt: now, CreatedByPrincipalID: "preparer-1",
-		Entries: []domain.MigrationCrosswalkEntry{{EntryID: uuid.New().String(), SourceReferenceID: "R1", TargetAccountCode: "1000-Cash"}},
+	// ledger, so it stays in ListPostedJournalRefs' population (see its own
+	// migration_batches UNION arm). ACC-17's write side that used to create
+	// these rows is retired (SPEC_DEVIATIONS.md A9); the table and this
+	// ACC-18 completeness read over it stay, so the fixture is inserted
+	// directly rather than through a now-removed store method — proving
+	// ACC-18 still classifies pre-existing/historical migration batch rows
+	// correctly.
+	batchID := uuid.New().String()
+	if err := pool.QueryRow(ctx, `SELECT set_config('app.tenant_id', $1, true)`, tenantID).Scan(new(string)); err != nil {
+		t.Fatalf("set tenant context: %v", err)
 	}
-	if err := s.CreateMigrationBatch(ctx, batch); err != nil {
-		t.Fatalf("CreateMigrationBatch: %v", err)
-	}
-	for _, step := range []func() error{
-		func() error { return s.MarkMigrationBatchValidated(ctx, batch.BatchID, now) },
-		func() error { return s.ApproveMigrationBatch(ctx, batch.BatchID, "approver-1", now) },
-		func() error { return s.MarkMigrationBatchPosted(ctx, batch.BatchID, "journal-migration", now) },
-		func() error {
-			return s.QuarantineMigrationBatch(ctx, batch.BatchID, domain.MigrationBatchStatusPosted, "reconciliation mismatch")
-		},
-	} {
-		if err := step(); err != nil {
-			t.Fatalf("migration batch fixture: %v", err)
-		}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO migration_batches (
+			batch_id, tenant_id, legal_entity_id, fiscal_period, source_system_name,
+			source_extract_hash, expected_row_count, expected_total_debits, expected_total_credits,
+			status, journal_id, created_at, created_by_principal_id, currency_code
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+	`, batchID, tenantID, "le-1", "2026-01", "LegacyERP", "sha256:x", 1, 500, 500,
+		domain.MigrationBatchStatusQuarantined, "journal-migration", now, "preparer-1", storeTestCurrency); err != nil {
+		t.Fatalf("migration batch fixture: %v", err)
 	}
 
 	got, err := s.ListPostedJournalLineage(ctx, "le-1")
@@ -497,7 +470,7 @@ func TestPgStore_ListPostedJournalLineage_ClassifiesInOneQuery_RealDB(t *testing
 	if l := byFrom[instances[2].RecognitionInstanceID]; l.HasEdge || l.Quarantined {
 		t.Fatalf("recognition with only a foreign edge must be a gap: got %+v", l)
 	}
-	if l, ok := byFrom[batch.BatchID]; !ok || l.JournalID != "journal-migration" || l.HasEdge {
+	if l, ok := byFrom[batchID]; !ok || l.JournalID != "journal-migration" || l.HasEdge {
 		t.Fatalf("quarantined-after-posting batch: got %+v (present=%v)", l, ok)
 	}
 

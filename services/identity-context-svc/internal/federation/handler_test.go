@@ -17,13 +17,15 @@ import (
 )
 
 type fakeAuthz struct {
-	err     error
-	asked   []string
-	allowed map[string]bool
+	err      error
+	asked    []string
+	allowed  map[string]bool
+	entities []string
 }
 
-func (f *fakeAuthz) CheckAllowed(_ context.Context, _, _, action, _ string) error {
+func (f *fakeAuthz) CheckAllowed(_ context.Context, _, legalEntityID, action, _ string) error {
 	f.asked = append(f.asked, action)
+	f.entities = append(f.entities, legalEntityID)
 	if f.err != nil {
 		return f.err
 	}
@@ -274,4 +276,23 @@ func (a *adminRepo) CreateLink(context.Context, Link, string, string) (*Link, er
 }
 func (a *adminRepo) ListLogins(context.Context, string, string, int) ([]LoginRecord, error) {
 	return nil, nil
+}
+
+// The admin routes are authorized at the legal entity the request acts within,
+// never with the tenant id in the entity position (authorization-svc refuses
+// that as tenant_scope_mismatch, and the route then answers 503).
+func TestAdminRoutesAuthorizeAtTheLegalEntityNotTheTenant(t *testing.T) {
+	rig := newHRig(t)
+	req := httptest.NewRequest(http.MethodGet, "/v1/federation/connections", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-a")
+	req.Header.Set("X-Principal-Id", "p-admin")
+	req.Header.Set("X-Legal-Entity-Id", "entity-1")
+	w := httptest.NewRecorder()
+	rig.r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list: %d %s", w.Code, w.Body)
+	}
+	if len(rig.authz.entities) != 1 || rig.authz.entities[0] != "entity-1" {
+		t.Fatalf("authorized at entity %v, want [entity-1] (never the tenant id)", rig.authz.entities)
+	}
 }

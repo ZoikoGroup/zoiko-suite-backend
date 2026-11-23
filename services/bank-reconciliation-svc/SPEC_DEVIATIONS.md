@@ -185,7 +185,63 @@ unchanged by this fix.
   This service has no match-group table. A `statement_lines` row carries at
   most one `matched_journal_id` or `matched_transaction_id` (plus the
   proposal columns). Consequences:
-  - no many-to-one, one-to-many or split matches;
+  - ~~no many-to-one, one-to-many or split matches~~ — **partially closed
+    2026-10-31** on the journal path only (migration 000015,
+    reconciliation-intelligence-svc's A2b part 2: "one payment booked as two
+    journals"). `ProposeMatch`/`propose-match` now also accepts
+    `journal_ids` (2–`MaxMatchJournals`, currently 10): every named journal
+    is independently verified against general-ledger-svc (FINALIZED, correct
+    legal entity, touches the line's cash account) and their combined net
+    movement, not any one alone, must equal the line's signed amount
+    exactly. The allocation — each journal's own verified net — is recorded
+    in the new `statement_line_matched_journals` table ("explicit
+    allocation" per ZS-CONTROL-001 §10), append-only once the parent line
+    reaches MATCHED. `ConfirmMatch` re-verifies the whole set, not just that
+    it was once true. The scalar `matched_journal_id`/`proposed_journal_id`
+    columns stay NULL for a multi-journal match; a reader must check the new
+    `matched_journal_ids`/`proposed_journal_ids` JSON fields too. This is
+    still not a `BankMatchGroup`: it has no partial-match amount/residual,
+    no retrieval route of its own (folded into `GetStatementLine`), and the
+    canonical-transaction path (banking-connector-svc) is untouched — still
+    exactly one transaction per line. The journal path was chosen over the
+    canonical-transaction path because it matches A2b part 2's own framing
+    and reconciliation-intelligence-svc's existing journal-first search
+    order, even though `journal_id`/`journal_ids` is this handler's
+    deprecated path (`transaction_id` is preferred for a new single match);
+    a reviewer may want this on the canonical-transaction path instead, or
+    on both.
+    - *Tests:* `internal/handler/multi_journal_match_test.go` (propose,
+      confirm with re-verification, self-confirmation, amount-mismatch,
+      wrong-entity, duplicate-id, too-few/too-many, reject-clears-proposal)
+      against a stub ledger; `internal/store/multi_journal_match_pg_smoke_test.go`
+      on real Postgres (round trip, the append-only trigger refusing
+      UPDATE/DELETE once MATCHED, and the down migration refusing while a
+      CONFIRMED allocation exists and succeeding once none does).
+  - *Lookup-by-journal-id — added 2026-11-01*, for
+    reconciliation-intelligence-svc's A2b part 3 ("already-matched journals
+    still counted as candidates"): `GET /v1/statement-lines` now also takes
+    `journal_ids` (comma-separated, up to `MaxJournalLookupIDs`, 200). It
+    ANDs with the existing `bank_account_id`/`statement_date`/`status`
+    filters exactly like they AND with each other; the expected caller sends
+    it alone. A line matches when one of the given ids is its scalar
+    `matched_journal_id`/`proposed_journal_id`, or is recorded against it in
+    `statement_line_matched_journals` (the many-to-one path above) — and when
+    matched that way, the response also carries `matched_journal_ids`/
+    `proposed_journal_ids` (via `attachMatchedJournalIDs`, otherwise only
+    populated by `GetStatementLine`) so the caller can see every journal the
+    line claims, not just the one it asked about. This service is the only
+    one that knows a journal has already been claimed, because the claim is
+    recorded here, not on the journal itself; bank-reconciliation-svc's own
+    propose/confirm verification remains the authoritative check regardless
+    of what this lookup reports. *Tests:* `internal/handler/handler_test.go`
+    (`TestListStatementLines_JournalIDsFilter_*`: distinct valid ids wired
+    through, malformed/duplicate/empty ids refused 400, no param leaves the
+    filter nil); `internal/store/journal_lookup_pg_smoke_test.go` on real
+    Postgres (scalar matched, scalar proposed, a multi-journal allocation
+    found by either of its two journal ids with both returned, no match is
+    `[]` not an error, the filter combines with an existing status filter
+    rather than overriding it, and more than `MaxJournalLookupIDs` ids is
+    refused with `ErrTooManyJournalIDs`).
   - no partial-match amount or residual;
   - no match identity to retrieve (`GetMatch` is absent, A4);
   - no group-level evidence or approval;

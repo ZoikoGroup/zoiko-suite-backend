@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"zoiko.io/public-ai-svc/internal/metrics"
 
 	"github.com/go-chi/chi/v5"
 	"go.opentelemetry.io/otel"
@@ -63,6 +64,9 @@ func SecurityHeaders(next http.Handler) http.Handler {
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
 		h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		// Doc 06 §11: browsers reach the API only through the console's
+		// same-origin proxy, so no other site may embed or read a response.
+		h.Set("Cross-Origin-Resource-Policy", "same-origin")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -192,6 +196,7 @@ func AccessLog(log *zap.Logger) func(http.Handler) http.Handler {
 			if rc := chi.RouteContext(r.Context()); rc != nil && rc.RoutePattern() != "" {
 				route = rc.RoutePattern()
 			}
+			metrics.ObserveHTTP(route, r.Method, rec.status, time.Since(start))
 			log.Info("http_request",
 				zap.String("request_id", w.Header().Get("X-Request-ID")),
 				zap.String("trace_id", TraceID(r.Header.Get("traceparent"))),

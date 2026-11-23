@@ -144,3 +144,23 @@ type EventJournalBreaksQuery struct {
 	Limit         int
 	AfterRecordID string
 }
+
+// MigrationBatchTieoutQuery scopes the migration-batch-tieout population:
+// exactly one record for one migration batch (docs/architecture/
+// control-population-contract.md, "financial-close-svc — Wave 6"). This is
+// general-ledger-svc's own source of truth for the kernel migration batches
+// it stages, approves, posts and reconciles (internal/kernel/migration.go) —
+// financial-close-svc's now-redundant migration-batch write path has no real
+// callers left, and its own migration_batches table stops being populated
+// once that path is retired. This population replaces it as the one
+// financial-control-svc's catalogue reads from.
+type MigrationBatchTieoutQuery struct {
+	LegalEntityID string
+	BatchID       string
+	Limit         int
+	AfterRecordID string
+}
+
+// ErrMigrationBatchNotFound is returned when batch_id names no migration
+// batch of the tenant/entity.
+var ErrMigrationBatchNotFound = errorString("migration batch not found")

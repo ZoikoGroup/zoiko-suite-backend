@@ -55,7 +55,7 @@ type Authorizer interface {
 // HistorySource lists prior governance decisions. clients.GovernanceLogClient
 // satisfies it.
 type HistorySource interface {
-	ListPriorDecisions(ctx context.Context, q clients.HistoryQuery) ([]clients.PriorDecision, error)
+	ListPriorDecisionsFor(ctx context.Context, q clients.HistoryQuery) ([]clients.PriorDecision, error)
 }
 
 // Service implements every decision-support use case.

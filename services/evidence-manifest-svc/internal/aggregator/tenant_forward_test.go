@@ -51,7 +51,7 @@ func TestGovernanceClient_List_ForwardsTenantHeader(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotTenant = r.Header.Get("X-Tenant-Id")
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[]`))
+		_, _ = w.Write([]byte(`{"records":[],"total_count":0,"next_cursor":""}`))
 	}))
 	defer srv.Close()
 
@@ -162,4 +162,3 @@ func TestWorkflowAndHistoryClients_ForwardPrincipalHeader(t *testing.T) {
 		})
 	}
 }
-

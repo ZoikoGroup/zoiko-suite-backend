@@ -35,7 +35,7 @@ type precedentResult struct {
 // failures degrade safely to no answer, deterministic workflow or human
 // review rather than fabricated authority" (Data/Search/Analytics/AI spec §2).
 func (s *Service) computePrecedent(ctx context.Context, caller domain.CallerContext, legalEntityID, actionType string) precedentResult {
-	decisions, err := s.history.ListPriorDecisions(ctx, clients.HistoryQuery{
+	decisions, err := s.history.ListPriorDecisionsFor(ctx, clients.HistoryQuery{
 		TenantID:      caller.TenantID,
 		PrincipalID:   caller.PrincipalID,
 		CorrelationID: caller.CorrelationID,

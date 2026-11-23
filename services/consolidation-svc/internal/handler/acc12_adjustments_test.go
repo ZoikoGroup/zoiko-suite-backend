@@ -31,11 +31,22 @@ func stubClientsWithMatched(amount domain.Decimal) *stubClients {
 		intercompanyEntries: []clients.IntercompanyEntry{
 			{IntercompanyEntryID: "ic-1", Amount: amount, MatchStatus: "MATCHED"},
 		},
+		reciprocalBalances: &domain.ReciprocalBalances{
+			EntityA:      "entity-a",
+			EntityB:      "entity-b",
+			FiscalPeriod: "2026-07",
+			ByMatchStatus: []domain.ReciprocalStatusBalances{
+				{
+					MatchStatus: "MATCHED",
+					Net:         []domain.ReciprocalCurrencyTotal{{CurrencyCode: "USD", Amount: amount}},
+				},
+			},
+		},
 	}
 }
 
 func validAdjustmentReq(adjType string) map[string]any {
-	return map[string]any{
+	req := map[string]any{
 		"group_legal_entity_id": "group-1",
 		"fiscal_period":         "2026-07",
 		"adjustment_type":       adjType,
@@ -45,6 +56,11 @@ func validAdjustmentReq(adjType string) map[string]any {
 			{"account_code": "9100", "credit_amount": 100},
 		},
 	}
+	if adjType == domain.AdjustmentTypeElimination {
+		req["source_legal_entity_id"] = "entity-a"
+		req["target_legal_entity_id"] = "entity-b"
+	}
+	return req
 }
 
 // ── CreateEliminationProposal ────────────────────────────────────────────────

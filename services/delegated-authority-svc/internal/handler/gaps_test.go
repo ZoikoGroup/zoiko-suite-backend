@@ -117,7 +117,7 @@ func TestCreate_CannotDelegateSomeoneElsesAuthorityToYourself(t *testing.T) {
 	r := newRouterAuthz(newStubStore(), az)
 
 	rr := doReq(r, http.MethodPost, "/v1/delegations/",
-		body("cfo-alice", "attacker", uuid.NewString()), "attacker")
+		body("cfo-alice", "attacker", uuid.NewString()), "attacker", "")
 
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("naming another principal as delegator and yourself as delegate must be refused, got %d: %s", rr.Code, rr.Body.String())
@@ -140,7 +140,7 @@ func TestCreate_AdministratorStillCannotNameThemselvesDelegate(t *testing.T) {
 	r := newRouterAuthz(newStubStore(), az)
 
 	rr := doReq(r, http.MethodPost, "/v1/delegations/",
-		body("cfo-alice", "admin-1", uuid.NewString()), "admin-1")
+		body("cfo-alice", "admin-1", uuid.NewString()), "admin-1", "")
 
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 for self-dealing even with administer, got %d: %s", rr.Code, rr.Body.String())
@@ -154,7 +154,7 @@ func TestCreate_OnBehalfOfRequiresAdministerGrant(t *testing.T) {
 	r := newRouterAuthz(newStubStore(), az)
 
 	rr := doReq(r, http.MethodPost, "/v1/delegations/",
-		body("cfo-alice", "bob", uuid.NewString()), "clerk")
+		body("cfo-alice", "bob", uuid.NewString()), "clerk", "")
 
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 got %d: %s", rr.Code, rr.Body.String())
@@ -171,7 +171,7 @@ func TestCreate_AdministratorMayDelegateBetweenOtherPrincipals(t *testing.T) {
 	r := newRouterAuthz(newStubStore(), az)
 
 	rr := doReq(r, http.MethodPost, "/v1/delegations/",
-		body("cfo-alice", "bob", uuid.NewString()), "admin-1")
+		body("cfo-alice", "bob", uuid.NewString()), "admin-1", "")
 
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
@@ -188,7 +188,7 @@ func TestCreate_DelegatingYourOwnAuthorityNeedsNoAdministerGrant(t *testing.T) {
 	r := newRouterAuthz(newStubStore(), az)
 
 	rr := doReq(r, http.MethodPost, "/v1/delegations/",
-		body("cfo-alice", "bob", uuid.NewString()), "cfo-alice")
+		body("cfo-alice", "bob", uuid.NewString()), "cfo-alice", "")
 
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
@@ -201,7 +201,7 @@ func TestCreate_DelegatingYourOwnAuthorityNeedsNoAdministerGrant(t *testing.T) {
 func TestCreate_DelegateMayNotBeTheDelegator(t *testing.T) {
 	r := newRouterAuthz(newStubStore(), newScopedAuthZ())
 	rr := doReq(r, http.MethodPost, "/v1/delegations/",
-		body("same-principal", "same-principal", uuid.NewString()), "same-principal")
+		body("same-principal", "same-principal", uuid.NewString()), "same-principal", "")
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -247,7 +247,7 @@ func TestList_UnscopedReadReturnsOnlyYourOwnDelegations(t *testing.T) {
 	seedTwo(t, s)
 	r := newRouterAuthz(s, newScopedAuthZ())
 
-	rr := doReq(r, http.MethodGet, "/v1/delegations/", nil, "me")
+	rr := doReq(r, http.MethodGet, "/v1/delegations/", nil, "me", "")
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -265,7 +265,7 @@ func TestList_UnscopedReadOfAnotherPrincipalIsForbidden(t *testing.T) {
 	seedTwo(t, s)
 	r := newRouterAuthz(s, newScopedAuthZ())
 
-	rr := doReq(r, http.MethodGet, "/v1/delegations/?delegate_principal_id=cto-carol", nil, "me")
+	rr := doReq(r, http.MethodGet, "/v1/delegations/?delegate_principal_id=cto-carol", nil, "me", "")
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -278,7 +278,7 @@ func TestList_EntityScopedReadRequiresViewGrant(t *testing.T) {
 	az := newScopedAuthZ("nosy|DELEGATION_VIEW")
 	r := newRouterAuthz(s, az)
 
-	rr := doReq(r, http.MethodGet, "/v1/delegations/?legal_entity_id=le-us", nil, "nosy")
+	rr := doReq(r, http.MethodGet, "/v1/delegations/?legal_entity_id=le-us", nil, "nosy", "")
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -292,7 +292,7 @@ func TestList_EntityScopedReadWithGrantSeesTheWholeEntity(t *testing.T) {
 	seedTwo(t, s)
 	r := newRouterAuthz(s, newScopedAuthZ())
 
-	rr := doReq(r, http.MethodGet, "/v1/delegations/?legal_entity_id=le-us", nil, "auditor")
+	rr := doReq(r, http.MethodGet, "/v1/delegations/?legal_entity_id=le-us", nil, "auditor", "")
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -305,7 +305,7 @@ func TestList_EntityScopedReadWithGrantSeesTheWholeEntity(t *testing.T) {
 
 func TestList_UnknownStatusIsRejected(t *testing.T) {
 	r := newRouterAuthz(newStubStore(), newScopedAuthZ())
-	rr := doReq(r, http.MethodGet, "/v1/delegations/?status=ACTIVEE", nil, "me")
+	rr := doReq(r, http.MethodGet, "/v1/delegations/?status=ACTIVEE", nil, "me", "")
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -319,7 +319,7 @@ func TestList_UnknownStatusIsRejected(t *testing.T) {
 func TestList_PagingValidation(t *testing.T) {
 	r := newRouterAuthz(newStubStore(), newScopedAuthZ())
 	for _, q := range []string{"limit=abc", "limit=0", "limit=501", "offset=-1"} {
-		rr := doReq(r, http.MethodGet, "/v1/delegations/?"+q, nil, "me")
+		rr := doReq(r, http.MethodGet, "/v1/delegations/?"+q, nil, "me", "")
 		if rr.Code != http.StatusBadRequest {
 			t.Fatalf("%s: expected 400 got %d", q, rr.Code)
 		}
@@ -331,7 +331,7 @@ func TestList_LimitIsApplied(t *testing.T) {
 	seedTwo(t, s)
 	r := newRouterAuthz(s, newScopedAuthZ())
 
-	rr := doReq(r, http.MethodGet, "/v1/delegations/?legal_entity_id=le-us&limit=1", nil, "auditor")
+	rr := doReq(r, http.MethodGet, "/v1/delegations/?legal_entity_id=le-us&limit=1", nil, "auditor", "")
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200 got %d", rr.Code)
 	}
@@ -354,7 +354,7 @@ func TestRoutes_MissingTenantIs401NotServiceUnavailable(t *testing.T) {
 		{http.MethodPost, "/v1/delegations/some-id/revoke", nil},
 	}
 	for _, c := range cases {
-		rr := doReq(r, c.method, c.path, c.body, "me")
+		rr := doReq(r, c.method, c.path, c.body, "me", "")
 		if rr.Code != http.StatusUnauthorized {
 			t.Fatalf("%s %s: expected 401 got %d: %s", c.method, c.path, rr.Code, rr.Body.String())
 		}
@@ -367,7 +367,7 @@ func TestCreate_UnknownFieldIsRejected(t *testing.T) {
 	r := newRouterAuthz(newStubStore(), newScopedAuthZ())
 	b := body("cfo-alice", "bob", uuid.NewString())
 	b["effective_untill"] = time.Now().UTC().Add(72 * time.Hour) // misspelled
-	rr := doReq(r, http.MethodPost, "/v1/delegations/", b, "cfo-alice")
+	rr := doReq(r, http.MethodPost, "/v1/delegations/", b, "cfo-alice", "")
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
 	}

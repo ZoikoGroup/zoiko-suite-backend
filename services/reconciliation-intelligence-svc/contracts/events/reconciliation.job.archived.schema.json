@@ -1,0 +1,20 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.reconciliation.job.archived (reconciliation-intelligence-svc, schema 1.0.0). AUTHORED contract, taken from the payload ArchiveJob enqueues (internal/store/pg_store.go): the archived job, the principal who archived it, and the job version after the archive.",
+  "properties": {
+    "archived_by": {
+      "type": "string"
+    },
+    "job_id": {
+      "type": "string"
+    },
+    "version": {
+      "type": "integer"
+    }
+  },
+  "required": [
+    "archived_by",
+    "job_id",
+    "version"
+  ],
+  "type": "object"
+}

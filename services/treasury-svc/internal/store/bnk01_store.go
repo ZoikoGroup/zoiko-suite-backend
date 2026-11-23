@@ -37,7 +37,7 @@ func (s *PgStore) VerifyBankAccountOwnership(ctx context.Context, p domain.Verif
 			&acct.BankAccountID, &acct.TenantID, &acct.LegalEntityID, &acct.AccountName,
 			&acct.MaskedAccountNumber, &acct.BankIdentifier, &acct.CurrencyCode, &acct.AccountStatus,
 			&acct.BranchRef, &acct.Country, &acct.AccountType, &acct.RequestedOperationalUse, &acct.TokenVersion,
-			&acct.CreatedByPrincipalID, &acct.CreatedAt, &acct.UpdatedAt); err != nil {
+			&acct.CreatedByPrincipalID, &acct.SuspendReason, &acct.CloseReason, &acct.CreatedAt, &acct.UpdatedAt); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return domain.ErrBankAccountNotFound
 			}
@@ -63,7 +63,7 @@ func (s *PgStore) VerifyBankAccountOwnership(ctx context.Context, p domain.Verif
 			return err
 		}
 		// Enqueue bank_account.ownership_verified event
-		return s.enqueueBankAccountEvent(ctx, tx, "ownership-verified", "bank_account.ownership_verified", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.VerifiedByPrincipalID, "", map[string]any{
+		return s.enqueueBankAccountEvent(ctx, tx, "ownership-verified", "bank_account.ownership_verified", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.VerifiedByPrincipalID, p.CorrelationID, map[string]any{
 			"bank_account_id":     acct.BankAccountID,
 			"tenant_id":           acct.TenantID,
 			"legal_entity_id":     acct.LegalEntityID,
@@ -121,7 +121,7 @@ func (s *PgStore) GetBankAccountAsOf(ctx context.Context, tenantID, bankAccountI
 		row := tx.QueryRow(ctx, `
 			SELECT history_id, bank_account_id, tenant_id, account_name, masked_account_number, bank_identifier,
 			       account_status, branch_ref, country, account_type, requested_operational_use, token_version,
-			       changed_by_principal_id, effective_at, superseded_by
+			       changed_by_principal_id, suspend_reason, close_reason, effective_at, superseded_by
 			FROM bank_account_history
 			WHERE bank_account_id = $1 AND tenant_id = $2 AND effective_at <= $3
 			ORDER BY effective_at DESC
@@ -129,7 +129,7 @@ func (s *PgStore) GetBankAccountAsOf(ctx context.Context, tenantID, bankAccountI
 			bankAccountID, tenantID, asOf)
 		return row.Scan(&e.HistoryID, &e.BankAccountID, &e.TenantID, &e.AccountName, &e.MaskedAccountNumber, &e.BankIdentifier,
 			&e.AccountStatus, &e.BranchRef, &e.Country, &e.AccountType, &e.RequestedOperationalUse, &e.TokenVersion,
-			&e.ChangedByPrincipalID, &e.EffectiveAt, &e.SupersededBy)
+			&e.ChangedByPrincipalID, &e.SuspendReason, &e.CloseReason, &e.EffectiveAt, &e.SupersededBy)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -183,7 +183,7 @@ func (s *PgStore) AmendBankAccountMetadata(ctx context.Context, p domain.AmendBa
 			return err
 		}
 		// Enqueue bank_account.metadata_amended event
-		return s.enqueueBankAccountEvent(ctx, tx, "metadata-amended", "bank_account.metadata_amended", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, "", map[string]any{
+		return s.enqueueBankAccountEvent(ctx, tx, "metadata-amended", "bank_account.metadata_amended", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, p.CorrelationID, map[string]any{
 			"bank_account_id": acct.BankAccountID,
 			"tenant_id":       acct.TenantID,
 			"legal_entity_id": acct.LegalEntityID,
@@ -215,7 +215,7 @@ func (s *PgStore) ChangeOperationalUse(ctx context.Context, p domain.ChangeOpera
 			return err
 		}
 		// Enqueue bank_account.operational_use_changed event
-		return s.enqueueBankAccountEvent(ctx, tx, "operational-use-changed", "bank_account.operational_use_changed", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, "", map[string]any{
+		return s.enqueueBankAccountEvent(ctx, tx, "operational-use-changed", "bank_account.operational_use_changed", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, p.CorrelationID, map[string]any{
 			"bank_account_id":           acct.BankAccountID,
 			"tenant_id":                 acct.TenantID,
 			"legal_entity_id":           acct.LegalEntityID,
@@ -248,11 +248,12 @@ func (s *PgStore) SuspendBankAccount(ctx context.Context, p domain.SuspendAccoun
 			return err
 		}
 		// Enqueue bank_account.suspended event
-		return s.enqueueBankAccountEvent(ctx, tx, "suspended", "bank_account.suspended", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, "", map[string]any{
+		return s.enqueueBankAccountEvent(ctx, tx, "suspended", "bank_account.suspended", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, p.CorrelationID, map[string]any{
 			"bank_account_id": acct.BankAccountID,
 			"tenant_id":       acct.TenantID,
 			"legal_entity_id": acct.LegalEntityID,
 			"account_status":  acct.AccountStatus,
+			"suspend_reason":  acct.SuspendReason,
 		})
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -280,7 +281,7 @@ func (s *PgStore) ReactivateBankAccount(ctx context.Context, p domain.Reactivate
 			return err
 		}
 		// Enqueue bank_account.reactivated event
-		return s.enqueueBankAccountEvent(ctx, tx, "reactivated", "bank_account.reactivated", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, "", map[string]any{
+		return s.enqueueBankAccountEvent(ctx, tx, "reactivated", "bank_account.reactivated", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, p.CorrelationID, map[string]any{
 			"bank_account_id": acct.BankAccountID,
 			"tenant_id":       acct.TenantID,
 			"legal_entity_id": acct.LegalEntityID,
@@ -312,11 +313,12 @@ func (s *PgStore) CloseBankAccount(ctx context.Context, p domain.CloseAccountPar
 			return err
 		}
 		// Enqueue bank_account.closed event
-		return s.enqueueBankAccountEvent(ctx, tx, "closed", "bank_account.closed", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, "", map[string]any{
+		return s.enqueueBankAccountEvent(ctx, tx, "closed", "bank_account.closed", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, p.CorrelationID, map[string]any{
 			"bank_account_id": acct.BankAccountID,
 			"tenant_id":       acct.TenantID,
 			"legal_entity_id": acct.LegalEntityID,
 			"account_status":  acct.AccountStatus,
+			"close_reason":    acct.CloseReason,
 		})
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -350,7 +352,7 @@ func (s *PgStore) RotateAccountIdentifierToken(ctx context.Context, p domain.Rot
 			return err
 		}
 		// Enqueue bank_account.token_rotated event
-		return s.enqueueBankAccountEvent(ctx, tx, "token-rotated", "bank_account.token_rotated", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, "", map[string]any{
+		return s.enqueueBankAccountEvent(ctx, tx, "token-rotated", "bank_account.token_rotated", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, p.CorrelationID, map[string]any{
 			"bank_account_id": acct.BankAccountID,
 			"tenant_id":       acct.TenantID,
 			"legal_entity_id": acct.LegalEntityID,
@@ -379,12 +381,12 @@ func (s *PgStore) recordAccountHistory(ctx context.Context, tx pgx.Tx, acct *dom
 		INSERT INTO bank_account_history (
 			history_id, bank_account_id, tenant_id, account_name, masked_account_number, bank_identifier,
 			account_status, branch_ref, country, account_type, requested_operational_use, token_version,
-			changed_by_principal_id
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+			changed_by_principal_id, suspend_reason, close_reason
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
 		RETURNING history_id`,
 		uuid.New().String(), acct.BankAccountID, acct.TenantID, acct.AccountName, acct.MaskedAccountNumber, acct.BankIdentifier,
 		acct.AccountStatus, acct.BranchRef, acct.Country, acct.AccountType, acct.RequestedOperationalUse, acct.TokenVersion,
-		actorPrincipalID,
+		actorPrincipalID, acct.SuspendReason, acct.CloseReason,
 	).Scan(&historyID); err != nil {
 		return err
 	}

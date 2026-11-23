@@ -2,12 +2,14 @@ package handler
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"zoiko.io/migration-integrity-svc/internal/domain"
+	"zoiko.io/migration-integrity-svc/internal/problem"
 	"zoiko.io/migration-integrity-svc/internal/store"
 )
 
@@ -26,6 +28,8 @@ import (
 //   - required fields, records (1..10000), control_totals           400
 //   - exception_owner_id is not the submitter (SoD)                 422
 //   - MIGRATION_JOB_VALIDATE at the legal entity                    403 / 503
+//   - source_extract_id (optional) names a registered extract of the
+//     same legal entity and record count                        501 / 404 / 409
 //
 // Writes: migration_jobs, migration_integrity_checks,
 // migration_audit_entries, migration_idempotency_keys — one transaction.
@@ -68,7 +72,16 @@ func (h *Handler) ValidateMigration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	extract, ok := h.resolveSourceExtract(w, r, &req, caller.TenantID)
+	if !ok {
+		return
+	}
+
 	job, outcome := h.buildDecidedJob(&req, caller)
+	if extract != nil {
+		job.SourceExtractID = extract.ID
+		job.SourceExtractVersion = extract.Version
+	}
 	err := h.store.CreateJob(r.Context(), caller.TenantID, job, outcome.Checks, outcome.Entries,
 		caller.PrincipalID, r.Header.Get(headerCorrelationID), claim)
 	if errors.Is(err, store.ErrIdempotencyKeyInUse) {
@@ -83,6 +96,43 @@ func (h *Handler) ValidateMigration(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("ETag", etagFor(job.Version))
 	w.Header().Set("Location", "/v1/migrations/"+job.ID)
 	h.writeJSON(w, http.StatusCreated, job)
+}
+
+// resolveSourceExtract binds the run to a registered, immutable
+// SourceExtract (MIG-INV-03) when the request names one. Backward
+// compatible: a request that omits source_extract_id validates the
+// submitted records directly and gets (nil, true).
+func (h *Handler) resolveSourceExtract(w http.ResponseWriter, r *http.Request, req *domain.ValidateMigrationRequest, tenantID string) (*domain.SourceExtract, bool) {
+	id := strings.TrimSpace(req.SourceExtractID)
+	if id == "" {
+		return nil, true
+	}
+	if h.cp == nil {
+		problem.Write(w, r, http.StatusNotImplemented, "control-plane-not-configured", "Control plane not configured",
+			"source_extract_id was given but the migration control plane is not configured on this instance")
+		return nil, false
+	}
+	extract, err := h.cp.GetExtractByID(r.Context(), tenantID, id)
+	if err != nil {
+		problem.Write(w, r, http.StatusNotFound, "source-extract-not-found", "Source extract not found",
+			"source_extract_id does not name a registered source extract in this tenant")
+		return nil, false
+	}
+	if extract.LegalEntityID != req.LegalEntityID {
+		problem.Write(w, r, http.StatusConflict, "source-extract-legal-entity-mismatch", "Source extract mismatch",
+			"the source extract was registered for a different legal_entity_id")
+		return nil, false
+	}
+	// The frozen extract and what is being validated against it must be the
+	// same population; otherwise a different submission could silently stand
+	// in for this extract.
+	if extract.RecordCount != len(req.Records) {
+		problem.Write(w, r, http.StatusConflict, "source-extract-record-count-mismatch", "Source extract mismatch",
+			fmt.Sprintf("record count mismatch: extract %s v%d declares %d records, but %d were submitted for validation",
+				extract.ExtractID, extract.Version, extract.RecordCount, len(req.Records)))
+		return nil, false
+	}
+	return extract, true
 }
 
 // resolveLegalEntity reconciles the body's legal_entity_id with the

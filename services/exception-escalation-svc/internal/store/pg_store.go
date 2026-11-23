@@ -24,10 +24,25 @@ type Store interface {
 
 type PgStore struct {
 	pool *pgxpool.Pool
+
+	// eventRegion is the residency region stamped on shared-outbox events (BIZ-08).
+	eventRegion string
 }
 
-func NewPgStore(pool *pgxpool.Pool) *PgStore {
-	return &PgStore{pool: pool}
+// Option configures a PgStore.
+type Option func(*PgStore)
+
+// WithEventRegion sets the residency region carried by every shared-outbox event.
+func WithEventRegion(region string) Option {
+	return func(s *PgStore) { s.eventRegion = region }
+}
+
+func NewPgStore(pool *pgxpool.Pool, opts ...Option) *PgStore {
+	s := &PgStore{pool: pool}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 func (s *PgStore) setRLS(ctx context.Context, tx pgx.Tx) error {

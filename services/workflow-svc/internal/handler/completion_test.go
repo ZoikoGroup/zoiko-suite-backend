@@ -31,7 +31,7 @@ const (
 
 func readInstance() *domain.WorkflowInstance {
 	return &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, TenantID: testTenant, LegalEntityID: testEntity,
-		WorkflowStatus: "PENDING", InitiatedBy: "requester-1", WorkflowType: "PURCHASE_APPROVAL", CurrentStage: 1}
+		WorkflowStatus: "PENDING", InitiatedBy: "requester-1", WorkflowType: "PURCHASE_APPROVAL", CurrentStage: 1, RowVersion: 1}
 }
 
 func routerWithReadMode(s *stubStore, a *stubAuthz, mode string) chi.Router {

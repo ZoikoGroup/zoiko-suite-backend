@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strconv"
@@ -20,6 +22,11 @@ type Config struct {
 	// Every admin mutating API call must be authorized before proceeding.
 	// No service self-authorizes (doctrine).
 	AuthZServiceURL string
+
+	// TenantRegistryURL is tenant-entity-registry-svc, read by the J-10
+	// backfill of the entity-jurisdiction projection. Empty disables the
+	// backfill route.
+	TenantRegistryURL string
 
 	// WorkflowServiceURL is workflow-svc, which confirms the approval a rule
 	// activation cites (J-02). Required outside local/dev.
@@ -85,12 +92,39 @@ type Config struct {
 	// production or staging then requires a ring and a region.
 	ResolverEnabled bool
 
+	// ResolverRequireLaunched makes the resolver serve only jurisdictions whose rollout is LAUNCHED with a
+	// released pack (Wave 8). OFF by default: turning it on changes what existing callers get.
+	ResolverRequireLaunched bool
+
+	// ResolverPushInvalidation makes every replica drop its resolver cache the moment a pack version, deployment, signing key or rollout changes
+	// (Postgres LISTEN/NOTIFY, migration 000025), instead of waiting for the cache TTL. On by default; set false when the database is reached
+	// through a pooler that cannot carry LISTEN (PgBouncer transaction mode).
+	ResolverPushInvalidation bool
+
 	// HotfixRetroSLAHours is how long a hotfix retrospective may stay open
 	// before it is reported overdue (s24 leaves the SLA to a controlled
 	// decision; default 120).
 	HotfixRetroSLAHours int
 	// PackCertAgeWarnDays marks a certification stale in the metrics (default 180).
 	PackCertAgeWarnDays int
+
+	// CursorSigningKey signs every list's next_cursor (API-4), binding it to
+	// the tenant, route and filters that produced it.
+	// CURSOR_SIGNING_KEY_HEX, at least 32 bytes; required outside local/dev,
+	// where a per-process random key would break every cursor on a restart or
+	// on another replica.
+	CursorSigningKey []byte
+
+	// IdentityVerifyAdmin is "require" (default outside local/dev) or "off":
+	// with require, every administrative write needs a verified identity
+	// (signed envelope or mTLS peer), whatever IDENTITY_VERIFY says for the
+	// rest of the API (J-01). "off" is refused outside local/dev.
+	IdentityVerifyAdmin string
+
+	// RuleEffectivityIntervalSeconds is how often the effectivity watcher
+	// announces rules reaching the start or end of their interval
+	// (regulatory-rule.effective / .expired). Default 60, 5 to 3600.
+	RuleEffectivityIntervalSeconds int
 }
 
 // KafkaConfig holds event-backbone connection parameters. Per
@@ -106,6 +140,11 @@ type KafkaConfig struct {
 	// entity.created and entity.jurisdiction.changed (Doc 03 §8.2). Empty
 	// disables the consumer.
 	EntityTopic string
+
+	// RegulatoryFeedTopic carries regulatory.source.changed (automatic legal
+	// drift, J-03/J-04). Empty disables the consumer; its producer,
+	// external-data-feed-svc, does not publish the event yet.
+	RegulatoryFeedTopic string
 }
 
 // DBConfig holds PostgreSQL connection parameters.
@@ -133,6 +172,8 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		Env:  env("ENV", "local"),
 		Port: envInt("PORT", 8082),
+
+		TenantRegistryURL: env("TENANT_REGISTRY_URL", ""),
 		DB: DBConfig{
 			Host:     env("DB_HOST", "localhost"),
 			Port:     envInt("DB_PORT", 5432),
@@ -146,6 +187,8 @@ func Load() (*Config, error) {
 			GroupID:     env("KAFKA_GROUP_ID", "jurisdiction-rules-svc"),
 			Topic:       env("KAFKA_EVENTS_TOPIC", "zoiko.jurisdiction.events"),
 			EntityTopic: env("KAFKA_ENTITY_TOPIC", "zoiko.entity.events"),
+
+			RegulatoryFeedTopic: env("KAFKA_REGULATORY_FEED_TOPIC", ""),
 		},
 		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
 		WorkflowServiceURL:   env("WORKFLOW_SERVICE_URL", ""),
@@ -164,16 +207,69 @@ func Load() (*Config, error) {
 		ResolverEligibleStatuses: envList("RESOLVER_ELIGIBLE_STATUSES", []string{"RELEASED"}),
 		ResolverCacheTTLSeconds:  envInt("RESOLVER_CACHE_TTL_SECONDS", 30),
 		ResolverEnabled:          env("RESOLVER_ENABLED", "false") == "true",
+		ResolverRequireLaunched:  env("RESOLVER_REQUIRE_LAUNCHED", "false") == "true",
+		ResolverPushInvalidation: env("RESOLVER_PUSH_INVALIDATION", "true") != "false",
 		ResolverRing:             env("RESOLVER_RING", ""),
 		ResolverRegion:           env("RESOLVER_REGION", ""),
 		HotfixRetroSLAHours:      envInt("HOTFIX_RETRO_SLA_HOURS", 120),
 		PackCertAgeWarnDays:      envInt("PACK_CERT_AGE_WARN_DAYS", 180),
+
+		RuleEffectivityIntervalSeconds: envInt("RULE_EFFECTIVITY_INTERVAL_SECONDS", 60),
 	}
+	if cfg.IdentityVerifyAdmin = strings.ToLower(strings.TrimSpace(os.Getenv("IDENTITY_VERIFY_ADMIN"))); cfg.IdentityVerifyAdmin == "" {
+		cfg.IdentityVerifyAdmin = "require"
+		if localEnv(cfg.Env) {
+			cfg.IdentityVerifyAdmin = "off"
+		}
+	}
+	key, err := cursorKey(os.Getenv("CURSOR_SIGNING_KEY_HEX"), localEnv(cfg.Env))
+	if err != nil {
+		return nil, err
+	}
+	cfg.CursorSigningKey = key
 
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
+	// Last, so the other guards report first: outside local/dev a cursor key
+	// that differs per process would break every next_cursor on a restart.
+	if len(cfg.CursorSigningKey) == 0 {
+		return nil, fmt.Errorf("CURSOR_SIGNING_KEY_HEX is required outside local/dev")
+	}
 	return cfg, nil
+}
+
+// localEnv reports whether env names a developer tier.
+func localEnv(env string) bool {
+	switch strings.ToLower(strings.TrimSpace(env)) {
+	case "local", "dev", "development", "test":
+		return true
+	}
+	return false
+}
+
+// cursorKey decodes CURSOR_SIGNING_KEY_HEX. Unset gives a random key per
+// process in local/dev and no key elsewhere (Load then refuses to start).
+func cursorKey(raw string, local bool) ([]byte, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		if !local {
+			return nil, nil
+		}
+		key := make([]byte, 32)
+		if _, err := rand.Read(key); err != nil {
+			return nil, fmt.Errorf("generate cursor signing key: %w", err)
+		}
+		return key, nil
+	}
+	key, err := hex.DecodeString(raw)
+	if err != nil {
+		return nil, fmt.Errorf("CURSOR_SIGNING_KEY_HEX is not hex: %w", err)
+	}
+	if len(key) < 32 {
+		return nil, fmt.Errorf("CURSOR_SIGNING_KEY_HEX must be at least 32 bytes, got %d", len(key))
+	}
+	return key, nil
 }
 
 // validate rejects configurations that would start the service in an unsafe
@@ -210,6 +306,18 @@ func (c *Config) validate() error {
 		}
 	}
 
+	switch c.IdentityVerifyAdmin {
+	case "require":
+	case "off":
+		if !localEnv(c.Env) {
+			return fmt.Errorf("IDENTITY_VERIFY_ADMIN=off is refused outside local/dev: administrative writes would trust identity headers (J-01)")
+		}
+	default:
+		return fmt.Errorf("IDENTITY_VERIFY_ADMIN must be require or off, got %q", c.IdentityVerifyAdmin)
+	}
+	if c.RuleEffectivityIntervalSeconds < 5 || c.RuleEffectivityIntervalSeconds > 3600 {
+		return fmt.Errorf("RULE_EFFECTIVITY_INTERVAL_SECONDS must be between 5 and 3600, got %d", c.RuleEffectivityIntervalSeconds)
+	}
 	if c.HotfixRetroSLAHours < 1 || c.PackCertAgeWarnDays < 1 {
 		return fmt.Errorf("HOTFIX_RETRO_SLA_HOURS and PACK_CERT_AGE_WARN_DAYS must be at least 1")
 	}

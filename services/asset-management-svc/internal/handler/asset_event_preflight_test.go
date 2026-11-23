@@ -44,7 +44,7 @@ func TestApplyAssetEvent_StoreSideRefusal_NeverPostsJournal(t *testing.T) {
 	effDate := time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC)
 	second := createDraftAssetEvent(t, r, id, domain.AssetEventTypeDisposal, domain.CreateAssetEventRequest{
 		Amount: &amount, Currency: "EUR", EffectiveDate: &effDate,
-		DebitAccountCode: "LOSS-ON-DISPOSAL", CreditAccountCode: "FIXED-ASSETS",
+		DebitMappingKey: "DISPOSAL_LOSS", CreditMappingKey: "FIXED_ASSET_COST",
 	})
 	walkToApproved(t, r, second.EventID)
 

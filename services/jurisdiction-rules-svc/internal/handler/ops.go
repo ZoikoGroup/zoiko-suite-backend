@@ -70,6 +70,7 @@ func registerOpsRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/admin/deployment-rings", h.CreateRing)
 	r.Post("/v1/admin/packs/{pack_ref}/versions/{version}/publish", h.PublishPackVersion)
 	r.Post("/v1/admin/packs/{pack_ref}/versions/{version}/withdraw", h.WithdrawPackVersion)
+	r.Post("/v1/admin/packs/{pack_ref}/versions/{version}/supersede", h.SupersedePackVersion)
 	r.Post("/v1/admin/packs/{pack_ref}/versions/{version}/block", h.BlockPackVersion)
 	r.Post("/v1/admin/packs/{pack_ref}/versions/{version}/unblock", h.UnblockPackVersion)
 	r.Post("/v1/admin/packs/{pack_ref}/versions/{version}/deploy", h.DeployPackVersion)
@@ -101,6 +102,10 @@ func (h *Handler) writeOpsError(w http.ResponseWriter, r *http.Request, err erro
 		writeError(w, r, http.StatusNotFound, "notice_not_found", err.Error())
 	case errors.Is(err, domain.ErrNotAssignedReviewer):
 		writeError(w, r, http.StatusForbidden, "not_assigned_reviewer", err.Error())
+	case errors.Is(err, domain.ErrProvenanceIncomplete):
+		writeError(w, r, http.StatusConflict, "provenance_incomplete", err.Error())
+	case errors.Is(err, domain.ErrRingOrdinalTaken):
+		writeError(w, r, http.StatusConflict, "ring_ordinal_taken", err.Error())
 	default:
 		h.writeCertError(w, r, err, corr)
 	}
@@ -145,12 +150,16 @@ func (h *Handler) CreateRegion(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListRegions(w http.ResponseWriter, r *http.Request) {
+	p, ok := h.beginList(w, r, nil, nil)
+	if !ok {
+		return
+	}
 	xs, err := h.registry.ListRegions(r.Context())
 	if err != nil {
 		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"regions": xs})
+	finishListAs(h, w, r, p, "regions", pageOf(p, xs))
 }
 
 type CreateRingRequest struct {
@@ -190,12 +199,16 @@ func (h *Handler) CreateRing(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListRings(w http.ResponseWriter, r *http.Request) {
+	p, ok := h.beginList(w, r, nil, nil)
+	if !ok {
+		return
+	}
 	xs, err := h.registry.ListRings(r.Context())
 	if err != nil {
 		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"rings": xs})
+	finishListAs(h, w, r, p, "rings", pageOf(p, xs))
 }
 
 // ── release lifecycle ───────────────────────────────────────────────────────
@@ -234,6 +247,9 @@ func (h *Handler) lifecycle(w http.ResponseWriter, r *http.Request, action strin
 	if res.Changed {
 		h.emitRegistry(r, event, ref+"@"+version, actor, map[string]any{"pack_ref": ref, "version": version,
 			"from_status": res.FromStatus, "to_status": res.ToStatus, "reason": req.Reason, "evidence_ref": req.EvidenceRef})
+		if res.RemediationOpened && res.RemediationCaseID != nil {
+			h.emitRemediationOpened(r, *res.RemediationCaseID, ref, version, domain.RemediationWithdraw, res.RemediationDecisions, actor)
+		}
 	}
 	writeJSON(w, http.StatusOK, res)
 }
@@ -336,17 +352,24 @@ func (h *Handler) RollbackDeployment(w http.ResponseWriter, r *http.Request) {
 	}
 	h.emitRegistry(r, events.EventPackRolledBack, res.RolledBack.DeploymentID, actor, map[string]any{"pack_ref": ref, "version": version,
 		"ring": req.Ring, "region": req.Region, "restored_version": req.RestoreVersion, "reason": req.Reason, "decisions_affected": res.DecisionsMade})
+	if res.RemediationOpened && res.RemediationCaseID != nil {
+		h.emitRemediationOpened(r, *res.RemediationCaseID, ref, version, domain.RemediationRollback, res.RemediationDecisions, actor)
+	}
 	writeJSON(w, http.StatusOK, res)
 }
 
 func (h *Handler) ListDeployments(w http.ResponseWriter, r *http.Request) {
+	p, ok := h.beginList(w, r, nil, nil)
+	if !ok {
+		return
+	}
 	ref, version := pathRefVersion(r)
 	ds, err := h.registry.ListDeployments(r.Context(), ref, version)
 	if err != nil {
 		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"deployments": ds})
+	finishListAs(h, w, r, p, "deployments", pageOf(p, ds))
 }
 
 // ── emergency hotfix ────────────────────────────────────────────────────────
@@ -504,16 +527,16 @@ func (h *Handler) GetNotice(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListNotices(w http.ResponseWriter, r *http.Request) {
-	limit, offset, ok := h.parsePaging(w, r, r.URL.Query())
+	p, ok := h.beginList(w, r, []string{"status"}, map[string]string{"status": "status"})
 	if !ok {
 		return
 	}
-	ns, err := h.registry.ListNotices(r.Context(), strings.ToUpper(r.URL.Query().Get("status")), limit, offset)
+	ns, err := h.registry.ListNotices(r.Context(), strings.ToUpper(p.filter("status")), p.fetch(), p.offset)
 	if err != nil {
 		h.writeOpsError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"notices": ns})
+	finishListAs(h, w, r, p, "notices", ns)
 }
 
 // StartNoticeReview assigns the caller as independent reviewer (not the intake author).
@@ -616,4 +639,3 @@ func (h *Handler) OpsMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, m)
 }
-

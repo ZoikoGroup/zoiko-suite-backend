@@ -71,6 +71,12 @@ var exemptPaths = map[string]bool{
 	// replay it to whoever repeats the key.
 	"/v1/authenticate/step-up": true,
 	"/v1/mfa/totp/enroll":      true,
+	// The passkey step-up finish mints a login token like the TOTP step-up.
+	// The begin routes answer a fresh single-use challenge: a replayed answer
+	// would hand back a ceremony already taken, never a working one.
+	"/v1/authenticate/step-up/passkey/begin":  true,
+	"/v1/authenticate/step-up/passkey/finish": true,
+	"/v1/mfa/passkeys/register/begin":         true,
 }
 
 // Middleware answers a repeated command from its first response.

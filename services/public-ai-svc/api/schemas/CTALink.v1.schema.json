@@ -1,0 +1,25 @@
+{
+  "$id": "https://schemas.zoikosuite.com/public-ai/CTALink.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "label": {
+      "description": "Doc 02 §06 default CTA for the intent",
+      "or the official page title.": null,
+      "type": "string"
+    },
+    "route_key": {
+      "type": "string"
+    },
+    "url": {
+      "description": "Omitted until the signed route registry has a real page.",
+      "format": "uri",
+      "type": "string"
+    }
+  },
+  "required": [
+    "route_key",
+    "label"
+  ],
+  "type": "object"
+}

@@ -45,11 +45,11 @@ CREATE POLICY refused_escalations_append ON refused_escalations FOR INSERT
 
 -- Grants are belt and braces on top of the policies, and guarded: the app role
 -- does not exist on every database this runs against.
-DO $$
+DO $migration_000007$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'zoiko_app') THEN
         REVOKE UPDATE, DELETE, TRUNCATE ON refused_escalations FROM zoiko_app;
         REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON protected_permissions FROM zoiko_app;
     END IF;
 END
-$$;
+$migration_000007$;

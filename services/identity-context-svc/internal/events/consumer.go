@@ -369,8 +369,7 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) error {
 	}
 
 	switch ev.EventType {
-	case "authority.revoked", "authority.expired", "authority.suspended", "role.updated", "entity.updated",
-		"iam.assignment.revoked":
+	case "authority.revoked", "authority.expired", "authority.suspended", "role.updated", "entity.updated":
 		if c.stale(ev) {
 			return nil
 		}
@@ -386,10 +385,20 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) error {
 		return c.handleAuthorityDelegated(ctx, ev)
 	case "role.updated":
 		return c.handleRoleUpdated(ctx, ev)
-	case "iam.assignment.revoked":
+	// IAM-09: authorization-svc (zoiko.authorization.events) and
+	// access-control-svc both publish the assignment lifecycle. An expiry
+	// ends authority like a revocation; an approval adds it, like a grant.
+	case "iam.assignment.revoked", "iam.assignment.expired":
 		return c.handleAssignmentRevoked(ctx, ev)
-	case "iam.assignment.granted":
+	case "iam.assignment.granted", "iam.assignment.approved":
 		return c.handleAssignmentGranted(ctx, ev)
+	// A suspended assignment confers nothing until it is resumed (ORG-06), so
+	// the subject's sessions end as on a revocation; a resume only ADDS access,
+	// like a grant, and ends nothing.
+	case "iam.assignment.suspended":
+		return c.handleAssignmentSuspended(ctx, ev)
+	case "iam.assignment.resumed":
+		return c.handleAssignmentResumed(ctx, ev)
 	case "entity.updated":
 		return c.handleEntityUpdated(ctx, ev)
 	case "session.risk.changed", "risk.signal.updated":
@@ -533,14 +542,21 @@ func (c *Consumer) handleRoleUpdated(ctx context.Context, ev inbound) error {
 // principal whose assignment was just revoked is no longer among them, so the
 // one session that most needs ending was the one it could never find. The
 // subject is payload.principal_id; ev.ActorID is the revoker and is never used.
+//
+// IC-11 (S1-9 K-1): The projection (EndRoleAssignment + tombstone) is ALWAYS
+// written, even for events older than the revocation horizon. Only session
+// eviction is skipped for stale events.
 func (c *Consumer) handleAssignmentRevoked(ctx context.Context, ev inbound) error {
 	var p struct {
 		PrincipalID       string `json:"principal_id"`
 		TargetPrincipalID string `json:"target_principal_id"`
 		RoleID            string `json:"role_id"`
 		AssignmentID      string `json:"assignment_id"`
+		// authorization-svc names the id principal_role_assignment_id.
+		AuthzAssignmentID string `json:"principal_role_assignment_id"`
 	}
 	_ = json.Unmarshal(ev.Payload, &p)
+	p.AssignmentID = firstNonEmpty(p.AssignmentID, p.AuthzAssignmentID)
 	principalID := firstNonEmpty(p.PrincipalID, p.TargetPrincipalID)
 	if principalID == "" {
 		c.log.Error("iam.assignment.revoked names no principal — cannot revoke",
@@ -552,6 +568,7 @@ func (c *Consumer) handleAssignmentRevoked(ctx context.Context, ev inbound) erro
 	}
 	// Close the projection first, so the re-resolve the eviction forces does
 	// not frame the revoked role back into the next envelope.
+	// IC-11: ALWAYS write the projection, even for stale events.
 	if proj, ok := c.roles.(RoleAssignmentProjector); ok && p.AssignmentID != "" {
 		if err := proj.EndRoleAssignment(ctx, ev.TenantID, p.AssignmentID, c.now()); err != nil {
 			c.log.Error("failed to close projected role assignment — will retry",
@@ -559,20 +576,29 @@ func (c *Consumer) handleAssignmentRevoked(ctx context.Context, ev inbound) erro
 			return c.retry(ctx, ev, err)
 		}
 	}
-	n, err := c.sessions.EvictAllForPrincipal(ctx, principalID, ev.TenantID, domain.InvalidationReasonAdminRevoke)
-	if err != nil {
-		c.log.Error("failed to revoke sessions after assignment revocation — will retry",
+	// IC-11: Only evict sessions if the event is NOT stale (within horizon).
+	// For stale events, the projection is still closed but sessions are not evicted.
+	if !c.stale(ev) {
+		n, err := c.sessions.EvictAllForPrincipal(ctx, principalID, ev.TenantID, domain.InvalidationReasonAdminRevoke)
+		if err != nil {
+			c.log.Error("failed to revoke sessions after assignment revocation — will retry",
+				zap.String("principal_id", principalID),
+				zap.String("role_id", p.RoleID),
+				zap.String("correlation_id", ev.CorrelationID),
+				zap.Error(err))
+			return c.retry(ctx, ev, err)
+		}
+		c.log.Warn("assignment revoked — sessions revoked",
 			zap.String("principal_id", principalID),
 			zap.String("role_id", p.RoleID),
-			zap.String("correlation_id", ev.CorrelationID),
-			zap.Error(err))
-		return c.retry(ctx, ev, err)
+			zap.Int("sessions_revoked", n),
+			zap.String("correlation_id", ev.CorrelationID))
+	} else {
+		c.log.Info("assignment revoked — projection closed (stale event, sessions not evicted)",
+			zap.String("principal_id", principalID),
+			zap.String("role_id", p.RoleID),
+			zap.String("correlation_id", ev.CorrelationID))
 	}
-	c.log.Warn("assignment revoked — sessions revoked",
-		zap.String("principal_id", principalID),
-		zap.String("role_id", p.RoleID),
-		zap.Int("sessions_revoked", n),
-		zap.String("correlation_id", ev.CorrelationID))
 	return nil
 }
 
@@ -586,17 +612,19 @@ func (c *Consumer) handleAssignmentGranted(ctx context.Context, ev inbound) erro
 		return nil
 	}
 	var p struct {
-		AssignmentID  string    `json:"assignment_id"`
-		PrincipalID   string    `json:"principal_id"`
-		RoleID        string    `json:"role_id"`
-		LegalEntityID string    `json:"legal_entity_id"`
-		EffectiveFrom time.Time `json:"effective_from"`
+		AssignmentID      string    `json:"assignment_id"`
+		AuthzAssignmentID string    `json:"principal_role_assignment_id"`
+		PrincipalID       string    `json:"principal_id"`
+		RoleID            string    `json:"role_id"`
+		LegalEntityID     string    `json:"legal_entity_id"`
+		EffectiveFrom     time.Time `json:"effective_from"`
 		// EffectiveTo is the assignment's end date when it was granted with
 		// one. Projected, so a resolve after it stops framing the role even
 		// before the expiry's iam.assignment.revoked arrives.
 		EffectiveTo time.Time `json:"effective_to"`
 	}
 	_ = json.Unmarshal(ev.Payload, &p)
+	p.AssignmentID = firstNonEmpty(p.AssignmentID, p.AuthzAssignmentID)
 	if p.AssignmentID == "" || p.PrincipalID == "" || p.RoleID == "" {
 		c.log.Error("iam.assignment.granted is missing assignment_id, principal_id or role_id — not projected",
 			zap.String("event_id", ev.EventID))

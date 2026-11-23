@@ -1,10 +1,12 @@
 package policy
 
+import "zoiko.io/public-ai-svc/internal/contract"
+
 // Guided topic menu and follow-ups for the structured widget (ADR-008).
 //
 // Nothing here is invented: categories are the Doc 02 §22 public page
-// families, labelled with the Homepage chips (Explore platform, Compare
-// plans, Security & trust, Book demo) and "Support Center"; items are each
+// families, labelled with the Homepage chips in Doc 02 §22 order (Explore
+// platform, Compare plans, Book demo, Security & trust) and "Support Center"; items are each
 // family's recommended chips, mapped to their Doc 02 §06 intent. Follow-ups
 // come from the Doc 02 §08 secondary-intent pairs, then the other items of
 // the same family, in menu order. The model never chooses any of them.
@@ -47,17 +49,17 @@ var Menu = []MenuCategory{
 		{"pricing.entities", "Entity limits", "I03", "How many entities can each plan include?"},
 		{"pricing.sales", "Talk to sales", "I24", "I'd like to talk to sales"},
 	}},
-	{ID: "trust", Label: "Security & trust", Items: []MenuItem{
-		{"trust.assurance", "Independent assurance", "I12", "Which security certifications does ZoikoSuite hold?"},
-		{"trust.residency", "Data residency", "I14", "Where is ZoikoSuite data stored?"},
-		{"trust.privacy", "Privacy", "I13", "How does ZoikoSuite handle privacy and personal data?"},
-		{"trust.review", "Security review", "I12", "How can we run a security review of ZoikoSuite?"},
-	}},
 	{ID: "demo", Label: "Book demo", Items: []MenuItem{
 		{"demo.coverage", "What can be covered", "I08", "What can a demo cover?"},
 		{"demo.plans", "Plans", "I05", "What do the plans cost?"},
 		{"demo.enterprise", "Enterprise", "I09", "Tell me about enterprise options"},
 		{"demo.integrations", "Integrations", "I10", "Which integrations does ZoikoSuite support?"},
+	}},
+	{ID: "trust", Label: "Security & trust", Items: []MenuItem{
+		{"trust.assurance", "Independent assurance", "I12", "Which security certifications does ZoikoSuite hold?"},
+		{"trust.residency", "Data residency", "I14", "Where is ZoikoSuite data stored?"},
+		{"trust.privacy", "Privacy", "I13", "How does ZoikoSuite handle privacy and personal data?"},
+		{"trust.review", "Security review", "I12", "How can we run a security review of ZoikoSuite?"},
 	}},
 	{ID: "support", Label: "Support Center", Items: []MenuItem{
 		{"support.sign_in", "Sign in", "I22", "How do I sign in?"},
@@ -85,11 +87,40 @@ var IntentCTA = map[string]string{
 	"I27": "Send site feedback", "I28": "Open billing help", "I29": "Help / human route", "I30": "Review responsible AI",
 }
 
+// TrialPricingCTA is Doc 02 T06's CTA when the trial answer links the
+// pricing page rather than a sign-up page.
+const TrialPricingCTA = "Review trial options"
+
 // RouteTitles names the official page behind a route key when a citation
 // points at a route rather than a knowledge source.
 var RouteTitles = map[string]string{
 	"pricing": "Pricing and plans", "signup_or_trial": "Start a trial", "demo": "Book a demo",
-	"support": "Support center", "trust": "Trust Center", "core_modules": "Core modules", "integrations": "Integrations",
+	"support": "Support center", "trust": "Trust Center", "trust-center": "Trust Center",
+	"core_modules": "Core modules", "integrations": "Integrations",
+	"platform-overview": "Platform overview",
+	"sign-in":           "Sign in securely",
+}
+
+// FallbackRoute maps a citation url_key to the published route that best
+// covers it. Exact route keys and tool pages use themselves; a knowledge
+// source falls back to the intent's default route. It returns "" when no
+// route applies, so a citation is never pointed at an unrelated page.
+func FallbackRoute(urlKey string) string {
+	if _, ok := RouteTitles[urlKey]; ok {
+		return urlKey
+	}
+	if urlKey == "core-modules" {
+		return "core_modules"
+	}
+	for intent, it := range Menu {
+		_ = intent
+		for _, item := range it.Items {
+			if item.ID == urlKey || item.IntentID == urlKey {
+				return DefaultRoute[item.IntentID]
+			}
+		}
+	}
+	return ""
 }
 
 // itemFor returns the first menu item for an intent.
@@ -135,4 +166,27 @@ func FollowUps(intent string) []MenuItem {
 		}
 	}
 	return out
+}
+
+// topicChips cover Doc 02 §06 topics that have no menu item. Each message
+// classifies to its intent like a typed question (menu_test.go).
+var topicChips = map[string]contract.Chip{
+	"I01": {Label: "Platform overview", Message: "What is ZoikoSuite?"},
+	"I02": {Label: "Explore modules", Message: "What modules does ZoikoSuite include?"},
+	"I04": {Label: "Countries", Message: "Which countries do you support?"},
+	"I11": {Label: "Migration", Message: "How do we migrate to ZoikoSuite?"},
+	"I17": {Label: "Tax", Message: "How does ZoikoSuite handle tax?"},
+	"I18": {Label: "Workforce", Message: "How does ZoikoSuite support payroll and workforce?"},
+	"I19": {Label: "Legal", Message: "How does ZoikoSuite handle contracts?"},
+	"I20": {Label: "Reporting", Message: "What reporting and dashboards does ZoikoSuite offer?"},
+}
+
+// ChipFor is the chip for an intent: its first menu item, else its topic
+// chip (a secondary topic offered after an answer, Doc 02 §08).
+func ChipFor(intent string) (contract.Chip, bool) {
+	if it, ok := itemFor(intent); ok {
+		return contract.Chip{Label: it.Label, Message: it.Message}, true
+	}
+	c, ok := topicChips[intent]
+	return c, ok
 }

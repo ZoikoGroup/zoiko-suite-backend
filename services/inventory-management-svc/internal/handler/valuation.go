@@ -313,8 +313,13 @@ func (h *Handler) CreateValuationRun(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if req.LegalEntityID == "" || req.FiscalPeriod == "" || req.InventoryAccountCode == "" || req.COGSAccountCode == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, fiscal_period, inventory_account_code and cogs_account_code are required")
+	if req.LegalEntityID == "" || req.FiscalPeriod == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id and fiscal_period are required")
+		return
+	}
+	if h.inventoryMappingKey == "" || h.cogsMappingKey == "" {
+		writeError(w, http.StatusUnprocessableEntity, "mapping_key_not_configured",
+			"valuation requires configured ACC-02 inventory and cogs mapping keys")
 		return
 	}
 	principalID, ok := h.requirePrincipal(w, r)
@@ -330,7 +335,7 @@ func (h *Handler) CreateValuationRun(w http.ResponseWriter, r *http.Request) {
 	}
 	run := &domain.ValuationRun{
 		RunID: uuid.NewString(), LegalEntityID: req.LegalEntityID, FiscalPeriod: req.FiscalPeriod,
-		InventoryAccountCode: req.InventoryAccountCode, COGSAccountCode: req.COGSAccountCode,
+		InventoryMappingKey: h.inventoryMappingKey, COGSMappingKey: h.cogsMappingKey,
 		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
 	}
 	frozenCount, err := h.store.CreateValuationRun(r.Context(), run)
@@ -440,18 +445,34 @@ func (h *Handler) EmitInventoryAccountingEvent(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusUnprocessableEntity, "no_valuation_to_emit", "this run's frozen population has no OUTBOUND (COGS) value and no AP-receipt-linked INBOUND value to post")
 		return
 	}
+	inventoryMappingKey, cogsMappingKey := run.InventoryMappingKey, run.COGSMappingKey
+	// Runs created before the ACC-02 migration have no mapping keys; they are
+	// still postable with the deployment's configured keys. A deployment
+	// with no configuration fails closed instead of using the legacy raw
+	// codes.
+	if inventoryMappingKey == "" {
+		inventoryMappingKey = h.inventoryMappingKey
+	}
+	if cogsMappingKey == "" {
+		cogsMappingKey = h.cogsMappingKey
+	}
+	if inventoryMappingKey == "" || cogsMappingKey == "" {
+		writeError(w, http.StatusUnprocessableEntity, "mapping_key_not_configured",
+			"this run has no ACC-02 inventory/cogs mapping keys and none are configured")
+		return
+	}
 	var lines []clients.LedgerLine
 	if totalOutbound != 0 {
 		lines = append(lines,
-			clients.LedgerLine{AccountCode: run.COGSAccountCode, DebitAmount: totalOutbound},
-			clients.LedgerLine{AccountCode: run.InventoryAccountCode, CreditAmount: totalOutbound})
+			clients.LedgerLine{MappingKey: cogsMappingKey, DebitAmount: totalOutbound},
+			clients.LedgerLine{MappingKey: inventoryMappingKey, CreditAmount: totalOutbound})
 	}
 	// Reclass: AP-03 already expensed the receipt via GRNI (Dr AP_GRNI_EXPENSE
 	// / Cr AP_GRNI_ACCRUAL); INV-04 owns the inventory value, so move that
 	// cost out of expense into the asset.
 	if inbound.ReceiptLinked != 0 {
 		lines = append(lines,
-			clients.LedgerLine{AccountCode: run.InventoryAccountCode, DebitAmount: inbound.ReceiptLinked},
+			clients.LedgerLine{MappingKey: inventoryMappingKey, DebitAmount: inbound.ReceiptLinked},
 			clients.LedgerLine{MappingKey: h.grniReclassMappingKey, CreditAmount: inbound.ReceiptLinked})
 	}
 
@@ -495,8 +516,8 @@ func (h *Handler) RecordInventoryWriteDown(w http.ResponseWriter, r *http.Reques
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if req.ItemID == "" || req.LocationID == "" || req.ExpenseAccountCode == "" || req.InventoryAccountCode == "" || req.FiscalPeriod == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields", "item_id, location_id, expense_account_code, inventory_account_code and fiscal_period are required")
+	if req.ItemID == "" || req.LocationID == "" || req.FiscalPeriod == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "item_id, location_id and fiscal_period are required")
 		return
 	}
 	if req.Amount <= 0 {
@@ -505,6 +526,11 @@ func (h *Handler) RecordInventoryWriteDown(w http.ResponseWriter, r *http.Reques
 	}
 	if req.ValuationEvidenceRef == "" {
 		writeError(w, http.StatusUnprocessableEntity, "valuation_evidence_required", domain.ErrValuationEvidenceRequired.Error())
+		return
+	}
+	if h.writeDownExpenseMappingKey == "" || h.inventoryMappingKey == "" {
+		writeError(w, http.StatusUnprocessableEntity, "mapping_key_not_configured",
+			"write-down requires configured ACC-02 expense and inventory mapping keys")
 		return
 	}
 	principalID, ok := h.requirePrincipal(w, r)
@@ -536,13 +562,13 @@ func (h *Handler) RecordInventoryWriteDown(w http.ResponseWriter, r *http.Reques
 	w2 := &domain.WriteDown{
 		WriteDownID: uuid.NewString(), LegalEntityID: item.LegalEntityID, ItemID: req.ItemID, LocationID: req.LocationID,
 		Amount: req.Amount, ValuationEvidenceRef: req.ValuationEvidenceRef,
-		ExpenseAccountCode: req.ExpenseAccountCode, InventoryAccountCode: req.InventoryAccountCode,
+		ExpenseMappingKey: h.writeDownExpenseMappingKey, InventoryMappingKey: h.inventoryMappingKey,
 		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
 	}
 	correlationID := getCorrelationID(r)
 	lines := []clients.LedgerLine{
-		{AccountCode: req.ExpenseAccountCode, DebitAmount: req.Amount},
-		{AccountCode: req.InventoryAccountCode, CreditAmount: req.Amount},
+		{MappingKey: h.writeDownExpenseMappingKey, DebitAmount: req.Amount},
+		{MappingKey: h.inventoryMappingKey, CreditAmount: req.Amount},
 	}
 	journalID, err := h.postWriteDownJournal(r.Context(), tenantID, principalID, correlationID, w2, req.FiscalPeriod, lines)
 	if err != nil {

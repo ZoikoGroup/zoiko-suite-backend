@@ -23,6 +23,11 @@ type Config struct {
 	// posts through its ACC-04 system-originated posting path
 	// (POST /v1/postings/events), never a bespoke ledger write.
 	LedgerServiceURL string
+	// RevenueMappingKey and WIPMappingKey are the ACC-02 mapping keys the
+	// recognition journal posts against. The ledger resolves them to
+	// accounts; this service never names a GL account directly.
+	RevenueMappingKey string
+	WIPMappingKey     string
 
 	// AuthzMTLSEnabled turns on the mTLS pilot for calls to authorization-svc.
 	// OFF by default — when false, nothing about the existing authz call
@@ -82,9 +87,11 @@ func Load() (*Config, error) {
 			GroupID: env("KAFKA_GROUP_ID", "project-accounting-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.project.events"),
 		},
-		AuthZServiceURL:  env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
-		CloseServiceURL:  env("CLOSE_SERVICE_URL", "http://financial-close-svc:8104"),
-		LedgerServiceURL: env("LEDGER_SERVICE_URL", "http://general-ledger-svc:8098"),
+		AuthZServiceURL:   env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		CloseServiceURL:   env("CLOSE_SERVICE_URL", "http://financial-close-svc:8104"),
+		LedgerServiceURL:  env("LEDGER_SERVICE_URL", "http://general-ledger-svc:8098"),
+		RevenueMappingKey: env("PROJECT_REVENUE_MAPPING_KEY", "PROJECT_REVENUE"),
+		WIPMappingKey:     env("PROJECT_WIP_MAPPING_KEY", "PROJECT_WIP"),
 
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),

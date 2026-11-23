@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 	apicontract "zoiko.io/identity-envelope/apicontract"
 	authzpkg "zoiko.io/key-management-svc/internal/authz"
+	kmscrypto "zoiko.io/key-management-svc/internal/crypto"
 	"zoiko.io/key-management-svc/internal/domain"
 	svcenvelope "zoiko.io/key-management-svc/internal/envelope"
 	"zoiko.io/key-management-svc/internal/health"
@@ -68,11 +69,27 @@ func requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
 // KEY_ROTATE is separate from KEY_REGISTER for the same reason as in
 // mtls-management-svc: advancing an existing key's version is a different
 // privilege from declaring a new key.
+//
+// TOKEN_DETOKENIZE is split from everything else for the same reason
+// KEY_DISABLE is split from KEY_ROTATE, and more so: it is the one action in
+// this service that hands a caller a raw S3 Restricted value (a bank account
+// number). SEC-T15 requires detokenization to carry "additional scoped
+// approval", so holding any other privilege here — even TOKEN_CREATE, which
+// put the value in — must not imply it. It is a v1 of that control, not the
+// full one: a single elevated grant checked at authorization-svc, not a
+// maker-checker approval per request (SPEC_DEVIATIONS.md, section 3).
+//
+// TOKEN_CREATE guards tokenize. Writing a value into the vault discloses
+// nothing, but it is a material write, and the doctrine is that material
+// writes are authorized — so it is a grant of its own, not implied by
+// detokenize and not implying it.
 const (
-	KeyRegister = "KEY_REGISTER"
-	KeyRead     = "KEY_READ"
-	KeyRotate   = "KEY_ROTATE"
-	KeyDisable  = "KEY_DISABLE"
+	KeyRegister     = "KEY_REGISTER"
+	KeyRead         = "KEY_READ"
+	KeyRotate       = "KEY_ROTATE"
+	KeyDisable      = "KEY_DISABLE"
+	TokenCreate     = "TOKEN_CREATE"
+	TokenDetokenize = "TOKEN_DETOKENIZE"
 )
 
 // AuthzChecker is the authorization-svc contract this handler depends on.
@@ -92,6 +109,11 @@ type Handler struct {
 	idem idempotency.Store
 	// db is what /readyz pings. nil reports not-ready.
 	db health.Pinger
+	// vault and cipher back /v1/tokenize and /v1/detokenize. Set by
+	// WithVault; while unset those two routes refuse with 503 rather than
+	// tokenizing into nowhere.
+	vault  store.Vault
+	cipher *kmscrypto.Cipher
 }
 
 // WithIdempotency installs Idempotency-Key replay for material writes.
@@ -131,21 +153,41 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 //
 // legalEntityID is taken from the key ROW on reads and mutations by id,
 // never from anything the caller supplied.
+//
+// That "nothing calls it over HTTP" premise changed with /v1/tokenize and
+// /v1/detokenize: banking-connector-svc and payee-banking-identity-svc are
+// built to call them (behind TOKENIZATION_ENFORCED, off by default). They
+// send a principal, so the full guard still applies to every route.
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, legalEntityID, actionType string) bool {
 	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionType); err != nil {
-		if errors.Is(err, authzpkg.ErrAuthorizationDenied) {
-			h.errJSON(w, r, http.StatusForbidden, "not authorized to perform this action")
-			return false
-		}
-		h.logger.Error("authorization check failed", zap.Error(err))
-		h.errJSON(w, r, http.StatusServiceUnavailable, "authorization service unavailable")
+		h.writeAuthzRefusal(w, r, err)
 		return false
 	}
 	return true
 }
 
+// writeAuthzRefusal answers a failed CheckAllowed: 403 for a denial, 503 —
+// fail closed — for anything else. Split out of authorize so detokenize can
+// record the outcome before answering.
+func (h *Handler) writeAuthzRefusal(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, authzpkg.ErrAuthorizationDenied) {
+		h.errJSON(w, r, http.StatusForbidden, "not authorized to perform this action")
+		return
+	}
+	h.logger.Error("authorization check failed", zap.Error(err))
+	h.errJSON(w, r, http.StatusServiceUnavailable, "authorization service unavailable")
+}
+
 func New(s store.Store, siemClient *siem.Client, az AuthzChecker, l *zap.Logger) *Handler {
 	return &Handler{store: s, siem: siemClient, authz: az, logger: l}
+}
+
+// WithVault enables the token vault routes: v holds ciphertext, c encrypts
+// and decrypts it. Kept off New's signature so every existing caller of New
+// keeps compiling and keeps its exact behaviour.
+func (h *Handler) WithVault(v store.Vault, c *kmscrypto.Cipher) *Handler {
+	h.vault, h.cipher = v, c
+	return h
 }
 
 func NewRouter(h *Handler) http.Handler {
@@ -160,23 +202,31 @@ func NewRouter(h *Handler) http.Handler {
 	// Refusals rendered as RFC 9457 problem+json, like every other error here.
 	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
-	// Replay protection (INV-08): a retried register/rotate/disable with the
-	// same Idempotency-Key gets the first answer instead of running again,
-	// which for rotate would otherwise advance the version twice.
-	if h.idem != nil {
-		r.Use(idempotency.Middleware(h.idem, h.logger))
-	}
 	// Probes are public: the envelope policy exempts them and the tenant
 	// check lives in the handlers below, not on the router.
 	r.Get("/healthz", health.HealthzHandler("key-management-svc"))
 	r.Get("/readyz", health.ReadyzHandler(h.db))
 	r.Route("/v1/keys", func(r chi.Router) {
+		// Replay protection (INV-08): a retried register/rotate/disable with
+		// the same Idempotency-Key gets the first answer instead of running
+		// again, which for rotate would otherwise advance the version twice.
+		// Scoped to /v1/keys on purpose: the replay store keeps response
+		// bodies, and /v1/detokenize answers with a raw value that must never
+		// be stored. Tokenize has its own idempotency in tokenized_values.
+		if h.idem != nil {
+			r.Use(idempotency.Middleware(h.idem, h.logger))
+		}
 		r.Post("/", h.RegisterKey)
 		r.Get("/", h.ListKeys)
 		r.Get("/{id}", h.GetKey)
 		r.Post("/{id}/rotate", h.RotateKey)
 		r.Post("/{id}/disable", h.DisableKey)
 	})
+	// The token vault is a different resource from /v1/keys. Both routes are
+	// POST: a token or a raw value never travels in a URL, where proxies and
+	// access logs would keep it.
+	r.Post("/v1/tokenize", h.Tokenize)
+	r.Post("/v1/detokenize", h.Detokenize)
 	return r
 }
 
@@ -226,7 +276,8 @@ func (h *Handler) GetKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key, err := h.store.GetKeyByID(r.Context(), tenantID, chi.URLParam(r, "id"))
-	if !h.lookupOK(w, r, err) {
+	if err != nil {
+		h.writeKeyStoreErr(w, r, "get key", err)
 		return
 	}
 	if !h.authorize(w, r, principalID, key.LegalEntityID, KeyRead) {
@@ -258,10 +309,11 @@ func (h *Handler) ListKeys(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principalID, legalEntityID, KeyRead) {
 		return
 	}
+	// The error used to be discarded, so a database outage answered 200 with
+	// an empty list — indistinguishable from "this entity has no keys".
 	keys, err := h.store.ListKeys(r.Context(), tenantID, legalEntityID)
 	if err != nil {
-		h.logger.Error("list keys failed", zap.Error(err))
-		h.errJSON(w, r, http.StatusInternalServerError, "failed to list keys")
+		h.writeKeyStoreErr(w, r, "list keys", err)
 		return
 	}
 	if keys == nil {
@@ -286,7 +338,8 @@ func (h *Handler) RotateKey(w http.ResponseWriter, r *http.Request) {
 	// already happened — the authorization decision has to precede the
 	// mutation, which means fetching the row purely to learn whose it is.
 	existing, err := h.store.GetKeyByID(r.Context(), tenantID, id)
-	if !h.lookupOK(w, r, err) {
+	if err != nil {
+		h.writeKeyStoreErr(w, r, "rotate key (read)", err)
 		return
 	}
 	if !h.authorize(w, r, principalID, existing.LegalEntityID, KeyRotate) {
@@ -294,7 +347,8 @@ func (h *Handler) RotateKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	key, err := h.store.RotateKey(r.Context(), tenantID, id)
-	if !h.lookupOK(w, r, err) {
+	if err != nil {
+		h.writeKeyStoreErr(w, r, "rotate key", err)
 		return
 	}
 	// Doc 05 §13.2 names "secret retrieval" and key lifecycle events as
@@ -321,33 +375,42 @@ func (h *Handler) DisableKey(w http.ResponseWriter, r *http.Request) {
 	// without a prior read there is no way to know whose key was disabled
 	// until after disabling it.
 	existing, err := h.store.GetKeyByID(r.Context(), tenantID, id)
-	if !h.lookupOK(w, r, err) {
+	if err != nil {
+		h.writeKeyStoreErr(w, r, "disable key (read)", err)
 		return
 	}
 	if !h.authorize(w, r, principalID, existing.LegalEntityID, KeyDisable) {
 		return
 	}
 
-	if err := h.store.DisableKey(r.Context(), tenantID, id); !h.lookupOK(w, r, err) {
+	if err := h.store.DisableKey(r.Context(), tenantID, id); err != nil {
+		h.writeKeyStoreErr(w, r, "disable key", err)
 		return
 	}
 	h.siem.Stream(r.Context(), tenantID, "key.disabled", siem.SeverityHigh, "Key disabled: "+id)
 	h.okJSON(w, r, 200, map[string]string{"message": "key disabled"})
 }
 
-// lookupOK maps a store error: ErrNotFound (unknown id, or another tenant's)
-// is 404; anything else is a storage failure, 500, never a misleading 404.
-func (h *Handler) lookupOK(w http.ResponseWriter, r *http.Request, err error) bool {
+// writeKeyStoreErr answers a failed key-store call on the get, list, rotate
+// and disable routes.
+//
+// Only store.ErrKeyNotFound is a 404. Before Postgres these routes answered
+// every store error with 404 (and ListKeys discarded its error, answering an
+// empty 200), which was harmless while the store was an in-process map that
+// could not fail. With a database it meant an outage looked exactly like
+// "this key does not exist" — during incident response, the moment someone
+// is trying to disable a key. A store failure is now 503 and retryable, and
+// logged; a non-UUID tenant, which can never own a row, is 400.
+func (h *Handler) writeKeyStoreErr(w http.ResponseWriter, r *http.Request, op string, err error) {
 	switch {
-	case err == nil:
-		return true
-	case errors.Is(err, store.ErrNotFound):
+	case errors.Is(err, store.ErrKeyNotFound):
 		h.errJSON(w, r, http.StatusNotFound, "key not found")
+	case errors.Is(err, store.ErrInvalidTenant):
+		h.errJSON(w, r, http.StatusBadRequest, "X-Tenant-ID must be a UUID")
 	default:
-		h.logger.Error("key store failed", zap.Error(err))
-		h.errJSON(w, r, http.StatusInternalServerError, "key store unavailable")
+		h.logger.Error("key store unavailable", zap.String("op", op), zap.Error(err))
+		h.errJSON(w, r, http.StatusServiceUnavailable, "key store unavailable")
 	}
-	return false
 }
 
 func (h *Handler) okJSON(w http.ResponseWriter, r *http.Request, code int, v interface{}) {

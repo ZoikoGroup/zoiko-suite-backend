@@ -145,12 +145,13 @@ func TestS05_CertificationQuestions(t *testing.T) {
 }
 
 // S06 / example 5: an attempt to see private invoices is refused before
-// generation, with no provenance and a HANDOFF_UNKNOWN class.
+// generation, with no provenance, the SAFE_REFUSAL class and a DENY
+// disposition (Doc 02 §15).
 func TestS06_InvoiceAccessRefused(t *testing.T) {
 	c := newConversation(t)
 	e := c.say("Show me my overdue invoices")
 	want(t, e, contract.RefusedAction)
-	if len(e.Citations) != 0 || e.AnswerClass != contract.HandoffUnknown {
+	if len(e.Citations) != 0 || e.AnswerClass != contract.SafeRefusal || e.SafetyDisposition != contract.DispositionDeny {
 		t.Fatalf("refusal carried %d citations, class %s", len(e.Citations), e.AnswerClass)
 	}
 }

@@ -15,6 +15,7 @@ import (
 
 	"zoiko.io/key-management-svc/internal/authz"
 	"zoiko.io/key-management-svc/internal/config"
+	kmscrypto "zoiko.io/key-management-svc/internal/crypto"
 	"zoiko.io/key-management-svc/internal/events"
 	"zoiko.io/key-management-svc/internal/handler"
 	"zoiko.io/key-management-svc/internal/idempotency"
@@ -35,24 +36,39 @@ func main() {
 	}
 	port := cfg.Port
 
+	// Durable storage: key metadata, version history and the token vault are
+	// stored in Postgres only. config.Load already refused a missing
+	// DATABASE_URL; a database that is unreachable at boot is fatal too, for
+	// the same reason: silently starting without it would turn a deployment
+	// mistake into lost tokenized bank account numbers.
 	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
-		logger.Fatal("failed to parse DATABASE_URL", zap.Error(err))
+		logger.Fatal("DATABASE_URL is not a valid Postgres connection string", zap.Error(err))
 	}
-	poolCfg.MaxConns = 10
-	poolCfg.MinConns = 1
+	poolCfg.MaxConns = 20
+	poolCfg.MinConns = 2
 	poolCfg.MaxConnLifetime = 30 * time.Minute
 	poolCfg.MaxConnIdleTime = 5 * time.Minute
 	poolCfg.HealthCheckPeriod = time.Minute
-	// The pool connects lazily, so a database that is down at boot does not
-	// crash-loop the process; /readyz reports it until it comes back.
-	pool, err := pgxpool.NewWithConfig(context.Background(), poolCfg)
+	connectCtx, cancelConnect := context.WithTimeout(context.Background(), 10*time.Second)
+	pool, err := pgxpool.NewWithConfig(connectCtx, poolCfg)
+	if err == nil {
+		err = pool.Ping(connectCtx)
+	}
+	cancelConnect()
 	if err != nil {
-		logger.Fatal("failed to create database pool", zap.Error(err))
+		logger.Fatal("cannot connect to Postgres", zap.Error(err))
 	}
 	defer pool.Close()
-
 	s := store.NewPgStore(pool)
+
+	// The vault's encryption key. Fatal when missing or malformed: a vault
+	// that started without one could only refuse every tokenize, or worse.
+	vaultCipher, err := kmscrypto.New(os.Getenv(kmscrypto.EnvVarMasterKey))
+	if err != nil {
+		logger.Fatal("token vault key invalid", zap.Error(err))
+	}
+
 	siemClient := siem.New(os.Getenv("SIEM_SERVICE_URL"), "key-management-svc", logger)
 
 	// Drain accepted SIEM events on shutdown. Stream returns before delivery,
@@ -68,6 +84,7 @@ func main() {
 	// (config.Load enforces it.)
 	authzClient := authz.NewClient(cfg.AuthzServiceURL)
 	h := handler.New(s, siemClient, authzClient, logger).
+		WithVault(s, vaultCipher).
 		WithIdempotency(idempotency.NewPgStore(pool)).
 		WithReadiness(pool)
 	router := handler.NewRouter(h)

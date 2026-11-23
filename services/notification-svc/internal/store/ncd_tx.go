@@ -34,7 +34,8 @@ const intentCols = `intent_id::text, version, tenant_id, legal_entity_id, intent
 	mandatory, preference_override_allowed, quiet_hours_policy, bulk_allowed, record_requirement, ack_requirement,
 	variable_contract, attachment_contract, approved_url_domains, default_expiry_seconds, status,
 	created_by_principal_id, created_at, COALESCE(approved_by_principal_id, ''), activated_at, effective_from,
-	retired_at, COALESCE(retired_by_principal_id, '')`
+	retired_at, COALESCE(retired_by_principal_id, ''),
+	COALESCE(privacy_activity_id, ''), COALESCE(privacy_purpose_id, '')`
 
 func scanIntent(r scannable) (*ncd.Intent, error) {
 	var i ncd.Intent
@@ -45,7 +46,7 @@ func scanIntent(r scannable) (*ncd.Intent, error) {
 		&i.Mandatory, &i.PreferenceOverrideAllowed, &i.QuietHoursPolicy, &i.BulkAllowed, &i.RecordRequirement, &i.AckRequirement,
 		&vc, &ac, &i.ApprovedURLDomains, &i.DefaultExpirySeconds, &i.Status,
 		&i.CreatedByPrincipalID, &i.CreatedAt, &i.ApprovedByPrincipalID, &i.ActivatedAt, &i.EffectiveFrom,
-		&i.RetiredAt, &i.RetiredByPrincipalID)
+		&i.RetiredAt, &i.RetiredByPrincipalID, &i.PrivacyActivityID, &i.PrivacyPurposeID)
 	if err != nil {
 		return nil, nf(err)
 	}
@@ -66,13 +67,13 @@ func (t *ncdTx) InsertIntent(i *ncd.Intent) error {
 			purpose_class, domain_owner, sensitivity, urgency, evidence_class, allowed_channels, fallback_allowed,
 			marketing_allowed, mandatory, preference_override_allowed, quiet_hours_policy, bulk_allowed, record_requirement,
 			ack_requirement, variable_contract, attachment_contract, approved_url_domains, default_expiry_seconds, status,
-			created_by_principal_id, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)`,
+			created_by_principal_id, created_at, privacy_activity_id, privacy_purpose_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,NULLIF($28,''),NULLIF($29,''))`,
 		i.IntentID, i.Version, t.tenant, i.LegalEntityID, i.IntentCode, i.DisplayName, string(i.PurposeClass), i.DomainOwner,
 		string(i.Sensitivity), string(i.Urgency), string(i.EvidenceClass), i.AllowedChannels, i.FallbackAllowed,
 		i.MarketingAllowed, i.Mandatory, i.PreferenceOverrideAllowed, i.QuietHoursPolicy, i.BulkAllowed, i.RecordRequirement,
 		i.AckRequirement, mustJSON(i.VariableContract), mustJSON(i.AttachmentContract), i.ApprovedURLDomains,
-		i.DefaultExpirySeconds, i.Status, i.CreatedByPrincipalID, i.CreatedAt)
+		i.DefaultExpirySeconds, i.Status, i.CreatedByPrincipalID, i.CreatedAt, i.PrivacyActivityID, i.PrivacyPurposeID)
 	return err
 }
 

@@ -59,6 +59,8 @@ func TestProtocolExempt(t *testing.T) {
 		"/oauth2/token": true, "/.well-known/openid-configuration": true, "/v1/context/session/introspect": true,
 		"/v1/logout": true, "/health": true, "/readyz": true, "/v1/authenticate": true,
 		"/v1/context/resolve": false, "/v1/principals/p-1/status": false,
+		"/v1/account/activate": true, "/v1/account/password/forgot": true, "/v1/account/password/reset": true,
+		"/v1/account/password": false,
 	} {
 		assert.Equal(t, want, exempt(httptest.NewRequest(http.MethodPost, path, nil)), path)
 	}

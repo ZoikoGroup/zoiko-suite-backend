@@ -25,12 +25,12 @@ func decodeGrant(t *testing.T, rr *httptest.ResponseRecorder) domain.DelegationG
 }
 
 func transition(r chi.Router, id, verb string, version int64, caller string, body any) *httptest.ResponseRecorder {
-	return doReq(r, http.MethodPost, fmt.Sprintf("/v1/delegations/%s/%s?expected_version=%d", id, verb, version), body, caller)
+	return doReq(r, http.MethodPost, fmt.Sprintf("/v1/delegations/%s/%s", id, verb), body, caller, fmt.Sprintf(`"v%d"`, version))
 }
 
 func propose(t *testing.T, r chi.Router, maker string) domain.DelegationGrant {
 	t.Helper()
-	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(24*time.Hour)), maker)
+	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(24*time.Hour)), maker, "")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("propose: %d %s", rr.Code, rr.Body.String())
 	}
@@ -103,18 +103,22 @@ func TestTransitions_RequireTheCurrentVersion(t *testing.T) {
 	r := newRouter(newStubStore(), &stubAuthZ{}, nil)
 	d := createActiveDelegation(t, r)
 
-	rr := doReq(r, http.MethodPost, "/v1/delegations/"+d.DelegationID+"/revoke", map[string]any{"reason": "x"}, "admin-1")
+	// Missing If-Match header should return 428
+	rr := doReq(r, http.MethodPost, "/v1/delegations/"+d.DelegationID+"/revoke", map[string]any{"reason": "x"}, "admin-1", "")
 	if rr.Code != http.StatusPreconditionRequired {
-		t.Errorf("no version: expected 428, got %d", rr.Code)
+		t.Errorf("no If-Match: expected 428, got %d", rr.Code)
 	}
-	rr = doReq(r, http.MethodPost, "/v1/delegations/"+d.DelegationID+"/revoke?expected_version=abc", map[string]any{"reason": "x"}, "admin-1")
+	// Malformed If-Match header should return 400
+	rr = doReq(r, http.MethodPost, "/v1/delegations/"+d.DelegationID+"/revoke", map[string]any{"reason": "x"}, "admin-1", "abc")
 	if rr.Code != http.StatusBadRequest {
-		t.Errorf("malformed version: expected 400 (it used to mean 'no check'), got %d", rr.Code)
+		t.Errorf("malformed If-Match: expected 400, got %d", rr.Code)
 	}
+	// Stale If-Match should return 412
 	rr = transition(r, d.DelegationID, "revoke", d.Version+5, "admin-1", map[string]any{"reason": "x"})
-	if rr.Code != http.StatusConflict {
-		t.Errorf("stale version: expected 409, got %d", rr.Code)
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Errorf("stale If-Match: expected 412, got %d", rr.Code)
 	}
+	// Correct If-Match but no reason should return 400
 	rr = transition(r, d.DelegationID, "revoke", d.Version, "admin-1", map[string]any{})
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("revoke without a reason: expected 400, got %d", rr.Code)
@@ -181,7 +185,7 @@ func TestExtend_StillRefusesARealOverlapAndRechecksAuthority(t *testing.T) {
 	d := createActiveDelegation(t, r)
 	// A second grant of the same action to the same delegate, starting where
 	// the first ends ([from, to) — adjacency is not an overlap).
-	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), d.EffectiveTo, d.EffectiveTo.Add(48*time.Hour)), "delegator-1")
+	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), d.EffectiveTo, d.EffectiveTo.Add(48*time.Hour)), "delegator-1", "")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("back-to-back grants must be allowed, got %d %s", rr.Code, rr.Body.String())
 	}
@@ -211,7 +215,7 @@ func TestLimit_AboveTheDelegatorsOwnIsRefused(t *testing.T) {
 	s := newStubStore()
 	az := &stubAuthZ{limitDenied: true}
 	r := newRouter(s, az, nil)
-	rr := doReq(r, http.MethodPost, "/v1/delegations/", limitBody(5000000, "USD"), "delegator-1")
+	rr := doReq(r, http.MethodPost, "/v1/delegations/", limitBody(5000000, "USD"), "delegator-1", "")
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 delegator_exceeds_limit, got %d %s", rr.Code, rr.Body.String())
 	}
@@ -230,7 +234,7 @@ func TestLimit_MalformedIsRefused(t *testing.T) {
 		"lowercase code": limitBody(100, "usd"),
 		"no currency":    func() map[string]any { b := limitBody(100, "USD"); delete(b, "authority_limit_currency"); return b }(),
 	} {
-		if rr := doReq(r, http.MethodPost, "/v1/delegations/", b, "delegator-1"); rr.Code != http.StatusBadRequest {
+		if rr := doReq(r, http.MethodPost, "/v1/delegations/", b, "delegator-1", ""); rr.Code != http.StatusBadRequest {
 			t.Errorf("%s: expected 400, got %d", name, rr.Code)
 		}
 	}
@@ -253,7 +257,7 @@ func TestFormatMinorUnits(t *testing.T) {
 func TestSoDConflictIsRefusedAndRecorded(t *testing.T) {
 	s := newStubStore()
 	r := newRouter(s, &stubAuthZ{}, newStubSoD("delegate-1|PO_ISSUE"))
-	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(time.Hour)), "delegator-1")
+	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(time.Hour)), "delegator-1", "")
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 sod_conflict, got %d %s", rr.Code, rr.Body.String())
 	}
@@ -268,7 +272,7 @@ func TestDelegateIsDelegatorIsRecordedUnderItsOwnName(t *testing.T) {
 	r := newRouter(s, &stubAuthZ{}, nil)
 	b := delegationBody("p1", uuid.NewString(), time.Now(), time.Now().Add(time.Hour))
 	b["delegate_principal_id"] = "p1"
-	if rr := doReq(r, http.MethodPost, "/v1/delegations/", b, "p1"); rr.Code != http.StatusBadRequest {
+	if rr := doReq(r, http.MethodPost, "/v1/delegations/", b, "p1", ""); rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", rr.Code)
 	}
 	if len(s.refusals) != 1 || s.refusals[0] != "delegate_is_delegator" {
@@ -280,7 +284,7 @@ func TestCreateRequiresAReason(t *testing.T) {
 	r := newRouter(newStubStore(), &stubAuthZ{}, nil)
 	b := delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(time.Hour))
 	delete(b, "reason")
-	if rr := doReq(r, http.MethodPost, "/v1/delegations/", b, "delegator-1"); rr.Code != http.StatusBadRequest {
+	if rr := doReq(r, http.MethodPost, "/v1/delegations/", b, "delegator-1", ""); rr.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 without a reason, got %d", rr.Code)
 	}
 }
@@ -291,7 +295,7 @@ func TestListAsOf(t *testing.T) {
 	r := newRouter(newStubStore(), &stubAuthZ{}, nil)
 	d := createActiveDelegation(t, r)
 	at := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
-	rr := doReq(r, http.MethodGet, "/v1/delegations/?legal_entity_id=le-us&as_of="+at, nil, "viewer")
+	rr := doReq(r, http.MethodGet, "/v1/delegations/?legal_entity_id=le-us&as_of="+at, nil, "viewer", "")
 	if rr.Code != http.StatusOK {
 		t.Fatalf("as_of: %d %s", rr.Code, rr.Body.String())
 	}
@@ -300,10 +304,10 @@ func TestListAsOf(t *testing.T) {
 	if len(list) != 1 || list[0].DelegationID != d.DelegationID {
 		t.Errorf("expected the grant effective then, got %v", list)
 	}
-	if rr := doReq(r, http.MethodGet, "/v1/delegations/?legal_entity_id=le-us&as_of=yesterday", nil, "viewer"); rr.Code != http.StatusBadRequest {
+	if rr := doReq(r, http.MethodGet, "/v1/delegations/?legal_entity_id=le-us&as_of=yesterday", nil, "viewer", ""); rr.Code != http.StatusBadRequest {
 		t.Errorf("malformed as_of: expected 400, got %d", rr.Code)
 	}
-	if rr := doReq(r, http.MethodGet, "/v1/delegations/?legal_entity_id=le-us&status=PROPOSED", nil, "viewer"); rr.Code != http.StatusOK {
+	if rr := doReq(r, http.MethodGet, "/v1/delegations/?legal_entity_id=le-us&status=PROPOSED", nil, "viewer", ""); rr.Code != http.StatusOK {
 		t.Errorf("PROPOSED is a status now and must be filterable, got %d", rr.Code)
 	}
 }
@@ -357,7 +361,7 @@ func TestExtendAndResume_MakerCannotWidenTheirOwnProposal(t *testing.T) {
 func TestRedelegatingDelegatedAuthorityIsRefused(t *testing.T) {
 	s := newStubStore()
 	r := newRouter(s, &stubAuthZ{delegatedOnly: "delegator-1"}, nil)
-	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(24*time.Hour)), "delegator-1")
+	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(24*time.Hour)), "delegator-1", "")
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d %s", rr.Code, rr.Body.String())
 	}
@@ -374,14 +378,14 @@ func TestGetDelegation_RefusalLooksLikeAbsenceAndPartiesMayRead(t *testing.T) {
 	r := newRouterAuthz(s, az)
 	d := createActiveDelegation(t, r)
 
-	refused := doReq(r, http.MethodGet, "/v1/delegations/"+d.DelegationID, nil, "stranger")
-	missing := doReq(r, http.MethodGet, "/v1/delegations/"+uuid.NewString(), nil, "stranger")
+	refused := doReq(r, http.MethodGet, "/v1/delegations/"+d.DelegationID, nil, "stranger", "")
+	missing := doReq(r, http.MethodGet, "/v1/delegations/"+uuid.NewString(), nil, "stranger", "")
 	if refused.Code != http.StatusNotFound || refused.Code != missing.Code || refused.Body.String() != missing.Body.String() {
 		t.Fatalf("a refused read must look like a missing id: refused %d %s, missing %d %s",
 			refused.Code, refused.Body.String(), missing.Code, missing.Body.String())
 	}
 	for _, party := range []string{"delegator-1", "delegate-1"} {
-		if rr := doReq(r, http.MethodGet, "/v1/delegations/"+d.DelegationID, nil, party); rr.Code != http.StatusOK {
+		if rr := doReq(r, http.MethodGet, "/v1/delegations/"+d.DelegationID, nil, party, ""); rr.Code != http.StatusOK {
 			t.Errorf("%s is party to the grant and may read it, got %d", party, rr.Code)
 		}
 	}

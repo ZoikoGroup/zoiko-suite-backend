@@ -161,7 +161,8 @@ func TestPostgres_EndToEnd(t *testing.T) {
 	pools := testdb.Open(t)
 	app := pools.RequireApp(t)
 	ctx := context.Background()
-	tenant, other := "t-"+uuid.NewString(), "t-"+uuid.NewString()
+	// Tenants are UUIDs: the store refuses anything else (ErrInvalidTenant).
+	tenant, other := uuid.NewString(), uuid.NewString()
 	build := func(pool *pgxpool.Pool) http.Handler {
 		return handler.NewRouter(newHandler(store.NewPgStore(pool), &stubAuthz{}).
 			WithIdempotency(idempotency.NewPgStore(pool)).

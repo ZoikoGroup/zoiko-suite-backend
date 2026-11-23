@@ -68,17 +68,28 @@ func applyAll(ctx context.Context, files []string) error {
 	return nil
 }
 
+// TestMain runs the suite against embedded Postgres, or, when JUR_IT_DSN is
+// set, against that database instead. The external database must be empty:
+// every migration is applied to it. JUR_IT_DSN exists for hosts where the
+// embedded server cannot run (it refuses to initdb as root in a container,
+// and Windows Application Control blocks its binaries).
 func TestMain(m *testing.M) {
-	port := uint32(17101 + uint32(os.Getpid()%499))
-	pg := embeddedpostgres.NewDatabase(embeddedpostgres.DefaultConfig().
-		Version(embeddedpostgres.V16).Port(port).Database("jur_test").Username("postgres").Password("postgres"))
-	if err := pg.Start(); err != nil {
-		fmt.Printf("embedded postgres: %v\n", err)
-		os.Exit(1)
-	}
 	ctx := context.Background()
 	var err error
-	pool, err = pgxpool.New(ctx, fmt.Sprintf("host=localhost port=%d dbname=jur_test user=postgres password=postgres sslmode=disable", port))
+	stop := func() error { return nil }
+	dsn := os.Getenv("JUR_IT_DSN")
+	if dsn == "" {
+		port := uint32(17101 + uint32(os.Getpid()%499))
+		pg := embeddedpostgres.NewDatabase(embeddedpostgres.DefaultConfig().
+			Version(embeddedpostgres.V16).Port(port).Database("jur_test").Username("postgres").Password("postgres"))
+		if err := pg.Start(); err != nil {
+			fmt.Printf("embedded postgres: %v\n", err)
+			os.Exit(1)
+		}
+		stop = pg.Stop
+		dsn = fmt.Sprintf("host=localhost port=%d dbname=jur_test user=postgres password=postgres sslmode=disable", port)
+	}
+	pool, err = pgxpool.New(ctx, dsn)
 	if err == nil {
 		for i := 0; i < 75; i++ {
 			if err = pool.Ping(ctx); err == nil {
@@ -94,7 +105,7 @@ func TestMain(m *testing.M) {
 	}
 	if err != nil {
 		fmt.Printf("setup: %v\n", err)
-		_ = pg.Stop()
+		_ = stop()
 		os.Exit(1)
 	}
 	log := zap.NewNop()
@@ -104,7 +115,7 @@ func TestMain(m *testing.M) {
 	st = store.New(pool, log)
 	code := m.Run()
 	pool.Close()
-	_ = pg.Stop()
+	_ = stop()
 	os.Exit(code)
 }
 
@@ -112,15 +123,35 @@ func TestMain(m *testing.M) {
 
 type spyPub struct {
 	events.Publisher
-	mu   sync.Mutex
-	seen []string
+	mu       sync.Mutex
+	seen     []string
+	payloads []seenEvent
 }
 
-func (p *spyPub) PublishRegistryEvent(_ context.Context, t, _, _, _ string, _ map[string]any) error {
+type seenEvent struct {
+	type_   string
+	payload map[string]any
+}
+
+func (p *spyPub) PublishRegistryEvent(_ context.Context, t, _, _, _ string, payload map[string]any) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.seen = append(p.seen, t)
+	p.payloads = append(p.payloads, seenEvent{t, payload})
 	return nil
+}
+
+// payloadsOf are the payloads of every event of a type, in order.
+func (p *spyPub) payloadsOf(t string) []map[string]any {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var out []map[string]any
+	for _, e := range p.payloads {
+		if e.type_ == t {
+			out = append(out, e.payload)
+		}
+	}
+	return out
 }
 func (p *spyPub) count(t string) int {
 	p.mu.Lock()
@@ -162,11 +193,25 @@ type env struct {
 
 func newEnv() *env { return newEnvWithSigner(nil) }
 
+// itTenant is the tenant every suite request acts for unless it names another:
+// the input envelope makes one mandatory on every write, as in production.
+const itTenant = "11111111-2222-4333-8444-555555555555"
+
+// newRouter is the production middleware stack around the routes that the
+// suite exercises: every write request runs in one transaction (J-11) that
+// carries the request's tenant for row-level security (000032), so the whole
+// suite runs on the unit of work's statement semantics.
+func newRouter() chi.Router {
+	r := chi.NewRouter()
+	r.Use(handler.UnitOfWork(st, zap.NewNop()))
+	return r
+}
+
 func newEnvWithSigner(signer domain.Signer) *env {
 	pub := &spyPub{}
 	auth := &recordingAuthz{}
-	r := chi.NewRouter()
-	h := handler.New(st, auth, pub, "platform-scope", zap.NewNop()).WithRegistry(st, pub)
+	r := newRouter()
+	h := handler.New(st, auth, pub, "platform-scope", zap.NewNop()).WithRegistry(st, pub).WithAggregateVersions(st)
 	if signer != nil {
 		h.WithSigner(signer)
 	}
@@ -179,6 +224,12 @@ func (e *env) do(method, path, principal string, body any) (int, map[string]any)
 }
 
 func (e *env) doWithHeaders(method, path, principal string, body any, headers map[string]string) (int, map[string]any) {
+	code, out, _ := e.doFull(method, path, principal, body, headers)
+	return code, out
+}
+
+// doFull is doWithHeaders that also returns the response headers.
+func (e *env) doFull(method, path, principal string, body any, headers map[string]string) (int, map[string]any, http.Header) {
 	var buf bytes.Buffer
 	switch b := body.(type) {
 	case nil:
@@ -192,6 +243,9 @@ func (e *env) doWithHeaders(method, path, principal string, body any, headers ma
 	if principal != "" {
 		req.Header.Set("X-Principal-Id", principal)
 	}
+	if _, named := headers["X-Tenant-Id"]; !named { // name it "" to send none
+		req.Header.Set("X-Tenant-Id", itTenant)
+	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -199,7 +253,7 @@ func (e *env) doWithHeaders(method, path, principal string, body any, headers ma
 	e.srv.ServeHTTP(rr, req)
 	var out map[string]any
 	_ = json.Unmarshal(rr.Body.Bytes(), &out)
-	return rr.Code, out
+	return rr.Code, out, rr.Header()
 }
 
 var ctx = context.Background()
@@ -321,7 +375,7 @@ func TestEvidenceIsImmutableAtTheDatabase(t *testing.T) {
 	require.Error(t, err, "an approved interpretation is immutable")
 }
 
-func TestSupersedingASourcePreservesIt(t *testing.T) {
+func TestJURNEG06_SupersedingASourcePreservesIt(t *testing.T) {
 	e := newEnv()
 	j := seedJurisdiction(t, "FR")
 	_, old := e.do("POST", "/v1/admin/sources", "author", sourceBody(j.JurisdictionID))
@@ -545,7 +599,7 @@ func TestExistingEndpointsAreUnaffected(t *testing.T) {
 }
 
 func TestRegistryRoutesAbsentWithoutRegistry(t *testing.T) {
-	r := chi.NewRouter()
+	r := newRouter()
 	handler.RegisterRoutes(r, handler.New(st, authz.NewStubAuthZClient(zap.NewNop()), events.NewNoopPublisher(zap.NewNop()), "s", zap.NewNop()))
 	rr := httptest.NewRecorder()
 	r.ServeHTTP(rr, httptest.NewRequest("GET", "/v1/regimes", nil))
@@ -554,10 +608,11 @@ func TestRegistryRoutesAbsentWithoutRegistry(t *testing.T) {
 
 // ── migration round trip ────────────────────────────────────────────────────
 
-func TestMigrations000005To000015_DownThenUp(t *testing.T) {
+func TestMigrations000005To000032_DownThenUp(t *testing.T) {
 	// Each migration depends on the earlier ones: down newest-first, up oldest-first.
 	names := []string{"000005_jurisdiction_pack_registries", "000006_pack_artifacts_and_signing_keys", "000007_pack_certification", "000008_rule_decision_evidence",
-		"000009_pack_release_operations", "000010_calendars_and_obligations", "000011_rule_parameters", "000012_payroll_parameter_evidence", "000013_records_evidence", "000014_regulatory_submissions", "000015_jurisdiction_rollout"}
+		"000009_pack_release_operations", "000010_calendars_and_obligations", "000011_rule_parameters", "000012_payroll_parameter_evidence", "000013_records_evidence", "000014_regulatory_submissions", "000015_jurisdiction_rollout", "000021_registration_evidence", "000022_jurisdiction_decision_evidence", "000023_applicability_evidence", "000024_pack_supersede_event", "000025_resolver_change_notify", "000026_remediation_cases",
+		"000032_tenant_row_security", "000034_aggregate_row_versions"}
 	var downs, ups []string
 	for i := len(names) - 1; i >= 0; i-- {
 		downs = append(downs, migrations(t, names[i]+".down.sql")...)
@@ -576,6 +631,16 @@ func TestMigrations000005To000015_DownThenUp(t *testing.T) {
 		WHERE table_name='jurisdiction_rules' AND column_name IN ('regime_id','precedence','interpretation_id')`).Scan(&n))
 	assert.Equal(t, 0, n, "down removes the provenance columns")
 	require.NoError(t, applyAll(ctx, ups), "up again")
+	var kindDef string
+	require.NoError(t, pool.QueryRow(ctx, `SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname='ck_decision_kind'`).Scan(&kindDef))
+	assert.Contains(t, kindDef, "THRESHOLD", "up again restores the s16 evidence kinds")
+	assert.Contains(t, kindDef, "PROFILE", "and keeps every earlier kind")
+	var actionDef string
+	require.NoError(t, pool.QueryRow(ctx, `SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname='ck_release_action'`).Scan(&actionDef))
+	assert.Contains(t, actionDef, "SUPERSEDE", "000024 up again allows the supersede release event")
+	require.NoError(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM pg_class WHERE relname IN ('regulatory_submissions','regulatory_submission_events','rule_decision_evidence')
+		AND relrowsecurity AND relforcerowsecurity`).Scan(&n))
+	assert.Equal(t, 3, n, "000032 up again restores the tenant row-level security")
 }
 
 // The original lifecycle (activate, drift, supersede) must keep working with
@@ -604,4 +669,43 @@ func TestOriginalRuleLifecycleUnaffectedByProvenanceTriggers(t *testing.T) {
 
 	_, _, err = st.DeactivateJurisdiction(ctx, j.JurisdictionID, "admin")
 	require.NoError(t, err)
+}
+
+// 000023 on its own (the newest evidence-kind migration): reverting it refuses the APPLICABILITY kind for new rows but keeps every earlier kind, and
+// applying it again restores it. (An older evidence migration cannot be reverted and re-applied alone once newer-kind evidence exists: that evidence is
+// append-only and the older, narrower constraint could not validate it. The migrations are reverted and applied as a chain, which
+// TestMigrations000005To000032_DownThenUp covers.)
+func TestMigration000023_DownThenUp(t *testing.T) {
+	kinds := func() string {
+		var def string
+		require.NoError(t, pool.QueryRow(ctx, `SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname='ck_decision_kind'`).Scan(&def))
+		return def
+	}
+	insert := func(kind string) error {
+		_, err := pool.Exec(ctx, `INSERT INTO rule_decision_evidence (requested_by, request_digest, request, effective_at, outcome, response, decision_kind)
+			VALUES ('x','sha256:`+strings.Repeat("0", 64)+`','{}'::jsonb,NOW(),'NO_RULE','{}'::jsonb,$1)`, kind)
+		return err
+	}
+	require.NoError(t, applyAll(ctx, migrations(t, "000023_applicability_evidence.down.sql")), "down")
+	def := kinds()
+	assert.NotContains(t, def, "APPLICABILITY")
+	for _, k := range []string{"JURISDICTION", "THRESHOLD", "PROFILE", "RETENTION"} {
+		assert.Contains(t, def, k, "every earlier kind survives")
+	}
+	require.Error(t, insert("APPLICABILITY"), "refused while 000023 is reverted")
+	require.NoError(t, insert("JURISDICTION"), "an s9 row is still accepted")
+
+	require.NoError(t, applyAll(ctx, migrations(t, "000023_applicability_evidence.up.sql")), "up again")
+	assert.Contains(t, kinds(), "APPLICABILITY")
+	require.NoError(t, insert("APPLICABILITY"))
+}
+
+// doRaw returns the status and the raw body of a GET (for routes answering a JSON array).
+func (e *env) doRaw(method, path string) (int, string) {
+	req := httptest.NewRequest(method, path, nil)
+	req.Header.Set("X-Principal-Id", "reader")
+	req.Header.Set("X-Tenant-Id", itTenant)
+	rr := httptest.NewRecorder()
+	e.srv.ServeHTTP(rr, req)
+	return rr.Code, rr.Body.String()
 }

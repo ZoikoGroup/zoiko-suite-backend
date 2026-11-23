@@ -125,11 +125,21 @@ func (h *Handler) createAssetEvent(w http.ResponseWriter, r *http.Request, req d
 	if req.DestinationLegalEntityID != "" {
 		e.DestinationLegalEntityID = &req.DestinationLegalEntityID
 	}
-	if req.DebitAccountCode != "" {
-		e.DebitAccountCode = &req.DebitAccountCode
+	// Resolve governed ACC-02 mapping keys at create time: request-level keys
+	// take precedence, otherwise the configured event-type pair is persisted.
+	// Raw account codes are not part of this contract and are never accepted.
+	mappingKeys := h.assetEventDefaultMappingKeys(req.EventType)
+	if req.DebitMappingKey != "" {
+		mappingKeys.Debit = req.DebitMappingKey
 	}
-	if req.CreditAccountCode != "" {
-		e.CreditAccountCode = &req.CreditAccountCode
+	if req.CreditMappingKey != "" {
+		mappingKeys.Credit = req.CreditMappingKey
+	}
+	if mappingKeys.Debit != "" {
+		e.DebitMappingKey = &mappingKeys.Debit
+	}
+	if mappingKeys.Credit != "" {
+		e.CreditMappingKey = &mappingKeys.Credit
 	}
 	if req.CorrectionOfEventID != "" {
 		e.CorrectionOfEventID = &req.CorrectionOfEventID
@@ -461,17 +471,23 @@ func (h *Handler) ApplyAssetEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var journalID *string
-	if e.Amount != nil && e.DebitAccountCode != nil && e.CreditAccountCode != nil {
+	if e.Amount != nil {
 		// currency is nullable on asset_events; the ledger requires a real
 		// one (ZS-ACC-KERNEL-001), so refuse rather than invent it.
 		if e.Currency == nil || *e.Currency == "" {
 			writeError(w, http.StatusUnprocessableEntity, "currency_required", "asset event carries an amount but no currency; a currency is required to post to the ledger")
 			return
 		}
+		mappingKeys := h.resolveAssetEventMappingKeys(e)
+		if mappingKeys.Debit == "" || mappingKeys.Credit == "" {
+			writeError(w, http.StatusUnprocessableEntity, "mapping_key_not_configured",
+				"this asset event has an amount but no ACC-02 mapping keys and none are configured")
+			return
+		}
 		correlationID := getCorrelationID(r)
 		lines := []clients.LedgerLine{
-			{AccountCode: *e.DebitAccountCode, DebitAmount: *e.Amount},
-			{AccountCode: *e.CreditAccountCode, CreditAmount: *e.Amount},
+			{MappingKey: mappingKeys.Debit, DebitAmount: *e.Amount},
+			{MappingKey: mappingKeys.Credit, CreditAmount: *e.Amount},
 		}
 		postedJournalID, err := h.ledger.PostAssetEventAccountingEvent(r.Context(), tenantID, principalID, e.LegalEntityID, e.FiscalPeriod,
 			"Asset event "+e.EventID+" ("+e.EventType+")", e.EventID, correlationID,
@@ -597,6 +613,8 @@ func (h *Handler) writeAssetEventErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusUnprocessableEntity, "book_rebase_refused", err.Error())
 	case errors.Is(err, domain.ErrAssetNotEligibleForDisposal):
 		writeError(w, http.StatusUnprocessableEntity, "asset_not_eligible_for_disposal", err.Error())
+	case errors.Is(err, domain.ErrMappingKeyNotConfigured):
+		writeError(w, http.StatusUnprocessableEntity, "mapping_key_not_configured", err.Error())
 	default:
 		h.log.Error("asset event store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())

@@ -77,7 +77,7 @@ func TestOutbox_KeyLifecycleEvents(t *testing.T) {
 	s := store.NewPgStore(app)
 	ctx := actorCtx(tenant, "alice")
 
-	key := newKey("le-1")
+	key := newScopedKey("le-1")
 	if err := s.CreateKey(ctx, tenant, key); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestOutbox_FailedEventRollsBackChange(t *testing.T) {
 	t.Cleanup(func() {
 		_, _ = pools.Admin.Exec(context.Background(), `ALTER TABLE outbox_events DROP CONSTRAINT IF EXISTS `+cname)
 	})
-	if err := store.NewPgStore(app).CreateKey(actorCtx(tenant, "alice"), tenant, newKey(marker)); err == nil {
+	if err := store.NewPgStore(app).CreateKey(actorCtx(tenant, "alice"), tenant, newScopedKey(marker)); err == nil {
 		t.Fatal("create must fail when its event cannot be written")
 	}
 	var keys, evs int
@@ -164,7 +164,7 @@ func TestOutbox_RelayPublishesAndMarks(t *testing.T) {
 	pools := testdb.Open(t)
 	app := pools.RequireApp(t)
 	tenant := newTenant()
-	key := newKey("le-1")
+	key := newScopedKey("le-1")
 	if err := store.NewPgStore(app).CreateKey(actorCtx(tenant, "alice"), tenant, key); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -207,7 +207,7 @@ func TestOutbox_RLS(t *testing.T) {
 	pools := testdb.Open(t)
 	app := pools.RequireApp(t)
 	tenant := newTenant()
-	if err := store.NewPgStore(app).CreateKey(actorCtx(tenant, "alice"), tenant, newKey("le-1")); err != nil {
+	if err := store.NewPgStore(app).CreateKey(actorCtx(tenant, "alice"), tenant, newScopedKey("le-1")); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	var visible int

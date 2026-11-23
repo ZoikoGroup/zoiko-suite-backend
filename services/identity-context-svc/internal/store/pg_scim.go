@@ -393,14 +393,23 @@ func (s *PgStore) MembersOfGroup(ctx context.Context, tenantID, groupID string) 
 
 // ── WebAuthn credentials ────────────────────────────────────────────────────
 
-// InsertWebAuthnCredential stores a registered credential with its events.
-func (s *PgStore) InsertWebAuthnCredential(ctx context.Context, c domain.WebAuthnCredential, recs ...outbox.Record) error {
+// InsertWebAuthnCredential stores a registered credential with its events and
+// its MFA_ACTIVATE decision, so the principal's assurance history records the
+// passkey in the same transaction (projectDecision reads the inserted row).
+func (s *PgStore) InsertWebAuthnCredential(ctx context.Context, c domain.WebAuthnCredential, correlationID string, recs ...outbox.Record) error {
 	return s.withRLS(ctx, c.TenantID, func(tx pgx.Tx) error {
+		if c.Transports == nil {
+			c.Transports = []string{}
+		}
 		if _, err := tx.Exec(ctx, `INSERT INTO webauthn_credentials (credential_id, tenant_id, principal_id, public_key,
 			    attestation_type, aaguid, sign_count, transports, backup_eligible, backup_state, user_verified, nickname, status)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'ACTIVE')`,
 			c.CredentialID, c.TenantID, c.PrincipalID, c.PublicKey, c.AttestationType, nullIfEmpty(c.AAGUID),
 			int64(c.SignCount), c.Transports, c.BackupEligible, c.BackupState, c.UserVerified, nullIfEmpty(c.Nickname)); err != nil {
+			return err
+		}
+		if err := s.appendDecision(ctx, tx, c.PrincipalID, c.TenantID, "MFA_ACTIVATE", "ALLOWED",
+			"passkey_registered", correlationID, time.Now().UTC()); err != nil {
 			return err
 		}
 		return s.enqueueAll(ctx, tx, recs)
@@ -435,13 +444,26 @@ func (s *PgStore) ListWebAuthnCredentials(ctx context.Context, tenantID, princip
 	return out, err
 }
 
-// UseWebAuthnCredential records an assertion: the new sign counter (a counter
-// that does not advance on an authenticator that keeps one signals a clone,
-// and the caller refuses before this) and last use.
-func (s *PgStore) UseWebAuthnCredential(ctx context.Context, tenantID, credentialID string, signCount uint32, backupState bool, recs ...outbox.Record) error {
+// UseWebAuthnCredential records an accepted assertion: the new sign counter
+// (a counter that does not advance on an authenticator that keeps one signals
+// a clone, and the caller refuses before this), last use, and the decision
+// (action MFA_LOGIN or MFA_STEP_UP), which becomes the sign-in event. The
+// credential must still be the principal's and ACTIVE when the assertion
+// lands: one retired between begin and finish is refused here.
+func (s *PgStore) UseWebAuthnCredential(ctx context.Context, tenantID, principalID, credentialID string, signCount uint32, backupState bool,
+	action, correlationID string, recs ...outbox.Record) error {
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `UPDATE webauthn_credentials SET sign_count = $3, backup_state = $4, last_used_at = NOW()
-			WHERE credential_id = $1 AND tenant_id = $2 AND status = 'ACTIVE'`, credentialID, tenantID, int64(signCount), backupState); err != nil {
+		tag, err := tx.Exec(ctx, `UPDATE webauthn_credentials SET sign_count = $4, backup_state = $5, last_used_at = NOW()
+			WHERE credential_id = $1 AND tenant_id = $2 AND principal_id = $3 AND status = 'ACTIVE'`,
+			credentialID, tenantID, principalID, int64(signCount), backupState)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrCredentialNotFound
+		}
+		if err := s.appendDecision(ctx, tx, principalID, tenantID, action, "ALLOWED", "passkey_assertion",
+			correlationID, time.Now().UTC()); err != nil {
 			return err
 		}
 		return s.enqueueAll(ctx, tx, recs)
@@ -449,19 +471,27 @@ func (s *PgStore) UseWebAuthnCredential(ctx context.Context, tenantID, credentia
 }
 
 // RetireWebAuthnCredential retires one credential (or all of a principal's
-// when credentialID is empty).
-func (s *PgStore) RetireWebAuthnCredential(ctx context.Context, tenantID, principalID, credentialID, reason string, recs ...outbox.Record) (int64, error) {
+// when credentialID is empty) with its event and decision (action MFA_REVOKE
+// by the owner or MFA_RESET by an administrator), so the assurance history
+// drops to the strongest factor left.
+func (s *PgStore) RetireWebAuthnCredential(ctx context.Context, tenantID, principalID, credentialID, reason, action, correlationID string,
+	recs ...outbox.Record) (int64, error) {
 	var n int64
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		now := time.Now().UTC()
 		tag, err := tx.Exec(ctx, `UPDATE webauthn_credentials SET status = 'RETIRED', retired_at = $4, retired_reason = $5
 			WHERE tenant_id = $1 AND principal_id = $2 AND ($3 = '' OR credential_id = $3) AND status = 'ACTIVE'`,
-			tenantID, principalID, credentialID, time.Now().UTC(), reason)
+			tenantID, principalID, credentialID, now, truncateText(reason, 100))
 		if err != nil {
 			return err
 		}
 		n = tag.RowsAffected()
 		if n == 0 {
 			return nil
+		}
+		if err := s.appendDecision(ctx, tx, principalID, tenantID, action, "ALLOWED", "passkey_retired",
+			correlationID, now); err != nil {
+			return err
 		}
 		return s.enqueueAll(ctx, tx, recs)
 	})

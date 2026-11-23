@@ -467,9 +467,10 @@ contract header naming someone else is 403 `identity_mismatch`.
 An administrator holding `IDENTITY_MFA_RESET` (access-control-svc 000020; HIGH,
 so the grant needs independent approval), with their own recent step-up, calls
 `POST /v1/principals/{id}/mfa/reset` with a `reason_code`. Every factor of the
-subject is retired; the person re-enrols after a fresh login. Self-reset is
-refused. Each reset is `identity.mfa_factor.reset` on the outbox and a HIGH
-SIEM event.
+subject is retired, passkeys included (the lost device may be the passkey);
+the person re-enrols after a fresh login. Self-reset is refused. Each reset is
+`identity.mfa_factor.reset` on the outbox (one for the TOTP factors, one with
+`factor_type: WEBAUTHN` for the passkeys) and a HIGH SIEM event.
 
 ### 11.4 Lockout
 
@@ -485,13 +486,99 @@ SIEM event.
 secret (`{"zoiko-console": "sha256:<hex>"}`); `IDP_CLIENT_CHANNELS` maps it to a
 channel (`zoiko-console=web`). A login that proves the client gets a verified
 `azp`, and its session a VERIFIED source channel (`X-Source-Channel-Basis:
-verified` at the gateway). `IDP_CLIENT_AUTH=optional` admits logins without a
-client; switch to `required` once the console's server tier sends
-`client_id` / `client_secret`. A presented client that fails is 401
+verified` at the gateway). The local stack runs `IDP_CLIENT_AUTH=required`
+(since 3 Nov 2026): a login without a client, or with one that fails, is 401
 `invalid_client`, decided before the account is touched (no lockout attempt).
+Every caller presents `zoiko-console`: the console's server tier
+(`IDENTITY_CONSOLE_CLIENT_ID` / `IDENTITY_CONSOLE_CLIENT_SECRET`, server-only
+env), `deployments/scripts/e2e-*-deps.py`, `scripts/audit.sh`,
+`scripts/verify.ps1` and gateway-auth-svc's `audit.sh` (all read the same two
+variables, defaulting to the local secret). `optional` remains for a
+deployment whose callers do not all send a client yet.
 To mint a secret: `openssl rand -base64 32`, then store
 `sha256:$(printf %s "$SECRET" | sha256sum | cut -d' ' -f1)`.
 
 TOTP is not phishing-resistant. It is the interim high-assurance factor
-pending Security's approval (ZS-IAM-001 §31, "session assurance taxonomy") and
-a WebAuthn factor.
+pending Security's approval (ZS-IAM-001 §31, "session assurance taxonomy");
+passkeys (11.6) are the phishing-resistant one.
+
+### 11.6 Passkeys (WebAuthn, AU-11)
+
+Added 3 Nov 2026 (`internal/webauthn`, go-webauthn v0.17.4; the
+`webauthn_credentials` table is 000014's). A passkey is a second factor beside
+or instead of TOTP, and the only one that yields assurance
+`PHISHING_RESISTANT`.
+
+- **Relying party.** `WEBAUTHN_RP_ID` (default: the issuer's host) and
+  `WEBAUTHN_RP_ORIGINS` (default: the issuer's origin). Every page that runs a
+  ceremony must be on an origin in the list and on a host that is the RP ID or
+  a subdomain of it. A passkey registered under one RP ID never works under
+  another, so changing it orphans every passkey: treat it as fixed per
+  environment. Locally: `localhost`, origins `:8080` (hosted login) and
+  `:3000` (console).
+- **Register.** From a live session: `POST /v1/mfa/passkeys/register/begin`
+  → pass `options` to `navigator.credentials.create`, then
+  `POST /v1/mfa/passkeys/register/finish` with `{ceremony, nickname,
+  credential}`. Same gate as a TOTP enrolment: a first factor needs a login
+  within `MFA_RECENT_AUTH_SECONDS`; adding one beside an existing TOTP factor
+  or passkey needs a recent step-up (403 `step_up_required`). Since the same
+  change, a TOTP enrolment beside a passkey needs the step-up too.
+- **Step up.** `POST /v1/authenticate/step-up/passkey/begin` →
+  `navigator.credentials.get` → `.../finish` returns a login token with
+  `amr: ["pwd","hwk"]`; resolve it for an envelope with `mfa_verified` and
+  `assurance_level: PHISHING_RESISTANT`. The hosted login offers "Use your
+  passkey" as its second step when the person holds one.
+- **Ceremonies** live in Redis (`webauthn:ceremony:<sha256>`, 5 min) and are
+  taken once: a replayed assertion is 400 `ceremony_invalid`. A ceremony is
+  bound to its principal, tenant and purpose (registration, login, step-up).
+- **Refusals** are one answer, 401 `passkey_rejected`; the reason is in
+  `access_decision_log` (`passkey_assertion_rejected`,
+  `passkey_clone_warning`, `passkey_retired_during_ceremony`, ...) and on the
+  SIEM stream. `passkey_clone_warning` (HIGH) means the signature counter did
+  not advance on an authenticator that keeps one: two copies of the key may
+  exist. Retire the credential and talk to its owner.
+- **Revoke.** The owner: `POST /v1/mfa/passkeys/revoke` behind a recent step-up.
+  An administrator: the MFA reset (11.3) retires passkeys with TOTP.
+- **Evidence.** Registration and retirement are assurance-history rows
+  (`PASSKEY` while one is active); each assertion is a sign-in event at
+  `PASSKEY`; `identity.mfa_factor.enrolled|revoked|reset` and
+  `identity.step_up.succeeded` (with `factor_type: WEBAUTHN`) commit with the
+  row they describe.
+
+## 12. Federation and SCIM (INT-10, AU-07/AU-08)
+
+Off unless the operator turns it on. With `FEDERATION_ENABLED=false` (the
+default) none of the `/v1/federation/*`, `/v1/authenticate/federated` or
+`/scim/v2/*` routes are mounted (404), and the console's Federation tab says
+so.
+
+### 12.1 Turning it on
+
+```bash
+# deployments/: the compose file reads these from the environment or .env
+FEDERATION_ENABLED=true docker compose -p deployments -f docker-compose.yml \
+  up -d --no-deps --no-build --force-recreate identity-svc
+docker logs identity-context-svc 2>&1 | grep -E 'federation (enabled|disabled)'
+# want: "federation enabled"  allow_http=false private_nets=0 provisioning=false
+```
+
+- `FEDERATION_EGRESS_ALLOW_HTTP` / `FEDERATION_EGRESS_PRIVATE_CIDRS`: a
+  tenant's IdP key location is a tenant-supplied destination, so it passes the
+  SSRF guard (https, public addresses, pinned dial, no redirects). The two
+  overrides exist for a local mock IdP and private-link IdPs only; never set
+  them in production.
+- `FEDERATION_PROVISIONING_ENABLED=true` adds SCIM (`/scim/v2/{tenant}/{connection}/Users`),
+  group-to-role mappings and the deprovisioning worker
+  (`FEDERATION_WORKER_INTERVAL_SECONDS`). It needs `IDENTITY_SERVICE_PRINCIPAL_ID`
+  to hold ROLE_MANAGE on the entities its mappings name: an operator grant.
+- A connection is configured (`POST /v1/federation/connections`), then approved
+  by a second person against the fingerprint they saw
+  (`.../versions/{n}/approve`). Only an approved, active connection admits
+  logins; `suspend` stops them at once, `revoke` for good.
+
+### 12.2 Turning it off
+
+Unset `FEDERATION_ENABLED` and force-recreate. Federated logins stop at once;
+sessions already issued from them run to their own expiry, so end them
+(`POST /v1/context/tenant/invalidate`) when the reason is a compromised IdP.
+

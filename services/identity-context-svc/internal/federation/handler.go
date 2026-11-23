@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/identity-context-svc/internal/domain"
+	svcenvelope "zoiko.io/identity-context-svc/internal/envelope"
 )
 
 // Actions authorization-svc is asked about. Reading and writing a tenant's federation is privileged:
@@ -108,7 +109,12 @@ func (h *Handler) require(w http.ResponseWriter, r *http.Request, action string)
 		writeError(w, http.StatusUnauthorized, "identity_missing", "X-Tenant-Id and X-Principal-Id are required — the gateway sets them from a verified identity envelope")
 		return c, false
 	}
-	if err := h.authz.CheckAllowed(r.Context(), c.principalID, c.tenantID, action, c.tenantID); err != nil {
+	// The legal entity the request acts within, not the tenant id: passing the
+	// tenant in the entity position made authorization-svc answer 403
+	// tenant_scope_mismatch, which the client fails closed on, so every
+	// federation admin route was 503 once federation was enabled (live probe,
+	// 3 Nov 2026). internal/context's authorize had the same defect.
+	if err := h.authz.CheckAllowed(r.Context(), c.principalID, legalEntityOf(r), action, c.tenantID); err != nil {
 		if errors.Is(err, domain.ErrAuthorizationDenied) {
 			writeError(w, http.StatusForbidden, "forbidden", "not authorized to perform this action")
 			return c, false
@@ -118,6 +124,16 @@ func (h *Handler) require(w http.ResponseWriter, r *http.Request, action string)
 		return c, false
 	}
 	return c, true
+}
+
+// legalEntityOf is the envelope middleware's parsed legal entity when present
+// (the production path) and the raw header otherwise (handler tests run
+// without the middleware).
+func legalEntityOf(r *http.Request) string {
+	if e, ok := svcenvelope.FromContext(r.Context()); ok {
+		return e.LegalEntityID
+	}
+	return strings.TrimSpace(r.Header.Get(svcenvelope.HeaderLegalEntityID))
 }
 
 func decodeBody(r *http.Request, v any) error {

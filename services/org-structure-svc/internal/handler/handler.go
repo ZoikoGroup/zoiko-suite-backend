@@ -27,6 +27,22 @@ type Store interface {
 
 	AssignEmployee(ctx context.Context, req *domain.AssignEmployeeRequest) (*domain.OrgAssignment, error)
 	GetEmployeeAssignment(ctx context.Context, employeeID string) (*domain.OrgAssignment, error)
+
+	CreateOrgUnit(ctx context.Context, req *domain.CreateOrgUnitRequest, actorID string) (u *domain.OrgUnit, created bool, err error)
+	GetOrgUnit(ctx context.Context, unitID, asOf string) (*domain.OrgUnit, error)
+	ListOrgUnits(ctx context.Context, legalEntityID, asOf string) ([]domain.OrgUnit, error)
+	TransitionOrgUnit(ctx context.Context, unitID, command string, expectedVersion int64) (*domain.OrgUnit, error)
+	ReparentOrgUnit(ctx context.Context, unitID string, req *domain.ReparentOrgUnitRequest, expectedVersion int64, actorID string) (*domain.OrgUnit, error)
+	ChangeOrgUnitManager(ctx context.Context, unitID string, req *domain.ChangeManagerRequest, expectedVersion int64, actorID string) (*domain.OrgUnit, error)
+	FindUnitsByManager(ctx context.Context, managerEmployeeID, asOf string) ([]domain.OrgUnit, error)
+	HierarchySnapshot(ctx context.Context, legalEntityID, asOf, recordedAsOf string, includeInactive bool) ([]domain.OrgUnit, error)
+
+	ReparentImpact(ctx context.Context, unitID, effectiveAt string) (*domain.ImpactReport, error)
+	CreateReparentRequest(ctx context.Context, unitID string, req *domain.ReparentOrgUnitRequest, expectedVersion int64, actorID string, impact domain.ImpactReport) (*domain.ChangeRequest, bool, error)
+	GetChangeRequest(ctx context.Context, requestID string) (*domain.ChangeRequest, error)
+	ListChangeRequests(ctx context.Context, legalEntityID, status string) ([]domain.ChangeRequest, error)
+	ApproveChangeRequest(ctx context.Context, requestID, approverID string) (*domain.ChangeRequest, *domain.OrgUnit, error)
+	RejectChangeRequest(ctx context.Context, requestID, deciderID, reason string) (*domain.ChangeRequest, error)
 }
 
 type Publisher interface {
@@ -82,6 +98,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 
 		r.Post("/assignments", h.AssignEmployee)
 		r.Get("/assignments/employee/{employee_id}", h.GetEmployeeAssignment)
+
+		registerOrgUnitRoutes(r, h)
 	})
 }
 

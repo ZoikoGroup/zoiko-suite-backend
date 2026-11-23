@@ -41,6 +41,13 @@ type MonitoringSnapshot struct {
 		LateData    int `json:"late_data"`
 	} `json:"exceptions"`
 
+	// Matching: automatic match_results versus human-asserted manual_matches,
+	// over the latest run of each control in scope (SPEC_DEVIATIONS A5).
+	Matching struct {
+		Automatic int `json:"automatic"`
+		Manual    int `json:"manual"`
+	} `json:"matching"`
+
 	Aging struct {
 		UpTo7Days  int `json:"up_to_7_days"`
 		Days8To30  int `json:"days_8_to_30"`
@@ -64,6 +71,7 @@ type MonitoringSnapshot struct {
 		FailureIndeterminate *float64 `json:"failure_or_indeterminate_rate"`
 		RecurringException   *float64 `json:"recurring_exception_rate"`
 		LateData             *float64 `json:"late_data_rate"`
+		ManualMatch          *float64 `json:"manual_match_rate"`
 	} `json:"rates"`
 
 	// Signals the platform cannot honestly produce, with the reason.
@@ -73,8 +81,7 @@ type MonitoringSnapshot struct {
 // UnavailableSignals names the s28 signals this build cannot compute and why.
 func UnavailableSignals() map[string]string {
 	return map[string]string{
-		"manual_match_rate": "matching is fully automatic; no manual-match action exists to measure",
-		"suspense_aging":    "FIN-CTRL-031 is BLOCKED: no suspense designation or item-level clearing in the ledger",
+		"suspense_aging": "FIN-CTRL-031 is BLOCKED: no suspense designation or item-level clearing in the ledger",
 	}
 }
 
@@ -93,4 +100,5 @@ func (m *MonitoringSnapshot) Derive() {
 	m.Rates.FailureIndeterminate = ratio(m.Completion.FailedOrIndeterminate, m.Completion.WithRun)
 	m.Rates.RecurringException = ratio(m.Exceptions.Recurring, m.Exceptions.Total)
 	m.Rates.LateData = ratio(m.Exceptions.LateData, m.Exceptions.Total)
+	m.Rates.ManualMatch = ratio(m.Matching.Manual, m.Matching.Automatic+m.Matching.Manual)
 }

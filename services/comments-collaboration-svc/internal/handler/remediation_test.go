@@ -42,12 +42,26 @@ func seeded() *stubStore {
 		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-1",
 		Body: "hello", CreatedByPrincipalID: "reviewer-1",
 	})
+	st.events = 0 // the seed above is set-up, not a request under test
 	return st
 }
 
-func routerWith(st store.Store, az handler.AuthZClient, opts ...func(*handler.Handler)) (*chi.Mux, *stubPublisher) {
-	pub := &stubPublisher{}
-	h := handler.New(st, pub, az, zap.NewNop()).WithRetentionClient(&stubRetention{})
+// evCount reads how many events the (stub) store wrote; see stubStore.events.
+type evCount struct{ st store.Store }
+
+func (e *evCount) n() int {
+	switch s := e.st.(type) {
+	case *stubStore:
+		return s.events
+	case *idemStore:
+		return s.stubStore.events
+	}
+	return 0
+}
+
+func routerWith(st store.Store, az handler.AuthZClient, opts ...func(*handler.Handler)) (*chi.Mux, *evCount) {
+	pub := &evCount{st: st}
+	h := handler.New(st, az, zap.NewNop()).WithRetentionClient(&stubRetention{})
 	for _, o := range opts {
 		o(h)
 	}
@@ -198,7 +212,7 @@ func TestMention_AllRefusalsAreIndistinguishable(t *testing.T) {
 		} else if w.Body.String() != first {
 			t.Fatalf("%s: refusal body %q differs from %q — an existence oracle", c.name, w.Body.String(), first)
 		}
-		if len(c.st.mentions["comment-1"]) != 0 || pub.calls != 0 {
+		if len(c.st.mentions["comment-1"]) != 0 || pub.n() != 0 {
 			t.Fatalf("%s: a refusal must create no mention and publish nothing", c.name)
 		}
 	}
@@ -236,7 +250,7 @@ func TestModerate_ActionValidation(t *testing.T) {
 		if w.Code != tc.want {
 			t.Fatalf("%s: want %d, got %d: %s", name, tc.want, w.Code, w.Body.String())
 		}
-		if tc.want != http.StatusOK && (len(st.trail["comment-1"]) != 0 || pub.calls != 0) {
+		if tc.want != http.StatusOK && (len(st.trail["comment-1"]) != 0 || pub.n() != 0) {
 			t.Fatalf("%s: a rejected moderation must write no trail and publish nothing", name)
 		}
 	}
@@ -262,8 +276,8 @@ func TestAddComment_RestrictionMismatch_Returns409(t *testing.T) {
 	w := do(r, http.MethodPost, "/v1/threads/comments", map[string]any{
 		"legal_entity_id": "le-1", "linked_object_type": "DOCUMENT", "linked_object_id": "d", "body": "x", "restricted": true,
 	}, "p", nil)
-	if w.Code != http.StatusConflict || pub.calls != 0 {
-		t.Fatalf("want 409 and no event, got %d (%d events)", w.Code, pub.calls)
+	if w.Code != http.StatusConflict || pub.n() != 0 {
+		t.Fatalf("want 409 and no event, got %d (%d events)", w.Code, pub.n())
 	}
 }
 
@@ -276,6 +290,10 @@ type idemStore struct {
 	*stubStore
 	seen map[string]string
 	n    int
+	last struct {
+		c *domain.Comment
+		t *domain.CommentThread
+	}
 }
 
 func (s *idemStore) AddComment(ctx context.Context, p domain.AddCommentParams) (*domain.Comment, *domain.CommentThread, error) {
@@ -285,12 +303,15 @@ func (s *idemStore) AddComment(ctx context.Context, p domain.AddCommentParams) (
 				return nil, nil, domain.ErrIdempotencyConflict
 			}
 			p.Idem.Replayed = true
+			return s.last.c, s.last.t, nil
 		} else {
 			s.seen[p.Idem.Key] = p.Idem.RequestHash
 		}
 	}
 	s.n++
-	return s.stubStore.AddComment(ctx, p)
+	c, t, err := s.stubStore.AddComment(ctx, p)
+	s.last.c, s.last.t = c, t
+	return c, t, err
 }
 
 func TestIdempotency_HandlerWiring(t *testing.T) {
@@ -307,8 +328,8 @@ func TestIdempotency_HandlerWiring(t *testing.T) {
 	if w1.Header().Get("Idempotent-Replayed") != "" || w2.Header().Get("Idempotent-Replayed") != "true" {
 		t.Fatalf("only the replay is marked: %q / %q", w1.Header().Get("Idempotent-Replayed"), w2.Header().Get("Idempotent-Replayed"))
 	}
-	if pub.calls != 1 {
-		t.Fatalf("a replay must not publish a second event, got %d", pub.calls)
+	if pub.n() != 1 {
+		t.Fatalf("a replay must not publish a second event, got %d", pub.n())
 	}
 
 	body["body"] = "different"

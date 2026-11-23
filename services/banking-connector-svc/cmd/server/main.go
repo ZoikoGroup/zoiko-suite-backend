@@ -25,6 +25,7 @@ import (
 	"zoiko.io/banking-connector-svc/internal/mtls"
 	"zoiko.io/banking-connector-svc/internal/store"
 	"zoiko.io/banking-connector-svc/internal/telemetry"
+	"zoiko.io/banking-connector-svc/internal/tokenization"
 	"zoiko.io/eventing/kafkaout"
 	"zoiko.io/eventing/outbox"
 )
@@ -41,6 +42,9 @@ func main() {
 	defer func() { _ = logger.Sync() }()
 
 	cfg := config.Load()
+	if err := cfg.Validate(); err != nil {
+		logger.Fatal("invalid configuration", zap.Error(err))
+	}
 	logger.Info("starting banking-connector-svc", zap.String("port", cfg.Port))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -74,7 +78,23 @@ func main() {
 		logger.Fatal("eventing outbox schema missing", zap.Error(err))
 	}
 
-	st := store.NewPgStore(dbpool, store.WithEventRegion(cfg.EventResidencyRegion))
+	// Tokenization of account numbers. TOKENIZATION_ENFORCED decides only
+	// whether NEW connections are tokenized. Reading an existing tokenized
+	// connection's full number (the privileged account-number route) needs
+	// the client regardless of that flag — a connection tokenized while
+	// enforcement was on stays tokenized after it is turned off — so the
+	// client is built whenever a service URL is configured. Building it makes
+	// no call; nothing reaches key-management-svc until a write is enforced
+	// or a tokenized row is read in full.
+	var tokenizer tokenization.Tokenizer
+	if cfg.TokenizationServiceURL != "" {
+		tokenizer = tokenization.NewClient(cfg.TokenizationServiceURL)
+	}
+	if cfg.TokenizationEnforced {
+		logger.Info("account-number tokenization enforced", zap.String("tokenization_service_url", cfg.TokenizationServiceURL))
+	}
+	st := store.NewPgStore(dbpool, store.WithEventRegion(cfg.EventResidencyRegion),
+		store.WithTokenization(tokenizer, cfg.TokenizationEnforced))
 
 	// Transactional outbox relay (ZS-EVENT-001 §6). Every BNK-02/03/04
 	// event is written to eventing_outbox in the same transaction as the
@@ -115,7 +135,7 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
 
-	h := handler.New(st, authzClient, logger)
+	h := handler.New(st, authzClient, logger).WithTokenizer(tokenizer)
 
 	// BNK-02 dependencies — real HTTP clients to secret-vault-integration-svc
 	// (revoke only — see internal/clients/vault.go's own doc comment on why
@@ -129,22 +149,37 @@ func main() {
 	r.Use(chimiddleware.RealIP)
 	r.Use(chimiddleware.Logger)
 	r.Use(chimiddleware.Recoverer)
-	r.Use(middleware.TenantContext)
 
-	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
-	// Recoverer and telemetry so a refusal is still traced, and ahead of every
-	// handler so no request reaches business logic without a resolved tenant,
-	// actor, correlation and — on material writes — an idempotency key.
-	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
-	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
-
-	// Idempotency-Key replay for material writes (INV-08): a retried write
-	// with the same key is answered from its first response, not re-run.
-	r.Use(idempotency.Middleware(idempotency.NewPgStore(dbpool), logger))
-
+	// /healthz is registered OUTSIDE the tenant/envelope-gated group below.
+	// It used to sit on the same router after r.Use(middleware.TenantContext),
+	// which chi applies to every route on that router regardless of
+	// registration order -- so Docker's own HEALTHCHECK probe (a plain
+	// http.Get with no headers, cmd/healthcheck/main.go) got 401
+	// missing_tenant_scope on every single check and the container could
+	// never report healthy. Found running this stack for real under
+	// docker-compose.phase7.yml; invisible in the native-process run, which
+	// polled the port directly rather than through Docker's HEALTHCHECK.
+	// A liveness probe must not require a verified tenant identity; nor does
+	// the readiness probe.
 	r.Get("/healthz", health.Handler())
 	r.Get("/readyz", health.ReadyHandler(dbpool))
-	handler.RegisterAll(r, h, st, bankAcctClient, vaultClient)
+
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.TenantContext)
+
+		// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
+		// Recoverer and telemetry so a refusal is still traced, and ahead of every
+		// handler so no request reaches business logic without a resolved tenant,
+		// actor, correlation and — on material writes — an idempotency key.
+		// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+		r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+
+		// Idempotency-Key replay for material writes (INV-08): a retried write
+		// with the same key is answered from its first response, not re-run.
+		r.Use(idempotency.Middleware(idempotency.NewPgStore(dbpool), logger))
+
+		handler.RegisterAll(r, h, st, bankAcctClient, vaultClient)
+	})
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,

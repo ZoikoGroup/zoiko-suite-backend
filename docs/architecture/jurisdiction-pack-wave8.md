@@ -41,12 +41,11 @@ Admin bundle `JURISDICTION_PACK_REGISTRY_FULL`: `JURISDICTION_ROLLOUT_CREATE|SEE
 
 ## Not built
 * **Any country's rules.** See above. Wave 8 is complete as governance; the content is a continuing programme.
-* **The runtime does not yet refuse unsupported jurisdictions by itself.** Resolution still serves any verified RELEASED pack; the support endpoint is the explicit answer clients can use, and an
-  opt-in gate in the resolver ("only serve jurisdictions whose rollout is LAUNCHED") is a small follow-up if you want it. Left out because it changes what existing callers get.
+* **The runtime refuses unsupported jurisdictions only when asked to:** the opt-in gate is built (`RESOLVER_REQUIRE_LAUNCHED=true`, see [jurisdiction-pack-wave2-determination.md](jurisdiction-pack-wave2-determination.md)). It is off by default because it changes what existing callers get; with it off, resolution still serves any verified RELEASED pack and the support endpoint is the explicit answer clients can use.
 * **The attestations are claims with evidence references, not machine checks.** Some items could be derived from the system (DOD_04 certification record, DOD_05 signature verifies, DOD_06 ring
   and region deployment); they are attested by a person today. Automating them would couple the checklist to Wave 3 and Wave 7 state.
 * **Expert qualification is free text.** There is no directory of qualified experts or approval model; that is an open pre-production decision (s38, "Jurisdiction expert approval model").
-* **Subdivision inheritance, rollout events and dashboards:** no `rollout.*` domain events are published, and there is no portfolio dashboard.
+* **Subdivision inheritance and dashboards:** not built. Rollout events are published: `jurisdiction-rollout.created|status-changed|attested|expert-decided`, and `jurisdiction.support-changed` whenever a move enters or leaves LAUNCHED. Refused moves emit nothing.
 * Rolling a rollout back (RETIRED is final, SUSPENDED is the reversible pause) is separate from pack rollback, which is Wave 7.
 
 ## Verification

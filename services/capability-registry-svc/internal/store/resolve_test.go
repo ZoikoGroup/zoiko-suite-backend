@@ -20,7 +20,7 @@ import (
 func TestPgStoreCreateRelease_NonexistentCapabilityMapsToNotFound(t *testing.T) {
 	_, pool := openIdempotencyTestPool(t)
 	ctx := context.Background()
-	store := NewPgStore(pool)
+	store := newTestStore(pool)
 
 	for _, capabilityID := range []string{uuid.NewString(), "not-a-uuid"} {
 		t.Run(capabilityID, func(t *testing.T) {
@@ -49,7 +49,7 @@ func TestPgStoreResolveCapability_LegalApprovalFailsClosed(t *testing.T) {
 		t.Run(legalStatus, func(t *testing.T) {
 			_, pool := openIdempotencyTestPool(t)
 			ctx := context.Background()
-			store := NewPgStore(pool)
+			store := newTestStore(pool)
 
 			capability := newTestCapability("RESOLVE_LEGAL_" + legalStatus)
 			if err := store.CreateCapability(ctx, capability, testIdempotencyClaim(
@@ -107,7 +107,7 @@ func TestPgStoreResolveCapability_LegalApprovalFailsClosed(t *testing.T) {
 func TestPgStoreResolveCapability_ReleaseTieBreakerIsDeterministic(t *testing.T) {
 	_, pool := openIdempotencyTestPool(t)
 	ctx := context.Background()
-	store := NewPgStore(pool)
+	store := newTestStore(pool)
 
 	capability := newTestCapability("RESOLVE_RELEASE_TIE")
 	if err := store.CreateCapability(ctx, capability, testIdempotencyClaim(
@@ -125,10 +125,13 @@ func TestPgStoreResolveCapability_ReleaseTieBreakerIsDeterministic(t *testing.T)
 		"tenant-resolve", "SetReleaseState", "release-tie-old", "release-tie-old", older.ReleaseID)); err != nil {
 		t.Fatalf("create older release: %v", err)
 	}
+	disabledReason := "resolve tie-breaker test"
+	disabledRef := "RUNBOOK-RESOLVE-TIE"
 	newer := &domain.Release{
 		ReleaseID: uuid.NewString(), CapabilityID: capability.CapabilityID,
-		State: domain.ReleaseStateDisabled, EffectiveFrom: effectiveFrom,
-		CreatedAt: effectiveFrom.Add(2 * time.Second), CreatedByPrincipalID: "resolve-test-principal",
+		State: domain.ReleaseStateDisabled, Reason: &disabledReason, ReconciliationProcedureRef: &disabledRef,
+		EffectiveFrom: effectiveFrom,
+		CreatedAt:     effectiveFrom.Add(2 * time.Second), CreatedByPrincipalID: "resolve-test-principal",
 	}
 	if err := store.CreateRelease(ctx, newer, testIdempotencyClaim(
 		"tenant-resolve", "SetReleaseState", "release-tie-new", "release-tie-new", newer.ReleaseID)); err != nil {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -1182,6 +1183,7 @@ func (h *NCDHandler) declareRecord(w http.ResponseWriter, r *http.Request) {
 	}
 	var in struct {
 		DRCRecordRef string `json:"drc_record_ref"`
+		ncd.VaultDeclareInput
 	}
 	if !decodeJSON(w, r, &in) {
 		return
@@ -1190,7 +1192,15 @@ func (h *NCDHandler) declareRecord(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	n, err := h.svc.DeclareRecord(r.Context(), a, id, in.DRCRecordRef)
+	// A record reference from elsewhere declares as before; without one, this service declares the evidence package
+	// in the document vault (S7-B2).
+	var n *ncd.RegulatedNotice
+	var err error
+	if strings.TrimSpace(in.DRCRecordRef) != "" {
+		n, err = h.svc.DeclareRecord(r.Context(), a, id, in.DRCRecordRef)
+	} else {
+		n, err = h.svc.DeclareRecordViaVault(r.Context(), a, id, in.VaultDeclareInput)
+	}
 	if err != nil {
 		h.fail(w, r, err)
 		return

@@ -73,6 +73,8 @@ spec:
           value: "kafka.zoiko-infra.svc.cluster.local:9092"
         - name: KAFKA_GROUP_ID
           value: "identity-context-svc"
+        - name: EVENT_RESIDENCY_REGION
+          value: "local"
         - name: KAFKA_EVENTS_TOPIC
           value: "zoiko.identity.events"
         # Read side: the producer topics of every handled event (see config.DefaultConsumeTopics).

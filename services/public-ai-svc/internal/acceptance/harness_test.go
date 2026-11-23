@@ -19,6 +19,7 @@ import (
 	"zoiko.io/public-ai-svc/internal/config"
 	"zoiko.io/public-ai-svc/internal/contract"
 	"zoiko.io/public-ai-svc/internal/fixtureenv"
+	"zoiko.io/public-ai-svc/internal/flags"
 	"zoiko.io/public-ai-svc/internal/httpapi"
 	"zoiko.io/public-ai-svc/internal/orchestrator"
 	"zoiko.io/public-ai-svc/internal/session"
@@ -40,8 +41,10 @@ func newH(t *testing.T) *h {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// enable structured responses for dev/test (DatabaseURL is empty in test)
 	cfg := config.Config{AllowedOrigins: []string{origin}, MaxBodyBytes: 16 * 1024, MaxActiveTurnsPerSession: 1,
-		PolicyVersion: "pub-policy-1.0", ModelTimeout: time.Second}
+		PolicyVersion: "pub-policy-1.0", ModelTimeout: time.Second,
+		StructuredResponseDev: true}
 	srv := httpapi.New(cfg, nil, httpapi.Deps{Store: env.Store, Sessions: session.New(env.Store, time.Hour), Answerer: env.Pipeline,
 		Config: env.Releases, Routes: env.Releases, Ready: func() bool { return env.Releases.Ready(time.Minute) }})
 	return &h{t: t, env: env, srv: srv.Router()}
@@ -192,4 +195,50 @@ func writeSource(t *testing.T, dir, name string, override map[string]any, body s
 
 func manual(t *testing.T, why string) { t.Skip("NOT AUTOMATABLE HERE: " + why) }
 
+// TestCitationTitleAndRouteKey: with structured responses on, a turn's
+// citations carry the approved title and the official route key (ADR-008).
+// The fields are added by the HTTP layer, so the turn goes through it.
+func TestCitationTitleAndRouteKey(t *testing.T) {
+	x := newH(t)
+	if err := flags.Set(ctx, x.env.Store, flags.StructuredResponseEnabled, []byte("true"), "test", "acceptance", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := x.env.Flags.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{AllowedOrigins: []string{origin}, MaxBodyBytes: 16 * 1024, MaxActiveTurnsPerSession: 1,
+		PolicyVersion: "pub-policy-1.0", ModelTimeout: time.Second}
+	x.srv = httpapi.New(cfg, nil, httpapi.Deps{Store: x.env.Store, Sessions: session.New(x.env.Store, time.Hour), Answerer: x.env.Pipeline,
+		Config: x.env.Releases, Routes: x.env.Releases, Flags: x.env.Flags, Ready: func() bool { return true }}).Router()
+
+	e := envelope(t, x.turn(x.session("cit-title-session-1"), "29292929-2929-4929-8929-292929292929", "What plans are available?"))
+	if e.Status != contract.Answered || len(e.Citations) == 0 {
+		t.Fatalf("want an answered turn with citations, got %s %d: %q", e.Status, len(e.Citations), e.Text)
+	}
+	for i, c := range e.Citations {
+		if c.Title == "" || c.RouteKey == "" {
+			t.Errorf("citation %d: title=%q route_key=%q", i, c.Title, c.RouteKey)
+		}
+	}
+}
+
+func TestCTAHasOnePrimary(t *testing.T) {
+	h := newH(t)
+	e := h.ask("What plans are available?")
+	if len(e.Actions) == 0 {
+		t.Fatal("expected at least one action")
+	}
+	if len(e.Actions) > 1 {
+		t.Fatalf("expected at most one primary CTA, got %d", len(e.Actions))
+	}
+	action := e.Actions[0]
+	if action.Type != contract.ActionOpenRoute {
+		t.Fatalf("expected OPEN_OFFICIAL_ROUTE action, got type %q", action.Type)
+	}
+	if action.RouteKey != "pricing" {
+		t.Fatalf("expected route_key pricing, got %q", action.RouteKey)
+	}
+}
+
+// nowUTC returns the current UTC time.
 func nowUTC() time.Time { return time.Now().UTC() }

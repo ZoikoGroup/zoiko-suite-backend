@@ -20,15 +20,15 @@ import (
 	"zoiko.io/banking-connector-svc/internal/store"
 )
 
-// recordingAuthz grants exactly the "principal|legal_entity|action" triples
+// grantingAuthz grants exactly the "principal|legal_entity|action" triples
 // in grants and records every question it was asked.
-type recordingAuthz struct {
+type grantingAuthz struct {
 	mu     sync.Mutex
 	grants map[string]bool
 	asked  []string
 }
 
-func (a *recordingAuthz) server(t *testing.T) *httptest.Server {
+func (a *grantingAuthz) server(t *testing.T) *httptest.Server {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var q struct {
 			PrincipalID   string `json:"principal_id"`
@@ -80,7 +80,7 @@ func TestApproveMappingException_AuthorizedForTheOwningLegalEntity(t *testing.T)
 		t.Fatalf("quarantine: %v", err)
 	}
 
-	az := &recordingAuthz{grants: map[string]bool{
+	az := &grantingAuthz{grants: map[string]bool{
 		"ops-2|le-x|" + handler.BANKING_MAPPING_EXCEPTION_APPROVE: true,
 		"ops-2|le-x|" + handler.BANKING_TRANSACTION_READ:          true,
 	}}

@@ -288,27 +288,32 @@ type RecalculateScheduleRequest struct {
 // DepreciationRun is AST-02's own authority over "DepreciationRun" — one
 // period's worth of calculated depreciation for a legal entity.
 type DepreciationRun struct {
-	RunID                              string     `json:"run_id"`
-	TenantID                           string     `json:"tenant_id"`
-	LegalEntityID                      string     `json:"legal_entity_id"`
-	FiscalPeriod                       string     `json:"fiscal_period"`
-	DepreciationExpenseAccountCode     string     `json:"depreciation_expense_account_code"`
-	AccumulatedDepreciationAccountCode string     `json:"accumulated_depreciation_account_code"`
-	Status                             string     `json:"status"`
-	JournalID                          *string    `json:"journal_id,omitempty"`
+	RunID         string `json:"run_id"`
+	TenantID      string `json:"tenant_id"`
+	LegalEntityID string `json:"legal_entity_id"`
+	FiscalPeriod  string `json:"fiscal_period"`
+	// Legacy raw account codes are retained only so runs created before the
+	// ACC-02 migration remain readable. New runs never write or post them.
+	DepreciationExpenseAccountCode     string `json:"depreciation_expense_account_code,omitempty"`
+	AccumulatedDepreciationAccountCode string `json:"accumulated_depreciation_account_code,omitempty"`
+	// ACC-02 mapping keys are the only account-resolution path for new runs.
+	DepreciationExpenseMappingKey     string  `json:"depreciation_expense_mapping_key,omitempty"`
+	AccumulatedDepreciationMappingKey string  `json:"accumulated_depreciation_mapping_key,omitempty"`
+	Status                            string  `json:"status"`
+	JournalID                         *string `json:"journal_id,omitempty"`
 	// LedgerJournalIDs lists every journal the run posted when it went through the kernel (one per asset category); JournalID is the first.
-	LedgerJournalIDs []string `json:"ledger_journal_ids,omitempty"`
-	SupersedesRunID                    *string    `json:"supersedes_run_id,omitempty"`
-	SupersededByRunID                  *string    `json:"superseded_by_run_id,omitempty"`
-	CreatedAt                          time.Time  `json:"created_at"`
-	CreatedByPrincipalID               string     `json:"created_by_principal_id"`
-	FrozenAt                           *time.Time `json:"frozen_at,omitempty"`
-	ValidatedAt                        *time.Time `json:"validated_at,omitempty"`
-	ApprovedAt                         *time.Time `json:"approved_at,omitempty"`
-	ApprovedByPrincipalID              *string    `json:"approved_by_principal_id,omitempty"`
-	EmittedAt                          *time.Time `json:"emitted_at,omitempty"`
-	SupersededAt                       *time.Time `json:"superseded_at,omitempty"`
-	SupersededByPrincipalID            *string    `json:"superseded_by_principal_id,omitempty"`
+	LedgerJournalIDs        []string   `json:"ledger_journal_ids,omitempty"`
+	SupersedesRunID         *string    `json:"supersedes_run_id,omitempty"`
+	SupersededByRunID       *string    `json:"superseded_by_run_id,omitempty"`
+	CreatedAt               time.Time  `json:"created_at"`
+	CreatedByPrincipalID    string     `json:"created_by_principal_id"`
+	FrozenAt                *time.Time `json:"frozen_at,omitempty"`
+	ValidatedAt             *time.Time `json:"validated_at,omitempty"`
+	ApprovedAt              *time.Time `json:"approved_at,omitempty"`
+	ApprovedByPrincipalID   *string    `json:"approved_by_principal_id,omitempty"`
+	EmittedAt               *time.Time `json:"emitted_at,omitempty"`
+	SupersededAt            *time.Time `json:"superseded_at,omitempty"`
+	SupersededByPrincipalID *string    `json:"superseded_by_principal_id,omitempty"`
 
 	Lines []DepreciationLine `json:"lines,omitempty"`
 }
@@ -328,10 +333,8 @@ type DepreciationLine struct {
 }
 
 type CreateDepreciationRunRequest struct {
-	LegalEntityID                      string `json:"legal_entity_id"`
-	FiscalPeriod                       string `json:"fiscal_period"`
-	DepreciationExpenseAccountCode     string `json:"depreciation_expense_account_code"`
-	AccumulatedDepreciationAccountCode string `json:"accumulated_depreciation_account_code"`
+	LegalEntityID string `json:"legal_entity_id"`
+	FiscalPeriod  string `json:"fiscal_period"`
 }
 
 type SupersedeDepreciationRunRequest struct {
@@ -366,6 +369,11 @@ var (
 	ErrPeriodCheckUnavailable = errorString("financial-close-svc unavailable")
 	ErrLedgerUnavailable      = errorString("general-ledger-svc unavailable")
 	ErrPeriodLocked           = errorString("cannot apply an asset event into a LOCKED fiscal period")
+
+	// ErrMappingKeyNotConfigured is the ACC-02 fail-closed path: no governed
+	// mapping key is available, and a raw caller-supplied account code is
+	// never an acceptable fallback.
+	ErrMappingKeyNotConfigured = errorString("ACC-02 mapping key is not configured")
 )
 
 // ── AST-03 Asset Event ───────────────────────────────────────────────────────
@@ -431,11 +439,17 @@ type AssetEvent struct {
 	DestinationCustodianID   *string   `json:"destination_custodian_id,omitempty"`
 	DestinationLocationID    *string   `json:"destination_location_id,omitempty"`
 	DestinationLegalEntityID *string   `json:"destination_legal_entity_id,omitempty"`
-	DebitAccountCode         *string   `json:"debit_account_code,omitempty"`
-	CreditAccountCode        *string   `json:"credit_account_code,omitempty"`
-	JournalID                *string   `json:"journal_id,omitempty"`
-	CorrectionOfEventID      *string   `json:"correction_of_event_id,omitempty"`
-	BookID                   *string   `json:"book_id,omitempty"` // IMPAIRMENT/REVALUATION/ADDITION: the book whose schedule is re-based
+	// Legacy raw account codes are retained only for events created before
+	// the ACC-02 migration. New events never write or post them.
+	DebitAccountCode  *string `json:"debit_account_code,omitempty"`
+	CreditAccountCode *string `json:"credit_account_code,omitempty"`
+	// ACC-02 mapping keys are the only account-resolution path for new
+	// events. Empty means "use the configured event-type mapping".
+	DebitMappingKey     *string `json:"debit_mapping_key,omitempty"`
+	CreditMappingKey    *string `json:"credit_mapping_key,omitempty"`
+	JournalID           *string `json:"journal_id,omitempty"`
+	CorrectionOfEventID *string `json:"correction_of_event_id,omitempty"`
+	BookID              *string `json:"book_id,omitempty"` // IMPAIRMENT/REVALUATION/ADDITION: the book whose schedule is re-based
 
 	CreatedAt               time.Time  `json:"created_at"`
 	CreatedByPrincipalID    string     `json:"created_by_principal_id"`
@@ -469,8 +483,8 @@ type CreateAssetEventRequest struct {
 	DestinationCustodianID   string     `json:"destination_custodian_id,omitempty"`
 	DestinationLocationID    string     `json:"destination_location_id,omitempty"`
 	DestinationLegalEntityID string     `json:"destination_legal_entity_id,omitempty"`
-	DebitAccountCode         string     `json:"debit_account_code,omitempty"`
-	CreditAccountCode        string     `json:"credit_account_code,omitempty"`
+	DebitMappingKey          string     `json:"debit_mapping_key,omitempty"`
+	CreditMappingKey         string     `json:"credit_mapping_key,omitempty"`
 	CorrectionOfEventID      string     `json:"correction_of_event_id,omitempty"`
 	BookID                   string     `json:"book_id,omitempty"`
 }
@@ -521,13 +535,13 @@ var (
 
 	// Book re-base (IMPAIRMENT/REVALUATION/ADDITION) errors — see
 	// internal/store/asset_event_rebase.go.
-	ErrBookRequiredForBookEvent = errorString("book_id is required for IMPAIRMENT, REVALUATION and ADDITION events (book-specific values)")
-	ErrNoActiveScheduleForBook  = errorString("asset has no current ACTIVE depreciation schedule for this book — nothing to re-base")
-	ErrRebaseAmountInvalid      = errorString("event amount is missing or not valid for this event type")
+	ErrBookRequiredForBookEvent  = errorString("book_id is required for IMPAIRMENT, REVALUATION and ADDITION events (book-specific values)")
+	ErrNoActiveScheduleForBook   = errorString("asset has no current ACTIVE depreciation schedule for this book — nothing to re-base")
+	ErrRebaseAmountInvalid       = errorString("event amount is missing or not valid for this event type")
 	ErrImpairmentExceedsCarrying = errorString("impairment amount must be less than the current carrying amount")
-	ErrScheduleFullyDepreciated = errorString("schedule has no remaining useful life — cannot re-base")
+	ErrScheduleFullyDepreciated  = errorString("schedule has no remaining useful life — cannot re-base")
 	ErrReversalWouldZeroCarrying = errorString("reversal would take the carrying amount to zero or below")
-	ErrReversalOutOfOrder       = errorString("a later re-base exists on this schedule — reverse the later event first")
+	ErrReversalOutOfOrder        = errorString("a later re-base exists on this schedule — reverse the later event first")
 	// ErrDepreciationRunInFlight: policy/life/residual changes after
 	// approval invalidate the run — we block instead of silently diverging.
 	ErrDepreciationRunInFlight = errorString("a depreciation run (POPULATION_FROZEN/VALIDATED/APPROVED) includes this schedule — emit or supersede it before re-basing")

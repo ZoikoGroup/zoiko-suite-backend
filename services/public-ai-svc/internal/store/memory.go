@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -12,6 +13,7 @@ import (
 // same atomicity rules as Postgres by holding one mutex per call.
 type Memory struct {
 	mu          sync.Mutex
+	rates       map[rateWindow]int64
 	sessions    map[string]*memSession
 	byGrant     map[string]string
 	sessionIdem map[string]idemEntry
@@ -20,10 +22,11 @@ type Memory struct {
 	pointers    map[string]string
 	revocations []Revocation
 	conflicts   map[string]Conflict
+	audit       []AuditEntry
 	flags       map[string]Flag
 	usage       map[string]int64
 	outbox      []OutboxEvent
-	published   map[int64]bool
+	published   map[int64]time.Time
 	nextOutbox  int64
 }
 
@@ -51,7 +54,7 @@ func NewMemory() *Memory {
 		conflicts:   map[string]Conflict{},
 		flags:       map[string]Flag{},
 		usage:       map[string]int64{},
-		published:   map[int64]bool{},
+		published:   map[int64]time.Time{},
 	}
 }
 
@@ -60,6 +63,9 @@ func (m *Memory) Ping(context.Context) error { return nil }
 func (m *Memory) CreateSession(_ context.Context, s Session, key string, hash []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if s.LastSeenAt.IsZero() {
+		s.LastSeenAt = s.CreatedAt
+	}
 	m.sessions[s.SessionID] = &memSession{Session: s}
 	m.byGrant[string(s.GrantHash)] = s.SessionID
 	if key != "" {
@@ -124,6 +130,17 @@ func (m *Memory) DeleteSession(_ context.Context, sessionID string, at time.Time
 	return nil
 }
 
+func (m *Memory) SetSessionMarket(_ context.Context, sessionID, market string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[sessionID]
+	if !ok || s.DeletedAt != nil {
+		return ErrNotFound
+	}
+	s.MarketCode = market
+	return nil
+}
+
 func (m *Memory) SetPendingContext(_ context.Context, sessionID string, data []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -171,13 +188,20 @@ func (m *Memory) BeginTurn(_ context.Context, t Turn, lockUntil time.Time) (Begi
 func (m *Memory) CompleteTurn(_ context.Context, t Turn, buckets []string, tokens int64, events []OutboxEvent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if s, ok := m.sessions[t.SessionID]; !ok || s.DeletedAt != nil || !time.Now().Before(s.ExpiresAt) {
+		return ErrSessionGone
+	}
 	cur, ok := m.turns[turnKey(t.SessionID, t.ClientTurnID)]
 	if !ok || cur.TurnID != t.TurnID {
 		return ErrNotFound
 	}
 	cur.Status, cur.IntentID, cur.Response, cur.Completed = t.Status, t.IntentID, t.Response, true
-	if s, ok := m.sessions[t.SessionID]; ok && s.activeTurnID == t.TurnID {
-		s.activeTurnID = ""
+	if s, ok := m.sessions[t.SessionID]; ok {
+		if s.activeTurnID == t.TurnID {
+			s.activeTurnID = ""
+		}
+		s.LastSeenAt = time.Now().UTC()
+		s.TokensUsed += tokens
 	}
 	for _, b := range buckets {
 		m.usage[b] += tokens
@@ -231,6 +255,22 @@ func (m *Memory) PurgeSessions(_ context.Context, cutoff time.Time) (int, error)
 				}
 			}
 			n++
+		}
+	}
+	// Doc 06 §17: delivered (or dead-lettered) events and old usage counters.
+	kept := m.outbox[:0]
+	for _, e := range m.outbox {
+		if at, done := m.published[e.OutboxID]; done && at.Before(cutoff) {
+			delete(m.published, e.OutboxID)
+			continue
+		}
+		kept = append(kept, e)
+	}
+	m.outbox = kept
+	day, month := UsageKeepFrom(time.Now().UTC())
+	for b := range m.usage {
+		if (strings.HasPrefix(b, "tokens:day:") && b < day) || (strings.HasPrefix(b, "tokens:month:") && b < month) {
+			delete(m.usage, b)
 		}
 	}
 	return n, nil
@@ -290,7 +330,7 @@ func (m *Memory) AddRevocation(_ context.Context, r Revocation, events []OutboxE
 	defer m.mu.Unlock()
 	r.Watermark = int64(len(m.revocations) + 1)
 	m.revocations = append(m.revocations, r)
-	m.appendOutbox(events)
+	m.appendOutbox(stampRevocationEpoch(events, r.Watermark))
 	return r.Watermark, nil
 }
 
@@ -315,12 +355,81 @@ func (m *Memory) RecordConflict(_ context.Context, c Conflict) error {
 	return nil
 }
 
+func (m *Memory) ResolveConflict(_ context.Context, id, state, evidenceRef string, audit AuditEntry) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.conflicts[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if c.ResolutionState != ConflictOpen || (state != ConflictResolved && state != ConflictDismissed) || strings.TrimSpace(evidenceRef) == "" {
+		return ErrConflictState
+	}
+	audit.Action, audit.Target = "conflict."+strings.ToLower(state), id
+	if err := m.appendAudit(audit); err != nil {
+		return err
+	}
+	c.ResolutionState, c.ResolutionEvidenceRef = state, evidenceRef
+	m.conflicts[id] = c
+	return nil
+}
+
+func (m *Memory) Conflicts(context.Context) ([]Conflict, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]Conflict, 0, len(m.conflicts))
+	for _, c := range m.conflicts {
+		out = append(out, c)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].DetectedAt.Equal(out[j].DetectedAt) {
+			return out[i].DetectedAt.Before(out[j].DetectedAt)
+		}
+		return out[i].ConflictID < out[j].ConflictID
+	})
+	return out, nil
+}
+
 func (m *Memory) SetFlag(_ context.Context, f Flag, events []OutboxEvent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// The change and its audit entry are one step (Doc 09 §22).
+	if err := m.appendAudit(AuditEntry{Action: "flag.set", Target: f.Name, Actor: f.ActorRef, Approval: f.ApprovalRef,
+		BeforeHash: Hash(m.flags[f.Name].Value), AfterHash: Hash(f.Value), Environment: f.Environment, At: f.UpdatedAt}); err != nil {
+		return err
+	}
 	m.flags[f.Name] = f
 	m.appendOutbox(events)
 	return nil
+}
+
+func (m *Memory) AppendAudit(_ context.Context, e AuditEntry) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.appendAudit(e)
+}
+
+func (m *Memory) appendAudit(e AuditEntry) error {
+	if e.Actor == "" || e.Approval == "" {
+		return ErrAuditIncomplete
+	}
+	e.AuditID = int64(len(m.audit)) + 1
+	if n := len(m.audit); n > 0 {
+		e.PrevHash = m.audit[n-1].RowHash
+	}
+	e.RowHash = AuditRowHash(e.PrevHash, e)
+	m.audit = append(m.audit, e)
+	return nil
+}
+
+func (m *Memory) ListAudit(_ context.Context, limit int) ([]AuditEntry, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]AuditEntry, 0, min(limit, len(m.audit)))
+	for i := len(m.audit) - 1; i >= 0 && len(out) < limit; i-- {
+		out = append(out, m.audit[i])
+	}
+	return out, nil
 }
 
 func (m *Memory) Flags(context.Context) ([]Flag, error) {
@@ -363,7 +472,7 @@ func (m *Memory) UnpublishedEvents(_ context.Context, limit int) ([]OutboxEvent,
 	defer m.mu.Unlock()
 	var out []OutboxEvent
 	for _, e := range m.outbox {
-		if !m.published[e.OutboxID] {
+		if _, done := m.published[e.OutboxID]; !done {
 			out = append(out, e)
 			if len(out) == limit {
 				break
@@ -373,11 +482,11 @@ func (m *Memory) UnpublishedEvents(_ context.Context, limit int) ([]OutboxEvent,
 	return out, nil
 }
 
-func (m *Memory) MarkPublished(_ context.Context, ids []int64, _ time.Time) error {
+func (m *Memory) MarkPublished(_ context.Context, ids []int64, at time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, id := range ids {
-		m.published[id] = true
+		m.published[id] = at
 	}
 	return nil
 }
@@ -393,4 +502,20 @@ func (m *Memory) MarkAttempt(_ context.Context, ids []int64) error {
 		}
 	}
 	return nil
+}
+
+// SetTokensUsedForTest sets a session's running token total (tests only).
+func (m *Memory) SetTokensUsedForTest(sessionID string, n int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s, ok := m.sessions[sessionID]; ok {
+		s.TokensUsed = n
+	}
+}
+
+// SetUsageForTest sets a usage bucket (tests only).
+func (m *Memory) SetUsageForTest(bucket string, n int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.usage[bucket] = n
 }

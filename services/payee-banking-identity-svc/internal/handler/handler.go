@@ -15,6 +15,7 @@ import (
 	"zoiko.io/payee-banking-identity-svc/internal/domain"
 	svcmiddleware "zoiko.io/payee-banking-identity-svc/internal/middleware"
 	"zoiko.io/payee-banking-identity-svc/internal/store"
+	"zoiko.io/payee-banking-identity-svc/internal/tokenization"
 )
 
 // Action constants — ORG-10's own contract's "Permissions / authorization"
@@ -40,11 +41,30 @@ type Handler struct {
 	authz AuthzChecker
 	party counterparty.Client
 	log   *zap.Logger
+
+	// tokenizer detokenizes a tokenized destination's identifier for a
+	// privileged reader. Needed whenever ANY destination is tokenized —
+	// which stays true after TOKENIZATION_ENFORCED is turned back off — so
+	// it is set whenever a tokenization service is configured.
+	tokenizer tokenization.Tokenizer
 }
 
 func New(st store.Store, az AuthzChecker, party counterparty.Client, log *zap.Logger) *Handler {
 	return &Handler{store: st, authz: az, party: party, log: log}
 }
+
+// WithTokenizer sets the client privileged reads detokenize through.
+func (h *Handler) WithTokenizer(t tokenization.Tokenizer) *Handler {
+	h.tokenizer = t
+	return h
+}
+
+// HeaderIdentifierWithheld names why a privileged reader received a blank
+// AccountIdentifier for a tokenized destination: detokenize_denied (no
+// TOKEN_DETOKENIZE at the vault), tokenization_unavailable, or
+// tokenization_not_configured. Its absence on a blank identifier means the
+// reader is simply not privileged.
+const HeaderIdentifierWithheld = "X-Account-Identifier-Withheld"
 
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/org10/destinations", func(r chi.Router) {
@@ -154,17 +174,71 @@ func (h *Handler) isPrivileged(r *http.Request, principalID, legalEntityID strin
 // overexposed": AccountIdentifier is cleared for every reader except one
 // holding PayeeMasterPrivilegedRead. AccountLast4 always stays — it's the
 // masked value the spec's own control expects a normal reader to see.
-func (h *Handler) maskIfNotPrivileged(r *http.Request, principalID, legalEntityID string, d *domain.PayeeDestination) {
+//
+// For a privileged reader, a TOKENIZED destination (a row in
+// payee_destination_identifier_tokens — domain.PayeeDestination.Tokenized)
+// carries a token in AccountIdentifier, not the identifier; revealIdentifier
+// replaces it with the detokenized value. A legacy raw row is returned
+// exactly as before.
+func (h *Handler) maskIfNotPrivileged(w http.ResponseWriter, r *http.Request, principalID, legalEntityID string, d *domain.PayeeDestination) {
 	if !h.isPrivileged(r, principalID, legalEntityID) {
 		d.AccountIdentifier = ""
+		return
 	}
+	h.revealIdentifier(w, r, principalID, d)
+}
+
+// revealIdentifier gives a privileged reader the real identifier of a
+// tokenized destination: detokenized through key-management-svc under the
+// reader's OWN principal, at the destination's legal entity, so the vault's
+// TOKEN_DETOKENIZE check (SEC-T15), tenant binding (SEC-T29) and audit event
+// (SEC-INV-15) all apply to this reader — PayeeMasterPrivilegedRead alone is
+// not enough to see a tokenized value.
+//
+// On any failure the identifier is WITHHELD — blanked, exactly the
+// unprivileged view, with HeaderIdentifierWithheld saying why — and the rest
+// of the destination is still returned. Never the token in its place, and
+// never a failed read: the destination record itself is authorized, and
+// failing the whole response would turn a vault outage (or a reader holding
+// PAYEE_MASTER_PRIVILEGED_READ without TOKEN_DETOKENIZE) into a payee-master
+// outage. payment-authorization-svc's eligibility check reads destinations
+// through /org10/.../active and never uses the identifier; a 503 there would
+// block payments for no reason.
+func (h *Handler) revealIdentifier(w http.ResponseWriter, r *http.Request, principalID string, d *domain.PayeeDestination) {
+	if !d.Tokenized() {
+		return // legacy raw row: AccountIdentifier is the identifier
+	}
+	token := d.AccountIdentifierToken
+	d.AccountIdentifier = "" // never serve the token as if it were the identifier
+	if h.tokenizer == nil {
+		h.log.Error("tokenized destination read with no tokenization service configured", zap.String("destination_id", d.DestinationID))
+		w.Header().Set(HeaderIdentifierWithheld, "tokenization_not_configured")
+		return
+	}
+	value, err := h.tokenizer.Detokenize(r.Context(), tokenization.Scope{
+		TenantID:      svcmiddleware.TenantFromContext(r.Context()),
+		PrincipalID:   principalID,
+		LegalEntityID: d.LegalEntityID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
+	}, token)
+	if err != nil {
+		reason := "tokenization_unavailable"
+		if errors.Is(err, tokenization.ErrDetokenizationDenied) {
+			reason = "detokenize_denied"
+		}
+		h.log.Warn("account identifier withheld from a privileged reader",
+			zap.String("destination_id", d.DestinationID), zap.String("reason", reason), zap.Error(err))
+		w.Header().Set(HeaderIdentifierWithheld, reason)
+		return
+	}
+	d.AccountIdentifier = value
 }
 
 // maskVersions preserves maskIfNotPrivileged's per-entity decision while
 // avoiding an authorization round trip for every version in the list. A
 // party's versions normally share one legal entity, so this is one call in
 // the common case (previously N calls for N versions).
-func (h *Handler) maskVersions(r *http.Request, principalID string, list []domain.PayeeDestination) {
+func (h *Handler) maskVersions(w http.ResponseWriter, r *http.Request, principalID string, list []domain.PayeeDestination) {
 	privileged := make(map[string]bool)
 	for i := range list {
 		entity := list[i].LegalEntityID
@@ -175,14 +249,22 @@ func (h *Handler) maskVersions(r *http.Request, principalID string, list []domai
 		}
 		if !allowed {
 			list[i].AccountIdentifier = ""
+			continue
 		}
+		h.revealIdentifier(w, r, principalID, &list[i])
 	}
 }
 
 // ProposePayeeDestination verifies the named party genuinely exists via
-// counterparty-management-svc before ever creating a candidate against
-// it. Negative-path enforcement lives one step later, at
-// VerifyPayeeDestination — see internal/domain's package doc.
+// counterparty-management-svc, is in eligible standing (not blocked/
+// inactive/non-compliant), and that the account identifier is a
+// structurally valid format for its stated country, before ever creating a
+// candidate against it. The candidate's resting state after this returns is
+// VERIFICATION_PENDING, not CANDIDATE — see SPEC_DEVIATIONS A4. Independent
+// verification of the bank details themselves is not performed here — that
+// is VerifyPayeeDestination's job — see internal/domain's package doc.
+// Sanctions/fraud screening is NOT wired here; see SPEC_DEVIATIONS A3 for
+// why.
 func (h *Handler) ProposePayeeDestination(w http.ResponseWriter, r *http.Request) {
 	var req domain.ProposeDestinationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -200,6 +282,14 @@ func (h *Handler) ProposePayeeDestination(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "source_type must be SUPPLIER_PORTAL, INVOICE_OCR, EMAIL, or MANUAL_ENTRY")
 		return
 	}
+	// Format/account-country validation — §4.10's "server-resolved context"
+	// line (SPEC_DEVIATIONS A3): refuse a proposal whose account identifier
+	// is not a structurally valid account/IBAN for its stated country
+	// before any party lookup or write is attempted.
+	if err := domain.ValidateAccountFormat(req.CountryCode, req.AccountIdentifier); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -214,13 +304,24 @@ func (h *Handler) ProposePayeeDestination(w http.ResponseWriter, r *http.Request
 	}
 
 	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-	if _, err := h.party.GetParty(r.Context(), verifiedTenant, req.LegalEntityID, req.PartyRef); err != nil {
+	party, err := h.party.GetParty(r.Context(), verifiedTenant, req.LegalEntityID, req.PartyRef)
+	if err != nil {
 		if errors.Is(err, domain.ErrPartyNotFound) {
 			writeError(w, http.StatusBadRequest, domain.ErrPartyNotFound.Error())
 			return
 		}
 		h.log.Error("ProposePayeeDestination: counterparty-management-svc lookup failed", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, domain.ErrPartyServiceUnavailable.Error())
+		return
+	}
+	// Party status / compliance enforcement — §4.10's "server-resolved
+	// context" line's "party status" clause (SPEC_DEVIATIONS A3): the
+	// ORG-07 lookup already returns Status and ComplianceStatus; this is
+	// the literal fix for discarding them. A blocked/inactive
+	// (SUSPENDED/TERMINATED) or non-compliant (REJECTED) party can no
+	// longer get a destination candidate.
+	if !domain.PartyEligibleForDestination(party.Status, party.ComplianceStatus) {
+		writeError(w, http.StatusBadRequest, domain.ErrPartyNotEligible.Error())
 		return
 	}
 
@@ -242,7 +343,7 @@ func (h *Handler) ProposePayeeDestination(w http.ResponseWriter, r *http.Request
 	// com.zoikosuite.banking.payee-destination.proposed is enqueued inside
 	// ProposeDestination's own transaction (the transactional outbox), not
 	// published here after the fact — see pg_store.go.
-	h.maskIfNotPrivileged(r, principalID, req.LegalEntityID, created)
+	h.maskIfNotPrivileged(w, r, principalID, req.LegalEntityID, created)
 	markIdempotentReplay(w, replay)
 	if replay {
 		// Match the platform's command pattern: the first response is 201,
@@ -263,7 +364,7 @@ func (h *Handler) GetPayeeDestination(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	h.maskIfNotPrivileged(r, principalID, d.LegalEntityID, d)
+	h.maskIfNotPrivileged(w, r, principalID, d.LegalEntityID, d)
 	writeJSON(w, http.StatusOK, d)
 }
 
@@ -279,7 +380,7 @@ func (h *Handler) ListPayeeVersions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	h.maskVersions(r, principalID, list)
+	h.maskVersions(w, r, principalID, list)
 	if list == nil {
 		list = []domain.PayeeDestination{}
 	}
@@ -306,7 +407,7 @@ func (h *Handler) GetActivePayeeDestination(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	h.maskIfNotPrivileged(r, principalID, d.LegalEntityID, d)
+	h.maskIfNotPrivileged(w, r, principalID, d.LegalEntityID, d)
 	writeJSON(w, http.StatusOK, d)
 }
 
@@ -355,7 +456,10 @@ func (h *Handler) VerifyPayeeDestination(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	if !h.authorize(w, r, principalID, d.LegalEntityID, PayeeMasterAdmin) {
+	// Own-object SoD, mirroring ApprovePayeeDestination's self-approval
+	// check exactly (SPEC_DEVIATIONS A6): the destination's own proposer
+	// cannot also be the one who verifies it.
+	if !h.authorizeOwnObject(w, r, principalID, d.LegalEntityID, PayeeMasterAdmin, d.ProposedByPrincipalID) {
 		return
 	}
 	// The state guard is deliberately in the store, after the idempotency
@@ -385,7 +489,7 @@ func (h *Handler) VerifyPayeeDestination(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	h.maskIfNotPrivileged(r, principalID, updated.LegalEntityID, updated)
+	h.maskIfNotPrivileged(w, r, principalID, updated.LegalEntityID, updated)
 	markIdempotentReplay(w, replay)
 	writeJSON(w, http.StatusOK, updated)
 }
@@ -426,7 +530,7 @@ func (h *Handler) ApprovePayeeDestination(w http.ResponseWriter, r *http.Request
 	}
 	// com.zoikosuite.banking.payee-destination.approved is enqueued inside
 	// ApproveDestination's own transaction — see pg_store.go.
-	h.maskIfNotPrivileged(r, principalID, updated.LegalEntityID, updated)
+	h.maskIfNotPrivileged(w, r, principalID, updated.LegalEntityID, updated)
 	markIdempotentReplay(w, replay)
 	writeJSON(w, http.StatusOK, updated)
 }
@@ -452,7 +556,11 @@ func (h *Handler) ActivateDestination(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !h.authorize(w, r, principalID, d.LegalEntityID, PayeeMasterAdmin) {
+	// Own-object SoD, mirroring ApprovePayeeDestination's self-approval
+	// check exactly (SPEC_DEVIATIONS A6): the destination's own proposer
+	// cannot also be the one who activates it, once someone else has
+	// approved it.
+	if !h.authorizeOwnObject(w, r, principalID, d.LegalEntityID, PayeeMasterAdmin, d.ProposedByPrincipalID) {
 		return
 	}
 
@@ -474,7 +582,7 @@ func (h *Handler) ActivateDestination(w http.ResponseWriter, r *http.Request) {
 	// activation replaces an existing ACTIVE row, that row's .superseded
 	// event are enqueued inside ActivateDestination's own transaction — see
 	// pg_store.go.
-	h.maskIfNotPrivileged(r, principalID, updated.LegalEntityID, updated)
+	h.maskIfNotPrivileged(w, r, principalID, updated.LegalEntityID, updated)
 	markIdempotentReplay(w, replay)
 	writeJSON(w, http.StatusOK, updated)
 }
@@ -522,7 +630,7 @@ func (h *Handler) SuspendDestination(w http.ResponseWriter, r *http.Request) {
 	}
 	// com.zoikosuite.banking.payee-destination.suspended is enqueued inside
 	// SuspendDestination's own transaction — see pg_store.go.
-	h.maskIfNotPrivileged(r, principalID, updated.LegalEntityID, updated)
+	h.maskIfNotPrivileged(w, r, principalID, updated.LegalEntityID, updated)
 	markIdempotentReplay(w, replay)
 	writeJSON(w, http.StatusOK, updated)
 }
@@ -570,7 +678,7 @@ func (h *Handler) SupersedeDestination(w http.ResponseWriter, r *http.Request) {
 	}
 	// com.zoikosuite.banking.payee-destination.superseded is enqueued inside
 	// SupersedeDestination's own transaction — see pg_store.go.
-	h.maskIfNotPrivileged(r, principalID, updated.LegalEntityID, updated)
+	h.maskIfNotPrivileged(w, r, principalID, updated.LegalEntityID, updated)
 	markIdempotentReplay(w, replay)
 	writeJSON(w, http.StatusOK, updated)
 }

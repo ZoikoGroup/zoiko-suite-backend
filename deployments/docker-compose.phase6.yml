@@ -18,9 +18,10 @@ services:
       - ../services/reconciliation-intelligence-svc/deployments/migrations:/migrations/reconciliation-intelligence:ro
       - ../services/reporting-orchestration-svc/deployments/migrations:/migrations/reporting-orchestration:ro
       - ../services/migration-integrity-svc/deployments/migrations:/migrations/migration-integrity:ro
+      - ../services/key-management-svc/deployments/migrations:/migrations/key-management:ro
       - postgres_p6_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U postgres -d postgres"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -234,8 +235,9 @@ services:
   # ── 06. Migration Integrity Service ──────────────────────────────────────
   migration-integrity-svc:
     build:
-      context: ../services/migration-integrity-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing — see the Dockerfile.
+      context: ../services
+      dockerfile: migration-integrity-svc/Dockerfile
     container_name: migration-integrity-svc-p6
     ports:
       - "8139:8139"
@@ -349,9 +351,17 @@ services:
       - "8143:8143"
     environment:
       PORT: "8143"
+      DATABASE_URL: postgres://zoiko_app:zoiko_app_password@postgres:5432/key_management?sslmode=disable
       AUTHZ_SERVICE_URL: http://authorization-svc:8089
       SIEM_SERVICE_URL: http://siem-integration-svc:8141
+      # AES-256 key for the token vault (tokenized bank details). Throwaway
+      # local-dev key — never used in staging/production, same posture as
+      # document-vault-svc's DOCUMENT_VAULT_MASTER_KEY_HEX. Losing or changing
+      # it makes every stored token undetokenizable.
+      VAULT_MASTER_KEY_HEX: "4b4d5374657374766175c06b6579000102030405060708090a0b0c0d0e0f1011"
     depends_on:
+      postgres:
+        condition: service_healthy
       authorization-svc:
         condition: service_healthy
     restart: on-failure

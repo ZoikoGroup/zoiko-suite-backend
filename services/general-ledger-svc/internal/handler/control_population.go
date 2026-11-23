@@ -83,6 +83,9 @@ func (h *Handler) GetControlPopulation(w http.ResponseWriter, r *http.Request) {
 	case populationTrialBalance:
 		h.getTrialBalancePopulation(w, r, principalID, tenantID)
 		return
+	case populationMigrationBatchTieout:
+		h.getMigrationBatchTieout(w, r, principalID, tenantID)
+		return
 	default:
 		writeError(w, http.StatusNotFound, "unknown_population", "")
 		return

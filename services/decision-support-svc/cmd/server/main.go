@@ -18,6 +18,7 @@ import (
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+	"zoiko.io/identity-envelope/mtlsclient"
 
 	"zoiko.io/decision-support-svc/internal/authz"
 	"zoiko.io/decision-support-svc/internal/clients"
@@ -114,9 +115,30 @@ func main() {
 
 	publisher := events.NewPublisher(kafkaWriter)
 	authzClient := authz.NewClient(cfg.AuthZServiceURL)
+	// Dispositions are recorded as the human who decided, over the plain URL
+	// (see outbox relay below).
 	governanceLog := clients.NewGovernanceLogClient(cfg.GovernanceDecisionLogURL)
+	// Precedent reads (D2-2.F07): over mTLS as this service's workload, as its
+	// own principal, when GOVERNANCE_DECISION_LOG_MTLS_URL is set. Until the
+	// certificate is provisioned a read fails and the recommendation degrades
+	// to NO_HISTORY, as it does for any decision-log outage.
+	var historyClient *clients.GovernanceLogClient
+	if cfg.GovernanceDecisionLogMTLSURL != "" {
+		identity := mtlsclient.Start(context.Background(), mtlsclient.Options{
+			ServiceName:        "decision-support-svc",
+			ManagementURL:      cfg.MTLSManagementServiceURL,
+			BootstrapTokenPath: cfg.MTLSBootstrapTokenPath,
+		}, log)
+		historyClient = clients.NewGovernanceLogClientWithHTTPClient(cfg.GovernanceDecisionLogMTLSURL,
+			identity.HTTPClient(5*time.Second), cfg.GovernanceDecisionLogPrincipalID)
+		log.Info("governance decision log reads over mTLS",
+			zap.String("url", cfg.GovernanceDecisionLogMTLSURL), zap.String("principal", cfg.GovernanceDecisionLogPrincipalID))
+	} else {
+		historyClient = clients.NewGovernanceLogClient(cfg.GovernanceDecisionLogURL)
+		log.Warn("GOVERNANCE_DECISION_LOG_MTLS_URL unset: precedent reads use plain HTTP, which a decision log running IDENTITY_VERIFY=require refuses")
+	}
 
-	recommendationService := service.New(pgStore, authzClient, governanceLog, log)
+	recommendationService := service.New(pgStore, authzClient, historyClient, log)
 
 	// The outbox relay delivers lifecycle events to Kafka and human
 	// dispositions to governance-decision-log-svc. It stops with the server.

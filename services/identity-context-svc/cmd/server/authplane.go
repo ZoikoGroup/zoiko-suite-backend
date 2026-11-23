@@ -18,6 +18,7 @@ import (
 	identityctx "zoiko.io/identity-context-svc/internal/context"
 	"zoiko.io/identity-context-svc/internal/credential"
 	"zoiko.io/identity-context-svc/internal/domain"
+	"zoiko.io/identity-context-svc/internal/events"
 	"zoiko.io/identity-context-svc/internal/keys"
 	"zoiko.io/identity-context-svc/internal/lifecycle"
 	"zoiko.io/identity-context-svc/internal/oidc"
@@ -97,7 +98,11 @@ func mergeClientChannels(cfg *config.Config, reg *oidc.Registry) {
 // replaces the built-in probe list, so the probes and the policy's own
 // ExemptPaths are listed again here.
 func protocolExempt(exemptPaths []string) func(*http.Request) bool {
-	exact := map[string]bool{"/healthz": true, "/readyz": true, "/health": true}
+	exact := map[string]bool{"/healthz": true, "/readyz": true, "/health": true,
+		// AU-09's pre-session routes: the caller has no session yet (an
+		// activation or reset link, or a forgotten password). Each is
+		// throttled per client address and answers without enumerating.
+		"/v1/account/activate": true, "/v1/account/password/forgot": true, "/v1/account/password/reset": true}
 	for _, p := range exemptPaths {
 		exact[p] = true
 	}
@@ -126,7 +131,10 @@ func skipProtocolPaths(mw func(http.Handler) http.Handler) func(http.Handler) ht
 // login session (with its refresh tokens and the session contexts resolved
 // under it) and then any session context left over. It is what a disable or
 // suspension calls (termination priority, IAM §17).
-func principalSessionEnder(st *store.PgStore, provider *oidc.Provider, sessions *session.DurableCache) lifecycle.SessionEnder {
+//
+// IC-16 (S1-12 K-6): emits identity.session.revoked for each individual
+// session context ID revoked, not just a summary count.
+func principalSessionEnder(st *store.PgStore, provider *oidc.Provider, sessions *session.DurableCache, pub *events.Publisher, log *zap.Logger) lifecycle.SessionEnder {
 	return func(ctx context.Context, tenantID, principalID, reason, actor, correlationID string) (int, error) {
 		ended := 0
 		sids, err := st.LiveAuthSessionIDs(ctx, tenantID, principalID, time.Now().UTC())
@@ -140,8 +148,17 @@ func principalSessionEnder(st *store.PgStore, provider *oidc.Provider, sessions 
 			}
 			ended += n
 		}
-		n, err := sessions.EvictAllForPrincipal(ctx, principalID, tenantID, domain.InvalidationReasonAdminRevoke)
-		return ended + n, err
+		// Evict session contexts and emit per-session revoked events
+		scIDs, err := sessions.EvictAllForPrincipalWithIDs(ctx, principalID, tenantID, domain.InvalidationReasonAdminRevoke)
+		if err != nil {
+			return ended, err
+		}
+		for _, scID := range scIDs {
+			if err := pub.PublishSessionRevoked(ctx, tenantID, scID, principalID, domain.InvalidationReasonAdminRevoke, actor, correlationID); err != nil {
+				log.Error("session revoked event not recorded", zap.String("session_context_id", scID), zap.Error(err))
+			}
+		}
+		return ended + len(scIDs), nil
 	}
 }
 
@@ -192,3 +209,13 @@ func (s statusChanger) ChangeStatus(ctx context.Context, tenantID, actorID, prin
 }
 
 var _ identityctx.StatusChanger = statusChanger{}
+
+// identityMerger adapts lifecycle.Service to the handler's IdentityMerger.
+type identityMerger struct{ svc *lifecycle.Service }
+
+func (m identityMerger) MergeDuplicate(ctx context.Context, tenantID, actorID, survivorID, duplicateID, reason, correlationID string) (*store.IdentityMerge, bool, error) {
+	return m.svc.MergeDuplicate(ctx, lifecycle.Actor{PrincipalID: actorID, TenantID: tenantID, CorrelationID: correlationID},
+		survivorID, duplicateID, reason)
+}
+
+var _ identityctx.IdentityMerger = identityMerger{}

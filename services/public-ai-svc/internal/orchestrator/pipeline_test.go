@@ -164,7 +164,7 @@ func TestPrivateDataAndActionsRefused(t *testing.T) {
 		"Pay my invoice from Acme now": "X02",
 	} {
 		r := ask(e, msg, "")
-		if r.Status != contract.RefusedAction || r.IntentID != x || len(r.Citations) != 0 || action(r) != "support" {
+		if r.Status != contract.RefusedAction || r.IntentID != x || len(r.Citations) != 0 || action(r) != "sign-in" {
 			t.Errorf("%q: %+v", msg, r)
 		}
 	}
@@ -362,5 +362,40 @@ func TestKillSwitchMidFlightWithholdsAnswer(t *testing.T) {
 	r := ask(e, "Which finance modules does ZoikoSuite include?", "")
 	if r.Status != contract.Unavailable || r.Reason != contract.ReasonKillSwitch || len(r.Citations) != 0 {
 		t.Fatalf("got %s %s %+v", r.Status, r.Reason, r.Citations)
+	}
+}
+
+// Doc 10 App. B: with commercial_routes_enabled off, a demo or pricing CTA
+// falls back to the support route; nothing else changes.
+func TestCommercialRoutesFlag(t *testing.T) {
+	e := newEnv(t)
+	if got := action(ask(e, "I'd like to book a demo", "")); got != "demo" {
+		t.Fatalf("flag on: %q", got)
+	}
+	setFlag(t, e, flags.CommercialRoutesEnabled, "false")
+	if got := action(ask(e, "I'd like to book a demo", "")); got != "support" {
+		t.Fatalf("flag off: %q, want support", got)
+	}
+}
+
+// Doc 06 §13: at the conversation's own token cap the reply says so and
+// points to a new conversation; it is not reported as an outage.
+func TestSessionCapIsNotAnOutage(t *testing.T) {
+	e := newEnv(t)
+	r := e.Pipeline.Answer(ctx, orchestrator.Input{RequestID: "req_cap", Message: "What does the tax module do?", Locale: "en-US",
+		Budget: orchestrator.BudgetStatic, SessionCapped: true})
+	if r.Status == contract.Unavailable || !strings.Contains(r.Text, "new conversation") {
+		t.Fatalf("got %s %q", r.Status, r.Text)
+	}
+}
+
+// Doc 03 §2, KB-004: a regional tax, payroll or legal question for a market
+// with no signed MARKET_AVAILABILITY claim is not answered as covered, even
+// when a page is tagged with that market.
+func TestRegionalCoverageNeedsMarketClaim(t *testing.T) {
+	e := newEnv(t)
+	r := ask(e, "Do you handle VAT filing in Ireland?", "IE")
+	if r.Status == contract.Answered {
+		t.Fatalf("IE has no market claim, yet answered: %q", r.Text)
 	}
 }

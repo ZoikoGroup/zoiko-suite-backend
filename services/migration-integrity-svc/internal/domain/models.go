@@ -22,31 +22,38 @@ type MigrationRecord struct {
 // Version starts at 1 and increases on every state change of the job or of
 // one of its quarantine items; it is the ETag clients send back in If-Match.
 type MigrationJob struct {
-	ID                      string           `json:"id"`
-	TenantID                string           `json:"tenant_id"`
-	LegalEntityID           string           `json:"legal_entity_id"`
-	MigrationName           string           `json:"migration_name"`
-	SourceSystem            string           `json:"source_system"`
-	TargetService           string           `json:"target_service"`
-	RequestedBy             string           `json:"requested_by,omitempty"`
-	TotalRecordsCount       int              `json:"total_records_count"`
-	ValidRecordsCount       int              `json:"valid_records_count"`
-	InvalidRecordsCount     int              `json:"invalid_records_count"`
-	IntegrityScore          float64          `json:"integrity_score"`
-	IntegrityScoreThreshold float64          `json:"integrity_score_threshold"`
-	BlockerCount            int              `json:"blocker_count"`
-	OpenQuarantineCount     int              `json:"open_quarantine_count"`
-	Status                  JobStatus        `json:"status"`
-	Version                 int              `json:"version"`
-	ControlTotals           *ControlTotals   `json:"control_totals,omitempty"`
-	IntegrityChecks         []IntegrityCheck `json:"integrity_checks,omitempty"`
-	AuditEntries            []AuditEntry     `json:"audit_entries,omitempty"`
-	StartedAt               *time.Time       `json:"started_at,omitempty"`
-	CompletedAt             *time.Time       `json:"completed_at,omitempty"`
-	ArchivedAt              *time.Time       `json:"archived_at,omitempty"`
-	ArchivedBy              string           `json:"archived_by,omitempty"`
-	CreatedAt               time.Time        `json:"created_at"`
-	UpdatedAt               time.Time        `json:"updated_at"`
+	ID                      string    `json:"id"`
+	TenantID                string    `json:"tenant_id"`
+	LegalEntityID           string    `json:"legal_entity_id"`
+	MigrationName           string    `json:"migration_name"`
+	SourceSystem            string    `json:"source_system"`
+	TargetService           string    `json:"target_service"`
+	RequestedBy             string    `json:"requested_by,omitempty"`
+	TotalRecordsCount       int       `json:"total_records_count"`
+	ValidRecordsCount       int       `json:"valid_records_count"`
+	InvalidRecordsCount     int       `json:"invalid_records_count"`
+	IntegrityScore          float64   `json:"integrity_score"`
+	IntegrityScoreThreshold float64   `json:"integrity_score_threshold"`
+	BlockerCount            int       `json:"blocker_count"`
+	OpenQuarantineCount     int       `json:"open_quarantine_count"`
+	Status                  JobStatus `json:"status"`
+	Version                 int       `json:"version"`
+	// SourceExtractID/Version bind this job to the immutable SourceExtract it
+	// validated against (ZS-MIG-001 MIG-INV-03), when the caller registered
+	// one -- see ValidateMigrationRequest.SourceExtractID. Both are blank for
+	// a job validated the pre-existing way, directly against submitted
+	// records with no extract on file.
+	SourceExtractID      string           `json:"source_extract_id,omitempty"`
+	SourceExtractVersion int              `json:"source_extract_version,omitempty"`
+	ControlTotals        *ControlTotals   `json:"control_totals,omitempty"`
+	IntegrityChecks      []IntegrityCheck `json:"integrity_checks,omitempty"`
+	AuditEntries         []AuditEntry     `json:"audit_entries,omitempty"`
+	StartedAt            *time.Time       `json:"started_at,omitempty"`
+	CompletedAt          *time.Time       `json:"completed_at,omitempty"`
+	ArchivedAt           *time.Time       `json:"archived_at,omitempty"`
+	ArchivedBy           string           `json:"archived_by,omitempty"`
+	CreatedAt            time.Time        `json:"created_at"`
+	UpdatedAt            time.Time        `json:"updated_at"`
 }
 
 // FindEntry returns the job's audit entry with the given id, or nil.

@@ -86,7 +86,7 @@ func main() {
 	}
 
 	h := handler.New(pgStore, authzClient, logger).
-		WithEvidenceGate(evidencereq.NewClient(cfg.EvidenceRequirementsURL))
+		WithEvidenceGate(evidencereq.NewClient(cfg.EvidenceRequirementsURL).WithLogger(logger))
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)

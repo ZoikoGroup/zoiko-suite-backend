@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -22,16 +21,17 @@ import (
 
 // fakeStore implements handler.Store; only what a test sets is exercised.
 type fakeStore struct {
-	run       *domain.ControlRun
-	created   bool
-	runErr    error
-	def       *domain.ControlDefinition
-	approveEr error
-	calls     []string
-	w1        wave1State
-	w5        wave5State
-	w7        wave7State
-	rv        revokeState
+	run            *domain.ControlRun
+	created        bool
+	runErr         error
+	def            *domain.ControlDefinition
+	approveEr      error
+	manualMatchErr error
+	calls          []string
+	w1             wave1State
+	w5             wave5State
+	w7             wave7State
+	rv             revokeState
 
 	// idemKey is the Idempotency-Key the last replayable command received;
 	// idemReplay makes the fake report that command as a replay.
@@ -70,8 +70,19 @@ func (f *fakeStore) CreateTolerancePolicy(context.Context, string, string, domai
 func (f *fakeStore) ListTolerancePolicies(context.Context, string, string, string) ([]domain.TolerancePolicy, error) {
 	return nil, nil
 }
+func (f *fakeStore) ApproveTolerancePolicy(context.Context, string, string, string, string) (*domain.TolerancePolicy, error) {
+	f.calls = append(f.calls, "ApproveTolerancePolicy")
+	return &domain.TolerancePolicy{ToleranceVersion: 1}, f.approveEr
+}
 func (f *fakeStore) CreateMaterialityPolicy(context.Context, string, string, domain.CreateMaterialityPolicyRequest) (*domain.MaterialityPolicy, error) {
 	return &domain.MaterialityPolicy{MaterialityVersion: 1}, nil
+}
+func (f *fakeStore) ListMaterialityPolicies(context.Context, string, string, string) ([]domain.MaterialityPolicy, error) {
+	return nil, nil
+}
+func (f *fakeStore) ApproveMaterialityPolicy(context.Context, string, string, string, string) (*domain.MaterialityPolicy, error) {
+	f.calls = append(f.calls, "ApproveMaterialityPolicy")
+	return &domain.MaterialityPolicy{MaterialityVersion: 1}, f.approveEr
 }
 func (f *fakeStore) CreateRun(_ context.Context, _, _, _, _ string, _ domain.CreateRunRequest) (*domain.ControlRun, bool, error) {
 	f.calls = append(f.calls, "CreateRun")
@@ -286,16 +297,51 @@ func TestApproveRuleVersion_ChecksApprovalAuthority(t *testing.T) {
 	assert.Equal(t, []string{"FINCTRL_APPROVE_RULE"}, a.actions, "authority re-evaluated at approval time (Invariant 11)")
 }
 
-func TestCreateTolerance_SelfApprovalRefusedBeforeStore(t *testing.T) {
+// SPEC_DEVIATIONS A4: approval is no longer a caller-declared field at
+// create time. A policy is created pending (no approved_by in the request
+// at all) and approved through its own, separately-authorized endpoint,
+// which refuses the creator as its own approver (store-layer ErrSelfApproval,
+// mapped to 403 here) exactly like ApproveRuleVersion already does.
+func TestCreateTolerance_IsCreatedPendingThenApprovedBySomeoneElse(t *testing.T) {
 	body := `{"legal_entity_id":"e1","metric":"FIN-CTRL-001","absolute_tolerance":"0.01","currency":"USD",
-		"rationale":"r","effective_from":"2026-09-01","approved_by":"alice"}`
+		"rationale":"r","effective_from":"2026-09-01"}`
 	s := &fakeStore{}
 	rr := do(newServer(s, &fakeAuthz{}), "POST", "/controls/v1/tolerance-policies", body, auth)
-	assert.Equal(t, 403, rr.Code)
-	assert.Empty(t, s.calls)
+	assert.Equal(t, 201, rr.Code, rr.Body.String())
 
-	body = strings.Replace(body, `"approved_by":"alice"`, `"approved_by":"bob"`, 1)
-	assert.Equal(t, 201, do(newServer(s, &fakeAuthz{}), "POST", "/controls/v1/tolerance-policies", body, auth).Code)
+	// The creator attempting to approve their own policy: refused.
+	selfApprove := &fakeStore{approveEr: domain.ErrSelfApproval}
+	rr = do(newServer(selfApprove, &fakeAuthz{}), "POST", "/controls/v1/tolerance-policies/t1/approve?legal_entity_id=e1", "", auth)
+	assert.Equal(t, 403, rr.Code)
+	assert.Equal(t, []string{"ApproveTolerancePolicy"}, selfApprove.calls)
+
+	// A distinct approver: succeeds.
+	distinctApprover := &fakeStore{}
+	rr = do(newServer(distinctApprover, &fakeAuthz{}), "POST", "/controls/v1/tolerance-policies/t1/approve?legal_entity_id=e1", "", auth)
+	assert.Equal(t, 200, rr.Code, rr.Body.String())
+}
+
+// SPEC_DEVIATIONS A5: validation (missing reason/evidence/record ids) is
+// refused before the run is even looked up, let alone the store touched —
+// same convention as every other create endpoint in this file.
+func TestCreateManualMatch_RequiresReasonEvidenceAndRecordIDs(t *testing.T) {
+	s := &fakeStore{run: sampleRun()}
+	cases := []string{
+		`{"side_a_record_ids":["a1"],"side_b_record_ids":["b1"],"evidence_ref":"e"}`,          // no reason
+		`{"side_a_record_ids":["a1"],"side_b_record_ids":["b1"],"reason":"explained"}`,        // no evidence_ref
+		`{"side_a_record_ids":[],"side_b_record_ids":["b1"],"reason":"r","evidence_ref":"e"}`, // no side A
+		`{"side_a_record_ids":["a1"],"side_b_record_ids":[],"reason":"r","evidence_ref":"e"}`, // no side B
+	}
+	for _, body := range cases {
+		rr := do(newServer(s, &fakeAuthz{}), "POST", "/controls/v1/runs/r1/manual-matches", body, auth)
+		assert.Equal(t, 400, rr.Code, body)
+	}
+	assert.Empty(t, s.calls, "an invalid request must never reach GetRun or the store")
+
+	good := `{"side_a_record_ids":["a1"],"side_b_record_ids":["b1"],"reason":"explained by ops","evidence_ref":"ticket-123"}`
+	rr := do(newServer(s, &fakeAuthz{}), "POST", "/controls/v1/runs/r1/manual-matches", good, auth)
+	assert.Equal(t, 201, rr.Code, rr.Body.String())
+	assert.Contains(t, s.calls, "CreateManualMatch")
 }
 
 func TestCreateDefinition_ValidatesInvariantOne(t *testing.T) {

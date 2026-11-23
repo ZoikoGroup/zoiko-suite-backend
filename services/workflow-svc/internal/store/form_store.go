@@ -8,11 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"zoiko.io/workflow-svc/internal/domain"
+	"zoiko.io/workflow-svc/internal/outbox"
 )
 
 const formDefinitionColumns = `form_id, tenant_id, legal_entity_id, name, business_purpose, target_domain, schema,
@@ -58,6 +60,31 @@ func scanFormSubmission(row pgx.Row) (*domain.FormSubmission, error) {
 		}
 	}
 	return s, nil
+}
+
+// enqueueFormEvent writes one BIZ-04 event to the outbox in the caller's transaction. These
+// events used to be published by the handler after the commit with a failure only logged,
+// so a broker problem lost them with no trace; they now commit atomically with the change,
+// like every other event this service emits, and the outbox relay delivers them.
+func enqueueFormEvent(ctx context.Context, tx pgx.Tx, eventType, aggregateType, aggregateID, tenantID, legalEntityID, actorID, correlationID string, payload map[string]any) error {
+	var corr *string
+	if correlationID != "" {
+		corr = &correlationID
+	}
+	payload["actor_principal_id"] = actorID
+	return outbox.Insert(ctx, tx, outbox.Event{AggregateType: aggregateType, AggregateID: aggregateID, EventType: eventType,
+		TenantID: tenantID, LegalEntityID: legalEntityID, ActorID: &actorID, CorrelationID: corr, Payload: payload})
+}
+
+func submissionEventPayload(s *domain.FormSubmission) map[string]any {
+	return map[string]any{
+		"submission_id":   s.SubmissionID,
+		"form_id":         s.FormID,
+		"tenant_id":       s.TenantID,
+		"legal_entity_id": s.LegalEntityID,
+		"form_version":    s.FormVersion,
+		"status":          s.Status,
+	}
 }
 
 func nullIfEmpty(s string) any {
@@ -107,7 +134,7 @@ func (s *PgStore) GetForm(ctx context.Context, tenantID, formID string) (*domain
 	var out *domain.FormDefinition
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		var err error
-		out, err = scanFormDefinition(tx.QueryRow(ctx, `SELECT `+formDefinitionColumns+` FROM form_definitions WHERE form_id=$1`, formID))
+		out, err = scanFormDefinition(tx.QueryRow(ctx, `SELECT `+formDefinitionColumns+` FROM form_definitions WHERE form_id=$1 AND tenant_id=$2`, formID, tenantID))
 		return err
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -127,7 +154,7 @@ func (s *PgStore) GetForm(ctx context.Context, tenantID, formID string) (*domain
 func (s *PgStore) PublishForm(ctx context.Context, p domain.PublishFormParams) (*domain.FormDefinition, error) {
 	var out *domain.FormDefinition
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
-		current, err := scanFormDefinition(tx.QueryRow(ctx, `SELECT `+formDefinitionColumns+` FROM form_definitions WHERE form_id=$1 FOR UPDATE`, p.FormID))
+		current, err := scanFormDefinition(tx.QueryRow(ctx, `SELECT `+formDefinitionColumns+` FROM form_definitions WHERE form_id=$1 AND tenant_id=$2 FOR UPDATE`, p.FormID, p.TenantID))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrFormNotFound
 		}
@@ -142,12 +169,18 @@ func (s *PgStore) PublishForm(ctx context.Context, p domain.PublishFormParams) (
 		}
 		out, err = scanFormDefinition(tx.QueryRow(ctx, `
 			UPDATE form_definitions SET status='PUBLISHED', published_by_principal_id=$2, published_at=now()
-			WHERE form_id=$1 AND status='DRAFT' RETURNING `+formDefinitionColumns,
-			p.FormID, p.ActorPrincipalID))
+			WHERE form_id=$1 AND tenant_id=$3 AND status='DRAFT' RETURNING `+formDefinitionColumns,
+			p.FormID, p.ActorPrincipalID, p.TenantID))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrFormNotDraft
 		}
-		return err
+		if err != nil {
+			return err
+		}
+		return enqueueFormEvent(ctx, tx, "form.published", "form_definition", out.FormID, out.TenantID, out.LegalEntityID, p.ActorPrincipalID, p.CorrelationID, map[string]any{
+			"form_id": out.FormID, "tenant_id": out.TenantID, "legal_entity_id": out.LegalEntityID,
+			"name": out.Name, "target_domain": out.TargetDomain, "version": out.Version,
+		})
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrFormNotFound) || errors.Is(err, domain.ErrFormSelfPublish) || errors.Is(err, domain.ErrFormNotDraft) {
@@ -167,7 +200,7 @@ func (s *PgStore) PublishForm(ctx context.Context, p domain.PublishFormParams) (
 func (s *PgStore) RetireForm(ctx context.Context, p domain.RetireFormParams) (*domain.FormDefinition, error) {
 	var out *domain.FormDefinition
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
-		current, err := scanFormDefinition(tx.QueryRow(ctx, `SELECT `+formDefinitionColumns+` FROM form_definitions WHERE form_id=$1 FOR UPDATE`, p.FormID))
+		current, err := scanFormDefinition(tx.QueryRow(ctx, `SELECT `+formDefinitionColumns+` FROM form_definitions WHERE form_id=$1 AND tenant_id=$2 FOR UPDATE`, p.FormID, p.TenantID))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrFormNotFound
 		}
@@ -179,8 +212,8 @@ func (s *PgStore) RetireForm(ctx context.Context, p domain.RetireFormParams) (*d
 		}
 		out, err = scanFormDefinition(tx.QueryRow(ctx, `
 			UPDATE form_definitions SET status='RETIRED', retired_by_principal_id=$2, retired_at=now()
-			WHERE form_id=$1 AND status <> 'RETIRED' RETURNING `+formDefinitionColumns,
-			p.FormID, p.ActorPrincipalID))
+			WHERE form_id=$1 AND tenant_id=$3 AND status <> 'RETIRED' RETURNING `+formDefinitionColumns,
+			p.FormID, p.ActorPrincipalID, p.TenantID))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrFormAlreadyRetired
 		}
@@ -211,7 +244,7 @@ func (s *PgStore) SaveDraft(ctx context.Context, p domain.SaveDraftParams) (*dom
 			var legalEntityID string
 			var formVersion int
 			var status string
-			if err := tx.QueryRow(ctx, `SELECT legal_entity_id, version, status FROM form_definitions WHERE form_id=$1`, p.FormID).
+			if err := tx.QueryRow(ctx, `SELECT legal_entity_id, version, status FROM form_definitions WHERE form_id=$1 AND tenant_id=$2`, p.FormID, p.TenantID).
 				Scan(&legalEntityID, &formVersion, &status); err != nil {
 				if errors.Is(err, pgx.ErrNoRows) {
 					return domain.ErrFormNotFound
@@ -237,7 +270,7 @@ func (s *PgStore) SaveDraft(ctx context.Context, p domain.SaveDraftParams) (*dom
 			return err
 		}
 
-		current, err := scanFormSubmission(tx.QueryRow(ctx, `SELECT `+formSubmissionColumns+` FROM form_submissions WHERE submission_id=$1 FOR UPDATE`, p.SubmissionID))
+		current, err := scanFormSubmission(tx.QueryRow(ctx, `SELECT `+formSubmissionColumns+` FROM form_submissions WHERE submission_id=$1 AND tenant_id=$2 FOR UPDATE`, p.SubmissionID, p.TenantID))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrFormSubmissionNotFound
 		}
@@ -249,8 +282,8 @@ func (s *PgStore) SaveDraft(ctx context.Context, p domain.SaveDraftParams) (*dom
 		}
 		out, err = scanFormSubmission(tx.QueryRow(ctx, `
 			UPDATE form_submissions SET submitted_values=$2::jsonb, consent_attestation=$3
-			WHERE submission_id=$1 AND status='DRAFT' RETURNING `+formSubmissionColumns,
-			p.SubmissionID, valuesJSON, nullIfEmpty(p.ConsentAttestation)))
+			WHERE submission_id=$1 AND tenant_id=$4 AND status='DRAFT' RETURNING `+formSubmissionColumns,
+			p.SubmissionID, valuesJSON, nullIfEmpty(p.ConsentAttestation), p.TenantID))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrFormSubmissionNotDraft
 		}
@@ -273,7 +306,7 @@ func (s *PgStore) SaveDraft(ctx context.Context, p domain.SaveDraftParams) (*dom
 func (s *PgStore) SubmitForm(ctx context.Context, p domain.SubmitFormParams) (*domain.FormSubmission, error) {
 	var out *domain.FormSubmission
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
-		current, err := scanFormSubmission(tx.QueryRow(ctx, `SELECT `+formSubmissionColumns+` FROM form_submissions WHERE submission_id=$1 FOR UPDATE`, p.SubmissionID))
+		current, err := scanFormSubmission(tx.QueryRow(ctx, `SELECT `+formSubmissionColumns+` FROM form_submissions WHERE submission_id=$1 AND tenant_id=$2 FOR UPDATE`, p.SubmissionID, p.TenantID))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrFormSubmissionNotFound
 		}
@@ -285,12 +318,15 @@ func (s *PgStore) SubmitForm(ctx context.Context, p domain.SubmitFormParams) (*d
 		}
 		out, err = scanFormSubmission(tx.QueryRow(ctx, `
 			UPDATE form_submissions SET status='SUBMITTED', submitted_at=now()
-			WHERE submission_id=$1 AND status='DRAFT' RETURNING `+formSubmissionColumns,
-			p.SubmissionID))
+			WHERE submission_id=$1 AND tenant_id=$2 AND status='DRAFT' RETURNING `+formSubmissionColumns,
+			p.SubmissionID, p.TenantID))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrFormSubmissionNotDraft
 		}
-		return err
+		if err != nil {
+			return err
+		}
+		return enqueueFormEvent(ctx, tx, "form.submission.received", "form_submission", out.SubmissionID, out.TenantID, out.LegalEntityID, p.ActorPrincipalID, p.CorrelationID, submissionEventPayload(out))
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrFormSubmissionNotFound) || errors.Is(err, domain.ErrFormSubmissionNotDraft) {
@@ -312,7 +348,7 @@ func (s *PgStore) SubmitForm(ctx context.Context, p domain.SubmitFormParams) (*d
 func (s *PgStore) ValidateSubmission(ctx context.Context, p domain.ValidateSubmissionParams) (*domain.FormSubmission, error) {
 	var out *domain.FormSubmission
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
-		current, err := scanFormSubmission(tx.QueryRow(ctx, `SELECT `+formSubmissionColumns+` FROM form_submissions WHERE submission_id=$1 FOR UPDATE`, p.SubmissionID))
+		current, err := scanFormSubmission(tx.QueryRow(ctx, `SELECT `+formSubmissionColumns+` FROM form_submissions WHERE submission_id=$1 AND tenant_id=$2 FOR UPDATE`, p.SubmissionID, p.TenantID))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrFormSubmissionNotFound
 		}
@@ -324,7 +360,7 @@ func (s *PgStore) ValidateSubmission(ctx context.Context, p domain.ValidateSubmi
 		}
 
 		var schemaRaw []byte
-		if err := tx.QueryRow(ctx, `SELECT schema FROM form_definitions WHERE form_id=$1`, current.FormID).Scan(&schemaRaw); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT schema FROM form_definitions WHERE form_id=$1 AND tenant_id=$2`, current.FormID, p.TenantID).Scan(&schemaRaw); err != nil {
 			return err
 		}
 		var schema []string
@@ -353,12 +389,19 @@ func (s *PgStore) ValidateSubmission(ctx context.Context, p domain.ValidateSubmi
 		}
 		out, err = scanFormSubmission(tx.QueryRow(ctx, `
 			UPDATE form_submissions SET status=$2, validation_result=$3::jsonb, rejection_reason=$4, validated_at=now()
-			WHERE submission_id=$1 AND status='SUBMITTED' RETURNING `+formSubmissionColumns,
-			p.SubmissionID, newStatus, resultJSON, rejectionReason))
+			WHERE submission_id=$1 AND tenant_id=$5 AND status='SUBMITTED' RETURNING `+formSubmissionColumns,
+			p.SubmissionID, newStatus, resultJSON, rejectionReason, p.TenantID))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrFormSubmissionNotSubmitted
 		}
-		return err
+		if err != nil {
+			return err
+		}
+		eventType := "form.submission.validated"
+		if newStatus == domain.FormSubmissionRejected {
+			eventType = "form.submission.rejected"
+		}
+		return enqueueFormEvent(ctx, tx, eventType, "form_submission", out.SubmissionID, out.TenantID, out.LegalEntityID, p.ActorPrincipalID, p.CorrelationID, submissionEventPayload(out))
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrFormSubmissionNotFound) || errors.Is(err, domain.ErrFormSubmissionNotSubmitted) {
@@ -373,7 +416,7 @@ func (s *PgStore) GetSubmission(ctx context.Context, tenantID, submissionID stri
 	var out *domain.FormSubmission
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		var err error
-		out, err = scanFormSubmission(tx.QueryRow(ctx, `SELECT `+formSubmissionColumns+` FROM form_submissions WHERE submission_id=$1`, submissionID))
+		out, err = scanFormSubmission(tx.QueryRow(ctx, `SELECT `+formSubmissionColumns+` FROM form_submissions WHERE submission_id=$1 AND tenant_id=$2`, submissionID, tenantID))
 		return err
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -395,7 +438,7 @@ func (s *PgStore) GetSubmission(ctx context.Context, tenantID, submissionID stri
 func (s *PgStore) SupersedeSubmission(ctx context.Context, p domain.SupersedeSubmissionParams) (*domain.FormSubmission, error) {
 	var out *domain.FormSubmission
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
-		previous, err := scanFormSubmission(tx.QueryRow(ctx, `SELECT `+formSubmissionColumns+` FROM form_submissions WHERE submission_id=$1 FOR UPDATE`, p.PreviousSubmissionID))
+		previous, err := scanFormSubmission(tx.QueryRow(ctx, `SELECT `+formSubmissionColumns+` FROM form_submissions WHERE submission_id=$1 AND tenant_id=$2 FOR UPDATE`, p.PreviousSubmissionID, p.TenantID))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrFormSubmissionNotFound
 		}
@@ -415,7 +458,7 @@ func (s *PgStore) SupersedeSubmission(ctx context.Context, p domain.SupersedeSub
 			return domain.ErrFormSubmissionNotAcceptedOrRejected
 		}
 
-		next, err := scanFormSubmission(tx.QueryRow(ctx, `SELECT `+formSubmissionColumns+` FROM form_submissions WHERE submission_id=$1`, p.NewSubmissionID))
+		next, err := scanFormSubmission(tx.QueryRow(ctx, `SELECT `+formSubmissionColumns+` FROM form_submissions WHERE submission_id=$1 AND tenant_id=$2`, p.NewSubmissionID, p.TenantID))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrFormSubmissionNotFound
 		}
@@ -431,8 +474,8 @@ func (s *PgStore) SupersedeSubmission(ctx context.Context, p domain.SupersedeSub
 
 		tag, err := tx.Exec(ctx, `
 			UPDATE form_submissions SET status='SUPERSEDED', superseded_by_submission_id=$2
-			WHERE submission_id=$1 AND superseded_by_submission_id IS NULL`,
-			p.PreviousSubmissionID, p.NewSubmissionID)
+			WHERE submission_id=$1 AND tenant_id=$3 AND superseded_by_submission_id IS NULL`,
+			p.PreviousSubmissionID, p.NewSubmissionID, p.TenantID)
 		if err != nil {
 			return err
 		}
@@ -479,11 +522,12 @@ func (s *PgStore) RouteToDomain(ctx context.Context, p domain.RouteToDomainParam
 		// than trusted from the request, so a route can never claim to
 		// have gone somewhere other than where its form was actually
 		// defined to go.
-		var status, targetDomain string
+		var status, targetDomain, formID, legalEntityID string
+		var formVersion int
 		if err := tx.QueryRow(ctx, `
-			SELECT fs.status, fd.target_domain
+			SELECT fs.status, fd.target_domain, fs.form_id, fs.legal_entity_id, fs.form_version
 			FROM form_submissions fs JOIN form_definitions fd ON fd.form_id = fs.form_id
-			WHERE fs.submission_id=$1`, p.SubmissionID).Scan(&status, &targetDomain); err != nil {
+			WHERE fs.submission_id=$1 AND fs.tenant_id=$2`, p.SubmissionID, p.TenantID).Scan(&status, &targetDomain, &formID, &legalEntityID, &formVersion); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return domain.ErrFormSubmissionNotFound
 			}
@@ -499,7 +543,13 @@ func (s *PgStore) RouteToDomain(ctx context.Context, p domain.RouteToDomainParam
 			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING `+formSubmissionRouteColumns,
 			uuid.NewString(), p.SubmissionID, p.TenantID, targetDomain, nullIfEmpty(p.CommandReference), nullIfEmpty(p.ResultReference),
 			p.Outcome, nullIfEmpty(p.FailureReason), p.ActorPrincipalID, nullIfEmpty(p.CorrelationID)))
-		return err
+		if err != nil {
+			return err
+		}
+		return enqueueFormEvent(ctx, tx, "form.submission.routed", "form_submission", p.SubmissionID, p.TenantID, legalEntityID, p.ActorPrincipalID, p.CorrelationID, map[string]any{
+			"submission_id": p.SubmissionID, "form_id": formID, "tenant_id": p.TenantID, "legal_entity_id": legalEntityID,
+			"form_version": formVersion, "status": status, "route_id": out.RouteID, "target_domain": targetDomain, "outcome": p.Outcome,
+		})
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrFormSubmissionNotFound) || errors.Is(err, domain.ErrFormSubmissionNotAccepted) {
@@ -516,7 +566,7 @@ func (s *PgStore) RouteToDomain(ctx context.Context, p domain.RouteToDomainParam
 func (s *PgStore) GetSubmissionVersion(ctx context.Context, tenantID, submissionID string) (*domain.FormSubmissionVersionInfo, error) {
 	var out domain.FormSubmissionVersionInfo
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `SELECT submission_id, form_id, form_version FROM form_submissions WHERE submission_id=$1`, submissionID).
+		return tx.QueryRow(ctx, `SELECT submission_id, form_id, form_version FROM form_submissions WHERE submission_id=$1 AND tenant_id=$2`, submissionID, tenantID).
 			Scan(&out.SubmissionID, &out.FormID, &out.FormVersion)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -546,14 +596,44 @@ func (s *PgStore) GetValidationResult(ctx context.Context, tenantID, submissionI
 // reviewer/validator works through. Scoped to one form (not the whole
 // tenant) so authorization stays meaningful: a caller is authorized per
 // legal entity, and a form is the unit that carries one.
-func (s *PgStore) ListPendingSubmissions(ctx context.Context, tenantID, formID string, limit, offset int) ([]*domain.FormSubmission, error) {
+// Uses cursor paging (API-4) with keyset pagination on (created_at DESC, submission_id DESC).
+func (s *PgStore) ListPendingSubmissions(ctx context.Context, tenantID, formID string, params domain.ListPendingSubmissionsParams) ([]*domain.FormSubmission, *domain.PaginationCursor, error) {
+	limit := params.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+
+	// Build cursor condition for keyset pagination
+	var cursorCondition string
+	var cursorArgs []any
+	if params.Cursor != nil && params.Cursor.StartedAt != "" && params.Cursor.InstanceID != "" {
+		cursorCondition = "AND (created_at, submission_id) < ($3, $4)"
+		cursorArgs = []any{params.Cursor.StartedAt, params.Cursor.InstanceID}
+	}
+
+	// BIZ-04: filtered by tenant as well as by row-level security.
+	query := fmt.Sprintf(`
+		SELECT %s
+		FROM form_submissions
+		WHERE form_id = $1
+		  AND tenant_id = $2
+		  AND status IN ('SUBMITTED', 'VALIDATING')
+		  %s
+		ORDER BY created_at DESC, submission_id DESC
+		LIMIT $%d`,
+		formSubmissionColumns, cursorCondition, len(cursorArgs)+3)
+
+	args := make([]any, 0, 2+len(cursorArgs)+1)
+	args = append(args, formID, tenantID)
+	args = append(args, cursorArgs...)
+	args = append(args, limit+1) // Fetch one extra to determine if there's a next page
+
 	var out []*domain.FormSubmission
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `
-			SELECT `+formSubmissionColumns+` FROM form_submissions
-			WHERE form_id=$1 AND status IN ('SUBMITTED', 'VALIDATING')
-			ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
-			formID, limit, offset)
+		rows, err := tx.Query(ctx, query, args...)
 		if err != nil {
 			return err
 		}
@@ -568,7 +648,20 @@ func (s *PgStore) ListPendingSubmissions(ctx context.Context, tenantID, formID s
 		return rows.Err()
 	})
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	return out, nil
+
+	// Determine next cursor
+	var nextCursor *domain.PaginationCursor
+	if len(out) > limit {
+		// We fetched limit+1 rows, so there's a next page
+		last := out[limit-1] // The last item of the actual page
+		out = out[:limit]
+		nextCursor = &domain.PaginationCursor{
+			StartedAt:  last.CreatedAt.UTC().Format(time.RFC3339),
+			InstanceID: last.SubmissionID,
+		}
+	}
+
+	return out, nextCursor, nil
 }

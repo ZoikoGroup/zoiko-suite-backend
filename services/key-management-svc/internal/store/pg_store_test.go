@@ -18,9 +18,10 @@ import (
 	"zoiko.io/key-management-svc/internal/testdb"
 )
 
-func newTenant() string { return "tenant-" + uuid.NewString() }
+// Tenants are UUIDs: the store refuses anything else (ErrInvalidTenant).
+func newTenant() string { return uuid.NewString() }
 
-func newKey(le string) *domain.CustomerKey {
+func newScopedKey(le string) *domain.CustomerKey {
 	return &domain.CustomerKey{
 		LegalEntityID:  le,
 		KeyAlias:       "alias-" + uuid.NewString()[:8],
@@ -75,7 +76,7 @@ func TestPgStore_PersistsAcrossRestart(t *testing.T) {
 	tenant := newTenant()
 	s := store.NewPgStore(app)
 
-	k := newKey("le-1")
+	k := newScopedKey("le-1")
 	if err := s.CreateKey(ctx, tenant, k); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -119,7 +120,7 @@ func TestPgStore_CrossTenantReadUpdateDeleteDenied(t *testing.T) {
 	s := store.NewPgStore(app)
 	tenantA, tenantB := newTenant(), newTenant()
 
-	k := newKey("le-1")
+	k := newScopedKey("le-1")
 	if err := s.CreateKey(ctx, tenantA, k); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -166,7 +167,7 @@ func TestPgStore_RLSBindsOrdinaryRole(t *testing.T) {
 	app := pools.RequireApp(t)
 	ctx := context.Background()
 	tenant := newTenant()
-	if err := store.NewPgStore(app).CreateKey(ctx, tenant, newKey("le-1")); err != nil {
+	if err := store.NewPgStore(app).CreateKey(ctx, tenant, newScopedKey("le-1")); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	for _, table := range []string{"customer_keys", "customer_key_versions"} {
@@ -200,7 +201,7 @@ func TestPgStore_RotateRollsBackOnFailure(t *testing.T) {
 	ctx := context.Background()
 	s := store.NewPgStore(pools.Store())
 	tenant := newTenant()
-	k := newKey("le-1")
+	k := newScopedKey("le-1")
 	if err := s.CreateKey(ctx, tenant, k); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -231,7 +232,7 @@ func TestPgStore_ConcurrentRotationsSerialise(t *testing.T) {
 	ctx := context.Background()
 	s := store.NewPgStore(pools.Store())
 	tenant := newTenant()
-	k := newKey("le-1")
+	k := newScopedKey("le-1")
 	if err := s.CreateKey(ctx, tenant, k); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -268,7 +269,7 @@ func TestPgStore_DisableIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	s := store.NewPgStore(pools.Store())
 	tenant := newTenant()
-	k := newKey("le-1")
+	k := newScopedKey("le-1")
 	if err := s.CreateKey(ctx, tenant, k); err != nil {
 		t.Fatalf("create: %v", err)
 	}

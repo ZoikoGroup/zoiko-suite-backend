@@ -297,17 +297,48 @@ func (h *Handler) ApproveSupportContext(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	correlationID := r.Header.Get("X-Correlation-ID")
-	sc, err := h.support.Approve(r.Context(), chi.URLParam(r, "supportContextID"), tenantID, callerPrincipalID, correlationID)
+
+	// Check If-Match for mutations of existing aggregates
+	supportContextID := chi.URLParam(r, "supportContextID")
+	sc, err := h.support.store.FindSupportContext(r.Context(), supportContextID, tenantID)
+	if err != nil {
+		writeCoded(w, r, http.StatusServiceUnavailable, domain.ErrCodeUpstreamUnavailable,
+			"could not read the support context")
+		return
+	}
+	if sc == nil {
+		writeCoded(w, r, http.StatusNotFound, domain.ErrCodeBreakGlassRequired, "support context not found")
+		return
+	}
+	// Refusal checks before the version precondition: a caller who may not
+	// approve hears 403, never 428. These mirror SupportService.Approve so the
+	// handler and the service agree on who may approve; the service re-checks
+	// them before the write.
+	if sc.RequestedByPrincipalID == callerPrincipalID || sc.SupportPrincipalID == callerPrincipalID {
+		writeCoded(w, r, http.StatusForbidden, domain.ErrCodeSoDConflict,
+			"a support context may not be approved by its requester or grantee")
+		return
+	}
+	if sc.ApproverPrincipalID != callerPrincipalID {
+		writeCoded(w, r, http.StatusForbidden, domain.ErrCodeAuthorizationDenied,
+			"only the named approver may approve")
+		return
+	}
+	if !h.requireIfMatch(w, r, sc.RecordVersion) {
+		return
+	}
+
+	sc, err = h.support.Approve(r.Context(), supportContextID, tenantID, callerPrincipalID, correlationID)
 	if err != nil {
 		h.writeSupportError(w, r, err, correlationID)
 		return
 	}
-	writeJSON(w, http.StatusOK, domain.AttachSupportContextResponse{
+	writeJSONWithETag(w, http.StatusOK, domain.AttachSupportContextResponse{
 		SupportContextID: sc.SupportContextID,
 		ApprovalStatus:   sc.ApprovalStatus,
 		ExpiresAt:        sc.ExpiresAt,
 		EvidenceID:       sc.EvidenceID,
-	})
+	}, sc.RecordVersion)
 }
 
 // GetSupportContext reads one grant, for the console that displays it and the
@@ -341,7 +372,7 @@ func (h *Handler) GetSupportContext(w http.ResponseWriter, r *http.Request) {
 		writeCoded(w, r, http.StatusNotFound, domain.ErrCodeBreakGlassRequired, "support context not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, sc)
+	writeJSONWithETag(w, http.StatusOK, sc, sc.RecordVersion)
 }
 
 // RevokeSupportContext ends an elevation early.
@@ -369,6 +400,21 @@ func (h *Handler) RevokeSupportContext(w http.ResponseWriter, r *http.Request) {
 
 	supportContextID := chi.URLParam(r, "supportContextID")
 	correlationID := r.Header.Get("X-Correlation-ID")
+
+	// Check If-Match for mutations of existing aggregates
+	sc, err := h.support.store.FindSupportContext(r.Context(), supportContextID, tenantID)
+	if err != nil {
+		writeCoded(w, r, http.StatusServiceUnavailable, domain.ErrCodeUpstreamUnavailable,
+			"could not read the support context")
+		return
+	}
+	if sc == nil {
+		writeCoded(w, r, http.StatusNotFound, domain.ErrCodeBreakGlassRequired, "support context not found")
+		return
+	}
+	if !h.requireIfMatch(w, r, sc.RecordVersion) {
+		return
+	}
 
 	var req domain.RevokeSupportContextRequest
 	// An empty body is fine here — a revocation with no stated reason still

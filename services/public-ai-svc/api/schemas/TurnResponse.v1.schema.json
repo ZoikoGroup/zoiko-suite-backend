@@ -1,0 +1,254 @@
+{
+  "$id": "https://schemas.zoikosuite.com/public-ai/TurnResponse.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "actions": {
+      "items": {
+        "$ref": "Action.v1.schema.json"
+      },
+      "maxItems": 3,
+      "type": "array"
+    },
+    "answer_class": {
+      "description": "ANSWERED is never HANDOFF_UNKNOWN; REFUSED_ACTION is always SAFE_REFUSAL; abstentions, handoffs and outages are HANDOFF_UNKNOWN.",
+      "enum": [
+        "VERIFIED_FACT",
+        "STATUS_QUALIFIED",
+        "PROCESS_EXPLANATION",
+        "HANDOFF_UNKNOWN",
+        "SAFE_REFUSAL"
+      ],
+      "type": "string"
+    },
+    "citations": {
+      "items": {
+        "$ref": "Citation.v1.schema.json"
+      },
+      "maxItems": 5,
+      "type": "array"
+    },
+    "clarification": {
+      "additionalProperties": false,
+      "description": "Present only on CLARIFY. Options are market codes, OTHER and GENERAL_OVERVIEW.",
+      "properties": {
+        "options": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "question": {
+          "type": "string"
+        },
+        "slot": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "slot",
+        "question",
+        "options"
+      ],
+      "type": "object"
+    },
+    "cta": {
+      "additionalProperties": false,
+      "description": "Structured responses only. At most one primary and one secondary official route.",
+      "properties": {
+        "primary": {
+          "$ref": "CTALink.v1.schema.json"
+        },
+        "secondary": {
+          "$ref": "CTALink.v1.schema.json"
+        }
+      },
+      "type": "object"
+    },
+    "draft": {
+      "description": "Answered from DRAFT_PENDING_REVIEW articles (local/dev only; refused in production).",
+      "type": "boolean"
+    },
+    "flags": {
+      "properties": {
+        "requires_human": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "followups": {
+      "description": "Structured responses only. Approved follow-ups after ANSWERED or HANDOFF.",
+      "items": {
+        "$ref": "FollowUp.v1.schema.json"
+      },
+      "maxItems": 4,
+      "type": "array"
+    },
+    "intent_id": {
+      "pattern": "^(I(0[1-9]|[12][0-9]|30)|X(0[1-9]|10)|UNKNOWN)$",
+      "type": "string"
+    },
+    "knowledge_release_id": {
+      "type": "string"
+    },
+    "market_code": {
+      "description": "The market a STATUS_QUALIFIED answer is scoped to.",
+      "pattern": "^[A-Z]{2}$",
+      "type": "string"
+    },
+    "outcome": {
+      "description": "Structured responses only (ADR-008). Typed form of status.",
+      "enum": [
+        "GROUNDED",
+        "CLARIFY",
+        "ABSTAIN",
+        "SAFE_FALLBACK",
+        "REFUSED",
+        "HANDOFF_OFFER"
+      ],
+      "type": "string"
+    },
+    "policy_version": {
+      "type": "string"
+    },
+    "reason": {
+      "description": "Why the turn ended this way, so the UI can word it. UNAVAILABLE carries only KILL_SWITCH, INTENT_DISABLED, GENERATION_DISABLED, MODEL_UNAVAILABLE, MODEL_TIMEOUT or KNOWLEDGE_UNAVAILABLE; \"no evidence\" and \"market not covered\" are ABSTAIN.",
+      "enum": [
+        "ANSWERED",
+        "GREETING",
+        "MARKET_REQUIRED",
+        "PLAN_REQUIRED",
+        "CLARIFY_EXHAUSTED",
+        "NO_EVIDENCE",
+        "CLAIM_CONFLICT",
+        "EXPIRED_SOURCE",
+        "SOURCE_REVOKED",
+        "MARKET_NOT_COVERED",
+        "OUT_OF_SCOPE",
+        "ROUTE_ONLY",
+        "SENSITIVE_INPUT",
+        "PRIVATE_DATA",
+        "ACTION_DENIED",
+        "REGULATED_ADVICE",
+        "SECURITY_REPORT",
+        "PROMPT_INJECTION",
+        "CROSS_PRODUCT",
+        "UNSUPPORTED_GUARANTEE",
+        "VALIDATION_FAILED",
+        "TOOL_INSTRUCTION",
+        "PRICING_DISABLED",
+        "KILL_SWITCH",
+        "INTENT_DISABLED",
+        "GENERATION_DISABLED",
+        "MODEL_UNAVAILABLE",
+        "MODEL_TIMEOUT",
+        "KNOWLEDGE_UNAVAILABLE",
+        "SPEND_CEILING",
+        "LIVE_PLATFORM_DATA",
+        "NO_APPROVED_INFO",
+        "GLOSSARY",
+        "CONTEXT_NOTED"
+      ],
+      "type": "string"
+    },
+    "request_id": {
+      "type": "string"
+    },
+    "safety_disposition": {
+      "description": "Doc 02 §15: ANSWERED=ALLOW, CLARIFY=CLARIFY, REFUSED_ACTION=DENY, ABSTAIN/HANDOFF=ESCALATE, UNAVAILABLE=RETRY. The UI shows no CTA or tool button the disposition does not allow.",
+      "enum": [
+        "ALLOW",
+        "CLARIFY",
+        "DENY",
+        "ESCALATE",
+        "RETRY"
+      ],
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "1.0"
+    },
+    "secondary_intent_id": {
+      "description": "Second intent of a two-part question (e.g. I05 plans with I06 trial).",
+      "pattern": "^(I(0[1-9]|[12][0-9]|30)|X(0[1-9]|10))$",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "ANSWERED",
+        "CLARIFY",
+        "REFUSED_ACTION",
+        "ABSTAIN",
+        "HANDOFF",
+        "UNAVAILABLE"
+      ],
+      "type": "string"
+    },
+    "status_label": {
+      "description": "Governed status from the signed claim registry only; never inferred or upgraded.",
+      "enum": [
+        "Available",
+        "Limited",
+        "Partner-Supported",
+        "Planned",
+        "Not Available",
+        "Unverified",
+        "Current Architecture",
+        "Implemented",
+        "In Validation",
+        "Readiness",
+        "MARKET_DEPENDENT",
+        "VERIFIED"
+      ],
+      "type": "string"
+    },
+    "suggestions": {
+      "description": "Pre-approved follow-up questions shown as chips when the assistant cannot answer (never links or CTAs).",
+      "items": {
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "message"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "text": {
+      "maxLength": 5000,
+      "type": "string"
+    },
+    "turn_id": {
+      "type": "string"
+    },
+    "turn_sequence": {
+      "minimum": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "turn_id",
+    "request_id",
+    "turn_sequence",
+    "status",
+    "intent_id",
+    "text",
+    "citations",
+    "actions",
+    "knowledge_release_id",
+    "policy_version",
+    "answer_class",
+    "safety_disposition"
+  ],
+  "title": "zs-public-answer-v1",
+  "type": "object"
+}

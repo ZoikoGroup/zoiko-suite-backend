@@ -67,6 +67,15 @@ func TestOpenAPI_EveryRouteAnswersAsDeclared(t *testing.T) {
 				req.Header.Set("Content-Type", "application/json")
 			}
 			req.Header.Set("X-Correlation-ID", corrID)
+			// Add If-Match header for mutating requests (required by API-3)
+			if rt.method == http.MethodPatch || rt.method == http.MethodPost || rt.method == http.MethodDelete {
+				if strings.Contains(rt.path, "/lifecycle") ||
+					strings.Contains(rt.path, "/status") ||
+					(rt.method == http.MethodPatch && (strings.Contains(rt.path, "/workspaces/") || strings.Contains(rt.path, "/entities/"))) ||
+					(rt.method == http.MethodDelete && (strings.Contains(rt.path, "/entity-hierarchies/") || strings.Contains(rt.path, "/entity-jurisdictions/"))) {
+					req.Header.Set("If-Match", `"v1"`)
+				}
+			}
 			rec := httptest.NewRecorder()
 			r.ServeHTTP(rec, req)
 

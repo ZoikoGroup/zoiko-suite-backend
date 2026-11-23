@@ -36,6 +36,10 @@ func registerCalendarRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/admin/calendars/{calendar_code}/versions", h.CreateCalendarVersion)
 	r.Put("/v1/admin/calendars/{calendar_code}/versions/{version}/sources", h.SetCalendarVersionSources)
 	r.Post("/v1/admin/calendars/{calendar_code}/versions/{version}/publish", h.PublishCalendarVersion)
+	r.Post("/v1/admin/calendars/{calendar_code}/imports", h.ImportHolidayCalendar)
+	r.Get("/v1/calendars/{calendar_code}/is-business-day", h.IsBusinessDay)
+	r.Get("/v1/calendars/{calendar_code}/add-business-days", h.AddBusinessDays)
+	registerPaymentTermRoutes(r, h)
 	r.Post("/v1/admin/obligation-rules", h.CreateObligationRule)
 	r.Put("/v1/admin/obligation-rules/{obligation_rule_id}/provenance", h.SetObligationProvenance)
 	r.Post("/v1/admin/obligation-rules/{obligation_rule_id}/publish", h.PublishObligationRule)
@@ -55,6 +59,10 @@ func (h *Handler) writeCalendarError(w http.ResponseWriter, r *http.Request, err
 		writeError(w, r, http.StatusNotFound, "obligation_rule_not_found", err.Error())
 	case errors.Is(err, domain.ErrNotIndependent):
 		writeError(w, r, http.StatusForbidden, "segregation_of_duties", err.Error())
+	case errors.Is(err, domain.ErrCalendarImportConflict):
+		writeError(w, r, http.StatusConflict, "calendar_import_conflict", err.Error())
+	case errors.Is(err, domain.ErrNoCalendarVersion):
+		writeError(w, r, http.StatusNotFound, "no_calendar_version", err.Error())
 	default:
 		h.writeOpsError(w, r, err, corr)
 	}
@@ -99,12 +107,16 @@ func (h *Handler) CreateCalendar(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListCalendars(w http.ResponseWriter, r *http.Request) {
+	p, ok := h.beginList(w, r, nil, nil)
+	if !ok {
+		return
+	}
 	cs, err := h.registry.ListCalendars(r.Context())
 	if err != nil {
 		h.writeCalendarError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"calendars": cs})
+	finishListAs(h, w, r, p, "calendars", pageOf(p, cs))
 }
 
 func (h *Handler) GetCalendar(w http.ResponseWriter, r *http.Request) {
@@ -174,12 +186,16 @@ func (h *Handler) GetCalendarVersion(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListCalendarVersions(w http.ResponseWriter, r *http.Request) {
+	p, ok := h.beginList(w, r, nil, nil)
+	if !ok {
+		return
+	}
 	vs, err := h.registry.ListCalendarVersions(r.Context(), chi.URLParam(r, "calendar_code"))
 	if err != nil {
 		h.writeCalendarError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"versions": vs})
+	finishListAs(h, w, r, p, "versions", pageOf(p, vs))
 }
 
 type SourceIDsRequest struct {
@@ -228,6 +244,7 @@ func (h *Handler) PublishCalendarVersion(w http.ResponseWriter, r *http.Request)
 		// Named in the service's original specification (03-microservices.md s8.2).
 		h.emitRegistry(r, events.EventCalendarChanged, v.CalendarVersionID, actor, map[string]any{
 			"calendar_code": code, "version": v.Version, "calendar_version_id": v.CalendarVersionID, "effective_from": v.EffectiveFrom})
+		h.emitCalendarPublished(r, code, actor, v)
 	}
 	writeJSON(w, http.StatusOK, v)
 }
@@ -299,17 +316,17 @@ func (h *Handler) GetObligationRule(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListObligationRules(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	limit, offset, ok := h.parsePaging(w, r, q)
+	p, ok := h.beginList(w, r, []string{"jurisdiction_id", "obligation_code"},
+		map[string]string{"jurisdiction_id": "jurisdiction_id", "obligation_code": "obligation_code"})
 	if !ok {
 		return
 	}
-	rs, err := h.registry.ListObligationRules(r.Context(), q.Get("jurisdiction_id"), q.Get("obligation_code"), limit, offset)
+	rs, err := h.registry.ListObligationRules(r.Context(), p.filter("jurisdiction_id"), p.filter("obligation_code"), p.fetch(), p.offset)
 	if err != nil {
 		h.writeCalendarError(w, r, err, r.Header.Get("X-Correlation-ID"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"obligation_rules": rs})
+	finishListAs(h, w, r, p, "obligation_rules", rs)
 }
 
 type ObligationProvenanceRequest struct {
@@ -457,6 +474,10 @@ func (h *Handler) CalculateObligation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !replayed && stored.Outcome == domain.DueCalculated {
+		h.emitRegistry(r, events.EventObligationDueDated, stored.DecisionID, actor, map[string]any{"decision_id": stored.DecisionID,
+			"jurisdiction_code": req.Jurisdiction, "obligation_code": req.ObligationCode})
+	}
 	status := http.StatusOK
 	switch stored.Outcome {
 	case domain.DueUnsupported, domain.DueInvalidFacts, domain.DueExtensionNotAllowed:
@@ -474,4 +495,3 @@ func (h *Handler) CalculateObligation(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, status, body)
 }
-

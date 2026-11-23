@@ -17,6 +17,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"zoiko.io/eventing/contracttest"
 	"go.uber.org/zap"
 
 	"zoiko.io/consolidation-svc/internal/domain"
@@ -40,6 +42,8 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
+	// ZS-EVENT-001 12.1: every event this test emitted must satisfy its published schema.
+	t.Cleanup(func() { contracttest.Verify(t, pool, filepath.Join(base, "../../contracts/events")) })
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS
 		command_idempotency, eventing_outbox, consolidation_eliminations, consolidation_adjustment_transitions, consolidation_adjustments, balance_contributions, balance_snapshots, consolidation_runs
@@ -54,6 +58,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		"000006_add_consolidation_adjustment_transitions.up.sql",
 		"000007_add_consolidation_eliminations.up.sql",
 		"000008_add_command_idempotency.up.sql",
+		"000009_add_elimination_pair_scope.up.sql",
 	} {
 		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
 		if err != nil {
@@ -241,5 +246,47 @@ func TestPgStore_ACC12_InvalidAdjustmentType_RejectedByCheckConstraint(t *testin
 	adj.AdjustmentType = "NOT_A_REAL_TYPE"
 	if err := createAdjustment(s, ctx, adj, "corr-1"); err == nil {
 		t.Fatal("expected the CHECK constraint to reject an unrecognized adjustment_type value")
+	}
+}
+
+// TestPgStore_ACC12_EliminationPairScope_RoundTrips proves migration
+// 000009's source_legal_entity_id/target_legal_entity_id round-trip for an
+// ELIMINATION adjustment (SPEC_DEVIATIONS A5: the bound check this pair
+// scope exists for is otherwise tenant-wide, not pair-scoped), and that a
+// MANUAL adjustment — which names no pair — persists both as NULL.
+func TestPgStore_ACC12_EliminationPairScope_RoundTrips(t *testing.T) {
+	pool := openTestPool(t)
+	s := newTestStore(pool)
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	entityA, entityB := uuid.New().String(), uuid.New().String()
+	elim := newTestAdjustment(tenantID, "group-1", "preparer-1")
+	elim.AdjustmentType = domain.AdjustmentTypeElimination
+	elim.SourceLegalEntityID = &entityA
+	elim.TargetLegalEntityID = &entityB
+	if err := createAdjustment(s, ctx, elim, "corr-elim"); err != nil {
+		t.Fatalf("CreateAdjustment (ELIMINATION): %v", err)
+	}
+	got, err := s.GetAdjustment(ctx, elim.ConsolidationAdjustmentID)
+	if err != nil {
+		t.Fatalf("GetAdjustment: %v", err)
+	}
+	if got.SourceLegalEntityID == nil || *got.SourceLegalEntityID != entityA ||
+		got.TargetLegalEntityID == nil || *got.TargetLegalEntityID != entityB {
+		t.Fatalf("expected the pair to round-trip, got source=%v target=%v", got.SourceLegalEntityID, got.TargetLegalEntityID)
+	}
+
+	manual := newTestAdjustment(tenantID, "group-1", "preparer-1")
+	if err := createAdjustment(s, ctx, manual, "corr-manual"); err != nil {
+		t.Fatalf("CreateAdjustment (MANUAL): %v", err)
+	}
+	gotManual, err := s.GetAdjustment(ctx, manual.ConsolidationAdjustmentID)
+	if err != nil {
+		t.Fatalf("GetAdjustment (MANUAL): %v", err)
+	}
+	if gotManual.SourceLegalEntityID != nil || gotManual.TargetLegalEntityID != nil {
+		t.Fatalf("expected a MANUAL adjustment to persist no pair, got source=%v target=%v", gotManual.SourceLegalEntityID, gotManual.TargetLegalEntityID)
 	}
 }

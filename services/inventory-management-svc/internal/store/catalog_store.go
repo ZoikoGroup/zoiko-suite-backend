@@ -81,7 +81,12 @@ func (s *PgStore) CreateOffering(ctx context.Context, o *domain.Offering, v *dom
 			}
 			return err
 		}
-		return insertOfferingVersion(ctx, tx, tenantID, v, variants)
+		if err := insertOfferingVersion(ctx, tx, tenantID, v, variants); err != nil {
+			return err
+		}
+		return s.enqueueCatalogEvent(ctx, tx, offeringCreatedEvent, o.CreatedByPrincipalID, tenantID, o.LegalEntityID, o.OfferingID, map[string]any{
+			"offering_id": o.OfferingID, "tenant_id": tenantID, "legal_entity_id": o.LegalEntityID, "sku_code": o.SKUCode, "version_id": v.VersionID,
+		})
 	})
 }
 
@@ -272,13 +277,28 @@ func (s *PgStore) ActivateOfferingVersion(ctx context.Context, offeringID, versi
 		`, domain.CatalogVersionStatusSuperseded, at, offeringID, tenantID, domain.CatalogVersionStatusActive, versionID)
 		var supersededID string
 		scanErr := row.Scan(&supersededID)
-		if errors.Is(scanErr, pgx.ErrNoRows) {
-			return nil
-		}
-		if scanErr != nil {
+		if scanErr != nil && !errors.Is(scanErr, pgx.ErrNoRows) {
 			return scanErr
 		}
-		supersededVersionID = &supersededID
+		if scanErr == nil {
+			supersededVersionID = &supersededID
+		}
+
+		// The events commit with the activation (and the supersession it caused).
+		var legalEntityID string
+		if err := tx.QueryRow(ctx, `SELECT legal_entity_id FROM inventory_catalog_offerings WHERE offering_id = $1 AND tenant_id = $2`, offeringID, tenantID).Scan(&legalEntityID); err != nil {
+			return err
+		}
+		if err := s.enqueueCatalogEvent(ctx, tx, offeringActivatedEvent, principalID, tenantID, legalEntityID, offeringID, map[string]any{
+			"offering_id": offeringID, "tenant_id": tenantID, "legal_entity_id": legalEntityID, "version_id": versionID, "activated_at": at.UTC().Format(time.RFC3339),
+		}); err != nil {
+			return err
+		}
+		if supersededVersionID != nil {
+			return s.enqueueCatalogEvent(ctx, tx, offeringVersionSupersededEvent, principalID, tenantID, legalEntityID, offeringID, map[string]any{
+				"offering_id": offeringID, "tenant_id": tenantID, "legal_entity_id": legalEntityID, "version_id": *supersededVersionID, "superseded_by_version_id": versionID,
+			})
+		}
 		return nil
 	})
 	if err != nil {
@@ -288,8 +308,24 @@ func (s *PgStore) ActivateOfferingVersion(ctx context.Context, offeringID, versi
 }
 
 func (s *PgStore) SuspendOfferingVersion(ctx context.Context, versionID, principalID, reason string, at time.Time) error {
-	return s.transitionOfferingVersion(ctx, versionID, domain.CatalogVersionStatusActive, domain.CatalogVersionStatusSuspended,
-		", suspended_at = $2, suspended_by_principal_id = $3, suspension_reason = $4", at, principalID, reason)
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		if err := execTransition(ctx, tx, "inventory_catalog_offering_versions", "version_id", versionID, tenantID,
+			domain.CatalogVersionStatusActive, domain.CatalogVersionStatusSuspended,
+			", suspended_at = $2, suspended_by_principal_id = $3, suspension_reason = $4", at, principalID, reason); err != nil {
+			return err
+		}
+		offeringID, legalEntityID, err := versionOffering(ctx, tx, tenantID, versionID)
+		if err != nil {
+			return err
+		}
+		return s.enqueueCatalogEvent(ctx, tx, offeringSuspendedEvent, principalID, tenantID, legalEntityID, offeringID, map[string]any{
+			"offering_id": offeringID, "tenant_id": tenantID, "legal_entity_id": legalEntityID, "version_id": versionID, "suspension_reason": reason,
+		})
+	})
 }
 
 // RetireOfferingVersion accepts either ACTIVE or SUSPENDED as the
@@ -313,8 +349,24 @@ func (s *PgStore) RetireOfferingVersion(ctx context.Context, versionID, principa
 		if tag.RowsAffected() == 0 {
 			return domain.ErrInvalidCatalogVersionTransition
 		}
-		return nil
+		offeringID, legalEntityID, err := versionOffering(ctx, tx, tenantID, versionID)
+		if err != nil {
+			return err
+		}
+		return s.enqueueCatalogEvent(ctx, tx, offeringRetiredEvent, principalID, tenantID, legalEntityID, offeringID, map[string]any{
+			"offering_id": offeringID, "tenant_id": tenantID, "legal_entity_id": legalEntityID, "version_id": versionID, "retirement_reason": reason,
+		})
 	})
+}
+
+// versionOffering returns the offering and legal entity a version belongs to, inside the caller's transaction.
+func versionOffering(ctx context.Context, tx pgx.Tx, tenantID, versionID string) (offeringID, legalEntityID string, err error) {
+	err = tx.QueryRow(ctx, `
+		SELECT v.offering_id, o.legal_entity_id
+		FROM inventory_catalog_offering_versions v
+		JOIN inventory_catalog_offerings o ON o.offering_id = v.offering_id AND o.tenant_id = v.tenant_id
+		WHERE v.version_id = $1 AND v.tenant_id = $2`, versionID, tenantID).Scan(&offeringID, &legalEntityID)
+	return offeringID, legalEntityID, err
 }
 
 // GetVersionAsOf resolves whichever version was ACTIVE at instant `at`

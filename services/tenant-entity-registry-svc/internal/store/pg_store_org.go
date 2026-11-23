@@ -675,6 +675,12 @@ func (s *PgStore) AmendLegalProfile(
 			return fmt.Errorf("insert profile version: %w", err)
 		}
 		out = created
+		if created.ChangeReason == domain.ProfileChangeRegisteredOfficeChange {
+			// ORG-08: the registered office is also an address, in the same transaction (see pg_store_registered_office.go).
+			if err := s.mirrorRegisteredOffice(ctx, tx, tid, created); err != nil {
+				return fmt.Errorf("record registered office address: %w", err)
+			}
+		}
 
 		// Is the new version the one in force NOW? Only then does the
 		// denormalized projection on legal_entities move.

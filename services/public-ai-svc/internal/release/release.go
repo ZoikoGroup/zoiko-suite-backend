@@ -7,16 +7,20 @@ package release
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"zoiko.io/public-ai-svc/internal/claims"
 	"zoiko.io/public-ai-svc/internal/contract"
 	"zoiko.io/public-ai-svc/internal/knowledge"
+	"zoiko.io/public-ai-svc/internal/metrics"
 	"zoiko.io/public-ai-svc/internal/policy"
 	"zoiko.io/public-ai-svc/internal/signing"
 	"zoiko.io/public-ai-svc/internal/store"
@@ -40,6 +44,22 @@ type Snapshot struct {
 // SourceRevoked implements knowledge.Revocations.
 func (s *Snapshot) SourceRevoked(sourceID, sourceVersionID string) bool {
 	return s.rev.sources[sourceID] || s.rev.sources[sourceVersionID]
+}
+
+// EvidenceRevoked reports whether a claim's evidence was withdrawn, by its
+// version or by its whole source (KB-030): a claim citing it is never stated.
+func (s *Snapshot) EvidenceRevoked(sourceVersionID string) bool {
+	if s.rev.sources[sourceVersionID] {
+		return true
+	}
+	if s.kbManifest != nil {
+		for _, src := range s.kbManifest.Sources {
+			if src.SourceVersionID == sourceVersionID && s.rev.sources[src.SourceID] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ClaimRevoked implements claims.RevocationSet.
@@ -84,12 +104,23 @@ type Runtime struct {
 	// DRAFT_PENDING_REVIEW content. Anywhere else such a release is refused
 	// and the service stays not-ready (fail closed).
 	AllowDraft bool
+	// AllowSynthetic lets a local/dev runtime serve a release containing
+	// synthetic test data (synthetic sources, synthetic routes, or synthetic
+	// claims). Anywhere else such a release is refused and the service stays
+	// not-ready (fail closed).
+	AllowSynthetic bool
 	// Embedder, when set, adds vector recall (knowledge.Hybrid) to each KB
 	// release. Nil (the R0 default: no approved model) keeps retrieval
 	// lexical. If embedding a release fails, that release is served
 	// lexically and VectorError reports why.
 	Embedder knowledge.Embedder
 	vecErr   error
+	// PolicyVersion is the running prompt/policy version. A release whose
+	// compatible_policy_versions does not include it is refused at load
+	// (Doc 08 OPR-004). RequireCompatibility also refuses a release that
+	// declares no range: set outside dev/test, where nothing is assumed.
+	PolicyVersion        string
+	RequireCompatibility bool
 
 	mu          sync.RWMutex
 	snap        *Snapshot
@@ -97,11 +128,41 @@ type Runtime struct {
 	claimsID    string
 	lastRefresh time.Time
 	lastErr     error
+	// scanPending: a release changed and its conflict cases are not yet
+	// all recorded; the next refresh retries.
+	scanPending bool
 }
 
 // New creates a Runtime. pubKey is the base64 Ed25519 verification key.
 func New(s store.Store, pubKey string) *Runtime {
 	return &Runtime{store: s, pubKey: pubKey, snap: &Snapshot{rev: &revocationSet{sources: map[string]bool{}, claims: map[string]bool{}}}}
+}
+
+// reject drops the active release and counts why the new one was refused
+// (SEC-T030: a checksum or signature failure must raise an alert, not only
+// turn readiness off).
+func (r *Runtime) reject(err error) error {
+	r.invalidate()
+	metrics.ReleaseRejected(rejectReason(err))
+	return err
+}
+
+func rejectReason(err error) string {
+	switch {
+	case errors.Is(err, signing.ErrBadSignature):
+		return "signature"
+	case errors.Is(err, knowledge.ErrChecksumMismatch):
+		return "checksum"
+	case errors.Is(err, ErrDraftInRelease):
+		return "draft"
+	case errors.Is(err, ErrSyntheticInRelease):
+		return "synthetic"
+	case errors.Is(err, ErrInvalidClaims):
+		return "claims"
+	case errors.Is(err, ErrIncompatibleRelease):
+		return "policy"
+	}
+	return "manifest"
 }
 
 // ErrNotLoaded means no verified release is active.
@@ -135,16 +196,25 @@ func (r *Runtime) refresh(ctx context.Context) error {
 	if newKB != kbID || cur.KB == nil {
 		var m knowledge.Manifest
 		if err := r.load(ctx, newKB, knowledge.KindKB, &m); err != nil {
-			r.invalidate()
-			return err
+			return r.reject(err)
 		}
 		if err := m.Validate(); err != nil {
-			r.invalidate()
-			return fmt.Errorf("release %s: %w", newKB, err)
+			return r.reject(fmt.Errorf("release %s: %w", newKB, err))
 		}
 		if m.HasDraft() && !r.AllowDraft {
-			r.invalidate()
-			return fmt.Errorf("release %s: %w", newKB, ErrDraftInRelease)
+			return r.reject(fmt.Errorf("release %s: %w", newKB, ErrDraftInRelease))
+		}
+		if m.HasSynthetic() && !r.AllowSynthetic {
+			return r.reject(fmt.Errorf("release %s: %w", newKB, ErrSyntheticInRelease))
+		}
+		if err := r.compatible(m.CompatiblePolicyVersions); err != nil {
+			return r.reject(fmt.Errorf("release %s: %w", newKB, err))
+		}
+		// additionally, gate synthetic routes
+		for _, rt := range m.Routes {
+			if rt.Synthetic && !r.AllowSynthetic {
+				return r.reject(fmt.Errorf("release %s: %w", newKB, ErrSyntheticInRelease))
+			}
 		}
 		next.KB, next.Routes, next.kbManifest = knowledge.NewIndex(m), m.Routes, &m
 		next.Retriever = next.KB
@@ -167,10 +237,24 @@ func (r *Runtime) refresh(ctx context.Context) error {
 	if newClaims != claimsID || cur.Claims == nil {
 		var m claims.Manifest
 		if err := r.load(ctx, newClaims, claims.KindClaims, &m); err != nil {
-			r.invalidate()
-			return err
+			return r.reject(err)
+		}
+		// Doc 03 §6/§12, CT-043: a claim release is held to the same load
+		// gates as a KB release, not only to the checks it passed at build.
+		if problems := m.StructuralProblems(); len(problems) > 0 {
+			return r.reject(fmt.Errorf("release %s: %w: %s", newClaims, ErrInvalidClaims, strings.Join(problems, "; ")))
+		}
+		if m.HasSynthetic() && !r.AllowSynthetic {
+			return r.reject(fmt.Errorf("release %s: %w", newClaims, ErrSyntheticInRelease))
+		}
+		if err := r.compatible(m.CompatiblePolicyVersions); err != nil {
+			return r.reject(fmt.Errorf("release %s: %w", newClaims, err))
 		}
 		next.Claims = claims.NewResolver(m)
+		if rel, err := r.store.GetRelease(ctx, newClaims); err == nil {
+			sum := sha256.Sum256(rel.Signature)
+			next.Claims = next.Claims.WithSignatureRef("ed25519:" + hex.EncodeToString(sum[:8]))
+		}
 		next.claimsChanged = true
 	}
 	if next.claimsChanged || newKB != kbID {
@@ -198,8 +282,83 @@ func (r *Runtime) refresh(ctx context.Context) error {
 	}
 	r.mu.Lock()
 	r.snap, r.kbID, r.claimsID = &next, newKB, newClaims
+	if newKB != kbID || newClaims != claimsID {
+		r.scanPending = true
+	}
+	scan := r.scanPending
 	r.mu.Unlock()
+	if scan && next.Claims != nil {
+		// Doc 03 §16, KB-005: every conflict in the new releases becomes an
+		// owned case at load, before any visitor asks about it.
+		for _, c := range ScanConflicts(next.kbManifest, next.Claims.Manifest(), time.Now().UTC()) {
+			if err := r.store.RecordConflict(ctx, c); err != nil {
+				return fmt.Errorf("record conflict %s: %w", c.ConflictID, err)
+			}
+		}
+		r.mu.Lock()
+		r.scanPending = false
+		r.mu.Unlock()
+	}
+	r.recordIndexHealth(ctx, &next)
 	return nil
+}
+
+// recordIndexHealth publishes the Doc 03 §22 index-health gauges.
+func (r *Runtime) recordIndexHealth(ctx context.Context, s *Snapshot) {
+	if s.kbManifest == nil {
+		return
+	}
+	now, oldest := time.Now().UTC(), 0.0
+	for _, src := range s.kbManifest.Sources {
+		t := src.ApprovalTS
+		if t == nil {
+			t = src.EffectiveFrom
+		}
+		if t != nil {
+			if d := now.Sub(*t).Hours() / 24; d > oldest {
+				oldest = d
+			}
+		}
+	}
+	revs := 0
+	if s.rev != nil {
+		revs = len(s.rev.sources) + len(s.rev.claims)
+	}
+	open := 0
+	if cs, err := r.store.Conflicts(ctx); err == nil {
+		for _, c := range cs {
+			if c.ResolutionState == "OPEN" {
+				open++
+			}
+		}
+	}
+	metrics.IndexHealth(len(s.kbManifest.Chunks), len(s.kbManifest.Sources), revs, open, oldest)
+}
+
+// ErrInvalidClaims means a signed claim release fails registry validation
+// at load; the runtime stays not-ready.
+var ErrInvalidClaims = errors.New("claim release fails validation")
+
+// ErrIncompatibleRelease means a release was not evaluated with the running
+// policy version (Doc 08 OPR-004); the runtime stays not-ready.
+var ErrIncompatibleRelease = errors.New("release is not compatible with the running policy version")
+
+func (r *Runtime) compatible(versions []string) error {
+	if len(versions) == 0 {
+		if r.RequireCompatibility {
+			return fmt.Errorf("%w: no compatible_policy_versions declared", ErrIncompatibleRelease)
+		}
+		return nil
+	}
+	if r.PolicyVersion == "" {
+		return nil
+	}
+	for _, v := range versions {
+		if v == r.PolicyVersion {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %s not in %v", ErrIncompatibleRelease, r.PolicyVersion, versions)
 }
 
 func (r *Runtime) invalidate() {
@@ -282,6 +441,54 @@ func (r *Runtime) RevokedSince(ctx context.Context, watermark int64, sourceIDs, 
 	return false, nil
 }
 
+// CitationsRevoked reports whether any cited source version or claim was
+// revoked, by id or (for a version) through its whole source, in the active
+// snapshot or in the ledger since it was refreshed. A stored answer is
+// re-checked with it before replay (Doc 03 §19, Doc 05 §12). Any doubt
+// (no release loaded, ledger unreadable) reports revoked: fail closed.
+func (r *Runtime) CitationsRevoked(ctx context.Context, sourceVersionIDs, claimIDs []string) (bool, error) {
+	snap, err := r.Snapshot()
+	if err != nil {
+		return true, err
+	}
+	for _, v := range sourceVersionIDs {
+		if snap.EvidenceRevoked(v) {
+			return true, nil
+		}
+	}
+	for _, c := range claimIDs {
+		if snap.ClaimRevoked(c) {
+			return true, nil
+		}
+	}
+	revs, err := r.store.Revocations(ctx, snap.Watermark)
+	if err != nil {
+		return true, err
+	}
+	if len(revs) == 0 {
+		return false, nil
+	}
+	newer := &Snapshot{kbManifest: snap.kbManifest, rev: &revocationSet{sources: map[string]bool{}, claims: map[string]bool{}}}
+	for _, v := range revs {
+		if v.TargetKind == "claim" {
+			newer.rev.claims[v.TargetID] = true
+		} else {
+			newer.rev.sources[v.TargetID] = true
+		}
+	}
+	for _, v := range sourceVersionIDs {
+		if newer.EvidenceRevoked(v) {
+			return true, nil
+		}
+	}
+	for _, c := range claimIDs {
+		if newer.ClaimRevoked(c) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // Run refreshes every interval until ctx ends.
 func (r *Runtime) Run(ctx context.Context, interval time.Duration, onErr func(error)) {
 	t := time.NewTicker(interval)
@@ -313,7 +520,7 @@ func (r *Runtime) PublicConfig() contract.ConfigResponse {
 	cfg := contract.ConfigResponse{
 		AssistantDisplayName: "ZoikoSuite Assistant", // neutral until brand clearance (DEC-04)
 		Capabilities:         contract.Capabilities{},
-		SupportedLocales:     []string{"en-US"},
+		SupportedLocales:     append([]string(nil), contract.SupportedLocales...),
 		MarketChoices:        []string{},
 		PublicRoutes:         []contract.PublicRoute{},
 		CitationLinks:        []contract.CitationLink{},
@@ -374,4 +581,11 @@ func (r *Runtime) VectorError() error {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.vecErr
+}
+
+// KBReleaseID is the active knowledge release id ("" before the first load).
+func (r *Runtime) KBReleaseID() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.kbID
 }

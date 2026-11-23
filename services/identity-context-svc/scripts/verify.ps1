@@ -52,7 +52,10 @@ try {
 
 # ---------------------------------------------------------------- STEP 3
 Show-Step 'STEP 3 - authenticate directly'
-$authBody = @{ tenant_id = $TEN; email = 'admin@zoikosuite.com'; password = 'Zoiko@Governance1' } | ConvertTo-Json
+# The console's confidential client (IDP_CLIENT_AUTH=required on the stack).
+$clientId = if ($env:IDENTITY_CONSOLE_CLIENT_ID) { $env:IDENTITY_CONSOLE_CLIENT_ID } else { 'zoiko-console' }
+$clientSecret = if ($env:IDENTITY_CONSOLE_CLIENT_SECRET) { $env:IDENTITY_CONSOLE_CLIENT_SECRET } else { 'local-dev-console-client-secret' }
+$authBody = @{ tenant_id = $TEN; email = 'admin@zoikosuite.com'; password = 'Zoiko@Governance1'; client_id = $clientId; client_secret = $clientSecret } | ConvertTo-Json
 $auth = Invoke-RestMethod -Uri "$API/v1/authenticate" -Method Post -ContentType 'application/json' -Body $authBody -TimeoutSec 30
 $TOKEN = $auth.access_token
 "token_type : $($auth.token_type)  expires_in: $($auth.expires_in)s"

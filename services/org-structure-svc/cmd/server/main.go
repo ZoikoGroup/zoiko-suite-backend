@@ -31,6 +31,7 @@ import (
 	"zoiko.io/org-structure-svc/internal/health"
 	svcmiddleware "zoiko.io/org-structure-svc/internal/middleware"
 	"zoiko.io/org-structure-svc/internal/mtls"
+	"zoiko.io/org-structure-svc/internal/outbox"
 	"zoiko.io/org-structure-svc/internal/store"
 	"zoiko.io/org-structure-svc/internal/telemetry"
 )
@@ -252,6 +253,16 @@ func main() {
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 
+	// ORG-05 events are written to event_outbox in the same transaction as the
+	// change they attest; the relay delivers them to Kafka (at-least-once).
+	relay := outbox.NewRelay(pool, kafkaWriterAdapter{kafkaWriter}, outbox.DefaultRelayConfig(), log)
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	relayDone := make(chan struct{})
+	go func() {
+		defer close(relayDone)
+		relay.Run(relayCtx)
+	}()
+
 	var httpClientForAuthz *http.Client
 	if cfg.AuthzMTLSEnabled {
 		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "org-structure-svc", platformScopeID)
@@ -329,7 +340,31 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed", zap.Error(err))
 	}
+
+	// No new commands can arrive now. Stop the relay, then make one last pass so
+	// events committed in the final moments are delivered rather than left for
+	// the next start. Whatever this cannot deliver stays in event_outbox.
+	stopRelay()
+	<-relayDone
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer drainCancel()
+	if n, err := relay.DrainOnce(drainCtx); err != nil {
+		log.Warn("final outbox drain failed; events stay queued", zap.Error(err))
+	} else if n > 0 {
+		log.Info("final outbox drain delivered events", zap.Int("count", n))
+	}
 	log.Info("server stopped")
+}
+
+// kafkaWriterAdapter bridges outbox.KafkaMessage to kafka.Message.
+type kafkaWriterAdapter struct{ w *kafka.Writer }
+
+func (a kafkaWriterAdapter) WriteMessages(ctx context.Context, msgs ...outbox.KafkaMessage) error {
+	out := make([]kafka.Message, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, kafka.Message{Key: m.Key, Value: m.Value})
+	}
+	return a.w.WriteMessages(ctx, out...)
 }
 
 func correlationIDMiddleware(next http.Handler) http.Handler {

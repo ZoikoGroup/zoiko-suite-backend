@@ -113,7 +113,6 @@ func TestReprocess_ReplayUsesCurrentMappingsAndRecordsTrace(t *testing.T) {
 	s := newStubStore()
 	req := validPostEventReq()
 	key := "REVENUE:SUBSCRIPTIONS"
-	req.Lines[1].AccountCode = nil
 	req.Lines[1].MappingKey = &key
 	s.accountsByCode["t1|4100-Subs"] = &domain.Account{AccountCode: "4100-Subs", Status: "ACTIVE"}
 	s.currentMappings["t1|"+key] = &domain.AccountMapping{TenantID: "t1", MappingKey: key, AccountCode: "4100-Subs"}

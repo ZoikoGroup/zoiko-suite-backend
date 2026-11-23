@@ -26,12 +26,12 @@ func TestCreate_ReplayAnswers200NotCreated(t *testing.T) {
 	r := newRouter(store, &stubAuthZ{}, nil)
 	body := delegationBody("delegator-1", correlationID, time.Now(), time.Now().Add(24*time.Hour))
 
-	first := doReq(r, http.MethodPost, "/v1/delegations/", body, "delegator-1")
+	first := doReq(r, http.MethodPost, "/v1/delegations/", body, "delegator-1", "")
 	if first.Code != http.StatusCreated {
 		t.Fatalf("first create: expected 201 got %d: %s", first.Code, first.Body.String())
 	}
 
-	second := doReq(r, http.MethodPost, "/v1/delegations/", body, "delegator-1")
+	second := doReq(r, http.MethodPost, "/v1/delegations/", body, "delegator-1", "")
 	if second.Code != http.StatusOK {
 		t.Fatalf("replay: expected 200 (nothing was written) got %d: %s", second.Code, second.Body.String())
 	}
@@ -53,8 +53,8 @@ func TestCreate_ReplayEmitsNoSecondEvent(t *testing.T) {
 	r := newRouter(store, &stubAuthZ{}, nil)
 	body := delegationBody("delegator-1", correlationID, time.Now(), time.Now().Add(24*time.Hour))
 
-	_ = doReq(r, http.MethodPost, "/v1/delegations/", body, "delegator-1")
-	_ = doReq(r, http.MethodPost, "/v1/delegations/", body, "delegator-1")
+	_ = doReq(r, http.MethodPost, "/v1/delegations/", body, "delegator-1", "")
+	_ = doReq(r, http.MethodPost, "/v1/delegations/", body, "delegator-1", "")
 
 	if n := store.countEvents(events.EventDelegated); n != 1 {
 		t.Errorf("two submissions of one correlation_id produced %d authority.delegated events, want 1", n)

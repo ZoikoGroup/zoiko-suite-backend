@@ -40,8 +40,9 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("connect to TEST_DATABASE_URL: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	verifyEventContracts(t, pool)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS mapping_exceptions, bank_transaction_mappings, bank_region_policies, bank_transactions_canonical, bank_statement_lines, bank_statements, bank_connection_events, bank_connections, eventing_outbox CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS bank_connection_account_tokens, mapping_exceptions, bank_transaction_mappings, bank_region_policies, bank_transactions_canonical, bank_statement_lines, bank_statements, bank_connection_events, bank_connections, eventing_outbox CASCADE;`)
 
 	// Every migration in filename order, never one hardcoded name — a
 	// suite that names migrations individually silently skips new ones,

@@ -16,13 +16,11 @@ import (
 
 // ZS-JUR-001 Wave 2: the runtime rule-resolution API (s25).
 //
-// Scope note: s25 lists POST /jurisdiction-decisions:resolve and
-// POST /regulatory-calculations:execute. The calculation endpoint is built
-// (tax.go). The decision endpoint is not: it needs authoritative legal-entity,
-// establishment, registration and counterparty facts, and those arrive with
-// ORG-5..ORG-7 in tenant-entity-registry-svc. Answering it today would be
-// inventing a legal conclusion, so there is no endpoint rather than a fake one.
-// JUR-1 builds it once those facts exist.
+// Scope note: s25 lists POST /jurisdiction-decisions:resolve (determination.go, JUR-1) and
+// POST /regulatory-calculations:execute (tax.go); both are built. The decision endpoint rests on the
+// entity's authorised assignments, establishments and registrations projected from
+// tenant-entity-registry-svc. It does not decide place of supply or any transaction-level question:
+// no such rules exist, and counterparty and transaction facts are recorded without deciding.
 
 // WithResolver enables the runtime resolution routes.
 func (h *Handler) WithResolver(r *resolver.Resolver) *Handler {
@@ -37,6 +35,7 @@ func registerResolverRoutes(r chi.Router, h *Handler) {
 	registerPayrollRoute(r, h)
 	registerRecordsRoutes(r, h)
 	registerSubmissionRoutes(r, h)
+	registerRegistrationRoutes(r, h)
 	r.Get("/v1/rule-decisions/{decision_id}", h.GetRuleDecision)
 	r.Get("/v1/pack-coverage", h.PackCoverage)
 	r.Post("/v1/admin/resolver-cache:invalidate", h.InvalidateResolverCache)
@@ -217,4 +216,3 @@ func (h *Handler) InvalidateResolverCache(w http.ResponseWriter, r *http.Request
 	hits, misses, refreshes := h.resolver.Stats()
 	writeJSON(w, http.StatusOK, map[string]any{"invalidated": true, "cache_hits": hits, "cache_misses": misses, "eligible_list_refreshes": refreshes})
 }
-

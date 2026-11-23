@@ -49,7 +49,7 @@ func (f *subFixture) newAccount(org, currency, market string) (string, string) {
 		f.t.Fatalf("create account: %v", err)
 	}
 	if market != "" {
-		if err := f.s.SetAccountMarket(ctx, a.CommercialAccountID, market, operator, t0); err != nil {
+		if err := f.s.SetAccountMarket(ctx, a.CommercialAccountID, market, operator, t0, f.tclaim(org, operator, "SetAccountMarket", a.CommercialAccountID)); err != nil {
 			f.t.Fatalf("set market: %v", err)
 		}
 	}
@@ -500,6 +500,32 @@ func TestSubscription_MutuallyExclusiveWithDoc7Subscriptions(t *testing.T) {
 	}
 	if err := legacy(ctx, acct); !errors.Is(err, domain.ErrActiveSubscriptionExists) {
 		t.Fatalf("a doc7 subscription was created on top of a live COM-02 one: %v", err)
+	}
+}
+
+// SPEC_DEVIATIONS A4: SetAccountMarket now claims an Idempotency-Key — a
+// retry under the same key replays rather than silently re-running the
+// write (harmless for this particular overwrite, but the same guarantee
+// every other canonical command here already makes).
+func TestSetAccountMarket_IsIdempotent(t *testing.T) {
+	f := newSub(t)
+	claim := f.tclaim(f.org, operator, "SetAccountMarket", f.account)
+	if err := f.s.SetAccountMarket(f.ctxOrg, f.account, "DE", operator, t0.Add(time.Hour), claim); err != nil {
+		t.Fatalf("first set: %v", err)
+	}
+
+	// A retry under the same key with a DIFFERENT market code must still
+	// replay (the original write stands), not apply the new value.
+	err := f.s.SetAccountMarket(f.ctxOrg, f.account, "FR", operator, t0.Add(2*time.Hour), claim)
+	var replay *domain.IdempotentReplayError
+	if !errors.As(err, &replay) || replay.ResourceID != f.account {
+		t.Fatalf("a retried set must replay, got: %v", err)
+	}
+
+	var market string
+	_ = f.admin.QueryRow(f.ctx, `SELECT market_code FROM commercial_accounts WHERE commercial_account_id = $1`, f.account).Scan(&market)
+	if market != "DE" {
+		t.Fatalf("market_code = %q, want DE (the replayed call must not have re-applied)", market)
 	}
 }
 

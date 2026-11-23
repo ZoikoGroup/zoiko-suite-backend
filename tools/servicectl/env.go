@@ -27,7 +27,7 @@ type GlobalEnv struct {
 // managedKeys are computed per service and must never be inherited from the
 // global file or from the launcher's own process environment. PORT is the reason
 // this list exists: a stray PORT in the shell would otherwise be handed to all
-// 86 services at once, and 85 of them would fail to bind with no obvious cause.
+// 87 services at once, and 85 of them would fail to bind with no obvious cause.
 var managedKeys = map[string]bool{
 	"PORT": true, "DB_NAME": true, "DB_SCHEMA": true, "DATABASE_URL": true,
 	"DB_HOST": true, "DB_PORT": true, "DB_USER": true, "DB_PASSWORD": true,

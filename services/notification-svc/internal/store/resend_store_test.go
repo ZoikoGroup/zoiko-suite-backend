@@ -15,7 +15,7 @@ import (
 // its reason (§3.4).
 func TestResend_PreservesTheChainOnTheSameCommunication(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 	n := seedNotification(t, s, "tenant-a", "corr-resend-chain")
 
@@ -55,7 +55,7 @@ func TestResend_PreservesTheChainOnTheSameCommunication(t *testing.T) {
 // The schema refuses a resend attempt with no reason, whatever the caller does.
 func TestResend_AttemptWithoutReasonIsRefusedByTheSchema(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 	n := seedNotification(t, s, "tenant-a", "corr-resend-noreason")
 	at := time.Now().UTC()
@@ -73,7 +73,7 @@ func TestResend_AttemptWithoutReasonIsRefusedByTheSchema(t *testing.T) {
 // PENDING_UNKNOWN is not resendable: it must be resolved first (§6.2).
 func TestResend_UnknownIsNotResendable(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 	n := seedNotification(t, s, "tenant-a", "corr-resend-unknown")
 	if err := s.MarkOutcomeUnknown(ctx, n.NotificationID, "tenant-a", "reset after DATA", time.Now().UTC(), "c", domain.AttemptMeta{}); err != nil {
@@ -87,7 +87,7 @@ func TestResend_UnknownIsNotResendable(t *testing.T) {
 // Two concurrent resends cannot both reopen one notification.
 func TestResend_ConcurrentResendsReopenOnce(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 	n := seedNotification(t, s, "tenant-a", "corr-resend-race")
 	at := time.Now().UTC()

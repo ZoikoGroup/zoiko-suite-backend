@@ -125,7 +125,7 @@ func TestPgStore_TOTPLifecycle_Integration(t *testing.T) {
 	// Evidence and events committed with the changes.
 	var decisions, outboxRows int
 	_ = admin.QueryRow(ctx, `SELECT COUNT(*) FROM access_decision_log WHERE principal_id = 'p-1' AND action_type LIKE 'MFA_%'`).Scan(&decisions)
-	_ = admin.QueryRow(ctx, `SELECT COUNT(*) FROM event_outbox WHERE event_type IN ('identity.mfa_factor.enrolled', 'identity.mfa_factor.reset')`).Scan(&outboxRows)
+	_ = admin.QueryRow(ctx, `SELECT COUNT(*) FROM eventing_outbox WHERE event_type IN ('com.zoikosuite.identity.mfa-factor.enrolled', 'com.zoikosuite.identity.mfa-factor.reset')`).Scan(&outboxRows)
 	if decisions < 7 || outboxRows != 2 {
 		t.Fatalf("evidence rows %d, outbox rows %d", decisions, outboxRows)
 	}

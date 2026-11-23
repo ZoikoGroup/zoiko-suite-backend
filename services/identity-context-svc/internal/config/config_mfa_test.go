@@ -20,6 +20,8 @@ func mfaBaseEnv(t *testing.T) {
 	t.Setenv("IDP_CLIENT_SECRETS_FILE", "")
 	t.Setenv("MFA_TOTP_SKEW_STEPS", "")
 	t.Setenv("OIDC_ISSUER", "https://auth.example.com")
+	t.Setenv("CURSOR_SIGNING_KEY_HEX", "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+	t.Setenv("COMMERCIAL_ACCOUNT_URL", "http://commercial-account-svc:8144")
 }
 
 func TestMFAKey_RequiredInProtectedTiers(t *testing.T) {

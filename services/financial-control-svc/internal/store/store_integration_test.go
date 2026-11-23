@@ -24,6 +24,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
+	"zoiko.io/eventing/envelope"
+
 	"zoiko.io/financial-control-svc/internal/domain"
 	"zoiko.io/financial-control-svc/internal/store"
 )
@@ -75,7 +77,7 @@ func TestMain(m *testing.M) {
 			os.Exit(1)
 		}
 	}
-	testStore = store.New(testPool, zap.NewNop())
+	testStore = store.New(testPool, zap.NewNop(), store.WithEventProfile(testEventRegion, envelope.Confidential))
 	code := m.Run()
 	testPool.Close()
 	_ = pg.Stop()
@@ -254,7 +256,9 @@ func TestRun_TolerancePinned_NewVersionOnlyAffectsNewRuns(t *testing.T) {
 
 	t1, err := testStore.CreateTolerancePolicy(ctx, tenant, "maker", domain.CreateTolerancePolicyRequest{
 		LegalEntityID: entity, Metric: "FIN-CTRL-001", AbsoluteTolerance: "0.01", Currency: "USD",
-		Rationale: "cent rounding", EffectiveFrom: "2026-01-01", ApprovedBy: "policy-owner"})
+		Rationale: "cent rounding", EffectiveFrom: "2026-01-01"})
+	require.NoError(t, err)
+	t1, err = testStore.ApproveTolerancePolicy(ctx, tenant, entity, t1.ToleranceID, "policy-owner")
 	require.NoError(t, err)
 	assert.Equal(t, 1, t1.ToleranceVersion)
 	assert.Equal(t, "0.010000000000", t1.AbsoluteTolerance, "exact decimal, no float artefacts")
@@ -270,7 +274,9 @@ func TestRun_TolerancePinned_NewVersionOnlyAffectsNewRuns(t *testing.T) {
 
 	t2, err := testStore.CreateTolerancePolicy(ctx, tenant, "maker", domain.CreateTolerancePolicyRequest{
 		LegalEntityID: entity, Metric: "FIN-CTRL-001", AbsoluteTolerance: "50", Currency: "USD",
-		Rationale: "widened", EffectiveFrom: "2026-01-01", ApprovedBy: "policy-owner"})
+		Rationale: "widened", EffectiveFrom: "2026-01-01"})
+	require.NoError(t, err)
+	t2, err = testStore.ApproveTolerancePolicy(ctx, tenant, entity, t2.ToleranceID, "policy-owner")
 	require.NoError(t, err)
 	assert.Equal(t, 2, t2.ToleranceVersion)
 
@@ -287,7 +293,9 @@ func TestRun_NamedPolicyMustBelongToTheEntity(t *testing.T) {
 	d := approvedDef(t, tenant, "FIN-CTRL-001")
 	tol, err := testStore.CreateTolerancePolicy(ctx, tenant, "maker", domain.CreateTolerancePolicyRequest{
 		LegalEntityID: entityA, Metric: "FIN-CTRL-001", AbsoluteTolerance: "1", Currency: "USD",
-		Rationale: "r", EffectiveFrom: "2026-01-01", ApprovedBy: "owner"})
+		Rationale: "r", EffectiveFrom: "2026-01-01"})
+	require.NoError(t, err)
+	tol, err = testStore.ApproveTolerancePolicy(ctx, tenant, entityA, tol.ToleranceID, "owner")
 	require.NoError(t, err)
 
 	req := runReq(d.ControlDefinitionID, entityB)
@@ -331,7 +339,7 @@ func TestRun_AdvanceHappyPath_WritesTransitionsAndOutbox(t *testing.T) {
 	assert.Equal(t, 1, dims["RESULT"])
 	assert.Equal(t, 1, dims["CERTIFICATION"])
 
-	rows, err := testPool.Query(ctx, `SELECT event_type FROM outbox_events WHERE tenant_id = $1 AND aggregate_id = $2 ORDER BY created_at, outbox_event_id`, tenant, run.RunID)
+	rows, err := testPool.Query(ctx, `SELECT event_type FROM `+legacyEvents+` WHERE tenant_id = $1 AND aggregate_id = $2 ORDER BY created_at, outbox_id`, tenant, run.RunID)
 	require.NoError(t, err)
 	defer rows.Close()
 	seen := map[string]bool{}
@@ -397,7 +405,7 @@ func TestRun_TechnicalFailureCanNeverBecomePass(t *testing.T) {
 	assert.ErrorIs(t, err, domain.ErrInvalidTransition, "NOT_EVALUATED is not certifiable")
 
 	var failedEvents int
-	require.NoError(t, testPool.QueryRow(ctx, `SELECT count(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'control.run.failed'`, run.RunID).Scan(&failedEvents))
+	require.NoError(t, testPool.QueryRow(ctx, `SELECT count(*) FROM `+legacyEvents+` WHERE aggregate_id = $1 AND event_type = 'control.run.failed'`, run.RunID).Scan(&failedEvents))
 	assert.Equal(t, 1, failedEvents)
 }
 

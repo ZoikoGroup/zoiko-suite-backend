@@ -101,6 +101,20 @@ func TestPgStore_FindRules_Integration(t *testing.T) {
 	if rulesCurr[0].RuleStatus != "ACTIVE" {
 		t.Errorf("expected status ACTIVE, got %s", rulesCurr[0].RuleStatus)
 	}
+
+	// Test Case 3: the register view lists every rule, the DRAFT included,
+	// whatever the date.
+	all, err := s.FindRules(ctx, store.FindRulesParams{JurisdictionID: jurID, AllVersions: true, EffectiveAt: histTime})
+	if err != nil {
+		t.Fatalf("FindRules register view failed: %v", err)
+	}
+	seen := map[string]string{}
+	for _, r := range all {
+		seen[r.JurisdictionRuleID] = r.RuleStatus
+	}
+	if len(all) != 3 || seen[rule1ID] != "SUPERSEDED" || seen[rule2ID] != "ACTIVE" || seen[rule3ID] != "DRAFT" {
+		t.Errorf("register view: expected the three rules (DRAFT included), got %v", seen)
+	}
 }
 
 // TestPgStore_FindRules_SurvivesDeactivation covers the §8.2 constraint that

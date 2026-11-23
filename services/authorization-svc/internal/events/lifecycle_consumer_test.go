@@ -34,6 +34,17 @@ type lifecycleStub struct {
 
 	entities  []domain.ProjectEntityStatusParams
 	entityErr error
+
+	merges   []domain.RepointMergedSubjectParams
+	mergeErr error
+}
+
+func (s *lifecycleStub) RepointMergedSubject(_ context.Context, p domain.RepointMergedSubjectParams) (int, error) {
+	if s.mergeErr != nil {
+		return 0, s.mergeErr
+	}
+	s.merges = append(s.merges, p)
+	return 1, nil
 }
 
 func (s *lifecycleStub) ProjectPrincipalStatus(_ context.Context, params domain.ProjectPrincipalStatusParams) (*domain.PrincipalStatusProjection, error) {
@@ -134,6 +145,34 @@ func TestLifecycle_PrincipalReinstated_IsProjected(t *testing.T) {
 	if len(store.projected) != 1 || store.projected[0].Status != domain.PrincipalStatusActive {
 		t.Fatalf("projected = %+v, want one ACTIVE row — reinstatement has to project too, or an unsuspension never takes effect",
 			store.projected)
+	}
+}
+
+// identity-context-svc retired principal.status.changed for the ZS-IAM-001
+// names (its publisher.go PublishPrincipalStatusChanged): SUSPENDED and
+// DISABLED go out as identity.subject.disabled, ACTIVE as
+// identity.subject.enabled, with the same payload. Until these were consumed a
+// suspension never reached layer 0.
+func TestLifecycle_IdentitySubjectEvents_AreProjected(t *testing.T) {
+	for _, tc := range []struct{ eventType, status string }{
+		{"identity.subject.disabled", "SUSPENDED"},
+		{"identity.subject.disabled", "DISABLED"},
+		{"identity.subject.enabled", "ACTIVE"},
+	} {
+		store := &lifecycleStub{}
+		c := newLifecycle(store)
+
+		c.Handle(context.Background(), lifecycleEnvelope(t, "e-"+tc.eventType+tc.status, tc.eventType, "t-1", map[string]any{
+			"principal_id":   "p-9",
+			"tenant_id":      "t-1",
+			"new_status":     tc.status,
+			"actor":          "p-admin",
+			"correlation_id": "corr-1",
+		}))
+
+		if len(store.projected) != 1 || store.projected[0].Status != tc.status || store.projected[0].PrincipalID != "p-9" {
+			t.Errorf("%s/%s: projected = %+v, want one %s row for p-9", tc.eventType, tc.status, store.projected, tc.status)
+		}
 	}
 }
 
@@ -499,6 +538,8 @@ func TestLifecycle_ConsumedEventTypesCoversBothGroups(t *testing.T) {
 
 	for _, et := range []string{
 		"principal.status.changed",
+		"identity.subject.disabled",
+		"identity.subject.enabled",
 		"role.created",
 		"role.updated",
 		"permission.bundle.updated",

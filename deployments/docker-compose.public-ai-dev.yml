@@ -1,0 +1,56 @@
+# Suivo public AI assistant (public-ai-svc) — LOCAL DEV, always on.
+#
+# Runs the assistant the console's chat widget talks to on 127.0.0.1:8001,
+# in dev mode (in-memory store, mock model, data/public-kb knowledge base),
+# and restarts it with Docker, so the console never shows "I couldn't connect"
+# because nobody started `go run ./cmd/server` after a reboot.
+#
+#   docker compose -f deployments/docker-compose.public-ai-dev.yml up -d --build
+#
+# Rebuild after changing the service code or its knowledge base:
+#   docker compose -f deployments/docker-compose.public-ai-dev.yml up -d --build
+# Stop it (e.g. to run `go run ./cmd/server` yourself on 8001):
+#   docker compose -f deployments/docker-compose.public-ai-dev.yml down
+#
+# Port 8001 belongs to this assistant; the main gateway uses GATEWAY_PORT
+# (default 8000). Never start the gateway with GATEWAY_PORT=8001.
+#
+# Kept apart from docker-compose.yml on purpose: the public chatbot has no
+# network route to the private ZoikoSuite services (INV-01). For a
+# Postgres-backed, signed-release setup use docker-compose.public-ai.yml.
+
+name: public-ai-dev
+
+services:
+  public-ai-svc-dev:
+    build:
+      context: ../services/public-ai-svc
+    container_name: public-ai-svc-dev
+    environment:
+      PUBLIC_AI_ENABLED: "true"
+      PUBLIC_AI_ENVIRONMENT: dev
+      PUBLIC_AI_HTTP_ADDR: ":8080"
+      PUBLIC_AI_DATASET: public-kb
+      PUBLIC_AI_DATA_DIR: /data
+      KB_ALLOW_DRAFT: "true"
+      MODEL_PROVIDER: mock
+      PUBLIC_AI_ALLOWED_ORIGINS: http://localhost:3000
+      PUBLIC_AI_LOG_RAW_PROMPT: "false"
+      PUBLIC_AI_PRODUCTION_CHAT_PII_CAPTURE: "false"
+    volumes:
+      # The knowledge base and synthetic claims, read-only. Edits to the
+      # files take effect on the next restart; code changes need --build.
+      - ../services/public-ai-svc/data:/data:ro
+    ports:
+      - "127.0.0.1:8001:8080"
+    networks: [public-ai-dev]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    stop_grace_period: 45s
+    restart: unless-stopped
+
+networks:
+  public-ai-dev:
+    name: public-ai-dev

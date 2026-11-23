@@ -159,7 +159,8 @@ func pgCall(r http.Handler, method, path, tenant, principal, key string, body an
 	return w
 }
 
-const pgLiveToken = "dd-api-key-LIVE-0123456789abcdef"
+// A fake exporter credential: the test proves it is stored sealed and never echoed.
+const pgLiveToken = "dd-api-key-LIVE-0123456789abcdef" // gitleaks:allow
 
 func exporterBody() map[string]any {
 	return map[string]any{"legal_entity_id": "le-1", "name": "dd", "platform": "DATADOG",

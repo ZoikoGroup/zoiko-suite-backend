@@ -13,29 +13,30 @@ import (
 	"fmt"
 	htmltemplate "html/template"
 	"sort"
+	texttemplate "text/template"
+	"text/template/parse"
 
 	"github.com/jackc/pgx/v5"
 
 	"zoiko.io/notification-svc/internal/domain"
-	"zoiko.io/notification-svc/internal/events"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 )
 
 const templateDefinitionColumns = `
 	template_id, tenant_id, legal_entity_id, name, business_purpose, owner_principal_id,
-	status, created_at, retired_at, retired_by_principal_id, intent_id
+	status, created_at, retired_at, retired_by_principal_id, intent_id, record_version
 `
 
 const templateVersionColumns = `
 	version_id, template_id, tenant_id, legal_entity_id, version_number, locale,
 	content, content_hash, variable_schema, subject, subject_variables, branding_metadata, accessibility_metadata,
 	status, created_by_principal_id, created_at, validated_at,
-	approved_by_principal_id, approved_at, published_at, retired_at, superseded_by_version_id
+	approved_by_principal_id, approved_at, published_at, retired_at, superseded_by_version_id, record_version
 `
 
 func scanTemplateDefinition(s scannable, d *domain.TemplateDefinition) error {
 	return s.Scan(&d.TemplateID, &d.TenantID, &d.LegalEntityID, &d.Name, &d.BusinessPurpose, &d.OwnerPrincipalID,
-		&d.Status, &d.CreatedAt, &d.RetiredAt, &d.RetiredByPrincipalID, &d.IntentID)
+		&d.Status, &d.CreatedAt, &d.RetiredAt, &d.RetiredByPrincipalID, &d.IntentID, &d.RecordVersion)
 }
 
 func scanTemplateVersion(s scannable, v *domain.TemplateVersion) error {
@@ -44,6 +45,7 @@ func scanTemplateVersion(s scannable, v *domain.TemplateVersion) error {
 		&v.Content, &v.ContentHash, &schemaRaw, &v.Subject, &subjectVarsRaw, &v.BrandingMetadata, &v.AccessibilityMetadata,
 		&v.Status, &v.CreatedByPrincipalID, &v.CreatedAt, &v.ValidatedAt,
 		&v.ApprovedByPrincipalID, &v.ApprovedAt, &v.PublishedAt, &v.RetiredAt, &v.SupersededByVersionID,
+		&v.RecordVersion,
 	); err != nil {
 		return err
 	}
@@ -93,11 +95,13 @@ func (s *PgStore) CreateTemplate(ctx context.Context, p domain.CreateTemplatePar
 		if err := scanTemplateDefinition(row, &out); err != nil {
 			return err
 		}
-		ev, err := events.TemplateCreated(p.CorrelationID, out)
-		if err != nil {
-			return err
-		}
-		return enqueue(ctx, tx, tenantID, ev)
+		return s.enqueueTemplateEvent(ctx, tx, templateCreatedEvent, p.CorrelationID, out.TenantID, out.LegalEntityID, out.OwnerPrincipalID, out.TemplateID, map[string]any{
+			"template_id":        out.TemplateID,
+			"tenant_id":          out.TenantID,
+			"legal_entity_id":    out.LegalEntityID,
+			"name":               out.Name,
+			"owner_principal_id": out.OwnerPrincipalID,
+		})
 	})
 	if errors.Is(err, domain.ErrIntentNotFound) || errors.Is(err, domain.ErrIntentRetired) || errors.Is(err, domain.ErrIntentInvalid) {
 		return nil, err // the caller asked for something that cannot be: not an outage
@@ -266,6 +270,11 @@ func (s *PgStore) ValidateTemplate(ctx context.Context, versionID string) (*doma
 		if err := validateTemplateContent(existing.Content); err != nil {
 			return err
 		}
+		// Spec BIZ-03: a missing variable schema blocks publication. Every variable the wording
+		// uses must be declared, or it would render as blank text at send time.
+		if undeclared := undeclaredVariables(existing.Content, existing.VariableSchema); len(undeclared) > 0 {
+			return domain.ErrTemplateVariablesUndeclared{VersionID: versionID, Undeclared: undeclared}
+		}
 		if existing.Subject != nil {
 			if err := domain.CheckSubjectVariables(*existing.Subject, existing.SubjectVariables, existing.VariableSchema); err != nil {
 				return err
@@ -346,11 +355,15 @@ func (s *PgStore) ApproveTemplate(ctx context.Context, p domain.ApproveVersionPa
 			}
 			return fmt.Errorf("template store unavailable: %w", err)
 		}
-		ev, err := events.TemplateVersionApproved(p.CorrelationID, out)
-		if err != nil {
-			return err
-		}
-		return enqueue(ctx, tx, tenantID, ev)
+		return s.enqueueTemplateEvent(ctx, tx, templateVersionApprovedEvent, p.CorrelationID, out.TenantID, out.LegalEntityID, p.ApprovedByPrincipalID, out.TemplateID, map[string]any{
+			"version_id":               out.VersionID,
+			"template_id":              out.TemplateID,
+			"tenant_id":                out.TenantID,
+			"legal_entity_id":          out.LegalEntityID,
+			"locale":                   out.Locale,
+			"version_number":           out.VersionNumber,
+			"approved_by_principal_id": p.ApprovedByPrincipalID,
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -402,11 +415,15 @@ func (s *PgStore) PublishTemplate(ctx context.Context, p domain.PublishVersionPa
 		`, existing.TemplateID, existing.Locale, out.VersionID, out.VersionID); err != nil {
 			return fmt.Errorf("template store unavailable: %w", err)
 		}
-		ev, err := events.TemplatePublished(p.CorrelationID, p.PublishedByPrincipalID, out)
-		if err != nil {
-			return err
-		}
-		return enqueue(ctx, tx, tenantID, ev)
+		return s.enqueueTemplateEvent(ctx, tx, templatePublishedEvent, p.CorrelationID, out.TenantID, out.LegalEntityID, p.PublishedByPrincipalID, out.TemplateID, map[string]any{
+			"version_id":      out.VersionID,
+			"template_id":     out.TemplateID,
+			"tenant_id":       out.TenantID,
+			"legal_entity_id": out.LegalEntityID,
+			"locale":          out.Locale,
+			"version_number":  out.VersionNumber,
+			"content_hash":    out.ContentHash,
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -475,11 +492,12 @@ func (s *PgStore) RetireTemplate(ctx context.Context, p domain.RetireTemplatePar
 		`, p.TemplateID); err != nil {
 			return fmt.Errorf("template store unavailable: %w", err)
 		}
-		ev, err := events.TemplateRetired(p.CorrelationID, out)
-		if err != nil {
-			return err
-		}
-		return enqueue(ctx, tx, tenantID, ev)
+		return s.enqueueTemplateEvent(ctx, tx, templateRetiredEvent, p.CorrelationID, out.TenantID, out.LegalEntityID, p.RetiredByPrincipalID, out.TemplateID, map[string]any{
+			"template_id":             out.TemplateID,
+			"tenant_id":               out.TenantID,
+			"legal_entity_id":         out.LegalEntityID,
+			"retired_by_principal_id": p.RetiredByPrincipalID,
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -678,6 +696,74 @@ func (s *PgStore) templateExists(ctx context.Context, tx pgx.Tx, tenantID, templ
 		return false, fmt.Errorf("template store unavailable: %w", err)
 	}
 	return exists, nil
+}
+
+// undeclaredVariables returns, sorted, the variables the content references (as {{.name}})
+// that the variable schema does not declare. Content that does not parse returns nil: the
+// parse gate reports that separately.
+func undeclaredVariables(content string, schema []string) []string {
+	t, err := texttemplate.New("vars").Parse(content)
+	if err != nil || t.Tree == nil || t.Tree.Root == nil {
+		return nil
+	}
+	declared := make(map[string]bool, len(schema))
+	for _, k := range schema {
+		declared[k] = true
+	}
+	used := map[string]bool{}
+	collectFields(t.Tree.Root, used)
+	var out []string
+	for k := range used {
+		if !declared[k] {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func collectFields(n parse.Node, used map[string]bool) {
+	switch x := n.(type) {
+	case nil:
+	case *parse.ListNode:
+		if x != nil {
+			for _, c := range x.Nodes {
+				collectFields(c, used)
+			}
+		}
+	case *parse.ActionNode:
+		collectFields(x.Pipe, used)
+	case *parse.PipeNode:
+		if x != nil {
+			for _, c := range x.Cmds {
+				collectFields(c, used)
+			}
+		}
+	case *parse.CommandNode:
+		for _, a := range x.Args {
+			collectFields(a, used)
+		}
+	case *parse.FieldNode:
+		if len(x.Ident) > 0 {
+			used[x.Ident[0]] = true
+		}
+	case *parse.ChainNode:
+		collectFields(x.Node, used)
+	case *parse.IfNode:
+		collectBranch(&x.BranchNode, used)
+	case *parse.RangeNode:
+		collectBranch(&x.BranchNode, used)
+	case *parse.WithNode:
+		collectBranch(&x.BranchNode, used)
+	case *parse.TemplateNode:
+		collectFields(x.Pipe, used)
+	}
+}
+
+func collectBranch(b *parse.BranchNode, used map[string]bool) {
+	collectFields(b.Pipe, used)
+	collectFields(b.List, used)
+	collectFields(b.ElseList, used)
 }
 
 // validateTemplateContent proves the content is at least syntactically

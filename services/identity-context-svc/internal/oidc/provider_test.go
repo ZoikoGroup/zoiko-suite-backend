@@ -314,7 +314,9 @@ type harness struct {
 
 func sha(s string) string { sum := sha256.Sum256([]byte(s)); return hex.EncodeToString(sum[:]) }
 
-func newHarness(t *testing.T) *harness {
+// newHarness builds the provider; opts adjust its options before it is built
+// (the passkey tests add Passkeys).
+func newHarness(t *testing.T, opts ...func(*oidc.Options)) *harness {
 	t.Helper()
 	k, err := rsa.GenerateKey(rand.Reader, 2048)
 	require.NoError(t, err)
@@ -349,9 +351,13 @@ func newHarness(t *testing.T) *harness {
 	limiter := ratelimit.New(ratelimit.NewMemoryCounter(), ratelimit.Limits{AttemptsPerIPPerMinute: 100,
 		FailuresPerIP: 3, FailuresPerTenant: 100, FailureWindow: 10 * time.Minute}, nil)
 
-	p, err := oidc.New(oidc.Options{Cfg: cfg, Clients: reg, Store: st, Pending: oidc.NewMemoryPending(), Ring: ring,
+	o := oidc.Options{Cfg: cfg, Clients: reg, Store: st, Pending: oidc.NewMemoryPending(), Ring: ring,
 		AccessTokens: issuerTok, AccessVerifier: verifier, Passwords: passwords{st}, Sessions: sessionInvalidator{st},
-		Events: ev, Limiter: limiter, PeerName: func(*http.Request) string { return "" }})
+		Events: ev, Limiter: limiter, PeerName: func(*http.Request) string { return "" }}
+	for _, f := range opts {
+		f(&o)
+	}
+	p, err := oidc.New(o)
 	require.NoError(t, err)
 	r := chi.NewRouter()
 	p.RegisterRoutes(r)

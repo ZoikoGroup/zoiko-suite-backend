@@ -5,6 +5,7 @@
 package knowledge
 
 import (
+	"errors"
 	"fmt"
 	"time"
 )
@@ -86,6 +87,12 @@ type Chunk struct {
 	ValidUntil      time.Time `json:"valid_until"`
 	ReleaseID       string    `json:"retrieval_release_id"`
 	Draft           bool      `json:"draft,omitempty"`
+	// Doc 03 §07 chunk record: subject and capability scope, and the review
+	// deadline of high-impact content, enforced at query time (§12/§26).
+	SubjectType   string     `json:"subject_type,omitempty"`
+	CapabilityIDs []string   `json:"capability_ids,omitempty"`
+	HighImpact    bool       `json:"high_impact,omitempty"`
+	ReviewDueAt   *time.Time `json:"review_due_at,omitempty"`
 }
 
 // Route is an official destination (Doc 05 §15). URL is never shown to the
@@ -114,6 +121,26 @@ func (m Manifest) HasDraft() bool {
 	return false
 }
 
+// HasSynthetic reports whether the release carries any synthetic data. A
+// synthetic runtime refuses such a release unless local/dev explicitly
+// allows it.
+func (m Manifest) HasSynthetic() bool {
+	if m.Synthetic {
+		return true
+	}
+	for _, s := range m.Sources {
+		if s.Synthetic {
+			return true
+		}
+	}
+	for _, r := range m.Routes {
+		if r.Synthetic {
+			return true
+		}
+	}
+	return false
+}
+
 // Validate checks a manifest's internal consistency before it is signed or
 // served (KB-008, A14): every chunk must belong to a listed, approved,
 // PUBLIC_APPROVED source and carry the same labels; no orphan chunks.
@@ -136,8 +163,37 @@ func (m Manifest) Validate() error {
 		if c.Classification != s.Classification || c.Audience != s.Audience || c.ReleaseID != m.ReleaseID {
 			return fmt.Errorf("chunk %s lost its parent labels", c.ChunkID)
 		}
+		// KB-008: a chunk keeps its parent's authority tier and market scope,
+		// and its text matches its checksum.
+		if c.AuthorityTier != s.AuthorityTier || !sameSet(c.MarketCodes, s.MarketCodes) {
+			return fmt.Errorf("chunk %s changed its parent's tier or market scope", c.ChunkID)
+		}
+		if c.TextSHA256 != sha256Hex(c.PlainText) {
+			return fmt.Errorf("chunk %s: %w", c.ChunkID, ErrChecksumMismatch)
+		}
 	}
 	return nil
+}
+
+// ErrChecksumMismatch: a chunk's text no longer matches its recorded
+// checksum (KB-008, SEC-T030); the release is refused.
+var ErrChecksumMismatch = errors.New("text does not match its checksum")
+
+func sameSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := map[string]int{}
+	for _, x := range a {
+		seen[x]++
+	}
+	for _, x := range b {
+		if seen[x] == 0 {
+			return false
+		}
+		seen[x]--
+	}
+	return true
 }
 
 // HeadingPrefix marks the start of a section inside chunk text. Retrieval and
@@ -146,19 +202,37 @@ func HeadingPrefix(heading string) string { return "\u00a7" + heading + "\u00a7 
 
 // Manifest is a signed knowledge release.
 type Manifest struct {
-	ReleaseID          string    `json:"release_id"`
-	Kind               string    `json:"kind"`
-	IndexSchemaVersion string    `json:"index_schema_version"`
-	CreatedAt          time.Time `json:"created_at"`
-	ApprovedBy         []string  `json:"approved_by"`
-	EvalRunID          string    `json:"eval_run_id"`
-	ChunkPolicy        string    `json:"chunk_policy"`
-	RedactionPolicy    string    `json:"redaction_policy"`
-	AllowedHosts       []string  `json:"allowed_hosts"`
-	Sources            []Source  `json:"sources"`
-	Chunks             []Chunk   `json:"chunks"`
-	Routes             []Route   `json:"routes"`
+	ReleaseID          string `json:"release_id"`
+	Kind               string `json:"kind"`
+	IndexSchemaVersion string `json:"index_schema_version"`
+	// EmbeddingModel and Tokenizer name how the index was built (Doc 03
+	// §11): "none" while retrieval is lexical only (D03-08).
+	EmbeddingModel  string    `json:"embedding_model,omitempty"`
+	Tokenizer       string    `json:"tokenizer,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+	ApprovedBy      []string  `json:"approved_by"`
+	EvalRunID       string    `json:"eval_run_id"`
+	ChunkPolicy     string    `json:"chunk_policy"`
+	RedactionPolicy string    `json:"redaction_policy"`
+	AllowedHosts    []string  `json:"allowed_hosts"`
+	Sources         []Source  `json:"sources"`
+	Chunks          []Chunk   `json:"chunks"`
+	Routes          []Route   `json:"routes"`
 	// Synonyms is the signed alias lexicon (Doc 03 §13), e.g. "ar" →
 	// "accounts receivable". Keys are lower-case visitor words.
 	Synonyms map[string][]string `json:"synonyms,omitempty"`
+	// Synthetic marks the whole release as test/dev data.
+	Synthetic bool `json:"synthetic,omitempty"`
+	// CompatiblePolicyVersions lists the prompt/policy versions this release
+	// was evaluated with (Doc 08 OPR-004); the runtime refuses any other.
+	CompatiblePolicyVersions []string `json:"compatible_policy_versions,omitempty"`
+	// Doc 03 §11 release identity: the product and audience the release is
+	// for, and when it was signed. Optional on load, so releases published
+	// before these fields still verify.
+	ProductID string    `json:"product_id,omitempty"`
+	Audience  string    `json:"audience,omitempty"`
+	SignedAt  time.Time `json:"signed_at,omitempty"`
 }
+
+// TokenizerVersion names the lexical tokenizer the index is built with.
+const TokenizerVersion = "lexical-v1"

@@ -54,7 +54,16 @@ func PublicKBDir() string {
 }
 
 // DatasetDir maps a PUBLIC_AI_DATASET value to its directory.
+// PUBLIC_AI_DATA_DIR, when set, is the folder that holds seed/ and
+// public-kb/: a container has no source tree, so the dev compose stack
+// mounts the data there (deployments/docker-compose.public-ai-dev.yml).
 func DatasetDir(name string) string {
+	if root := os.Getenv("PUBLIC_AI_DATA_DIR"); root != "" && name != "fixtures" {
+		if name == "seed" {
+			return filepath.Join(root, "seed")
+		}
+		return filepath.Join(root, "public-kb")
+	}
 	switch name {
 	case "fixtures":
 		return FixturesDir()
@@ -109,11 +118,11 @@ func NewFromDirWith(ctx context.Context, dir string, st store.Store, suffix stri
 	if _, err := os.Stat(kbDir); err != nil {
 		kbDir = dir
 	}
-	kb, kbSig, _, err := release.BuildKBWith(kbDir, kbID, now, priv, knowledge.IngestOptions{AllowDraft: allowDraft})
+	kb, kbSig, _, err := release.BuildKBWith(kbDir, kbID, now, priv, knowledge.IngestOptions{AllowDraft: allowDraft, AllowSynthetic: true})
 	if err != nil {
 		return nil, fmt.Errorf("build kb: %w", err)
 	}
-	cl, clSig, err := release.BuildClaims(filepath.Join(dir, "claims.json"), clID, now, priv)
+	cl, clSig, err := release.BuildClaimsWith(filepath.Join(dir, "claims.json"), clID, now, priv, release.ClaimsOptions{AllowSynthetic: true})
 	if err != nil {
 		return nil, fmt.Errorf("build claims: %w", err)
 	}
@@ -132,6 +141,7 @@ func NewFromDirWith(ctx context.Context, dir string, st store.Store, suffix stri
 
 	rt := release.New(st, pub)
 	rt.AllowDraft = allowDraft
+	rt.AllowSynthetic = true // fixtureenv is dev/test only; its data is synthetic by design
 	if err := rt.Refresh(ctx); err != nil {
 		return nil, err
 	}

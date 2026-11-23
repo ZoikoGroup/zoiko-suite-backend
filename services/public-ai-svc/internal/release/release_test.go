@@ -2,6 +2,9 @@ package release
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -9,6 +12,7 @@ import (
 
 	"zoiko.io/public-ai-svc/internal/claims"
 	"zoiko.io/public-ai-svc/internal/knowledge"
+	"zoiko.io/public-ai-svc/internal/metrics"
 	"zoiko.io/public-ai-svc/internal/signing"
 	"zoiko.io/public-ai-svc/internal/store"
 )
@@ -85,13 +89,24 @@ func TestIngestionStates(t *testing.T) {
 
 func TestRoutesRejectUnsafeURLs(t *testing.T) {
 	m, _, _ := knowledge.IngestDir(filepath.Join(fixtures, "kb"), "kb-x", now)
+	expectedKeys := []string{"pricing", "demo", "support", "core_modules", "trust", "platform-overview", "sign-in", "signup_or_trial"}
+	keySet := map[string]bool{}
 	for _, r := range m.Routes {
+		keySet[r.RouteKey] = true
 		if !strings.HasPrefix(r.URL, "https://example.invalid/") {
 			t.Fatalf("unsafe route accepted: %+v", r)
 		}
 	}
-	if len(m.Routes) != 6 {
-		t.Fatalf("expected 6 valid routes, got %d", len(m.Routes))
+	for _, k := range expectedKeys {
+		if !keySet[k] {
+			t.Fatalf("expected route key %q not present", k)
+		}
+	}
+	// ensure that no route with a javascript: URL slipped through
+	for _, r := range m.Routes {
+		if strings.HasPrefix(r.URL, "javascript:") {
+			t.Fatalf("unsafe javascript route was not rejected: %+v", r)
+		}
 	}
 }
 
@@ -290,4 +305,127 @@ func TestClaimsValidationRequiresTwoApprovals(t *testing.T) {
 	if len(m.Validate()) == 0 {
 		t.Fatal("single-approval ACTIVE claim must be rejected")
 	}
+}
+
+// OPR-004: a release evaluated with another policy version is refused at
+// load, and outside dev/test a release must declare its range.
+func TestIncompatibleReleaseRefusedAtLoad(t *testing.T) {
+	withRange := func(t *testing.T, e env, id string, versions []string) {
+		t.Helper()
+		raw, err := os.ReadFile(filepath.Join(fixtures, "claims.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatal(err)
+		}
+		m["compatible_policy_versions"] = versions
+		path := filepath.Join(t.TempDir(), "claims.json")
+		b, _ := json.Marshal(m)
+		if err := os.WriteFile(path, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cl, sig, err := BuildClaims(path, id, now, e.key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := Publish(ctx, e.st, e.pub, id, "claims", cl, sig); err != nil {
+			t.Fatal(err)
+		}
+		if err := Promote(ctx, e.st, "claims", id, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	e := setup(t)
+	e.rt.PolicyVersion = "pub-policy-1.0"
+	withRange(t, e, "claims-compat-ok", []string{"pub-policy-0.9", "pub-policy-1.0"})
+	if err := e.rt.Refresh(ctx); err != nil {
+		t.Fatalf("compatible release refused: %v", err)
+	}
+	withRange(t, e, "claims-compat-bad", []string{"pub-policy-2.0"})
+	if err := e.rt.Refresh(ctx); !errors.Is(err, ErrIncompatibleRelease) {
+		t.Fatalf("incompatible release: got %v", err)
+	}
+	if _, err := e.rt.Snapshot(); err == nil {
+		t.Fatal("no snapshot may be served from an incompatible release")
+	}
+
+	strict := setup(t) // the fixture releases declare no range
+	strict.rt = New(strict.st, strict.pub)
+	strict.rt.PolicyVersion, strict.rt.RequireCompatibility = "pub-policy-1.0", true
+	if err := strict.rt.Refresh(ctx); !errors.Is(err, ErrIncompatibleRelease) {
+		t.Fatalf("release without a range outside dev/test: got %v", err)
+	}
+}
+
+// Doc 03 §11: a KB release names its product, audience and signing time.
+func TestKBReleaseIdentityFields(t *testing.T) {
+	_, key, _ := signing.GenerateKey()
+	body, _, _, err := BuildKB(filepath.Join(fixtures, "kb"), "kb-identity-1", now, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m knowledge.Manifest
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m.ProductID != "zoikosuite" || m.Audience != knowledge.Audience || !m.SignedAt.Equal(now) {
+		t.Fatalf("identity: product=%q audience=%q signed=%v", m.ProductID, m.Audience, m.SignedAt)
+	}
+}
+
+// SEC-T030: a correctly signed release whose chunk text no longer matches its
+// checksum is refused, readiness goes off, and the refusal is counted with
+// reason "checksum" so PublicAIReleaseRejected pages.
+func TestChecksumMismatchIsCountedForAlert(t *testing.T) {
+	e := setup(t)
+	before := rejections(t, "checksum")
+	kb, _, _, err := BuildKB(filepath.Join(fixtures, "kb"), "kb-test-sum", now, e.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m knowledge.Manifest
+	if err := json.Unmarshal(kb, &m); err != nil {
+		t.Fatal(err)
+	}
+	m.Chunks[0].PlainText += " tampered after the checksum was taken"
+	bad, _ := json.Marshal(m)
+	sig, err := signing.Sign(e.key, bad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = e.st.PutRelease(ctx, store.Release{ReleaseID: "kb-test-sum", Kind: "kb", Manifest: bad, Signature: sig, CreatedAt: now})
+	_ = e.st.SetPointer(ctx, "kb", "kb-test-sum", nil)
+	if err := e.rt.Refresh(ctx); !errors.Is(err, knowledge.ErrChecksumMismatch) {
+		t.Fatalf("refresh error = %v, want a checksum mismatch", err)
+	}
+	if e.rt.Ready(time.Minute) {
+		t.Fatal("runtime must not be ready with a tampered release")
+	}
+	if got := rejections(t, "checksum"); got != before+1 {
+		t.Fatalf("release rejections{reason=checksum} = %v, want %v", got, before+1)
+	}
+}
+
+func rejections(t *testing.T, reason string) float64 {
+	t.Helper()
+	mfs, err := metrics.Registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "public_ai_release_rejections_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "reason" && l.GetValue() == reason {
+					return m.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	return 0
 }

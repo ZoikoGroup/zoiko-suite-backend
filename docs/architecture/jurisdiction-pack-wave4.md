@@ -66,9 +66,8 @@ Calendars: `REGULATORY_CALENDAR_CREATE`, `REGULATORY_CALENDAR_VERSION_CREATE|SET
 
 ## Not built
 * **Tax rule families beyond flat and marginal-band rates** (place of supply, reverse charge, exemptions, compound taxes, withholding, caps and floors); see the tax section below.
-* **Obligation instances and tracking** (s27 RegulatoryObligation per entity; the `created` / `due-date-calculated` / `overdue` events): the service calculates and records, it does not hold a per-entity
-  obligation list or detect overdue items. The existing `obligations-svc` and `filing-tracker-svc` are not integrated. `as_of` gives a point-in-time verdict only.
-* **Registrations, licences, schemes and threshold monitors** (s16), and **registration-driven applicability** (which obligations apply to which entity).
+* **Obligation instances and tracking** are not held here by design: s27 names the Obligation Service as the owner of the entity-specific obligation, and `obligations-svc` already holds instances and publishes `obligation.created` and `obligation.overdue`. This service calculates and records due dates and answers which obligations apply (see [jurisdiction-pack-wave4-applicability.md](jurisdiction-pack-wave4-applicability.md)); `as_of` gives a point-in-time `overdue` verdict only. `obligations-svc` and `filing-tracker-svc` do not yet call this service to derive due dates.
+* ~~Registrations, licences, schemes and threshold monitors (s16)~~: built, see [jurisdiction-pack-wave4-registrations.md](jurisdiction-pack-wave4-registrations.md) (rule content only; entity registrations stay in `tenant-entity-registry-svc`). Registration-driven applicability is built too: see [jurisdiction-pack-wave4-applicability.md](jurisdiction-pack-wave4-applicability.md).
 * Rolling calendars generated from rules (e.g. "last Monday of May"); holidays are listed dates. Half-day closures and authority-specific cutoff exceptions.
 * Provenance-driven **drift detection** for calendars, and source-change linkage to calendar versions beyond the existing notice intake.
 * Deploy order: apply migration 000010 before the new binary; the registry routes are always mounted.
@@ -103,3 +102,6 @@ rates, band limits and rounding live in a NEW typed field `parameters` (migratio
 * **Not built:** place of supply and situs, reverse charge, exemptions and their evidence hooks, compound or inclusive-of-tax maths, per-line versus per-document rounding, currency precision,
   caps and floors, withholding and payroll families. Each would be a new closed family decided with Tax Engineering. `tax-rules-svc` and `tax-determination-svc` are **not modified**; the
   migration path is in the decision record. Currency is echoed, not validated (no registry exists).
+
+## Events (s26)
+`regulatory-obligation.due-date-calculated` is published when a due date is calculated (not on an idempotent replay, and not for refusals). `regulatory-obligation.created` and `.overdue` are **still not emitted**: they need per-entity obligation instances (see Not built above).

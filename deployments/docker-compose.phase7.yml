@@ -34,7 +34,7 @@ services:
     ports:
       - "5442:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U postgres"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -96,9 +96,26 @@ services:
   # ─── Banking Connector (8145) ────────────────────────────────────────────────
   banking-connector-svc:
     build:
-      context: ../services/banking-connector-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing - see the Dockerfile.
+      # Was context: ../services/banking-connector-svc, dockerfile: Dockerfile
+      # -- that context cannot resolve the eventing replace directive at all
+      # (Docker cannot COPY from outside its build context), so this service's
+      # image had never actually built under this file. Found running this
+      # stack for real under TOKENIZATION_ENFORCED=true.
+      context: ../services
+      dockerfile: banking-connector-svc/Dockerfile
     networks: [zoiko-p7]
+    # host.docker.internal does NOT resolve on this bridge network without
+    # this -- found running this stack for real: AUTHZ_SERVICE_URL and
+    # TOKENIZATION_SERVICE_URL below both point at it (authorization-svc and
+    # key-management-svc are published by docker-compose.phase6.yml, a
+    # separate compose project), and every authz/tokenize call failed with
+    # "wget: bad address 'host.docker.internal'" until this was added.
+    # host-gateway is Docker's own alias for whatever address reaches the
+    # host from inside a container; harmless on setups where it already
+    # resolves.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres-p7:
         condition: service_healthy
@@ -109,7 +126,29 @@ services:
       DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres-p7:5432/zoiko_banking_connector?sslmode=disable"
       KAFKA_BROKERS: "kafka-p7:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.banking.connector.events"
-      AUTHZ_SERVICE_URL: "http://host.docker.internal:8081"
+      # Required, no default (ZS-EVENT-001 §4 residency region) -- missing
+      # here entirely, so every mutating call failed building its outbox
+      # event: "residency region \"\" must be a controlled lower-case code".
+      # Found running this stack for real under TOKENIZATION_ENFORCED=true.
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-uk}"
+      # Was host.docker.internal:8081 -- that is tenant-entity-registry-svc's
+      # port, not authorization-svc's (see e2e-authorization-deps.py: AUTHZ is
+      # :8089, REGISTRY is :8081). Found running this stack for real under
+      # TOKENIZATION_ENFORCED=true: every authz check this service makes
+      # (including the privileged account-number read's grant check) silently
+      # hit the wrong service -- a 404/connection behavior that reads like an
+      # outage rather than the copy-paste port bug it is. authorization-svc
+      # (docker-compose.phase6.yml) is published on host port 8089.
+      AUTHZ_SERVICE_URL: "http://host.docker.internal:8089"
+      # Account-number tokenization (Security Standard §14). OFF by default
+      # and opt-in only: export TOKENIZATION_ENFORCED=true before
+      # `docker compose up` to tokenize new connections (SPEC_DEVIATIONS.md
+      # G6 has the enablement steps, including the one-off backfill).
+      # key-management-svc (docker-compose.phase6.yml) is published on host
+      # port 8143. The URL is used even with enforcement off: the privileged
+      # account-number read of an already-tokenized connection detokenizes.
+      TOKENIZATION_SERVICE_URL: "http://host.docker.internal:8143"
+      TOKENIZATION_ENFORCED: "${TOKENIZATION_ENFORCED:-false}"
     ports:
       - "8145:8145"
     healthcheck:

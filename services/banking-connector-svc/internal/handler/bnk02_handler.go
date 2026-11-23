@@ -34,8 +34,19 @@ type BNK02Handler struct {
 	vault      clients.VaultClient
 }
 
-// RegisterBNK02Routes mounts BNK-02's routes on r. Called separately from
+// RegisterBNK02Routes registers BNK-02's routes on r. Called separately from
 // RegisterRoutes in cmd/server/main.go.
+//
+// Each route is registered by its full path, NOT under a mounted
+// r.Route("/v1/banking/connections", ...) subrouter. RegisterRoutes already
+// mounts "/v1/banking", and chi gives every request under the more specific
+// mount to that mount: a second subrouter at "/v1/banking/connections"
+// therefore captured POST /v1/banking/connections, GET /v1/banking/
+// connections/{id} and GET .../{id}/account-number, had no handler for them,
+// and answered 404 — in the assembled server only; tests that mounted
+// RegisterRoutes alone never saw it. Only the /v1/banking/accounts aliases
+// worked. Full-path routes sit beside the /v1/banking mount instead of
+// shadowing it (TestAssembledRouter_ConnectionRoutesAreReachable).
 func RegisterBNK02Routes(r chi.Router, h *Handler, bnk02Store store.BNK02Store, bankAccts clients.BankAccountClient, vault clients.VaultClient) {
 	bh := &BNK02Handler{Handler: h, bnk02Store: bnk02Store, bankAccts: bankAccts, vault: vault}
 	// Registered as full paths, not r.Route("/v1/banking/connections", ...):

@@ -2,11 +2,10 @@ package orchestrator
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"regexp"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -17,6 +16,7 @@ import (
 	"zoiko.io/public-ai-svc/internal/contract"
 	"zoiko.io/public-ai-svc/internal/flags"
 	"zoiko.io/public-ai-svc/internal/knowledge"
+	"zoiko.io/public-ai-svc/internal/metrics"
 	"zoiko.io/public-ai-svc/internal/model"
 	"zoiko.io/public-ai-svc/internal/policy"
 	"zoiko.io/public-ai-svc/internal/release"
@@ -48,6 +48,12 @@ type Pipeline struct {
 	Now      func() time.Time
 	// MaxOutputTokens bounds generation (token budget per turn).
 	MaxOutputTokens int
+	// PolicyVersion is sent with every model request (Doc 05 §19); empty means
+	// the pinned default.
+	PolicyVersion string
+	// ModelID and AppVersion complete the release tuple on each decision
+	// record (Doc 08 §06).
+	ModelID, AppVersion string
 }
 
 // Security signal reason classes (no prompt content).
@@ -65,6 +71,16 @@ func (p *Pipeline) now() time.Time {
 	return time.Now().UTC()
 }
 
+// EffectivePolicyVersion is the policy version this pipeline sends and records.
+func (p *Pipeline) EffectivePolicyVersion() string { return p.policyVersion() }
+
+func (p *Pipeline) policyVersion() string {
+	if p.PolicyVersion != "" {
+		return p.PolicyVersion
+	}
+	return "pub-policy-1.0"
+}
+
 func (p *Pipeline) log() *zap.Logger {
 	if p.Log == nil {
 		return zap.NewNop()
@@ -79,14 +95,58 @@ func (p *Pipeline) log() *zap.Logger {
 func (p *Pipeline) Answer(ctx context.Context, in Input) Result {
 	ctx, span := telemetry.Tracer().Start(ctx, "public_ai.turn")
 	defer span.End()
+	original := in.Message
+	injected := false
+	if rest, ok := policy.InjectionRemainder(in.Message); ok {
+		// Doc 02 S07: the injected instruction is ignored and recorded; the
+		// permitted question after it is still answered.
+		in.Message, injected = rest, true
+	}
 	r := p.answer(ctx, in)
+	if injected && r.SecuritySignal == "" {
+		r.SecuritySignal = SignalInjection
+	}
+	d := policy.Classify(original)
+	if d.Exception != policy.X03SensitiveInput && d.Slots.MarketCode != "" && r.Status != contract.Unavailable {
+		r.RememberMarket = d.Slots.MarketCode
+	}
+	r.Confidence = d.Confidence
+	if r.Pending == nil && offersDemo(r) {
+		r.Pending = &Pending{Offer: "demo"}
+	}
+	// Doc 06 §27, Doc 08 §14: one decision record per turn, enums and ids
+	// only; visitor text never reaches logs, traces or metrics (A39).
+	claimIDs, sourceIDs, route := decisionRefs(r)
+	p.log().Info("policy_decision", zap.String("request_id", in.RequestID), zap.String("intent", r.IntentID),
+		zap.String("status", string(r.Status)), zap.String("reason", r.Reason), zap.String("answer_class", r.AnswerClass),
+		zap.String("budget", in.Budget), zap.Int("citations", len(r.Citations)), zap.String("security_signal", r.SecuritySignal),
+		// Doc 03 §22, Doc 04 §16, Doc 08 §06: the release tuple and the ids the
+		// answer rests on, never text.
+		zap.String("release_kb", r.KnowledgeReleaseID), zap.String("release_claims", p.claimsRelease()),
+		zap.String("policy_version", p.policyVersion()), zap.String("prompt_version", model.PromptVersion),
+		zap.String("model_id", p.ModelID), zap.String("app_version", p.AppVersion),
+		zap.Strings("claim_ids", claimIDs), zap.Strings("source_version_ids", sourceIDs), zap.String("handoff_route", route),
+		zap.Int64("tokens", r.Tokens),
+		// Doc 02 App. C: the template a reply came from, by id and locale.
+		zap.String("template_id", firstNonEmpty(policy.TemplateID(r.Text), r.QualifierID)), zap.String("template_locale", policy.TemplateLocale),
+		zap.String("template_version", policy.TemplateVersion()), zap.String("intent_version", policy.IntentVersion()),
+		zap.String("confidence", r.Confidence), zap.String("conflict_id", r.ConflictID))
+	if policy.HasContact(in.Message) && r.Status != contract.Unavailable && !strings.Contains(r.Text, policy.ContactNotice) {
+		// Doc 10 §21: contact details were masked, not kept; say so.
+		r.Text = strings.TrimSpace(r.Text + "\n\n" + policy.ContactNotice)
+	}
 	span.SetAttributes(
 		attribute.String("suivo.outcome", string(r.Status)),
 		attribute.String("suivo.reason", r.Reason),
 		attribute.String("suivo.intent", r.IntentID),
 		attribute.String("suivo.release.kb", r.KnowledgeReleaseID),
 		attribute.String("suivo.release.policy", model.PromptVersion),
+		attribute.String("suivo.release.claims", p.claimsRelease()),
+		attribute.String("suivo.release.policy_version", p.policyVersion()),
+		attribute.String("suivo.release.model", p.ModelID),
+		attribute.String("suivo.release.app", p.AppVersion),
 		attribute.String("suivo.answer_class", r.AnswerClass),
+		attribute.String("suivo.template_id", policy.TemplateID(r.Text)),
 		attribute.String("suivo.retrieval.mode", r.Diag.RetrievalMode),
 		attribute.Int("suivo.retrieval.count", len(r.Diag.EvidenceIDs)),
 		attribute.StringSlice("suivo.retrieval.chunk_ids", r.Diag.EvidenceIDs),
@@ -118,6 +178,31 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 	if market == "" {
 		market = in.MarketCode
 	}
+	if pd := in.Pending; pd != nil && (pd.Offer != "" || pd.Refused) {
+		// An offer or a refusal is not an open question: it changes only
+		// the very next turn, then the normal pipeline runs.
+		in.Pending = nil
+		if pd.Offer == "demo" && policy.IsAffirmative(in.Message) {
+			// Doc 02 S10: "yes" opens the official demo form. Nothing is booked.
+			return p.fromTemplate(policy.TplDemoAccepted, "I08", snap, market, now, releaseID)
+		}
+		if pd.Refused && (dec.Exception == "" || dec.Exception == policy.X01PrivateAction) && policy.HasRecordIdentifiers(dec.Redaction.Text) {
+			// Doc 02 S04: identifiers for the records just refused are
+			// refused again and never repeated.
+			res := p.fromTemplate(policy.TplAvoidSharing, policy.X01PrivateAction, snap, market, now, releaseID)
+			res.Pending = &Pending{Refused: true}
+			return res
+		}
+	}
+
+	// Doc 09 §12: data-rights requests are route-only; the chat never claims
+	// to have recorded, exported or deleted anything.
+	// It wins over the "act on records" refusals (X01/X02), never over a
+	// pasted secret (X03).
+	if (dec.Exception == "" || dec.Exception == policy.X01PrivateAction || dec.Exception == policy.X02ActionDenied) &&
+		policy.IsDataRightsRequest(dec.Redaction.Text) {
+		return p.fromTemplate(policy.TplDataRights, "I13", snap, market, now, releaseID)
+	}
 
 	// Exceptions are answered from pre-approved templates before retrieval.
 	if dec.Exception == policy.X01PrivateAction && policy.IsLivePlatform(dec.Redaction.Text) {
@@ -128,7 +213,14 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 		return res
 	}
 	if dec.Exception != "" {
-		res := p.fromTemplate(policy.ExceptionTemplates[dec.Exception], dec.Exception, snap, market, now, releaseID)
+		tpl := policy.ExceptionTemplates[dec.Exception]
+		switch {
+		case dec.Exception == policy.X09UnsupportedCover:
+			tpl = policy.UnsupportedCover(dec.Redaction.Text) // Doc 02 §19, one correction per claim
+		case dec.Exception == policy.X08ClaimVerification && policy.AsksPrice(dec.Redaction.Text):
+			tpl = policy.TplPriceGuarantee // Doc 06 §20
+		}
+		res := p.fromTemplate(tpl, dec.Exception, snap, market, now, releaseID)
 		switch dec.Exception {
 		case policy.X06PromptInjection:
 			res.SecuritySignal = SignalInjection
@@ -136,28 +228,98 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 			res.SecuritySignal = SignalSensitive
 		case policy.X05SecurityEscalate:
 			res.SecuritySignal = SignalSecurity
+		case policy.X01PrivateAction, policy.X02ActionDenied:
+			res.Pending = &Pending{Refused: true}
+		}
+		// Doc 02 S05/S09: a fixed second sentence keeps the other part of a
+		// two-part question visible without answering it.
+		if extra := policy.SecondarySentence(dec.Exception, dec.Primary, dec.Redaction.Text); extra != "" {
+			res.Text += " " + extra
+		}
+		switch dec.Exception {
+		case policy.X01PrivateAction, policy.X02ActionDenied, policy.X04RegulatedAdvice, policy.X07CrossProduct, policy.X08ClaimVerification:
+			// Doc 02 S05: the exception leads; the product topic is logged
+			// as the secondary intent (never answered in the same reply).
+			if dec.Primary != "I29" {
+				res.SecondaryIntentID = dec.Primary
+			}
 		}
 		return res
 	}
 	if policy.IsGreeting(in.Message) && in.Pending == nil {
 		return p.fromTemplate(policy.TplWelcome, "I01", snap, market, now, releaseID)
 	}
+	if tpl, chips, ok := policy.Glossary(dec.Redaction.Text); ok {
+		// Doc 02 §23: acronyms are expanded on request, with no ZoikoSuite claim.
+		res := p.fromTemplate(tpl, dec.Primary, snap, market, now, releaseID)
+		res.Suggestions = chips
+		return res
+	}
+	if policy.CredentialSharedRe.MatchString(dec.Redaction.Text) {
+		// Doc 06 §20: a visitor who says they shared a secret is told not to,
+		// even when the secret itself is not in this message.
+		res := p.fromTemplate(policy.TplCredentialShared, policy.X03SensitiveInput, snap, market, now, releaseID)
+		res.SecuritySignal = SignalSensitive
+		return res
+	}
+	if policy.ToolRequestRe.MatchString(dec.Redaction.Text) {
+		// Doc 07 QA-T041: no browsing or tool use; the model has no tools.
+		return p.fromTemplate(policy.TplNoTools, policy.X02ActionDenied, snap, market, now, releaseID)
+	}
+	if policy.PartnershipRe.MatchString(dec.Redaction.Text) {
+		// Doc 10 COM-10: partner interest goes to the official contact route.
+		return p.fromTemplate(policy.TplPartnership, "I24", snap, market, now, releaseID)
+	}
+	if policy.SecurityReviewRe.MatchString(dec.Redaction.Text) {
+		// Doc 02 §22: "Security review" starts the Trust Center route.
+		return p.fromTemplate(policy.TplSecurityReview, "I12", snap, market, now, releaseID)
+	}
+	if policy.UptimeQuestionRe.MatchString(dec.Redaction.Text) {
+		// Doc 02 T27: an uptime or SLA figure is never inferred.
+		return p.fromTemplate(policy.TplUptime, "I12", snap, market, now, releaseID)
+	}
 	intent := dec.Primary
-	if intent == "I29" && policy.IsModuleQuestion(dec.Redaction.Text) {
+	if (intent == "I12" || intent == "I16") && policy.ReadinessRe.MatchString(dec.Redaction.Text) {
+		// Doc 02 S03: readiness is not certification.
+		return p.fromTemplate(policy.TplReadiness, "I12", snap, market, now, releaseID)
+	}
+	if dec.Slots.PlanName != "" && !policy.AsksPrice(dec.Redaction.Text) && policy.EntitlementRe.MatchString(dec.Redaction.Text) {
+		// Doc 01 AT-12: plan and configuration qualifiers, plus the comparison.
+		return p.fromTemplate(policy.PlanEntitlement(dec.Redaction.Text), "I05", snap, market, now, releaseID)
+	}
+	if intent == "I29" && policy.IsNonEnglish(dec.Redaction.Text) {
+		// Doc 02 §23: English fallback where the language has no approved content.
+		return p.fromTemplate(policy.TplNonEnglish, intent, snap, market, now, releaseID)
+	}
+	// rerouted: the question names no area but one KB section covers it, so
+	// it is ranked on content alone, not towards articles tagged I02.
+	rerouted := false
+	// A message without its own intent continues the open question only when
+	// it supplies something for it (a market, plan or billing term).
+	supplies := dec.Slots.MarketCode != "" || dec.Slots.PlanName != "" || dec.Slots.BillingCadence != ""
+	// A reply to an open question ("United States") is not a new question
+	// because some article mentions the country it names: coverage is judged
+	// without the market it supplies. "How do I create a tax rule in the US?"
+	// is still covered and still rerouted.
+	covered := dec.Redaction.Text
+	if in.Pending != nil && dec.Slots.MarketCode != "" {
+		covered = policy.WithoutMarket(covered)
+	}
+	if intent == "I29" && (policy.IsModuleQuestion(dec.Redaction.Text) || (snap.KB != nil && snap.KB.Covers(covered))) {
 		// Fallback ladder: rules -> (model classifier, none in R0) -> a named
 		// area, module or alias -> only then out of scope.
+		rerouted = !policy.IsModuleQuestion(dec.Redaction.Text)
 		intent = "I02"
 	}
 	diag := Diag{Slots: slotMap(dec.Slots, market)}
 	unverifiedConnector := false
+	qualifiedLabel := "" // Doc 03 §08: answered only from CONDITIONAL/TARGET claims
 	clarifications := 0
 	carried := false
 	secondary := dec.Secondary
-	// A message without its own intent continues the open question only when
-	// it supplies something for it (a market, plan or billing term). Anything
-	// else is a new question, so an unrelated message never gets the same
-	// clarifying question again (Doc 02 §10, G34).
-	supplies := dec.Slots.MarketCode != "" || dec.Slots.PlanName != "" || dec.Slots.BillingCadence != ""
+	// Anything that supplies nothing (see supplies above) is a new question,
+	// so an unrelated message never gets the same clarifying question again
+	// (Doc 02 §10, G34).
 	if pd := in.Pending; pd != nil && (intent == pd.Intent || ((intent == "I29" || intent == "I04") && supplies) ||
 		policy.IsGeneralOverview(in.Message) || policy.IsOtherMarket(in.Message)) {
 		// A reply to our clarifying question, or a follow-up to an answer
@@ -177,6 +339,15 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 			dec.Slots.Integration = pd.Integration
 		}
 	}
+	if intent == "I29" && !carried && dec.Slots.MarketCode != "" && !strings.Contains(in.Message, "?") {
+		// Doc 02 §10: "We're evaluating ZoikoSuite for the US." The market
+		// is kept for the session; coverage is never implied.
+		tpl := policy.TplMarketNoted
+		tpl.Text, _ = policy.Render(tpl.Text, map[string]string{"country": policy.CountryName(dec.Slots.MarketCode)})
+		res := p.fromTemplate(tpl, intent, snap, market, now, releaseID)
+		res.Suggestions = policy.SuggestAreas
+		return res
+	}
 	// "Show general overview": answer the pending question without the
 	// missing slot, from approved narrative only (no market-scoped claims).
 	overview := carried && policy.IsGeneralOverview(in.Message)
@@ -185,7 +356,7 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 		// It is not a dead end (Doc 02 escalation matrix: unsupported market
 		// -> demo): the question stays open so "Show general overview" still
 		// answers it, and the approved next steps are offered.
-		res := p.fromTemplate(policy.TplAbstainCoverage, intent, snap, "", now, releaseID)
+		res := p.fromTemplate(p.coverage(intent, dec.Redaction.Text, market), intent, snap, "", now, releaseID)
 		res.Suggestions = policy.SuggestCoverage
 		res.Pending = &Pending{Intent: intent, Secondary: secondary, PlanName: dec.Slots.PlanName,
 			BillingCadence: dec.Slots.BillingCadence, Clarifications: clarifications}
@@ -194,14 +365,45 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 	// "What plans are there, and is there a trial?" needs both answers, each
 	// from its own typed claim for the same market (Master prompt T1-T3).
 	plansAndTrial := (intent == "I05" && secondary == "I06") || (intent == "I06" && secondary == "I05")
+	// Doc 02 §08/§10: a second, unrelated topic is not answered in the same
+	// reply; it is offered as one chip.
+	var secondaryChip string
 	if !plansAndTrial {
+		if !carried && secondary != "" && secondary != intent {
+			secondaryChip = secondary
+		}
 		secondary = ""
 	}
 	if fv.DisabledIntents[intent] {
 		return because(p.fromTemplate(withRoute(policy.TplUnavailable, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID), contract.ReasonIntentDisabled)
 	}
+	if intent == "I23" || intent == "I24" || intent == "I21" {
+		if tpl, ok := policy.SupportTemplate(dec.Redaction.Text); ok {
+			return p.fromTemplate(tpl, "I23", snap, market, now, releaseID)
+		}
+	}
+	if intent == "I22" && policy.LoginTroubleRe.MatchString(dec.Redaction.Text) {
+		return p.fromTemplate(policy.TplLoginHelp, intent, snap, market, now, releaseID) // Doc 10 COM-06
+	}
+	if intent == "I24" && policy.SalesContactRe.MatchString(dec.Redaction.Text) {
+		return p.fromTemplate(policy.TplSalesContact, intent, snap, market, now, releaseID) // Doc 10 COM-04
+	}
 	if tpl, ok := policy.RouteTemplates[intent]; ok {
-		return p.fromTemplate(tpl, intent, snap, market, now, releaseID)
+		ask := false
+		if intent == "I08" {
+			// Doc 01 FR-04, Doc 02 S10: the area the visitor named, else
+			// one optional qualification question with its answers as chips.
+			tpl, ask = policy.DemoReply(dec.Redaction.Text, dec.Slots.Workstream)
+		}
+		res := p.fromTemplate(tpl, intent, snap, market, now, releaseID)
+		if ask {
+			res.Suggestions = policy.DemoAreaChips
+		}
+		if intent == "I24" {
+			// Doc 02 T26 asks which team; the three answers are chips.
+			res.Suggestions = policy.SuggestTeams
+		}
+		return res
 	}
 	// P1 claims first (Doc 05 §11 step 3).
 	var verified []claims.Claim
@@ -214,12 +416,14 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 				verified = append(verified, d.Verified...)
 			}
 		}
-	} else if reqs := claimRequests(intent, plansAndTrial, dec, in.Message, snap.Claims, market, now, carried); len(reqs) > 0 && !overview {
+	} else if reqs := p.planRequests(intent, plansAndTrial, dec, in, snap, market, now, carried); len(reqs) > 0 && !overview {
 		for _, req := range reqs {
 			if (req.Subject == claims.Price || req.Subject == claims.Trial) && !fv.PricingClaimsEnabled {
 				return because(p.fromTemplate(withRoute(policy.TplAbstainNoEvidence, "pricing"), intent, snap, market, now, releaseID), contract.ReasonPricingDisabled)
 			}
+			claimStart := time.Now()
 			d := snap.Claims.Resolve(req, snap)
+			metrics.ObserveStage("claims", time.Since(claimStart))
 			diag.ClaimVerdict = d.Decision
 			switch d.Decision {
 			case claims.MarketRequired:
@@ -227,16 +431,23 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 					// Two failed clarifications: one verified route, no third question (Doc 02 §10).
 					return p.fromTemplate(withRoute(policy.TplClarifyGiveUp, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)
 				}
-				res := p.fromTemplate(policy.TplClarifyMarket, intent, snap, market, now, releaseID)
+				// A trial question asks for the market in T06/S01 words, a price
+				// question in T05's (Doc 02 §17-18).
+				ask := policy.TplClarifyMarket
+				if intent == "I06" {
+					ask = policy.TplClarifyTrialMarket
+				}
+				res := p.fromTemplate(ask, intent, snap, market, now, releaseID)
 				res.StatusLabel, res.SecondaryIntentID = "MARKET_DEPENDENT", secondary
-				res.Clarification = &contract.Clarification{Slot: "market_code", Question: policy.TplClarifyMarket.Text,
+				res.Clarification = &contract.Clarification{Slot: "market_code", Question: ask.Text,
 					Options: append(snap.Claims.Markets(), contract.OtherOption, contract.OverviewOption)}
 				res.Pending = &Pending{Intent: intent, Secondary: secondary, PlanName: dec.Slots.PlanName, BillingCadence: dec.Slots.BillingCadence,
 					Integration: dec.Slots.Integration, Clarifications: clarifications + 1}
 				return res
 			case claims.Contradicted:
-				p.recordConflict(ctx, req, d, now)
+				conflictID, owner := p.recordConflict(ctx, req, d, now)
 				res := p.fromTemplate(withRoute(policy.TplAbstainConflict, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)
+				res.ConflictID, res.ConflictOwner = conflictID, owner
 				return keepAsking(res, snap, market, &Pending{Intent: intent, Secondary: secondary, PlanName: dec.Slots.PlanName,
 					BillingCadence: dec.Slots.BillingCadence, Clarifications: clarifications})
 			case claims.RevokedDecision, claims.ExpiredDecision:
@@ -247,7 +458,28 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 				}
 				return keepAsking(because(p.fromTemplate(withRoute(policy.TplAbstainStale, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID), d.ReasonCode), snap, market, pd)
 			case claims.InsufficientEvidence:
+				if len(d.Qualified) > 0 {
+					// Only CONDITIONAL/TARGET claims: their approved wording is
+					// shown with the governed label, never as a current fact.
+					verified = append(verified, d.Qualified...)
+					if qualifiedLabel == "" {
+						qualifiedLabel = claims.StatusLabelFor(d.Qualified[0])
+					}
+					continue
+				}
+				if d.ReasonCode == claims.ReasonIncomplete {
+					tpl := policy.TplPriceIncomplete
+					if req.Subject == claims.Trial {
+						tpl = policy.TplTrialIncomplete
+					}
+					return p.fromTemplate(tpl, intent, snap, market, now, releaseID)
+				}
 				if req.Subject == claims.IntegrationStatus {
+					if heldConnector(snap.Claims.Manifest(), req.SubjectID) {
+						// KB-024: a connector whose claim is on HOLD is never
+						// described as available; Doc 02 T18 availability reply.
+						return p.fromTemplate(policy.BoundaryTemplates["I25"], intent, snap, market, now, releaseID)
+					}
 					// No signed status for this connector: explain the capability
 					// from approved articles, but the status stays Unverified.
 					unverifiedConnector = true
@@ -255,7 +487,7 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 				}
 				if req.Subject == claims.PlanAvailability {
 					// No plans are verified for this market: coverage is not assumed.
-					return p.fromTemplate(policy.TplAbstainCoverage, intent, snap, market, now, releaseID)
+					return p.fromTemplate(p.coverage(intent, dec.Redaction.Text, market), intent, snap, market, now, releaseID)
 				}
 				if req.Subject == claims.Certification {
 					// Doc 02 T10: due-diligence route, never an asserted status.
@@ -270,7 +502,7 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 					// G06: a named country with no claims at all is not covered
 					// (as for "Other"); the markets with claims and the general
 					// overview are offered, and the question stays open.
-					res := p.fromTemplate(policy.TplAbstainCoverage, intent, snap, market, now, releaseID)
+					res := p.fromTemplate(p.coverage(intent, dec.Redaction.Text, market), intent, snap, market, now, releaseID)
 					return keepAsking(res, snap, market, &Pending{Intent: intent, Secondary: secondary,
 						PlanName: dec.Slots.PlanName, BillingCadence: dec.Slots.BillingCadence, Clarifications: clarifications})
 				}
@@ -288,14 +520,45 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 	// P2/P3 retrieval with mandatory filters (only when no claim answers it).
 	var hits []knowledge.Hit
 	if len(verified) == 0 {
-		qtext := dec.Redaction.Text
+		qtext := policy.SearchText(dec.Redaction.Text)
+		if q, ok := chipQueries[strings.ToLower(strings.Trim(strings.TrimSpace(in.Message), ".!?"))]; ok && !carried {
+			// A menu chip carries no search words of its own (Doc 02 §17
+			// T02/T03): search the general question it stands for.
+			qtext = q
+		}
 		if overview {
 			// The overview reply carries no search terms of its own; search
 			// the fixed general question for the pending intent instead.
 			qtext = overviewQuery[intent]
 		}
-		kq := knowledge.Query{Text: qtext, Market: market, Locale: in.Locale, Now: now, MaxChunks: 4, IntentID: intent}
+		// Doc 03 §14 step 4: a chunk scoped to other plans is not evidence for
+		// the plan the visitor named.
+		plan := ""
+		if dec.Slots.PlanName != "" && snap.Claims != nil {
+			plan = snap.Claims.PlanCode(dec.Slots.PlanName)
+		}
+		kq := knowledge.Query{Text: qtext, Market: market, Locale: in.Locale, Now: now, MaxChunks: 4, IntentID: intent, Plan: plan}
+		if rerouted {
+			kq.IntentID = ""
+		}
+		kq.HowTo = howToRe.MatchString(dec.Redaction.Text)
+		searchStart := time.Now()
 		r := snap.Retriever.Retrieve(ctx, kq, snap)
+		if positionIntents[intent] && !kq.HowTo && !rerouted && secondary == "" && !policy.MentionsAI(dec.Redaction.Text) && len(knowledge.Tokens(qtext)) <= 4 && (r.Answerability != knowledge.Answerable ||
+			(!r.Hits[0].Named && !hasIntentID(r.Hits[0].Chunk.IntentIDs, intent))) {
+			// Docs 01-02: an overview, multi-entity, trust, privacy, residency,
+			// governance, evidence or comparison question (short, one topic) whose best match is
+			// a console article that only shares a word with it (and does not
+			// name that article) is answered from the article written for the
+			// topic (Doc 02 §17 T02-T15). A question that names a console
+			// area keeps that area's article.
+			only := kq
+			only.OnlyIntent = true
+			if o := snap.Retriever.Retrieve(ctx, only, snap); o.Answerability == knowledge.Answerable {
+				r = o
+			}
+		}
+		metrics.ObserveStage("retrieval", time.Since(searchStart))
 		if r.Answerability == knowledge.NotFound && intent != "I29" {
 			r = snap.Retriever.ByIntent(kq, snap)
 		}
@@ -314,17 +577,35 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 			res.Diag = diag
 			return res
 		}
-		if t, ok := policy.BoundaryTemplates[intent]; ok && !anyTagged(r.Hits, intent) && r.Answerability != knowledge.Revoked {
+		// I25 (availability "today", roadmap, release dates) is a status
+		// question: without a signed feature-release claim it always gets
+		// Doc 02 T18, never an article that describes the capability (S02).
+		if t, ok := policy.BoundaryTemplates[intent]; ok && (intent == "I25" || !anyTagged(r.Hits, intent)) && r.Answerability != knowledge.Revoked {
+			if intent == "I25" && policy.ConsolidationRe.MatchString(dec.Redaction.Text) {
+				t = policy.TplConsolidationToday // Doc 02 S02 turn 2
+			}
+			if intent == "I14" && policy.TrustCenterRe.MatchString(dec.Redaction.Text) {
+				// Doc 02 S07: the Trust Center was asked about; point to it.
+				t.Text += " The Trust Center has the current published position."
+			}
 			res := p.fromTemplate(t, intent, snap, market, now, releaseID)
 			res.Diag = diag
 			return res
 		}
 		switch r.Answerability {
 		case knowledge.Answerable:
+			if intent == "I29" {
+				// Doc 02 §16: an off-topic message is not answered from an
+				// article that only shares a word with it (T25).
+				return p.fromTemplate(policy.TplOutOfScope, intent, snap, market, now, releaseID)
+			}
 			hits = withNeighbor(snap.KB, r.Hits, kq, snap)
-			if regionalIntents[intent] && market != "" && !hasMarketEvidence(hits, market) {
+			// Doc 03 §2, KB-004: a page tagged with a country is not proof that
+			// the country is covered; a signed MARKET_AVAILABILITY claim is.
+			if regionalIntents[intent] && market != "" && (!hasMarketEvidence(hits, market) ||
+				!snap.Claims.HasVerified(claims.MarketAvailability, market, now, snap)) {
 				// G12/G13: a named country needs country-specific evidence; never assume coverage.
-				return regionalCoverage(p.fromTemplate(policy.TplAbstainCoverage, intent, snap, market, now, releaseID))
+				return regionalCoverage(p.fromTemplate(p.coverage(intent, dec.Redaction.Text, market), intent, snap, market, now, releaseID))
 			}
 		case knowledge.Stale:
 			return p.fromTemplate(withRoute(policy.TplAbstainStale, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)
@@ -334,7 +615,7 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 			if regionalIntents[intent] && market != "" {
 				// G13: a named country with no approved material at all is not
 				// assumed covered (same reply as G12 with material elsewhere).
-				return regionalCoverage(p.fromTemplate(policy.TplAbstainCoverage, intent, snap, market, now, releaseID))
+				return regionalCoverage(p.fromTemplate(p.coverage(intent, dec.Redaction.Text, market), intent, snap, market, now, releaseID))
 			}
 			if intent == "I29" {
 				// Off-topic and nothing approved matches: out of scope, with
@@ -356,7 +637,10 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 
 	cards := make([]model.ClaimCard, 0, len(verified))
 	for _, c := range verified {
-		cards = append(cards, model.ClaimCard{Ref: c.ClaimID, Statement: c.PublicStatement})
+		// "SYNTHETIC: " marks placeholder statements in the dev datasets; the
+		// marker stays in the data (and synthetic releases are refused
+		// outside dev/test) but is not shown to visitors.
+		cards = append(cards, model.ClaimCard{Ref: c.ClaimID, Statement: strings.TrimPrefix(c.PublicStatement, "SYNTHETIC: ")})
 	}
 	evidence := make([]model.Evidence, 0, len(hits))
 	for _, h := range hits {
@@ -373,16 +657,24 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 
 	var text string
 	var draft model.Draft
-	staticOnly := !fv.ModelGenerationEnabled || fv.FallbackMode == "static"
+	staticOnly := !fv.ModelGenerationEnabled || fv.FallbackMode == "static" || in.Budget == BudgetStatic
 	switch {
 	case staticOnly && len(cards) > 0:
 		// Signed claim statements are static, pre-approved content.
 		draft = model.Draft{ClaimRefs: refs(cards)}
 		text = joinStatements(cards)
+	case staticOnly && in.SessionCapped:
+		// Doc 06 §13: this conversation used its token cap. A new
+		// conversation starts a fresh cap, so say that rather than "outage".
+		return because(p.fromTemplate(policy.TplSessionLimit, intent, snap, market, now, releaseID), contract.ReasonSpendCeiling)
 	case staticOnly:
-		return because(p.fromTemplate(withRoute(policy.TplUnavailable, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID), contract.ReasonGenerationDisabled)
+		reason := contract.ReasonGenerationDisabled
+		if in.Budget == BudgetStatic {
+			reason = contract.ReasonSpendCeiling
+		}
+		return because(p.fromTemplate(withRoute(policy.TplUnavailable, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID), reason)
 	default:
-		text, draft, err = p.generate(ctx, intent, modelQuestion(dec.Redaction.Text, overview, intent), cards, evidence)
+		text, draft, err = p.generate(ctx, intent, modelQuestion(dec.Redaction.Text, overview, intent), cards, evidence, in.Budget == BudgetReduced)
 		if errors.Is(err, validate.ErrToolInstruction) {
 			// CT-033: no tool exists to invoke; the draft is discarded and a safety signal recorded.
 			res := p.fromTemplate(withRoute(policy.TplAbstainNoEvidence, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID)
@@ -397,7 +689,9 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 				}
 				return because(p.fromTemplate(withRoute(policy.TplUnavailable, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID), reason)
 			}
-			return because(p.fromTemplate(withRoute(policy.TplAbstainNoEvidence, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID), contract.ReasonValidationFailed)
+			res := because(p.fromTemplate(withRoute(policy.TplAbstainNoEvidence, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID), contract.ReasonValidationFailed)
+			res.Tokens = int64(draft.InputTokens + draft.OutputTokens)
+			return res
 		}
 	}
 
@@ -411,6 +705,10 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 	}
 	// Revocation check at commit (Doc 08 §06): fail closed on any doubt.
 	if revoked, err := p.Releases.RevokedSince(ctx, snap.Watermark, sourceIDs, refs(cards)); revoked || err != nil {
+		if revoked {
+			// Pages via PublicAIRevocationRejectedAtCommit (Doc 08 §13, OPR-023).
+			metrics.CommitRevocation(releaseID, market)
+		}
 		return because(p.fromTemplate(withRoute(policy.TplAbstainStale, policy.DefaultRoute[intent]), intent, snap, market, now, releaseID), contract.ReasonSourceRevoked)
 	}
 
@@ -424,9 +722,16 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 		Tokens: int64(draft.InputTokens + draft.OutputTokens), Reason: contract.ReasonAnswered, SecondaryIntentID: secondary,
 	}
 	res.AnswerClass, res.StatusLabel, res.MarketCode = qualify(verified, market)
+	// Doc 02 §17: the template's fixed qualifier line, in approved wording.
+	res.Text, res.QualifierID = policy.WithQualifier(intent, dec.Redaction.Text, res.Text, dec.Slots, validate.MaxFullWords)
+	if chip, ok := policy.ChipFor(secondaryChip); ok {
+		res.SecondaryIntentID, res.Suggestions = secondaryChip, []contract.Chip{chip}
+	}
 	switch {
 	case overview:
 		res.StatusLabel = "MARKET_DEPENDENT" // the general answer; terms depend on the country
+	case qualifiedLabel != "":
+		res.StatusLabel, res.AnswerClass = qualifiedLabel, contract.StatusQualified
 	case unverifiedConnector:
 		res.StatusLabel, res.AnswerClass = "Unverified", contract.StatusQualified
 	}
@@ -445,24 +750,42 @@ func (p *Pipeline) answer(ctx context.Context, in Input) Result {
 	return res
 }
 
-func (p *Pipeline) generate(ctx context.Context, intent, msg string, cards []model.ClaimCard, evidence []model.Evidence) (string, model.Draft, error) {
-	req := model.Request{PolicyVersion: "pub-policy-1.0", IntentID: intent, Message: msg, Claims: cards, Evidence: evidence, MaxOutputTokens: p.MaxOutputTokens}
+func (p *Pipeline) generate(ctx context.Context, intent, msg string, cards []model.ClaimCard, evidence []model.Evidence, reduced bool) (string, model.Draft, error) {
+	req := model.Request{PolicyVersion: p.policyVersion(), IntentID: intent, Message: msg, Claims: cards, Evidence: evidence, MaxOutputTokens: p.MaxOutputTokens}
+	attempts := 2 // one repair attempt within budget
+	if reduced {
+		// Stage 1 of Doc 06 §13: half the output, no repair attempt.
+		req.MaxOutputTokens, attempts = p.MaxOutputTokens/2, 1
+	}
 	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ { // one repair attempt within budget
+	// spent carries the tokens of every attempt, rejected ones included:
+	// they were used and are charged (A24, Doc 06 §13).
+	var spent model.Draft
+	for attempt := 0; attempt < attempts; attempt++ {
+		modelStart := time.Now()
 		d, err := p.Model.Generate(ctx, req)
+		metrics.ObserveStage("model", time.Since(modelStart))
 		if err != nil {
-			return "", model.Draft{}, providerError{err}
+			return "", spent, providerError{err}
 		}
+		spent.InputTokens += d.InputTokens
+		spent.OutputTokens += d.OutputTokens
+		validateStart := time.Now()
 		text, verr := validate.Check(d, cards, evidence)
+		metrics.ObserveStage("validate", time.Since(validateStart))
 		if verr == nil {
+			d.InputTokens, d.OutputTokens = spent.InputTokens, spent.OutputTokens
 			return text, d, nil
 		}
 		p.log().Warn("draft rejected by output validation", zap.String("reason", verr.Error()), zap.Int("attempt", attempt),
 			zap.String("prompt_version", model.PromptVersion))
 		lastErr = verr
+		if errors.Is(verr, validate.ErrToolInstruction) || errors.Is(verr, validate.ErrMarkup) {
+			break // unsafe output is discarded, never repaired (A20, A22)
+		}
 		req.RepairNote = "Previous draft was rejected: " + verr.Error()
 	}
-	return "", model.Draft{}, lastErr
+	return "", spent, lastErr
 }
 
 type providerError struct{ error }
@@ -475,16 +798,61 @@ func isProviderError(err error) bool {
 	return ok
 }
 
+// claimsRelease is the active claim release id, or "" when none is loaded.
+func (p *Pipeline) claimsRelease() string {
+	if p.Releases == nil {
+		return ""
+	}
+	snap, err := p.Releases.Snapshot()
+	if err != nil || snap.Claims == nil {
+		return ""
+	}
+	return snap.Claims.ReleaseID()
+}
+
+// decisionRefs lists the claim ids, cited source versions and offered route
+// of a turn, for the decision record.
+func decisionRefs(r Result) (claimIDs, sourceIDs []string, route string) {
+	claimIDs, sourceIDs = []string{}, []string{}
+	for _, c := range r.Citations {
+		claimIDs = append(claimIDs, c.ClaimIDs...)
+		sourceIDs = append(sourceIDs, c.SourceVersionID)
+	}
+	if len(r.Actions) > 0 {
+		route = r.Actions[0].RouteKey
+	}
+	return claimIDs, sourceIDs, route
+}
+
 // citations returns ≤3 citations backed by what the answer actually used,
 // plus the source ids to re-check at commit.
 func (p *Pipeline) citations(snap *release.Snapshot, verified []claims.Claim, hits []knowledge.Hit, d model.Draft) ([]contract.Citation, []string) {
 	var out []contract.Citation
 	var ids []string
 	bySource := map[string]int{}
+	seenSource := map[string]bool{}
+	claimByID := make(map[string]claims.Claim, len(verified))
+	for _, c := range verified {
+		claimByID[c.ClaimID] = c
+	}
 	add := func(svid, urlKey, claimID string) {
-		if i, ok := bySource[svid]; ok {
-			if claimID != "" {
+		// Doc 03 §14 step 8, KB-026: one link per distinct page. Sources that
+		// share a url_key merge, but every source id is still re-checked for
+		// revocation at commit.
+		key := urlKey
+		if key == "" {
+			key = svid
+		}
+		if i, ok := bySource[key]; ok {
+			if claimID != "" && !slices.Contains(out[i].ClaimIDs, claimID) {
 				out[i].ClaimIDs = append(out[i].ClaimIDs, claimID)
+			}
+			if !seenSource[svid] {
+				seenSource[svid] = true
+				if s, ok := snap.KB.Source(svid); ok {
+					ids = append(ids, s.SourceID)
+				}
+				ids = append(ids, svid)
 			}
 			return
 		}
@@ -495,11 +863,17 @@ func (p *Pipeline) citations(snap *release.Snapshot, verified []claims.Claim, hi
 		if claimID != "" {
 			c.ClaimIDs = append(c.ClaimIDs, claimID)
 		}
-		bySource[svid] = len(out)
-		out = append(out, c)
+		bySource[key] = len(out)
+		seenSource[svid] = true
 		if s, ok := snap.KB.Source(svid); ok {
 			ids = append(ids, s.SourceID)
+			c.ReviewedAt = reviewedAt(s)
+		} else if cl, ok := claimByID[claimID]; ok && !cl.ValidFrom.IsZero() {
+			// A claim's own evidence page (the price book) is not a KB
+			// article; its effective date is the date shown (Doc 01 AT-01).
+			c.ReviewedAt = cl.ValidFrom.UTC().Format("2006-01-02")
 		}
+		out = append(out, c)
 		ids = append(ids, svid)
 	}
 	used := map[string]bool{}
@@ -527,11 +901,60 @@ func (p *Pipeline) actions(snap *release.Snapshot, routeKey, market string, now 
 	if routeKey == "" || snap == nil {
 		return []contract.Action{}
 	}
+	if commercialRoutes[routeKey] && p.Flags != nil && !p.Flags.Values().CommercialRoutes {
+		// Doc 10 App. B: with commercial_routes_enabled off, demo, pricing and
+		// trial CTAs fall back to the general support route.
+		routeKey = "support"
+	}
+	if routeKey == "signup_or_trial" {
+		// Doc 02 T06: with no approved sign-up page but an approved pricing
+		// page, the trial CTA opens the pricing page, which carries the trial
+		// terms (Doc 03 S03). With neither, the route key is kept as before.
+		trial, tok := snap.Route("signup_or_trial", market, now)
+		pricing, pok := snap.Route("pricing", market, now)
+		if (!tok || knowledge.IsPlaceholderURL(trial.URL)) && pok && !knowledge.IsPlaceholderURL(pricing.URL) {
+			routeKey = "pricing"
+		}
+	}
 	if _, ok := snap.Route(routeKey, market, now); !ok {
-		return []contract.Action{} // missing/unpublished route → hide the CTA
+		// Sign-in (Doc 02 T17/T21) falls back to the support route where the
+		// release has no sign-in page; any other missing route hides the CTA.
+		if routeKey != "sign-in" {
+			return []contract.Action{}
+		}
+		if _, ok := snap.Route("support", market, now); !ok {
+			return []contract.Action{}
+		}
+		routeKey = "support"
 	}
 	return []contract.Action{{Type: contract.ActionOpenRoute, RouteKey: routeKey}}
 }
+
+// coverage is the no-coverage abstention naming the countries asked about
+// (Doc 02 T12/T13, G12/G13).
+func (p *Pipeline) coverage(intent, text, market string) policy.Template {
+	codes := policy.CountriesIn(text)
+	if len(codes) == 0 && market != "" {
+		codes = []string{market}
+	}
+	return policy.CoverageFor(intent, codes)
+}
+
+func hasIntentID(ids []string, id string) bool {
+	for _, x := range ids {
+		if x == id {
+			return true
+		}
+	}
+	return false
+}
+
+// positionIntents ask for ZoikoSuite's public position on a topic rather
+// than how to do something in the console.
+var positionIntents = map[string]bool{"I01": true, "I03": true, "I12": true, "I13": true, "I14": true, "I15": true, "I16": true, "I26": true}
+
+// commercialRoutes are the CTAs gated by commercial_routes_enabled.
+var commercialRoutes = map[string]bool{"demo": true, "pricing": true, "signup_or_trial": true}
 
 // qualify derives the answer class and governed status label from the claims
 // that backed an ANSWERED turn (Master prompt §4.1). Labels come only from the
@@ -582,7 +1005,8 @@ func supportOnly(intent string) string {
 func slotMap(s policy.Slots, market string) map[string]string {
 	m := map[string]string{}
 	for k, v := range map[string]string{"market_code": market, "plan": s.PlanName, "billing_cadence": s.BillingCadence,
-		"entity_band": s.EntityBand, "integration": s.Integration} {
+		"entity_band": s.EntityBand, "integration": s.Integration, "persona": s.Persona, "workstream": s.Workstream,
+		"support_topic": s.SupportTopic, "jurisdiction": s.Jurisdiction, "handoff_intent": s.HandoffIntent} {
 		if v != "" {
 			m[k] = v
 		}
@@ -592,6 +1016,14 @@ func slotMap(s policy.Slots, market string) map[string]string {
 
 // overviewQuery is the general, market-free question answered when a visitor
 // picks "Show general overview" instead of naming a market.
+// chipQueries are the general questions behind content-free menu chips.
+var chipQueries = map[string]string{
+	"show general overview": "What is ZoikoSuite and what does it do?",
+	"general overview":      "What is ZoikoSuite and what does it do?",
+	"explore capabilities":  "What are ZoikoSuite's core modules and capabilities?",
+	"privacy":               "How does ZoikoSuite handle privacy and personal data?",
+}
+
 var overviewQuery = map[string]string{
 	"I04": "Which countries and markets is ZoikoSuite available in?",
 	"I05": "What plans are available and how is pricing structured?",
@@ -617,6 +1049,20 @@ func because(res Result, reason string) Result {
 
 // trialStale is the market-named abstention for trial terms that cannot be
 // verified (expired or revoked trial claim).
+// heldConnector reports a connector whose integration claim exists but is
+// not ACTIVE (HOLD, TARGET, ...): its availability cannot be stated.
+func heldConnector(m claims.Manifest, connector string) bool {
+	if connector == "" {
+		return false
+	}
+	for _, c := range m.Claims {
+		if c.ClaimType == claims.IntegrationStatus && strings.EqualFold(c.SubjectID, connector) && c.Status != claims.StatusActive {
+			return true
+		}
+	}
+	return false
+}
+
 // regionalCoverage offers the coverage confirmation route as a next step
 // (Doc 02 escalation matrix: regional payroll / tax / legal coverage -> demo).
 func regionalCoverage(res Result) Result {
@@ -663,19 +1109,49 @@ func (p *Pipeline) fromTemplate(t policy.Template, intent string, snap *release.
 	return res
 }
 
-func (p *Pipeline) recordConflict(ctx context.Context, req claims.Request, d claims.Decision, now time.Time) {
-	if p.Store == nil {
-		return
+func (p *Pipeline) recordConflict(ctx context.Context, req claims.Request, d claims.Decision, now time.Time) (string, string) {
+	// Doc 03 §16: the claim stays blocked and the case has an owner. The id
+	// and detection type match the load-time scan (release.ScanConflicts), so
+	// the same problem is one case, not two.
+	kind, key, ids := release.DetectClaimConflict, "", append([]string(nil), d.ConflictKeys...)
+	sort.Strings(ids)
+	var m claims.Manifest
+	if snap, err := p.Releases.Snapshot(); err == nil && snap.Claims != nil {
+		m = snap.Claims.Manifest()
+		if req.Subject == claims.Price && snap.Claims.Disputed(req.SubjectID) {
+			// A published page contradicts the signed price (KB-003).
+			kind, key, ids = release.DetectAuthorityMismatch, "PRICE|"+req.SubjectID, nil
+			for _, c := range m.Claims {
+				if c.ClaimType == claims.Price && c.SubjectID == req.SubjectID && c.Status == claims.StatusActive {
+					ids = append(ids, c.ClaimID)
+				}
+			}
+			sort.Strings(ids)
+		}
 	}
-	key := strings.Join([]string{req.Subject, req.SubjectID, req.Market, req.BillingTerm}, "|")
-	sum := sha256.Sum256([]byte(key + "|" + strings.Join(d.ConflictKeys, ",")))
+	if key == "" {
+		for _, c := range m.Conflicts() {
+			if slices.Equal(c.ClaimIDs, ids) {
+				key = c.SubjectKey
+			}
+		}
+	}
+	if key == "" {
+		key = strings.Join([]string{req.Subject, req.SubjectID, req.Market, req.BillingTerm}, "|")
+	}
+	id, owner := release.ConflictID(kind, key, ids), release.OwnerFor(req.Subject, "")
+	if p.Store == nil {
+		return id, owner
+	}
 	err := p.Store.RecordConflict(ctx, store.Conflict{
-		ConflictID: "conf-" + hex.EncodeToString(sum[:8]), SubjectKey: key, ClaimIDs: d.ConflictKeys,
-		DetectionType: "AUTHORITY_MISMATCH", Severity: "HIGH", ResolutionState: "OPEN", DetectedAt: now,
+		ConflictID: id, SubjectKey: key, ClaimIDs: ids,
+		DetectionType: kind, Severity: "HIGH", ResolutionState: "OPEN", DetectedAt: now,
+		BlockedClaim: true, AssignedOwner: owner,
 	})
 	if err != nil {
 		p.log().Error("conflict record failed", zap.Error(err))
 	}
+	return id, owner
 }
 
 func withRoute(t policy.Template, route string) policy.Template {
@@ -726,6 +1202,24 @@ var (
 // claimRequests lists the typed claims an intent needs, in answer order.
 // A plans-and-trial question needs plan availability and trial terms for
 // the same market; anything else needs at most one claim.
+// myMarketRe: the visitor ties the question to their own market (Doc 01
+// AT-01 "Which plans are available in my market?").
+var myMarketRe = regexp.MustCompile(`(?i)\b(?:my|our) (?:market|country|region|location|jurisdiction)\b|\bwhere (?:i|we) (?:am|are|operate|live)\b`)
+
+// planRequests is claimRequests plus the plan-availability rule: a plans
+// question with no market asks for one (Doc 02 T05) when the visitor refers
+// to their own market, or when no approved pricing page exists to answer it
+// generally; the signed PLAN_AVAILABILITY claim then answers per market.
+func (p *Pipeline) planRequests(intent string, plansAndTrial bool, dec policy.Decision, in Input, snap *release.Snapshot, market string, now time.Time, carried bool) []claims.Request {
+	if intent == "I05" && !plansAndTrial && !carried && !policy.AsksPrice(in.Message) && dec.Slots.BillingCadence == "" {
+		pricingPage := snap.Retriever.ByIntent(knowledge.Query{IntentID: "I05", Locale: in.Locale, Now: now, MaxChunks: 1}, snap).Answerability == knowledge.Answerable
+		if myMarketRe.MatchString(dec.Redaction.Text) || !pricingPage || market != "" {
+			return []claims.Request{{Subject: claims.PlanAvailability, Market: market, AsOf: now}}
+		}
+	}
+	return claimRequests(intent, plansAndTrial, dec, in.Message, snap.Claims, market, now, carried)
+}
+
 func claimRequests(intent string, plansAndTrial bool, dec policy.Decision, msg string, reg *claims.Resolver, market string, now time.Time, carried bool) []claims.Request {
 	if plansAndTrial {
 		return []claims.Request{
@@ -767,7 +1261,7 @@ func claimRequest(intent string, dec policy.Decision, msg string, reg *claims.Re
 		case frameworkRe.MatchString(msg):
 			// A11: a named framework we hold no claim for must not borrow another one.
 			q.Subject, q.SubjectID = claims.Certification, strings.ToUpper(nonAlnum.ReplaceAllString(frameworkRe.FindString(msg), ""))
-		case strings.Contains(strings.ToLower(msg), "certif"):
+		case certificationWordRe.MatchString(msg):
 			q.Subject = claims.Certification
 		default:
 			return q, false // general security questions come from approved trust pages
@@ -840,3 +1334,49 @@ func withNeighbor(kb *knowledge.Index, hits []knowledge.Hit, q knowledge.Query, 
 	}
 	return out
 }
+
+// offersDemo reports whether a reply offers the demo route, so a bare "yes"
+// next can open it (Doc 02 S10).
+func offersDemo(r Result) bool {
+	if r.Status != contract.Handoff && r.IntentID != "I08" {
+		return false
+	}
+	// The demo reply itself is the offer (Doc 02 S10), even where the
+	// release publishes no demo page and so no CTA is attached.
+	if r.Status == contract.Handoff && r.IntentID == "I08" {
+		return true
+	}
+	for _, a := range r.Actions {
+		if a.RouteKey == "demo" {
+			return true
+		}
+	}
+	return false
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
+// reviewedAt is the date a source was last approved, else its effective
+// date (Doc 01 FR-03: cite a dated source).
+func reviewedAt(s knowledge.Source) string {
+	for _, t := range []*time.Time{s.ApprovalTS, s.EffectiveFrom} {
+		if t != nil && !t.IsZero() {
+			return t.UTC().Format("2006-01-02")
+		}
+	}
+	return ""
+}
+
+// howToRe asks how to do something in the product: such a question is
+// answered from a section written as steps when one matches.
+var howToRe = regexp.MustCompile(`(?i)^\s*(?:how\s+(?:do|can|should|would)\s+(?:i|we|you|one)\b|how\s+to\b|what\s+are\s+the\s+steps\b|steps?\s+(?:to|for)\b|walk\s+me\s+through\b|guide\s+me\b|use\s+of\b)`)
+
+// certificationWordRe asks about a certification ("are you certified",
+// "which certifications"), not a TLS or X.509 certificate ("how do I issue an
+// mTLS certificate"), which is answered from the console articles.
+var certificationWordRe = regexp.MustCompile(`(?i)\bcertif(?:y|ied|ication|ications)\b|\bindependent\s+assurance\b`)

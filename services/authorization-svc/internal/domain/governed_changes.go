@@ -70,6 +70,12 @@ const (
 	AuthorityLimitPendingRetire = "RETIRE"
 )
 
+// Authority limit kinds (000040, S8-D1).
+const (
+	AuthorityLimitMonetary = "MONETARY"
+	AuthorityLimitQuantity = "QUANTITY"
+)
+
 // Session kinds on decision evidence (000034, AU-13).
 const (
 	SessionKindPrivileged = "PRIVILEGED"

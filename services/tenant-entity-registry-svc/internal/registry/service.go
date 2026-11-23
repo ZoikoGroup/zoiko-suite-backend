@@ -22,6 +22,8 @@ import (
 
 	"zoiko.io/tenant-entity-registry-svc/internal/authz"
 	"zoiko.io/tenant-entity-registry-svc/internal/classification"
+	"zoiko.io/tenant-entity-registry-svc/internal/currency"
+	"zoiko.io/tenant-entity-registry-svc/internal/fiscalcal"
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
 	"zoiko.io/tenant-entity-registry-svc/internal/entitlement"
 	"zoiko.io/tenant-entity-registry-svc/internal/events"
@@ -83,6 +85,13 @@ type Service struct {
 
 	// expectedVersionOptional — dev-only, see ConfigureConcurrency.
 	expectedVersionOptional bool
+
+	// importAsync runs the work of a master import in the background; see SetImportExecutor.
+	importAsync func(func())
+	// currencies validates currency codes against currency-registry-svc, read-only (REF-03). Nil fails closed.
+	currencies currency.Validator
+	// fiscal checks a legal entity's fiscal_calendar_id against fiscal-calendar-svc (ORG-03 s4.3, REF-04). Nil leaves the format check only.
+	fiscal fiscalcal.Validator
 
 	log *zap.Logger
 }
@@ -348,6 +357,9 @@ func (s *Service) CreateEntity(
 		return nil, err
 	}
 	if err := validateFiscalCalendarRef(req.FiscalCalendarID); err != nil {
+		return nil, err
+	}
+	if err := s.checkFiscalCalendar(ctx, req.TenantID, req.FiscalCalendarID); err != nil {
 		return nil, err
 	}
 	profileInputs, err := s.entityProfileInputs(req)
@@ -1388,6 +1400,18 @@ func (s *Service) authorizeHierarchy(ctx context.Context, hierarchyID, action st
 	return s.authorizeEntities(ctx, "entity.hierarchy", action, h.ChildLegalEntityID, h.ParentLegalEntityID)
 }
 
+// GetHierarchyByID retrieves a hierarchy by ID for ETag/If-Match support.
+func (s *Service) GetHierarchyByID(ctx context.Context, hierarchyID string) (*domain.EntityHierarchy, error) {
+	h, err := s.store.GetHierarchyByID(ctx, hierarchyID)
+	if err != nil {
+		return nil, fmt.Errorf("store.GetHierarchyByID: %w", err)
+	}
+	if h == nil {
+		return nil, ErrNotFound
+	}
+	return h, nil
+}
+
 func (s *Service) authorizeJurisdictionAssignment(ctx context.Context, assignmentID, action string) error {
 	a, err := s.store.GetJurisdictionAssignmentByID(ctx, assignmentID)
 	if err != nil {
@@ -1397,6 +1421,18 @@ func (s *Service) authorizeJurisdictionAssignment(ctx context.Context, assignmen
 		return s.authorize(ctx, "entity.jurisdiction", action)
 	}
 	return s.authorizeEntity(ctx, a.LegalEntityID, "entity.jurisdiction", action)
+}
+
+// GetJurisdictionAssignmentByID retrieves a jurisdiction assignment by ID for ETag/If-Match support.
+func (s *Service) GetJurisdictionAssignmentByID(ctx context.Context, assignmentID string) (*domain.EntityJurisdictionAssignment, error) {
+	a, err := s.store.GetJurisdictionAssignmentByID(ctx, assignmentID)
+	if err != nil {
+		return nil, fmt.Errorf("store.GetJurisdictionAssignmentByID: %w", err)
+	}
+	if a == nil {
+		return nil, ErrNotFound
+	}
+	return a, nil
 }
 
 func (s *Service) authorizeBundle(ctx context.Context, bundleID, resource, action string) error {

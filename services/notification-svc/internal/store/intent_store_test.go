@@ -57,7 +57,7 @@ func publishVersion(t *testing.T, s *store.PgStore, tenant string, v *domain.Int
 }
 
 func TestIntent_StableIdentityKeyShapeUniquenessAndIsolation(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	i := newIntent(t, s, "tenant-int", "payroll.payslip_available")
 	assert.Equal(t, "ACTIVE", i.Status)
 
@@ -77,7 +77,7 @@ func TestIntent_StableIdentityKeyShapeUniquenessAndIsolation(t *testing.T) {
 }
 
 func TestIntentVersion_LifecycleAndMakerChecker(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-int")
 	i := newIntent(t, s, "tenant-int", "hr.review_invitation")
 	v := draftVersion(t, s, "tenant-int", i.IntentID, nil)
@@ -109,7 +109,7 @@ func TestIntentVersion_LifecycleAndMakerChecker(t *testing.T) {
 }
 
 func TestIntentVersion_RefusesAnInvalidContractBeforeStoringIt(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	i := newIntent(t, s, "tenant-int", "billing.invoice_issued")
 	bad := map[string]func(*domain.CreateIntentVersionParams){
 		"unknown purpose class":          func(p *domain.CreateIntentVersionParams) { p.PurposeClass = "Z9" },
@@ -150,7 +150,7 @@ func TestIntentVersion_RefusesAnInvalidContractBeforeStoringIt(t *testing.T) {
 // The database refuses what the service would, without the service.
 func TestIntentVersion_DatabaseGuards(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	bg := context.Background()
 	i := newIntent(t, s, "tenant-int-db", "legal.consultation_notice")
 	v := draftVersion(t, s, "tenant-int-db", i.IntentID, nil)
@@ -195,7 +195,7 @@ func TestIntentVersion_DatabaseGuards(t *testing.T) {
 
 // NCD-01 4.5 and 9.2: what was in force at time T, as known at time K.
 func TestIntent_EffectiveDatingAndKnowledgeTime(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	tenant := "tenant-int-time"
 	ctx := tenantCtx(tenant)
 	i := newIntent(t, s, tenant, "tax.filing_reminder")
@@ -231,7 +231,7 @@ func TestIntent_EffectiveDatingAndKnowledgeTime(t *testing.T) {
 
 // Publication is never backdated and never reorders history.
 func TestIntent_PublicationCannotBackdateOrReorder(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	tenant := "tenant-int-order"
 	ctx := tenantCtx(tenant)
 	i := newIntent(t, s, tenant, "ops.maintenance_notice")
@@ -257,7 +257,7 @@ func TestIntent_PublicationCannotBackdateOrReorder(t *testing.T) {
 }
 
 func TestIntent_RetirementEndsTheFutureNotTheHistory(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	tenant := "tenant-int-retire"
 	ctx := tenantCtx(tenant)
 	i := newIntent(t, s, tenant, "support.case_update")

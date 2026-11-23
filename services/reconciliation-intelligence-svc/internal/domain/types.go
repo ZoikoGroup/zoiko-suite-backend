@@ -116,7 +116,7 @@ type ReconciliationJob struct {
 	UnmatchedCount          int          `json:"unmatched_count"`
 	ReconciliationRate      *float64     `json:"reconciliation_rate,omitempty"` // 0.00 to 100.00%; legacy jobs only
 	Status                  string       `json:"status"`                        // COMPLETED, ARCHIVED
-	// RequestedBy is the principal who ran the analysis (migration 000011);
+	// RequestedBy is the principal who ran the analysis (migration 000013);
 	// the SoD rule refuses that principal's own APPROVED / EXECUTED decisions.
 	RequestedBy string `json:"requested_by,omitempty"`
 	// Version is the aggregate version behind the ETag / If-Match contract;
@@ -157,6 +157,18 @@ type ReconciliationSuggestion struct {
 	// this line's book side on an AUTO_MATCH or DATE_SKEW suggestion (A2a).
 	// Proposed only: the match is made in bank-reconciliation-svc, by humans.
 	CounterpartJournalID string `json:"counterpart_journal_id,omitempty"`
+	// CounterpartTransactionID is the banking-connector-svc canonical
+	// transaction proposed instead, on a line no journal matched (A2b). At
+	// most one of the two counterparts is ever named; HeuristicRule says
+	// which kind of record was found. Proposed only, like the journal.
+	CounterpartTransactionID string `json:"counterpart_transaction_id,omitempty"`
+	// CounterpartJournalIDs is A2b part 2's many-to-one form of
+	// CounterpartJournalID: exactly two general-ledger-svc journals whose
+	// combined net movement — not either one alone — equals the line's
+	// amount. Mutually exclusive with CounterpartJournalID and
+	// CounterpartTransactionID; HeuristicRule names it as the multi-journal
+	// rule when set.
+	CounterpartJournalIDs []string `json:"counterpart_journal_ids,omitempty"`
 	// CandidateSearchOutcome is what the search for a counterpart found, on
 	// every searched line; empty on a DUPLICATE_ENTRY copy (not searched)
 	// and on rows written before migration 000008.
@@ -399,6 +411,12 @@ const MetricMissingReferenceTolerance = "RECONCILIATION_MISSING_REFERENCE_WRITEO
 // qualifying journals, none, no cash account — is recorded on the
 // missing-reference suggestion, and several candidates force MANUAL_REVIEW:
 // a line with book-side candidates is never recommended for write-off.
+//
+// A line the journal search leaves NO_CANDIDATE — and only such a line — is
+// then searched for a banking-connector-svc canonical transaction (A2b,
+// canonical_candidates.go), with the same outcomes. search must carry that
+// read for the line's bank account (CanonicalSearchLines says which lines
+// need it); a line that needs it without it is refused, never "no candidate".
 func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID string, missingReferenceTolerance *GovernedTolerance, search *CandidateSearch) ([]ReconciliationSuggestion, error) {
 	if missingReferenceTolerance == nil || missingReferenceTolerance.Amount == nil {
 		return nil, fmt.Errorf("the governed missing-reference tolerance is required")
@@ -406,39 +424,14 @@ func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID s
 	if missingReferenceTolerance.Version <= 0 {
 		return nil, fmt.Errorf("the governed missing-reference tolerance version is required")
 	}
-	if search == nil || search.Tolerance.Version <= 0 || search.Tolerance.Days < 0 || search.HorizonDays < search.Tolerance.Days {
-		return nil, fmt.Errorf("a governed candidate date tolerance and a search horizon at least as wide are required")
-	}
 	tol := CanonicalAmount(missingReferenceTolerance.Amount)
 
-	amounts := make([]*big.Rat, len(lines))
-	for i, line := range lines {
-		amount, err := ParseStorableAmount(line.Amount)
-		if err != nil {
-			return nil, fmt.Errorf("statement line %s: %w", line.StatementLineID, err)
-		}
-		amounts[i] = amount
-	}
-
-	// Duplicate detection runs first and is exclusive for the duplicate: a
-	// line identified as a copy of another gets ONE suggestion,
-	// DUPLICATE_ENTRY, and not also a write-off or review recommendation.
-	// Writing off or investigating a copy is the wrong action, and two
-	// suggestions about the same line could contradict each other. The
-	// anchor — the entry that stays — still goes through the rules below:
-	// once the copy is removed it is one real entry that is still UNMATCHED.
-	// So every line is still the subject of exactly one suggestion.
-	dupOf, dupsOf := findDuplicates(lines, amounts)
-
-	// A copy is not searched: the entry it duplicates is, once.
-	searched := make(map[int]bool, len(lines))
-	for i := range lines {
-		if _, isDup := dupOf[i]; !isDup {
-			searched[i] = true
-		}
-	}
-	found, err := searchCandidates(lines, amounts, searched, tenantID, search)
+	a, err := analyzeSearch(lines, tenantID, search)
 	if err != nil {
+		return nil, err
+	}
+	amounts, dupOf, dupsOf, found := a.amounts, a.dupOf, a.dupsOf, a.found
+	if err := searchCanonical(lines, amounts, found, tenantID, search); err != nil {
 		return nil, err
 	}
 
@@ -469,6 +462,18 @@ func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID s
 			items = append(items, item)
 			continue
 		}
+		if ls.proposedPair != nil {
+			item := candidateItemMulti(line, amount, ls.outcome, *ls.proposedPair, runID, tenantID, missingReferenceTolerance.Version, search, now)
+			item.ResolutionNotes += dupNote
+			items = append(items, item)
+			continue
+		}
+		if ls.proposedTxn != nil {
+			item := canonicalItem(line, amount, ls.outcome, *ls.proposedTxn, runID, tenantID, missingReferenceTolerance.Version, search, now)
+			item.ResolutionNotes += dupNote
+			items = append(items, item)
+			continue
+		}
 
 		// The tolerance is a magnitude: a large credit (negative amount) is
 		// as material as a large debit and must never qualify as a "small
@@ -491,10 +496,16 @@ func AnalyzeUnmatchedStatementLines(lines []BankStatementLine, runID, tenantID s
 				line.StatementLineID, runID, mag, tol)
 		}
 		if ls.outcome == CandidateAmbiguous {
-			// Book-side candidates exist, so this is never a write-off.
+			// Counterpart candidates exist, so this is never a write-off.
 			rec = RecommendationManualReview
 			confScore = candidateAmbiguousConfidence
 			rule = HeuristicCandidateAmbiguous
+			switch {
+			case len(ls.pairCandidates) > 0:
+				rule = HeuristicCandidateMultiJournalAmbiguous
+			case len(ls.txnCandidates) > 0:
+				rule = HeuristicCandidateTransactionAmbiguous
+			}
 		}
 		rationale += dupNote + candidateNote(ls, line, search)
 
@@ -609,7 +620,7 @@ func RequiresIndependentDecider(to SuggestionStatus) bool {
 // CheckJobCommand applies the rules every job command shares, in order:
 // archived jobs are read-only, a sent If-Match version must be current, and
 // a decision that needs an independent decider is refused for the requester.
-// requestedBy is "" for jobs analysed before migration 000011 (no SoD check
+// requestedBy is "" for jobs analysed before migration 000013 (no SoD check
 // is possible for those).
 func CheckJobCommand(status, requestedBy string, version int, actorID string, expectedVersion int, needsIndependentDecider bool) error {
 	if status == "ARCHIVED" {

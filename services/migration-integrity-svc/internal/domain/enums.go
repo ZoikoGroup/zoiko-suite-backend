@@ -11,7 +11,7 @@ type CheckType string
 
 const (
 	CheckSchemaValidation   CheckType = "SCHEMA_VALIDATION"
-	CheckReferentialInteg   CheckType = "REFERENTIAL_INTEGRITY" // declared, not yet produced (SPEC_DEVIATIONS A7)
+	CheckReferentialInteg   CheckType = "REFERENTIAL_INTEGRITY" // currency-code validity (MIG-C12, SPEC_DEVIATIONS A7)
 	CheckSourceIdentity     CheckType = "SOURCE_IDENTITY"
 	CheckDuplicateDetection CheckType = "DUPLICATE_DETECTION"
 	CheckRangeCheck         CheckType = "RANGE_CHECK" // declared, not yet produced (SPEC_DEVIATIONS A7)
@@ -84,7 +84,7 @@ const (
 	ViolationTypeMismatch          ViolationType = "TYPE_MISMATCH"
 	ViolationDuplicate             ViolationType = "DUPLICATE"
 	ViolationOutOfRange            ViolationType = "OUT_OF_RANGE"       // declared, not yet produced
-	ViolationOrphanedRef           ViolationType = "ORPHANED_REFERENCE" // declared, not yet produced
+	ViolationOrphanedRef           ViolationType = "ORPHANED_REFERENCE" // unknown currency code (MIG-N12)
 	ViolationMissingSourceIdentity ViolationType = "MISSING_SOURCE_IDENTITY"
 	ViolationControlCountMismatch  ViolationType = "CONTROL_COUNT_MISMATCH"
 	ViolationControlAmountMismatch ViolationType = "CONTROL_AMOUNT_MISMATCH"

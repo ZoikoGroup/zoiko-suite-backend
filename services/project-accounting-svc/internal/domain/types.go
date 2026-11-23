@@ -371,8 +371,13 @@ type RecognitionRun struct {
 	Margin                      *float64   `json:"margin,omitempty"`
 	BalanceType                 *string    `json:"balance_type,omitempty"`
 	BalanceAmount               *float64   `json:"balance_amount,omitempty"`
+	// RevenueAccountCode/WIPAccountCode are legacy read-only fields retained
+	// for runs created before ACC-02 migration. New runs carry mapping keys
+	// and post through ACC-02 only.
 	RevenueAccountCode          string     `json:"revenue_account_code,omitempty"`
 	WIPAccountCode              string     `json:"wip_account_code,omitempty"`
+	RevenueMappingKey           string     `json:"revenue_mapping_key,omitempty"`
+	WIPMappingKey               string     `json:"wip_mapping_key,omitempty"`
 	JournalID                   *string    `json:"journal_id,omitempty"`
 	SupersedesRunID             *string    `json:"supersedes_run_id,omitempty"`
 	SupersededByRunID           *string    `json:"superseded_by_run_id,omitempty"`
@@ -397,12 +402,10 @@ type SetApprovedEstimateRequest struct {
 }
 
 type CreateRecognitionRunRequest struct {
-	ProjectID          string  `json:"project_id"`
-	FiscalPeriod       string  `json:"fiscal_period"`
-	ContractValue      float64 `json:"contract_value"`
-	BilledToDate       float64 `json:"billed_to_date"`
-	RevenueAccountCode string  `json:"revenue_account_code"`
-	WIPAccountCode     string  `json:"wip_account_code"`
+	ProjectID     string  `json:"project_id"`
+	FiscalPeriod  string  `json:"fiscal_period"`
+	ContractValue float64 `json:"contract_value"`
+	BilledToDate  float64 `json:"billed_to_date"`
 }
 
 type SupersedeRecognitionRunRequest struct {

@@ -1,0 +1,44 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.accounting.kernel.event.rejected (general-ledger-svc, schema 1.0.0). OBSERVED contract inferred from 6 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "code": {
+      "type": "string"
+    },
+    "detail": {
+      "type": "string"
+    },
+    "event_type": {
+      "type": "string"
+    },
+    "event_version": {
+      "type": "integer"
+    },
+    "family": {
+      "type": "string"
+    },
+    "idempotency_key": {
+      "type": "string"
+    },
+    "legal_entity_id": {
+      "type": "string"
+    },
+    "source_event_id": {
+      "type": "string"
+    },
+    "source_system": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "code",
+    "detail",
+    "event_type",
+    "event_version",
+    "family",
+    "idempotency_key",
+    "legal_entity_id",
+    "source_event_id",
+    "source_system"
+  ],
+  "type": "object"
+}

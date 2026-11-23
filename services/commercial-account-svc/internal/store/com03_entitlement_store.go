@@ -14,7 +14,6 @@ import (
 	"zoiko.io/commercial-account-svc/internal/domain"
 	svcmiddleware "zoiko.io/commercial-account-svc/internal/middleware"
 	"zoiko.io/commercial-account-svc/internal/money"
-	"zoiko.io/commercial-account-svc/internal/outbox"
 )
 
 // EntitlementStore is the COM-03 persistence contract. Every decision is
@@ -383,7 +382,7 @@ func (s *PgStore) GetEffectiveEntitlements(ctx context.Context, now time.Time) (
 // record the event was invisible to the caller. Doing everything in the
 // one transaction the public method already opens fixes that as a side
 // effect of the extraction, not a separate change.
-func recomputeEntitlementsTx(ctx context.Context, tx pgx.Tx, org, actor string, now time.Time) ([]domain.CapabilityDecision, error) {
+func (s *PgStore) recomputeEntitlementsTx(ctx context.Context, tx pgx.Tx, org, actor string, now time.Time) ([]domain.CapabilityDecision, error) {
 	basis, err := loadEntitlementBasis(ctx, tx, org, now)
 	if err != nil {
 		return nil, err
@@ -397,9 +396,7 @@ func recomputeEntitlementsTx(ctx context.Context, tx pgx.Tx, org, actor string, 
 		return nil, err
 	}
 	ds := domain.EffectiveEntitlements(basis, restrictions, policy, now)
-	if err := outbox.Insert(ctx, tx, outbox.Event{AggregateType: "commercial_entitlement", AggregateID: org,
-		EventType: "entitlement_snapshot.changed", TenantID: &org,
-		Payload: map[string]any{"organization_id": org, "decisions": ds, "actor_id": actor, "occurred_at": now.UTC()}}); err != nil {
+	if err := s.emit(ctx, tx, "entitlement_snapshot.changed", "commercial_entitlement", org, org, actor, map[string]any{"organization_id": org, "decisions": ds, "actor_id": actor, "occurred_at": now.UTC()}); err != nil {
 		return nil, err
 	}
 	for _, d := range ds {
@@ -419,7 +416,7 @@ func (s *PgStore) RecomputeEntitlements(ctx context.Context, actor string, now t
 	org := svcmiddleware.TenantFromContext(ctx)
 	var out []domain.CapabilityDecision
 	err := s.subscriptionTx(ctx, func(tx pgx.Tx) error {
-		ds, err := recomputeEntitlementsTx(ctx, tx, org, actor, now)
+		ds, err := s.recomputeEntitlementsTx(ctx, tx, org, actor, now)
 		out = ds
 		return err
 	})
@@ -439,7 +436,7 @@ func (s *PgStore) CreateSnapshot(ctx context.Context, organizationID, actor stri
 		if err := declareOrgForSellerPlane(ctx, tx, organizationID); err != nil {
 			return err
 		}
-		ds, err := recomputeEntitlementsTx(ctx, tx, organizationID, actor, now)
+		ds, err := s.recomputeEntitlementsTx(ctx, tx, organizationID, actor, now)
 		out = ds
 		return err
 	})
@@ -523,9 +520,8 @@ func scanRestriction(row pgx.Row) (*domain.CommercialRestriction, error) {
 	return &r, nil
 }
 
-func restrictionEvent(ctx context.Context, tx pgx.Tx, eventType string, r *domain.CommercialRestriction) error {
-	return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "commercial_restriction", AggregateID: r.RestrictionID,
-		EventType: eventType, TenantID: &r.OrganizationID, Payload: r})
+func (s *PgStore) restrictionEvent(ctx context.Context, tx pgx.Tx, eventType string, r *domain.CommercialRestriction) error {
+	return s.emit(ctx, tx, eventType, "commercial_restriction", r.RestrictionID, r.OrganizationID, "", r)
 }
 
 // applyRestrictionTx is ApplyRestriction's body, extracted so a caller that
@@ -533,7 +529,7 @@ func restrictionEvent(ctx context.Context, tx pgx.Tx, eventType string, r *domai
 // escalating to RESTRICTED/SUSPENDED) can apply a restriction atomically
 // with whatever triggered it, instead of opening a second, separate
 // transaction that could commit out of step with the first.
-func applyRestrictionTx(ctx context.Context, tx pgx.Tx, r *domain.CommercialRestriction) (*domain.CommercialRestriction, error) {
+func (s *PgStore) applyRestrictionTx(ctx context.Context, tx pgx.Tx, r *domain.CommercialRestriction) (*domain.CommercialRestriction, error) {
 	got, err := scanRestriction(tx.QueryRow(ctx, `
 		INSERT INTO commercial_restrictions (restriction_id, organization_id, level, reason_code, policy_ref, basis_ref,
 			applied_at, applied_by_principal_id)
@@ -546,7 +542,7 @@ func applyRestrictionTx(ctx context.Context, tx pgx.Tx, r *domain.CommercialRest
 	if got.Level == domain.RestrictionReadOnly {
 		eventType = "entitlement.grace_period_started"
 	}
-	if err := restrictionEvent(ctx, tx, eventType, got); err != nil {
+	if err := s.restrictionEvent(ctx, tx, eventType, got); err != nil {
 		return nil, err
 	}
 	return got, nil
@@ -559,7 +555,7 @@ func (s *PgStore) ApplyRestriction(ctx context.Context, r *domain.CommercialRest
 		if err := claimIdempotency(ctx, tx, claim); err != nil {
 			return err
 		}
-		got, err := applyRestrictionTx(ctx, tx, r)
+		got, err := s.applyRestrictionTx(ctx, tx, r)
 		if err != nil {
 			return err
 		}
@@ -570,7 +566,7 @@ func (s *PgStore) ApplyRestriction(ctx context.Context, r *domain.CommercialRest
 		if err := declareOrgForSellerPlane(ctx, tx, r.OrganizationID); err != nil {
 			return err
 		}
-		if _, err := recomputeEntitlementsTx(ctx, tx, r.OrganizationID, r.AppliedByPrincipalID, r.AppliedAt); err != nil {
+		if _, err := s.recomputeEntitlementsTx(ctx, tx, r.OrganizationID, r.AppliedByPrincipalID, r.AppliedAt); err != nil {
 			return err
 		}
 		out = got
@@ -582,7 +578,7 @@ func (s *PgStore) ApplyRestriction(ctx context.Context, r *domain.CommercialRest
 // removeRestrictionTx is RemoveRestriction's body, extracted for the same
 // reason as applyRestrictionTx (B3: StopDunning lifting the restriction it
 // applied, atomically with closing the case).
-func removeRestrictionTx(ctx context.Context, tx pgx.Tx, restrictionID, actor, reason string, now time.Time) (*domain.CommercialRestriction, error) {
+func (s *PgStore) removeRestrictionTx(ctx context.Context, tx pgx.Tx, restrictionID, actor, reason string, now time.Time) (*domain.CommercialRestriction, error) {
 	cur, err := scanRestriction(tx.QueryRow(ctx, `SELECT `+restrictionColumns+` FROM commercial_restrictions
 		WHERE restriction_id = $1 FOR UPDATE`, restrictionID))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -606,7 +602,7 @@ func removeRestrictionTx(ctx context.Context, tx pgx.Tx, restrictionID, actor, r
 	if got.Level == domain.RestrictionReadOnly {
 		eventType = "entitlement.grace_period_ended"
 	}
-	if err := restrictionEvent(ctx, tx, eventType, got); err != nil {
+	if err := s.restrictionEvent(ctx, tx, eventType, got); err != nil {
 		return nil, err
 	}
 	return got, nil
@@ -617,14 +613,14 @@ func removeRestrictionTx(ctx context.Context, tx pgx.Tx, restrictionID, actor, r
 func (s *PgStore) RemoveRestriction(ctx context.Context, restrictionID, actor, reason string, now time.Time) (*domain.CommercialRestriction, error) {
 	var out *domain.CommercialRestriction
 	err := s.withSellerPlane(ctx, func(tx pgx.Tx) error {
-		got, err := removeRestrictionTx(ctx, tx, restrictionID, actor, reason, now)
+		got, err := s.removeRestrictionTx(ctx, tx, restrictionID, actor, reason, now)
 		if err != nil {
 			return err
 		}
 		if err := declareOrgForSellerPlane(ctx, tx, got.OrganizationID); err != nil {
 			return err
 		}
-		if _, err := recomputeEntitlementsTx(ctx, tx, got.OrganizationID, actor, now); err != nil {
+		if _, err := s.recomputeEntitlementsTx(ctx, tx, got.OrganizationID, actor, now); err != nil {
 			return err
 		}
 		out = got
@@ -674,8 +670,7 @@ func (s *PgStore) PublishEntitlementPolicy(ctx context.Context, p *domain.Entitl
 			return err
 		}
 		out = p
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "entitlement_policy", AggregateID: "grace-policy",
-			EventType: "entitlement_policy.published", Payload: p})
+		return s.emit(ctx, tx, "entitlement_policy.published", "entitlement_policy", "grace-policy", PlatformScopeID, claim.PrincipalID, p)
 	})
 	return out, err
 }

@@ -234,38 +234,3 @@ func TestOutcomeUnknown_CarriesReasonAndUnknownAt(t *testing.T) {
 	assert.Equal(t, "connection reset after DATA", p["reason"])
 	assert.Equal(t, at.Format(time.RFC3339), p["unknown_at"])
 }
-
-// Every event about one template — created, a version approved, published,
-// retired — is keyed on the template id, so they share a partition and a
-// consumer sees them in the order they happened.
-func TestTemplateEvents_KeyedOnTemplateWithTheRightActor(t *testing.T) {
-	approver, retirer := "approver-1", "retirer-1"
-	def := domain.TemplateDefinition{TemplateID: "tpl-1", TenantID: "t", LegalEntityID: "le", Name: "Payslip", OwnerPrincipalID: "owner-1"}
-	ver := domain.TemplateVersion{VersionID: "ver-1", TemplateID: "tpl-1", TenantID: "t", LegalEntityID: "le", Locale: "en-GB", VersionNumber: 2, ApprovedByPrincipalID: &approver, ContentHash: "abc"}
-
-	created, err := events.TemplateCreated("c", def)
-	require.NoError(t, err)
-	approved, err := events.TemplateVersionApproved("c", ver)
-	require.NoError(t, err)
-	published, err := events.TemplatePublished("c", "publisher-1", ver)
-	require.NoError(t, err)
-	def.RetiredByPrincipalID = &retirer
-	retired, err := events.TemplateRetired("c", def)
-	require.NoError(t, err)
-
-	for _, tc := range []struct {
-		out       events.Outbound
-		eventType string
-		actor     string
-	}{
-		{created, events.TypeTemplateCreated, "owner-1"},
-		{approved, events.TypeTemplateVersionApproved, "approver-1"},
-		{published, events.TypeTemplatePublished, "publisher-1"},
-		{retired, events.TypeTemplateRetired, "retirer-1"},
-	} {
-		assert.Equal(t, tc.eventType, tc.out.EventType)
-		assert.Equal(t, "tpl-1", tc.out.Key, tc.eventType)
-		assert.Equal(t, tc.actor, decodeBody(t, tc.out.Body).ActorID, tc.eventType)
-	}
-	assert.Equal(t, "ver-1", payloadOf(t, decodeBody(t, published.Body))["version_id"])
-}

@@ -99,6 +99,7 @@ func TestWorkload_UndeclaredBoundWorkloadIsStillAWorkload(t *testing.T) {
 func postWorkloadAdmin(r chi.Router, path, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("If-Match", "*") // required on binding deactivate / reactivate (AZ-1)
 	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -182,5 +183,19 @@ func TestWorkloadBindings_ThroughTheCache(t *testing.T) {
 		`{"workload_id":"ledger-sync","allowed_audience":"ledger-api","allowed_actions":["GL_JOURNAL_READ"],"reason_code":"ONBOARD"}`)
 	if w.Code != http.StatusOK {
 		t.Errorf("save through cache.Store: want 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// AZ-1 (10 Nov 2026): deactivate / reactivate require If-Match, like every
+// other versioned aggregate. No If-Match and no expected_version is 428.
+func TestWorkloadBindings_IfMatchRequired(t *testing.T) {
+	s := &workloadStub{stubStore: &stubStore{rbacActions: []string{handler.PermissionWorkloadManage}}}
+	req := httptest.NewRequest(http.MethodPost, "/v1/admin/workload-bindings/ledger-sync/deactivate", bytes.NewBufferString(`{"reason_code":"COMPROMISED"}`))
+	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
+	w := httptest.NewRecorder()
+	workloadRouter(s).ServeHTTP(w, req)
+	if w.Code != http.StatusPreconditionRequired || s.setActive != nil {
+		t.Fatalf("no If-Match: want 428 and nothing changed, got %d: %s", w.Code, w.Body.String())
 	}
 }

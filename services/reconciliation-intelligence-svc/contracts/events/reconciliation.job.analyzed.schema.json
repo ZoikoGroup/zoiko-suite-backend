@@ -1,0 +1,52 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.reconciliation.job.analyzed (reconciliation-intelligence-svc, schema 1.0.0). OBSERVED contract inferred from 32 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "bank_reconciliation_run_id": {
+      "type": "string"
+    },
+    "job_id": {
+      "type": "string"
+    },
+    "job_name": {
+      "type": "string"
+    },
+    "legal_entity_id": {
+      "type": "string"
+    },
+    "matched_count": {},
+    "reconciliation_rate": {},
+    "source_system_a": {
+      "type": "string"
+    },
+    "source_system_b": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "total_processed_count": {
+      "type": "integer"
+    },
+    "unmatched_count": {
+      "type": "integer"
+    }
+  },
+  "required": [
+    "bank_reconciliation_run_id",
+    "job_id",
+    "job_name",
+    "legal_entity_id",
+    "matched_count",
+    "reconciliation_rate",
+    "source_system_a",
+    "source_system_b",
+    "status",
+    "tenant_id",
+    "total_processed_count",
+    "unmatched_count"
+  ],
+  "type": "object"
+}

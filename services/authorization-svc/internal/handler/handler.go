@@ -209,6 +209,13 @@ type Handler struct {
 	sessionLimits SessionLimits
 	// breakGlassApprovals is the AU-02 quorum; see SetBreakGlassApprovals.
 	breakGlassApprovals int
+	// fxRates is the authority-limit FX reference table
+	// (AUTHZ_FX_REFERENCE_RATES); nil is StandardReferenceFXRates. See
+	// SetFXReferenceRates.
+	fxRates map[string]float64
+	// metrics is the §26 decision telemetry; nil records nothing. See
+	// SetMetrics.
+	metrics DecisionMetrics
 }
 
 // SetEntityRegistry lets resolveTenantScope check, with
@@ -253,6 +260,12 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/admin/role-assignments", h.CreateRoleAssignment)
 	r.Get("/v1/admin/role-assignments", h.ListRoleAssignments)
 	r.Post("/v1/admin/role-assignments/{assignment_id}/revoke", h.RevokeRoleAssignment)
+	// ORG-06 s4.6: suspend and resume, the suspension history, and the
+	// as-of reconstruction (000037).
+	r.Post("/v1/admin/role-assignments/{assignment_id}/suspend", h.SuspendRoleAssignment)
+	r.Post("/v1/admin/role-assignments/{assignment_id}/resume", h.ResumeRoleAssignment)
+	r.Get("/v1/admin/role-assignments/{assignment_id}/suspensions", h.ListAssignmentSuspensions)
+	r.Get("/v1/admin/role-assignments/as-of", h.GetAssignmentsAsOf)
 	// Maker-checker on privileged assignments (GOV-12; ZS-IAM-001 §9, A20).
 	r.Post("/v1/admin/role-assignments/{assignment_id}/approve", h.ApproveRoleAssignment)
 	r.Post("/v1/admin/role-assignments/{assignment_id}/reject", h.RejectRoleAssignment)
@@ -265,6 +278,15 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/admin/delegated-authorities", h.CreateDelegatedAuthority)
 	r.Get("/v1/admin/delegated-authorities", h.ListDelegatedAuthorities)
 	r.Post("/v1/admin/delegated-authorities/{delegation_id}/revoke", h.RevokeDelegatedAuthority)
+	// ZS-IAM-001 §21's own names for the same commands (tracker D2-5.F19):
+	// aliases, not a second implementation — one handler, one set of checks.
+	// The colon form is the documented one; the slash form is served too
+	// because some HTTP tooling percent-encodes a colon in a path segment
+	// (access-control-svc serves /v1/iam/access-assignments the same way).
+	r.Post("/v1/iam/delegations", h.CreateDelegatedAuthority)
+	r.Get("/v1/iam/delegations", h.ListDelegatedAuthorities)
+	r.Post("/v1/iam/delegations/{delegation_id}:revoke", h.RevokeDelegatedAuthority)
+	r.Post("/v1/iam/delegations/{delegation_id}/revoke", h.RevokeDelegatedAuthority)
 	r.Post("/v1/admin/sod-rules", h.CreateSoDRule)
 	r.Get("/v1/admin/sod-rules", h.ListSoDRules)
 	r.Post("/v1/admin/sod-rules/{sod_rule_id}/retire", h.RetireSoDRule)
@@ -787,14 +809,14 @@ func (h *Handler) setRoleActive(w http.ResponseWriter, r *http.Request, active b
 		}
 	}
 
-	expectedVersion, ok := h.readCommand(w, &r)
+	expectedVersion, ok := h.readVersionedCommand(w, &r)
 	if !ok {
 		return
 	}
 	role, err = h.store.SetRoleActive(r.Context(), roleID, tenantScope, active, expectedVersion)
 	if err != nil {
 		if errors.Is(err, domain.ErrVersionConflict) {
-			writeVersionConflict(w)
+			writeVersionConflict(w, r)
 			return
 		}
 		if errors.Is(err, domain.ErrRoleNotFound) {
@@ -820,7 +842,7 @@ func (h *Handler) setRoleActive(w http.ResponseWriter, r *http.Request, active b
 		zap.String("tenant_id", role.TenantID),
 		zap.Bool("active_flag", role.ActiveFlag))
 
-	writeJSON(w, http.StatusOK, role)
+	writeJSONWithETag(w, http.StatusOK, role, role.Version)
 }
 
 // ── POST /v1/admin/roles/{role_id}/permission-bundles ───────────────────────
@@ -908,7 +930,7 @@ func (h *Handler) CreatePermissionBundle(w http.ResponseWriter, r *http.Request)
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrVersionConflict) {
-			writeVersionConflict(w)
+			writeVersionConflict(w, r)
 			return
 		}
 		if errors.Is(err, domain.ErrRoleNotFound) {
@@ -1003,6 +1025,11 @@ func (h *Handler) ListPermissionBundles(w http.ResponseWriter, r *http.Request) 
 	if bundles == nil {
 		bundles = []domain.PermissionBundle{}
 	}
+	// API-4 cursor paging, opt-in (page_size / cursor) — see paging.go.
+	if pageRequested(r) {
+		writePage(w, r, bundles, func(x domain.PermissionBundle) string { return x.PermissionBundleID }, 500)
+		return
+	}
 	writeJSON(w, http.StatusOK, bundles)
 }
 
@@ -1095,14 +1122,14 @@ func (h *Handler) setPermissionBundleActive(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	expectedVersion, ok := h.readCommand(w, &r)
+	expectedVersion, ok := h.readVersionedCommand(w, &r)
 	if !ok {
 		return
 	}
 	bundle, err := h.store.SetPermissionBundleActive(r.Context(), bundleID, tenantScope, active, expectedVersion)
 	if err != nil {
 		if errors.Is(err, domain.ErrVersionConflict) {
-			writeVersionConflict(w)
+			writeVersionConflict(w, r)
 			return
 		}
 		if errors.Is(err, domain.ErrPermissionBundleNotFound) {
@@ -1126,7 +1153,7 @@ func (h *Handler) setPermissionBundleActive(w http.ResponseWriter, r *http.Reque
 		zap.Bool("active", bundle.ActiveFlag),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, http.StatusOK, bundle)
+	writeJSONWithETag(w, http.StatusOK, bundle, bundle.Version)
 }
 
 // ── POST /v1/admin/role-assignments ──────────────────────────────────────────
@@ -1322,7 +1349,7 @@ func (h *Handler) CreateRoleAssignment(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusAccepted, assignment)
 		return
 	}
-	writeJSON(w, http.StatusCreated, assignment)
+	writeJSONWithETag(w, http.StatusCreated, assignment, assignment.Version)
 }
 
 // assignmentSoDConflicts returns the static SoD conflicts assigning roleID to
@@ -1389,11 +1416,13 @@ func (h *Handler) assignmentSoDConflicts(w http.ResponseWriter, r *http.Request,
 	return conflicts, true
 }
 
-func writeVersionConflict(w http.ResponseWriter) {
-	writeJSON(w, http.StatusConflict, map[string]string{
-		"error":   "version_conflict",
-		"message": "the object has changed since expected_version; re-read it and retry",
-	})
+// writeVersionConflict answers a mutation whose expected version (If-Match or
+// expected_version) is no longer current: 412 stale_version (API-3). The
+// stores check the version in the UPDATE itself, so the race between a read
+// and the write cannot slip a stale change through.
+func writeVersionConflict(w http.ResponseWriter, r *http.Request) {
+	apicontract.WriteProblem(w, r, apicontract.ProblemFor(http.StatusPreconditionFailed, "stale_version",
+		"the object has changed since the version you sent; re-read it and retry"))
 }
 
 // roleAssignmentFinder is the store capability behind the platform-scope check
@@ -1464,24 +1493,22 @@ func (h *Handler) RevokeRoleAssignment(w http.ResponseWriter, r *http.Request) {
 	if !h.applyReason(w, &r, body.reason()) {
 		return
 	}
+	if body.ExpectedVersion < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_expected_version", "message": "expected_version must be positive"})
+		return
+	}
+	expected, ok := expectedVersion(w, r, body.ExpectedVersion)
+	if !ok {
+		return
+	}
 
 	// Ending a platform-scope assignment withdraws platform authority, so it
 	// is a platform act too — otherwise any tenant administrator could strip
-	// the platform's own rule authors.
-	if h.platformScopeEntityID != "" {
-		finder, ok := h.store.(roleAssignmentFinder)
+	// the platform's own rule authors. The same read checks a version the
+	// caller sent.
+	if h.platformScopeEntityID != "" || expected > 0 {
+		existing, ok := h.assignmentForMutation(w, r, assignmentID, tenantScope, expected)
 		if !ok {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-			return
-		}
-		existing, err := finder.FindRoleAssignmentByID(r.Context(), assignmentID, tenantScope)
-		if err != nil {
-			if errors.Is(err, domain.ErrRoleAssignmentNotFound) {
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_assignment_not_found"})
-				return
-			}
-			h.log.Error("RevokeRoleAssignment: assignment lookup failed", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 			return
 		}
 		if existing.LegalEntityID != nil && h.isPlatformScopeEntity(*existing.LegalEntityID) &&
@@ -1513,7 +1540,7 @@ func (h *Handler) RevokeRoleAssignment(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 			return
 		}
-		writeJSON(w, http.StatusOK, assignment)
+		writeJSONWithETag(w, http.StatusOK, assignment, assignment.Version)
 		return
 	}
 
@@ -1531,7 +1558,7 @@ func (h *Handler) RevokeRoleAssignment(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
-	writeJSON(w, http.StatusOK, assignment)
+	writeJSONWithETag(w, http.StatusOK, assignment, assignment.Version)
 }
 
 // ── POST /v1/admin/delegated-authorities ─────────────────────────────────────
@@ -2045,7 +2072,7 @@ func (h *Handler) setSoDRuleActive(w http.ResponseWriter, r *http.Request, activ
 		return
 	}
 
-	expectedVersion, ok := h.readCommand(w, &r)
+	expectedVersion, ok := h.readVersionedCommand(w, &r)
 	if !ok {
 		return
 	}
@@ -2087,7 +2114,7 @@ func (h *Handler) setSoDRuleActive(w http.ResponseWriter, r *http.Request, activ
 	if requested {
 		status = http.StatusAccepted
 	}
-	writeJSON(w, status, rule)
+	writeJSONWithETag(w, status, rule, rule.Version)
 }
 
 // ── /v1/admin/abac-rules ─────────────────────────────────────────────────────
@@ -2295,6 +2322,11 @@ func (h *Handler) ListABACRules(w http.ResponseWriter, r *http.Request) {
 	if rules == nil {
 		rules = []domain.ABACRule{}
 	}
+	// API-4 cursor paging, opt-in (page_size / cursor) — see paging.go.
+	if pageRequested(r) {
+		writePage(w, r, rules, func(x domain.ABACRule) string { return x.ABACRuleID }, 500)
+		return
+	}
 	writeJSON(w, http.StatusOK, rules)
 }
 
@@ -2341,7 +2373,7 @@ func (h *Handler) setABACRuleActive(w http.ResponseWriter, r *http.Request, acti
 	// PLATFORM-WIDE rule answers 404 here rather than being retired from one
 	// tenant's console. That is deliberate and is the point: a rule binding
 	// every tenant must not be disableable by any one of them.
-	expectedVersion, ok := h.readCommand(w, &r)
+	expectedVersion, ok := h.readVersionedCommand(w, &r)
 	if !ok {
 		return
 	}
@@ -2376,7 +2408,7 @@ func (h *Handler) setABACRuleActive(w http.ResponseWriter, r *http.Request, acti
 	if requested {
 		status = http.StatusAccepted
 	}
-	writeJSON(w, status, rule)
+	writeJSONWithETag(w, status, rule, rule.Version)
 }
 
 // supportedOperators renders domain.ABACOperators for a 400 body, sorted so
@@ -2975,7 +3007,8 @@ type grantingAssignmentFinder interface {
 // decision leaves /v1/authorize and the canonical API through here, so "no
 // material action executes without an authorization decision artifact" holds
 // on both. Writes a 503 and returns false if the artifact cannot be written.
-func (h *Handler) recordDecision(w http.ResponseWriter, r *http.Request, in evalContext, evaluationEntityID string, res *evalResult) (*domain.AccessDecisionLog, bool) {
+func (h *Handler) recordDecision(w http.ResponseWriter, r *http.Request, in evalContext, evaluationEntityID string, res *evalResult) (decision *domain.AccessDecisionLog, recorded bool) {
+	defer func() { h.observeRecorded(in, res, recorded) }()
 	expires := time.Now().UTC().Add(decisionTTL)
 	params := domain.RecordAccessDecisionParams{
 		PrincipalID: in.PrincipalID,
@@ -3153,10 +3186,44 @@ func (h *Handler) ListRoleAssignments(w http.ResponseWriter, r *http.Request) {
 	roleFilter := strings.TrimSpace(r.URL.Query().Get("role_id"))
 	activeOnly := r.URL.Query().Get("include_expired") != "true"
 
+	// as_of: what granted at that instant, from the history (ORG-06
+	// GetAssignmentsAsOf) rather than the current rows.
+	if asOf := strings.TrimSpace(r.URL.Query().Get("as_of")); asOf != "" {
+		h.listRoleAssignmentsAsOf(w, r, tenantScope, principalFilter, roleFilter, asOf)
+		return
+	}
+
+	qs := r.URL.Query()
+	// API-4 cursor paging (page_size / cursor): keyset on the assignment id in
+	// SQL, so a traversal of a large register neither repeats nor skips rows
+	// when assignments are added or removed between pages.
+	if pageRequested(r) {
+		p, ok := parsePage(w, r)
+		if !ok {
+			return
+		}
+		pager, ok := h.store.(assignmentPager)
+		if !ok {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		page, err := pager.QueryRoleAssignments(r.Context(), domain.AssignmentQuery{
+			TenantID: tenantScope, PrincipalID: principalFilter, RoleID: roleFilter, ActiveOnly: activeOnly,
+			IncludeUsage: qs.Get("include_usage") == "true", Limit: p.size + 1, Keyset: true, AfterID: p.after,
+		})
+		if err != nil {
+			h.log.Error("ListRoleAssignments: store unavailable",
+				zap.String("correlation_id", correlationID), zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		writePageOf(w, p, page, func(a domain.PrincipalRoleAssignment) string { return a.PrincipalRoleAssignmentID }, false)
+		return
+	}
+
 	// Paged / usage form: limit, offset, include_usage=true. The plain form
 	// stops at 500 rows without saying so; a caller that must see every
 	// assignment (an access review) pages with offset until a short page.
-	qs := r.URL.Query()
 	if qs.Has("limit") || qs.Has("offset") || qs.Get("include_usage") == "true" {
 		limit, lErr := atoiOrZero(qs.Get("limit"))
 		offset, oErr := atoiOrZero(qs.Get("offset"))
@@ -3243,6 +3310,11 @@ func (h *Handler) ListSoDRules(w http.ResponseWriter, r *http.Request) {
 	if rules == nil {
 		rules = []domain.SoDRule{}
 	}
+	// API-4 cursor paging, opt-in (page_size / cursor) — see paging.go.
+	if pageRequested(r) {
+		writePage(w, r, rules, func(x domain.SoDRule) string { return x.SoDRuleID }, 500)
+		return
+	}
 	writeJSON(w, http.StatusOK, rules)
 }
 
@@ -3298,6 +3370,11 @@ func (h *Handler) ListRoles(w http.ResponseWriter, r *http.Request) {
 	}
 	if roles == nil {
 		roles = []domain.Role{}
+	}
+	// API-4 cursor paging, opt-in (page_size / cursor) — see paging.go.
+	if pageRequested(r) {
+		writePage(w, r, roles, func(x domain.Role) string { return x.RoleID }, 500)
+		return
 	}
 	writeJSON(w, http.StatusOK, roles)
 }
@@ -3358,6 +3435,11 @@ func (h *Handler) ListDelegatedAuthorities(w http.ResponseWriter, r *http.Reques
 	}
 	if delegations == nil {
 		delegations = []domain.DelegatedAuthority{}
+	}
+	// API-4 cursor paging, opt-in (page_size / cursor) — see paging.go.
+	if pageRequested(r) {
+		writePage(w, r, delegations, func(x domain.DelegatedAuthority) string { return x.DelegatedAuthorityID }, 500)
+		return
 	}
 	writeJSON(w, http.StatusOK, delegations)
 }
@@ -3614,6 +3696,11 @@ func (h *Handler) ListPrivilegedSessions(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// API-4 cursor paging, opt-in (page_size / cursor) — see paging.go.
+	if pageRequested(r) {
+		writePage(w, r, sessions, func(x domain.PrivilegedSession) string { return x.SessionID }, 0)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
 }
 
@@ -3642,7 +3729,24 @@ func (h *Handler) RevokePrivilegedSession(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	ps, err := h.store.RevokePrivilegedSession(r.Context(), sessionID, tenantScope, callerPrincipalID)
+	// Fetch current session to get its version for If-Match validation
+	ps, err := h.store.FindPrivilegedSessionByID(r.Context(), sessionID, tenantScope)
+	if err != nil {
+		if errors.Is(err, domain.ErrPrivilegedSessionNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "privileged_session_not_found", "session_id": sessionID})
+		} else {
+			h.log.Error("RevokePrivilegedSession: store failed", zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		}
+		return
+	}
+
+	// Validate If-Match against current version
+	if !h.requireIfMatch(w, r, ps.RecordVersion) {
+		return
+	}
+
+	ps, err = h.store.RevokePrivilegedSession(r.Context(), sessionID, tenantScope, callerPrincipalID)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrPrivilegedSessionNotFound):
@@ -3656,7 +3760,7 @@ func (h *Handler) RevokePrivilegedSession(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	writeJSON(w, http.StatusOK, ps)
+	writeJSONWithETag(w, http.StatusOK, ps, ps.RecordVersion)
 }
 
 // ── Break-Glass Emergency Session Handlers (ZS-IAM-001 §14 & §21) ───────────
@@ -3820,7 +3924,7 @@ func (h *Handler) GetBreakGlassSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, bg)
+	writeJSONWithETag(w, http.StatusOK, bg, bg.RecordVersion)
 }
 
 func (h *Handler) ListBreakGlassSessions(w http.ResponseWriter, r *http.Request) {
@@ -3847,6 +3951,11 @@ func (h *Handler) ListBreakGlassSessions(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// API-4 cursor paging, opt-in (page_size / cursor) — see paging.go.
+	if pageRequested(r) {
+		writePage(w, r, sessions, func(x domain.BreakGlassSession) string { return x.SessionID }, 0)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
 }
 
@@ -3875,7 +3984,24 @@ func (h *Handler) RevokeBreakGlassSession(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	bg, err := h.store.RevokeBreakGlassSession(r.Context(), sessionID, tenantScope, callerPrincipalID)
+	// Fetch current session to get its version for If-Match validation
+	bg, err := h.store.FindBreakGlassSessionByID(r.Context(), sessionID, tenantScope)
+	if err != nil {
+		if errors.Is(err, domain.ErrBreakGlassSessionNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "break_glass_session_not_found", "session_id": sessionID})
+		} else {
+			h.log.Error("RevokeBreakGlassSession: store failed", zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		}
+		return
+	}
+
+	// Validate If-Match against current version
+	if !h.requireIfMatch(w, r, bg.RecordVersion) {
+		return
+	}
+
+	bg, err = h.store.RevokeBreakGlassSession(r.Context(), sessionID, tenantScope, callerPrincipalID)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrBreakGlassSessionNotFound):
@@ -3894,7 +4020,7 @@ func (h *Handler) RevokeBreakGlassSession(w http.ResponseWriter, r *http.Request
 	// straight to Kafka and discarded the error, so every revoke published the
 	// event twice — the second copy without a tenant (second-pass scan,
 	// 13 Oct 2026). The started event had already moved to the trigger alone.
-	writeJSON(w, http.StatusOK, bg)
+	writeJSONWithETag(w, http.StatusOK, bg, bg.RecordVersion)
 }
 
 // ── Tenant Support Session Handlers (ZS-IAM-001 §15 & §21) ──────────────────
@@ -4043,7 +4169,7 @@ func (h *Handler) GetSupportSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, ss)
+	writeJSONWithETag(w, http.StatusOK, ss, ss.RecordVersion)
 }
 
 func (h *Handler) ListSupportSessions(w http.ResponseWriter, r *http.Request) {
@@ -4070,6 +4196,11 @@ func (h *Handler) ListSupportSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// API-4 cursor paging, opt-in (page_size / cursor) — see paging.go.
+	if pageRequested(r) {
+		writePage(w, r, sessions, func(x domain.SupportSession) string { return x.SessionID }, 0)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
 }
 
@@ -4098,7 +4229,24 @@ func (h *Handler) RevokeSupportSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ss, err := h.store.RevokeSupportSession(r.Context(), sessionID, tenantScope, callerPrincipalID)
+	// Fetch current session to get its version for If-Match validation
+	ss, err := h.store.FindSupportSessionByID(r.Context(), sessionID, tenantScope)
+	if err != nil {
+		if errors.Is(err, domain.ErrSupportSessionNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "support_session_not_found", "session_id": sessionID})
+		} else {
+			h.log.Error("RevokeSupportSession: store failed", zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		}
+		return
+	}
+
+	// Validate If-Match against current version
+	if !h.requireIfMatch(w, r, ss.RecordVersion) {
+		return
+	}
+
+	ss, err = h.store.RevokeSupportSession(r.Context(), sessionID, tenantScope, callerPrincipalID)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrSupportSessionNotFound):
@@ -4112,7 +4260,7 @@ func (h *Handler) RevokeSupportSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, ss)
+	writeJSONWithETag(w, http.StatusOK, ss, ss.RecordVersion)
 }
 
 // writeError writes a RFC 9457 problem details response using the shared apicontract package.
@@ -4129,4 +4277,15 @@ func writeError(w http.ResponseWriter, r *http.Request, status int, legacy, deta
 		Retryable: status >= 500,
 		Extra:     extra,
 	})
+}
+
+// writeJSONWithETag writes a JSON response with an ETag header.
+func writeJSONWithETag(w http.ResponseWriter, status int, body any, version int64) {
+	apicontract.WriteETag(w, version)
+	writeJSON(w, status, body)
+}
+
+// requireIfMatch checks the If-Match header and returns false if the request should be rejected.
+func (h *Handler) requireIfMatch(w http.ResponseWriter, r *http.Request, currentVersion int64) bool {
+	return apicontract.CheckIfMatch(w, r, currentVersion)
 }

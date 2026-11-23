@@ -208,7 +208,7 @@ func (s *stubStore) CreateJurisdictionWithQuerier(_ context.Context, _ store.Que
 }
 
 // DeactivateJurisdictionWithQuerier implements handler.JurisdictionStore.
-func (s *stubStore) DeactivateJurisdictionWithQuerier(_ context.Context, _ store.Querier, _, actorID string) (*domain.Jurisdiction, bool, error) {
+func (s *stubStore) DeactivateJurisdictionWithQuerier(_ context.Context, _ store.Querier, _, actorID string, _ *int64) (*domain.Jurisdiction, bool, error) {
 	return s.DeactivateJurisdiction(context.Background(), "", actorID)
 }
 
@@ -777,6 +777,35 @@ func TestFindRules_SupersededRuleReturnedForHistoricalQuery(t *testing.T) {
 	}
 	if !(*got.EffectiveTo).Equal(end1) {
 		t.Errorf("expected effective_to %v, got %v", end1, *got.EffectiveTo)
+	}
+}
+
+// TestGetRules_ScopeAllIsTheRegisterView: scope=all (and its paged form
+// filter[scope]=all) asks the store for every rule recorded here, DRAFT
+// included; any other scope is refused before the store is asked.
+func TestGetRules_ScopeAllIsTheRegisterView(t *testing.T) {
+	for _, q := range []string{"scope=all", "filter%5Bscope%5D=all&page_size=10"} {
+		st := &stubStore{}
+		rr := executeRequest(newTestRouter(st), httptest.NewRequest(http.MethodGet, "/v1/jurisdictions/j-1/rules?"+q, nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("%s: expected 200, got %d — %s", q, rr.Code, rr.Body.String())
+		}
+		if !st.rulesParams.AllVersions {
+			t.Errorf("%s: the store was not asked for all versions", q)
+		}
+	}
+	st := &stubStore{}
+	rr := executeRequest(newTestRouter(st), httptest.NewRequest(http.MethodGet, "/v1/jurisdictions/j-1/rules", nil))
+	if rr.Code != http.StatusOK || st.rulesParams.AllVersions {
+		t.Errorf("without scope: expected the point-in-time view, got code %d AllVersions=%v", rr.Code, st.rulesParams.AllVersions)
+	}
+	st = &stubStore{}
+	rr = executeRequest(newTestRouter(st), httptest.NewRequest(http.MethodGet, "/v1/jurisdictions/j-1/rules?scope=drafts", nil))
+	if rr.Code != http.StatusBadRequest || decodeError(t, rr)["code"] != "invalid_scope" {
+		t.Errorf("scope=drafts: expected 400 invalid_scope, got %d", rr.Code)
+	}
+	if st.storeCalled {
+		t.Error("store was queried despite an invalid scope")
 	}
 }
 

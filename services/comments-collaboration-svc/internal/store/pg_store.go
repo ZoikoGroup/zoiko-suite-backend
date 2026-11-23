@@ -43,10 +43,25 @@ type Store interface {
 
 type PgStore struct {
 	pool *pgxpool.Pool
+
+	// eventRegion is the residency region stamped on shared-outbox events (BIZ-09).
+	eventRegion string
 }
 
-func NewPgStore(pool *pgxpool.Pool) *PgStore {
-	return &PgStore{pool: pool}
+// Option configures a PgStore.
+type Option func(*PgStore)
+
+// WithEventRegion sets the residency region carried by every shared-outbox event.
+func WithEventRegion(region string) Option {
+	return func(s *PgStore) { s.eventRegion = region }
+}
+
+func NewPgStore(pool *pgxpool.Pool, opts ...Option) *PgStore {
+	s := &PgStore{pool: pool}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 func (s *PgStore) setRLS(ctx context.Context, tx pgx.Tx) error {
@@ -221,6 +236,13 @@ func (s *PgStore) AddComment(ctx context.Context, p domain.AddCommentParams) (*d
 	}
 	comment.CurrentBody = p.Body
 
+	if err := s.enqueueCommentEvent(ctx, tx, commentAddedEvent, p.CorrelationID, p.CreatedByPrincipalID, p.TenantID, thread.LegalEntityID, thread.Classification, comment.CommentID, map[string]any{
+		"comment_id": comment.CommentID, "thread_id": thread.ThreadID, "tenant_id": p.TenantID, "legal_entity_id": thread.LegalEntityID,
+		"linked_object_type": thread.LinkedObjectType, "linked_object_id": thread.LinkedObjectID, "classification": thread.Classification,
+	}); err != nil {
+		return nil, nil, err
+	}
+
 	if err := idemRecord(ctx, tx, p.TenantID, p.Idem, addCommentResult{Comment: comment, Thread: thread}); err != nil {
 		return nil, nil, err
 	}
@@ -281,6 +303,16 @@ func (s *PgStore) EditComment(ctx context.Context, p domain.EditCommentParams) (
 		return nil, err
 	}
 	comment.CurrentBody = p.Body
+	entity, class, err := threadScope(ctx, tx, p.TenantID, comment.ThreadID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.enqueueCommentEvent(ctx, tx, commentEditedEvent, p.CorrelationID, p.ActorPrincipalID, p.TenantID, entity, class, comment.CommentID, map[string]any{
+		"comment_id": comment.CommentID, "thread_id": comment.ThreadID, "tenant_id": p.TenantID, "legal_entity_id": entity,
+		"current_version_id": comment.CurrentVersionID,
+	}); err != nil {
+		return nil, err
+	}
 	if err := idemRecord(ctx, tx, p.TenantID, p.Idem, comment); err != nil {
 		return nil, err
 	}
@@ -349,7 +381,8 @@ func (s *PgStore) ListComments(ctx context.Context, tenantID, threadID string) (
 	rows, err := tx.Query(ctx, `
 		SELECT c.comment_id, c.thread_id, c.tenant_id, c.parent_comment_id, c.current_version_id, c.status,
 			c.created_by, c.created_at, c.updated_at, c.moderated_at, c.moderated_by_principal_id, c.moderation_reason,
-			c.deleted_at, c.deleted_by_principal_id, c.deletion_reason, c.classification, v.body
+			c.deleted_at, c.deleted_by_principal_id, c.deletion_reason, c.classification,
+			CASE WHEN c.status = 'DELETED_REDACTED' THEN '' ELSE v.body END
 		FROM comments c
 		JOIN comment_versions v ON v.version_id = c.current_version_id AND v.tenant_id = c.tenant_id
 		WHERE c.tenant_id=$1 AND c.thread_id=$2
@@ -487,6 +520,20 @@ func (s *PgStore) Mention(ctx context.Context, p domain.MentionParams) (*domain.
 	if err != nil {
 		return nil, fmt.Errorf("insert mention: %w", err)
 	}
+	var threadID string
+	if err := tx.QueryRow(ctx, `SELECT thread_id FROM comments WHERE comment_id=$1 AND tenant_id=$2`, p.CommentID, p.TenantID).Scan(&threadID); err != nil {
+		return nil, err
+	}
+	entity, class, err := threadScope(ctx, tx, p.TenantID, threadID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.enqueueCommentEvent(ctx, tx, mentionCreatedEvent, p.CorrelationID, p.ActorPrincipalID, p.TenantID, entity, class, m.CommentID, map[string]any{
+		"mention_id": m.MentionID, "comment_id": m.CommentID, "thread_id": threadID, "tenant_id": p.TenantID, "legal_entity_id": entity,
+		"mentioned_principal_id": m.MentionedPrincipalID,
+	}); err != nil {
+		return nil, err
+	}
 	if err := idemRecord(ctx, tx, p.TenantID, p.Idem, m); err != nil {
 		return nil, err
 	}
@@ -587,6 +634,16 @@ func (s *PgStore) Moderate(ctx context.Context, p domain.ModerateParams) (*domai
 	`, "modtrail-"+uuid.New().String(), p.CommentID, p.TenantID, p.ModeratorPrincipalID, p.Action, p.Reason); err != nil {
 		return nil, fmt.Errorf("insert moderation_trail: %w", err)
 	}
+	entity, class, err := threadScope(ctx, tx, p.TenantID, comment.ThreadID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.enqueueCommentEvent(ctx, tx, commentModeratedEvent, p.CorrelationID, p.ModeratorPrincipalID, p.TenantID, entity, class, comment.CommentID, map[string]any{
+		"comment_id": comment.CommentID, "thread_id": comment.ThreadID, "tenant_id": p.TenantID, "legal_entity_id": entity,
+		"moderation_reason": comment.ModerationReason,
+	}); err != nil {
+		return nil, err
+	}
 	if err := idemRecord(ctx, tx, p.TenantID, p.Idem, comment); err != nil {
 		return nil, err
 	}
@@ -627,6 +684,11 @@ func (s *PgStore) ResolveThread(ctx context.Context, p domain.ResolveThreadParam
 		WHERE thread_id=$1 AND tenant_id=$2 RETURNING `+threadColumns,
 		p.ThreadID, p.TenantID, p.ActorPrincipalID, p.ResolutionNote))
 	if err != nil {
+		return nil, err
+	}
+	if err := s.enqueueCommentEvent(ctx, tx, threadResolvedEvent, p.CorrelationID, p.ActorPrincipalID, p.TenantID, thread.LegalEntityID, thread.Classification, thread.ThreadID, map[string]any{
+		"thread_id": thread.ThreadID, "tenant_id": p.TenantID, "legal_entity_id": thread.LegalEntityID, "resolution_note": thread.ResolutionNote,
+	}); err != nil {
 		return nil, err
 	}
 	if err := idemRecord(ctx, tx, p.TenantID, p.Idem, thread); err != nil {

@@ -1,0 +1,12 @@
+# The isolated assistant stack's own Grafana (Doc 08 §15). Its only data
+# source is the public-ai Prometheus on the public-ai network (INV-01).
+apiVersion: 1
+
+datasources:
+  - name: Public AI Prometheus
+    uid: public-ai-prometheus
+    type: prometheus
+    access: proxy
+    url: http://public-ai-prometheus:9090
+    isDefault: true
+    editable: false

@@ -7,13 +7,13 @@ import (
 	"runtime"
 	"sort"
 	"testing"
-	"zoiko.io/exception-escalation-svc/internal/middleware"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
 	"zoiko.io/exception-escalation-svc/internal/domain"
+	"zoiko.io/exception-escalation-svc/internal/middleware"
 	"zoiko.io/exception-escalation-svc/internal/store"
 )
 
@@ -29,8 +29,11 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 	pool, err := pgxpool.New(context.Background(), dsn)
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
+	verifyEventContracts(t, pool)
 
 	_, err = pool.Exec(context.Background(), `
+		DROP TABLE IF EXISTS eventing_outbox;
+		DROP TABLE IF EXISTS deadline_due_history;
 		DROP TABLE IF EXISTS deadline_escalations;
 		DROP TABLE IF EXISTS deadlines;
 		DROP TABLE IF EXISTS task_transitions;
@@ -68,9 +71,8 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 // resolves an unset context to "default", which every call in a given
 // test agrees on, so this is a real single-tenant scope, not an unscoped
 // call.
-// ctx carries the "default" tenant the fixtures are written under. It used to
-// be a bare Background context and lean on GetTenantID's old "default"
-// fallback, which was removed (a missing tenant must never alias a real one).
+// ctx carries the tenant the fixtures are created under. The store reads the tenant from the
+// context (tenant isolation), so a tenant-less context cannot see its own rows.
 func ctx() context.Context { return middleware.WithTenant(context.Background(), "default") }
 
 // newExceptionCaseForFindingTest inserts the exception_cases fixture row
@@ -104,7 +106,7 @@ func newExceptionCaseForFindingTest(t *testing.T, pool *pgxpool.Pool) *domain.Ex
 // required -> block closure."
 func TestPgStore_CloseFinding_RequiresRemediationEvidence(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	c := newExceptionCaseForFindingTest(t, pool)
 	finding, err := s.CreateFinding(ctx(), domain.CreateFindingParams{
@@ -130,7 +132,7 @@ func TestPgStore_CloseFinding_RequiresRemediationEvidence(t *testing.T) {
 // is refused by the trigger.
 func TestPgStore_AuditFinding_OriginalContentImmutable(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	c := newExceptionCaseForFindingTest(t, pool)
 	finding, err := s.CreateFinding(ctx(), domain.CreateFindingParams{
@@ -156,7 +158,7 @@ func TestPgStore_AuditFinding_OriginalContentImmutable(t *testing.T) {
 // regardless of the parent finding's own status.
 func TestPgStore_ScopeLimitation_SurvivesFindingClosure(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.NewPgStore(pool)
+	s := store.NewPgStore(pool, store.WithEventRegion("local"))
 
 	c := newExceptionCaseForFindingTest(t, pool)
 	finding, err := s.CreateFinding(ctx(), domain.CreateFindingParams{

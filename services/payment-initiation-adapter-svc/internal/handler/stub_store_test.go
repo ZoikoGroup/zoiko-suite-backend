@@ -2,6 +2,7 @@ package handler_test
 
 import (
 	"context"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -85,6 +86,61 @@ func (s *stubStore) FindByIdempotencyKey(ctx context.Context, idempotencyKey str
 		return nil, domain.ErrAttemptNotFound
 	}
 	return s.attempts[id], nil
+}
+
+// ListPaymentAttempts replicates PgStore's tenant+legal-entity scope,
+// optional status filter and (created_at, attempt_id) DESC keyset cursor.
+func (s *stubStore) ListPaymentAttempts(ctx context.Context, f domain.ListPaymentAttemptsFilter) ([]domain.PaymentAttemptSummary, error) {
+	tenantID := middleware.TenantFromContext(ctx)
+	var matched []*domain.PaymentInitiationAttempt
+	for _, a := range s.attempts {
+		if a.LegalEntityID != f.LegalEntityID {
+			continue
+		}
+		if a.TenantID == nil || *a.TenantID != tenantID {
+			continue
+		}
+		if f.Status != "" && string(a.Status) != f.Status {
+			continue
+		}
+		matched = append(matched, a)
+	}
+	sort.Slice(matched, func(i, j int) bool {
+		if !matched[i].CreatedAt.Equal(matched[j].CreatedAt) {
+			return matched[i].CreatedAt.After(matched[j].CreatedAt)
+		}
+		return matched[i].AttemptID > matched[j].AttemptID
+	})
+	if f.AfterID != "" {
+		cursor, ok := s.attempts[f.AfterID]
+		if ok {
+			var rest []*domain.PaymentInitiationAttempt
+			for _, a := range matched {
+				if a.CreatedAt.Before(cursor.CreatedAt) ||
+					(a.CreatedAt.Equal(cursor.CreatedAt) && a.AttemptID < cursor.AttemptID) {
+					rest = append(rest, a)
+				}
+			}
+			matched = rest
+		}
+	}
+	limit := f.Limit
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	if len(matched) > limit {
+		matched = matched[:limit]
+	}
+	out := make([]domain.PaymentAttemptSummary, 0, len(matched))
+	for _, a := range matched {
+		out = append(out, domain.PaymentAttemptSummary{
+			AttemptID: a.AttemptID, LegalEntityID: a.LegalEntityID, SourceReference: a.SourceReference,
+			Amount: a.Amount, Currency: a.Currency, Status: a.Status, ExecutionDate: a.ExecutionDate,
+			CreatedByPrincipalID: a.CreatedByPrincipalID, SubmittedAt: a.SubmittedAt, ResolvedAt: a.ResolvedAt,
+			CreatedAt: a.CreatedAt, UpdatedAt: a.UpdatedAt,
+		})
+	}
+	return out, nil
 }
 
 func (s *stubStore) MarkSubmitted(_ context.Context, attemptID, providerRequestID, responseRef, principalID, _ string) (*domain.PaymentInitiationAttempt, error) {

@@ -31,6 +31,15 @@ type Config struct {
 	// on EntityJurisdictionAssignment creation (Q2 resolution).
 	JurisdictionRulesURL string
 
+	// CurrencyRegistryURL is currency-registry-svc, which owns currency identity. Exchange-rate commands check currency
+	// codes against it, read-only and fail-closed. Unset, development and test use a shape-only stub and every other
+	// environment refuses exchange-rate ingestion rather than accept an unconfirmed currency.
+	CurrencyRegistryURL string
+
+	// FiscalCalendarURL is fiscal-calendar-svc (REF-04). A legal entity's fiscal_calendar_id is checked there, read-only and
+	// fail-closed. Unset in development and test the check is format-only; staging and production refuse to start without it.
+	FiscalCalendarURL string
+
 	// AuthZServiceURL is the base URL of the Authorization Service.
 	// Every mutating API call must be authorized before proceeding.
 	AuthZServiceURL string
@@ -210,6 +219,8 @@ func Load() (*Config, error) {
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.entity.events"),
 		},
 		JurisdictionRulesURL: env("JURISDICTION_RULES_URL", "http://jurisdiction-rules-svc"),
+		CurrencyRegistryURL:  env("CURRENCY_REGISTRY_URL", ""),
+		FiscalCalendarURL:    env("FISCAL_CALENDAR_URL", ""),
 		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
 		AuthZPlatformScopeID: env("AUTHZ_PLATFORM_SCOPE_ID", ""),
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
@@ -288,6 +299,9 @@ func (c *Config) validate() error {
 	// environment, so a production deployment validated nothing.
 	if !c.JurisdictionValidatorIsReal() {
 		return fmt.Errorf("JURISDICTION_RULES_URL must point at the Jurisdiction Rules Service in %s environment (the stub accepts every jurisdiction)", c.Env)
+	}
+	if c.FiscalCalendarURL == "" {
+		return fmt.Errorf("FISCAL_CALENDAR_URL must be set in %s environment (a legal entity fiscal calendar is checked against fiscal-calendar-svc)", c.Env)
 	}
 	if c.CommercialAccountURL == "" {
 		return fmt.Errorf("COMMERCIAL_ACCOUNT_URL must be set in %s environment (plan entitlement is a §4.2 server-resolved check)", c.Env)

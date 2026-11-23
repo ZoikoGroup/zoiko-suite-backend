@@ -1,0 +1,24 @@
+{
+  "$id": "https://schemas.zoikosuite.com/public-ai/Capabilities.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "authenticated": {
+      "type": "boolean"
+    },
+    "chat_enabled": {
+      "description": "false while the kill switch is on: the widget shows the official routes instead of a composer (Doc 08 §10).",
+      "type": "boolean"
+    },
+    "file_upload": {
+      "type": "boolean"
+    },
+    "lead_capture": {
+      "type": "boolean"
+    },
+    "streaming": {
+      "type": "boolean"
+    }
+  },
+  "type": "object"
+}

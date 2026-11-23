@@ -45,7 +45,7 @@ type WorkflowStore interface {
 	VerifyRelease(ctx context.Context, params domain.VerifyReleaseParams) (*domain.ReleaseVerificationResult, error)
 	EscalateToWorkflow(ctx context.Context, params domain.EscalateToWorkflowParams) (*domain.WorkflowInstance, bool, error)
 	RequestChanges(ctx context.Context, workflowInstanceID, actorPrincipalID, rationale string, causationID *string, cmd ...domain.LifecycleCommand) error
-	ListPendingApprovals(ctx context.Context, tenantID string, limit, offset int) ([]*domain.WorkflowInstance, error)
+	ListPendingApprovals(ctx context.Context, tenantID string, params domain.ListPendingApprovalsParams) ([]*domain.WorkflowInstance, *domain.PaginationCursor, error)
 	GetApprovalEvidence(ctx context.Context, workflowInstanceID string) ([]*domain.WorkflowTransition, error)
 
 	// Workflow definitions (WFC-02) — see internal/store/pg_store.go.
@@ -123,7 +123,7 @@ type WorkflowStore interface {
 	RouteToDomain(ctx context.Context, params domain.RouteToDomainParams) (*domain.FormSubmissionRoute, error)
 	GetSubmissionVersion(ctx context.Context, tenantID, submissionID string) (*domain.FormSubmissionVersionInfo, error)
 	GetValidationResult(ctx context.Context, tenantID, submissionID string) (*domain.ValidationResult, error)
-	ListPendingSubmissions(ctx context.Context, tenantID, formID string, limit, offset int) ([]*domain.FormSubmission, error)
+	ListPendingSubmissions(ctx context.Context, tenantID, formID string, params domain.ListPendingSubmissionsParams) ([]*domain.FormSubmission, *domain.PaginationCursor, error)
 }
 
 // EventPublisher is the narrow interface the handler depends on. actorID on
@@ -142,9 +142,8 @@ type EventPublisher interface {
 	PublishWorkflowInvalidated(ctx context.Context, w domain.WorkflowInstance, actorID string) error
 	PublishAuditEngagementEvent(ctx context.Context, eventType string, engagement domain.AuditEngagement, actorID, correlationID string) error
 
-	// BIZ-04 Form — see internal/events/publisher.go's own doc comments.
-	PublishFormPublished(ctx context.Context, f domain.FormDefinition, actorID, correlationID string) error
-	PublishFormEvent(ctx context.Context, eventType string, s domain.FormSubmission, actorID, correlationID string) error
+	// The BIZ-04 form events are not published here: the store writes them to the outbox in
+	// the same transaction as the change.
 }
 
 // DocumentVaultClient verifies evidence references without making workflow-svc
@@ -870,7 +869,7 @@ func (h *Handler) GetWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, r, h.log, err, correlationID, "GetWorkflow")
 		return
 	}
-	writeJSON(w, r, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: stages})
+	writeJSONWithETag(w, r, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: stages}, instance.RowVersion)
 }
 
 // ── GET /v1/workflows/{id}/next-approver ─────────────────────────────────────
@@ -986,6 +985,11 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 	instanceForAuthzCheck, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
 	if err != nil {
 		writeStoreErr(w, r, h.log, err, correlationID, "SubmitAction")
+		return
+	}
+
+	// API-3: optimistic concurrency via If-Match header
+	if !requireIfMatch(w, r, instanceForAuthzCheck.RowVersion) {
 		return
 	}
 
@@ -1111,7 +1115,7 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 		zap.String("workflow_status", instance.WorkflowStatus),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, r, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: []*domain.WorkflowStage{stage}, DecisionID: decisionIDFor(meta, transitioned)})
+	writeJSONWithETag(w, r, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: []*domain.WorkflowStage{stage}, DecisionID: decisionIDFor(meta, transitioned)}, instance.RowVersion)
 }
 
 // ── POST /v1/workflows/{id}/quorum-votes ─────────────────────────────────────
@@ -1155,6 +1159,11 @@ func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
 	instanceForAuthzCheck, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
 	if err != nil {
 		writeStoreErr(w, r, h.log, err, correlationID, "SubmitQuorumVote")
+		return
+	}
+
+	// API-3: optimistic concurrency via If-Match header
+	if !requireIfMatch(w, r, instanceForAuthzCheck.RowVersion) {
 		return
 	}
 
@@ -1223,7 +1232,7 @@ func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
 		zap.String("workflow_status", instance.WorkflowStatus),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, r, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: []*domain.WorkflowStage{stage}, DecisionID: decisionIDFor(meta, transitioned)})
+	writeJSONWithETag(w, r, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: []*domain.WorkflowStage{stage}, DecisionID: decisionIDFor(meta, transitioned)}, instance.RowVersion)
 }
 
 // ── Lifecycle authorization (cancel / escalate / invalidate) ─────────────────
@@ -1386,6 +1395,12 @@ func (h *Handler) EscalateWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, r, h.log, err, correlationID, "EscalateWorkflow")
 		return
 	}
+
+	// API-3: optimistic concurrency via If-Match header
+	if !requireIfMatch(w, r, instanceForAuthzCheck.RowVersion) {
+		return
+	}
+
 	// The initiator chasing their request, or an approver sitting on the
 	// current stage, escalates under WORKFLOW_ESCALATE; anyone else is acting
 	// on someone else's workflow and needs WORKFLOW_ADMINISTER.
@@ -1413,7 +1428,7 @@ func (h *Handler) EscalateWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, r, h.log, err, correlationID, "EscalateWorkflow")
 		return
 	}
-	writeJSON(w, r, http.StatusOK, instance)
+	writeJSONWithETag(w, r, http.StatusOK, instance, instance.RowVersion)
 }
 
 // ── POST /v1/workflows/{id}/cancel ───────────────────────────────────────────
@@ -1443,6 +1458,12 @@ func (h *Handler) CancelWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, r, h.log, err, correlationID, "CancelWorkflow")
 		return
 	}
+
+	// API-3: optimistic concurrency via If-Match header
+	if !requireIfMatch(w, r, instanceForAuthzCheck.RowVersion) {
+		return
+	}
+
 	// The initiator withdrawing their own request cancels under
 	// WORKFLOW_CANCEL; cancelling anyone else's workflow is an administrative
 	// act and needs WORKFLOW_ADMINISTER.
@@ -1461,7 +1482,7 @@ func (h *Handler) CancelWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, r, h.log, err, correlationID, "CancelWorkflow")
 		return
 	}
-	writeJSON(w, r, http.StatusOK, instance)
+	writeJSONWithETag(w, r, http.StatusOK, instance, instance.RowVersion)
 }
 
 // ── POST /v1/workflows/{id}/invalidate ───────────────────────────────────────
@@ -1576,6 +1597,12 @@ func (h *Handler) InvalidateWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, r, h.log, findErr, correlationID, "InvalidateWorkflow")
 		return
 	}
+
+	// API-3: optimistic concurrency via If-Match header
+	if !requireIfMatch(w, r, existing.RowVersion) {
+		return
+	}
+
 	// Invalidation is a system transition: the service that owns the bound
 	// business object calls it when that object changes. It has no participant
 	// rule, only its own permission.
@@ -1658,7 +1685,7 @@ func (h *Handler) InvalidateWorkflow(w http.ResponseWriter, r *http.Request) {
 
 		// Record governance decision per GOV §1 "No evidence afterthought"
 	}
-	writeJSON(w, r, http.StatusOK, instance)
+	writeJSONWithETag(w, r, http.StatusOK, instance, instance.RowVersion)
 }
 
 // ── POST /v1/workflows/{id}/verify-release ───────────────────────────────────
@@ -1706,6 +1733,12 @@ func (h *Handler) VerifyRelease(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, r, h.log, err, correlationID, "VerifyRelease")
 		return
 	}
+
+	// API-3: optimistic concurrency via If-Match header
+	if !requireIfMatch(w, r, instanceForAuthz.RowVersion) {
+		return
+	}
+
 	if _, err := h.authz.CheckApprovalAllowed(r.Context(), principalID, instanceForAuthz.LegalEntityID, instanceForAuthz.InitiatedBy,
 		map[string]string{authz.AttrWorkflowType: instanceForAuthz.WorkflowType}); err != nil {
 		switch {
@@ -1758,7 +1791,7 @@ func (h *Handler) VerifyRelease(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, r, http.StatusConflict, res)
 		return
 	}
-	writeJSON(w, r, http.StatusOK, res)
+	writeJSONWithETag(w, r, http.StatusOK, res, instanceForAuthz.RowVersion)
 }
 
 // ── Workflow Definition Handlers (WFC-02) ───────────────────────────────────
@@ -1899,7 +1932,7 @@ func (h *Handler) GetWorkflowDefinition(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
-	writeJSON(w, r, http.StatusOK, definition)
+	writeJSONWithETag(w, r, http.StatusOK, definition, definition.RowVersion)
 }
 
 // refuseUnknownDefinition fetches a workflow definition under tenant scope,
@@ -1944,7 +1977,23 @@ func (h *Handler) SupersedeWorkflowDefinition(w http.ResponseWriter, r *http.Req
 		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_definition_id"})
 		return
 	}
-	if h.refuseUnknownDefinition(w, r, tenantScope, oldDefID, correlationID, "SupersedeWorkflowDefinition") {
+
+	// Fetch the definition to check its version for If-Match
+	oldDef, err := h.store.GetWorkflowDefinition(r.Context(), domain.GetWorkflowDefinitionParams{
+		TenantID:             tenantScope,
+		WorkflowDefinitionID: &oldDefID,
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrWorkflowNotFound) {
+			writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "workflow_definition_not_found"})
+		} else {
+			writeStoreErr(w, r, h.log, err, correlationID, "SupersedeWorkflowDefinition")
+		}
+		return
+	}
+
+	// API-3: optimistic concurrency via If-Match header
+	if !requireIfMatch(w, r, oldDef.RowVersion) {
 		return
 	}
 
@@ -1964,7 +2013,7 @@ func (h *Handler) SupersedeWorkflowDefinition(w http.ResponseWriter, r *http.Req
 		writeStoreErr(w, r, h.log, err, correlationID, "SupersedeWorkflowDefinition")
 		return
 	}
-	writeJSON(w, r, http.StatusOK, map[string]string{"status": "superseded"})
+	writeJSONWithETag(w, r, http.StatusOK, map[string]string{"status": "superseded"}, oldDef.RowVersion)
 }
 
 // ActivateWorkflowDefinition handles POST /v1/workflow-definitions/{workflow_definition_id}/activate.
@@ -1988,7 +2037,22 @@ func (h *Handler) ActivateWorkflowDefinition(w http.ResponseWriter, r *http.Requ
 		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_definition_id"})
 		return
 	}
-	if h.refuseUnknownDefinition(w, r, tenantScope, workflowDefinitionID, correlationID, "ActivateWorkflowDefinition") {
+
+	def, err := h.store.GetWorkflowDefinition(r.Context(), domain.GetWorkflowDefinitionParams{
+		TenantID:             tenantScope,
+		WorkflowDefinitionID: &workflowDefinitionID,
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrWorkflowNotFound) {
+			writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "workflow_definition_not_found"})
+		} else {
+			writeStoreErr(w, r, h.log, err, correlationID, "ActivateWorkflowDefinition")
+		}
+		return
+	}
+
+	// API-3: optimistic concurrency via If-Match header
+	if !requireIfMatch(w, r, def.RowVersion) {
 		return
 	}
 
@@ -1996,7 +2060,7 @@ func (h *Handler) ActivateWorkflowDefinition(w http.ResponseWriter, r *http.Requ
 		writeStoreErr(w, r, h.log, err, correlationID, "ActivateWorkflowDefinition")
 		return
 	}
-	writeJSON(w, r, http.StatusOK, map[string]string{"status": "activated"})
+	writeJSONWithETag(w, r, http.StatusOK, map[string]string{"status": "activated"}, def.RowVersion)
 }
 
 // SuspendWorkflowDefinition handles POST /v1/workflow-definitions/{workflow_definition_id}/suspend.
@@ -2020,7 +2084,22 @@ func (h *Handler) SuspendWorkflowDefinition(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_definition_id"})
 		return
 	}
-	if h.refuseUnknownDefinition(w, r, tenantScope, workflowDefinitionID, correlationID, "SuspendWorkflowDefinition") {
+
+	def, err := h.store.GetWorkflowDefinition(r.Context(), domain.GetWorkflowDefinitionParams{
+		TenantID:             tenantScope,
+		WorkflowDefinitionID: &workflowDefinitionID,
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrWorkflowNotFound) {
+			writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "workflow_definition_not_found"})
+		} else {
+			writeStoreErr(w, r, h.log, err, correlationID, "SuspendWorkflowDefinition")
+		}
+		return
+	}
+
+	// API-3: optimistic concurrency via If-Match header
+	if !requireIfMatch(w, r, def.RowVersion) {
 		return
 	}
 
@@ -2028,7 +2107,7 @@ func (h *Handler) SuspendWorkflowDefinition(w http.ResponseWriter, r *http.Reque
 		writeStoreErr(w, r, h.log, err, correlationID, "SuspendWorkflowDefinition")
 		return
 	}
-	writeJSON(w, r, http.StatusOK, map[string]string{"status": "suspended"})
+	writeJSONWithETag(w, r, http.StatusOK, map[string]string{"status": "suspended"}, def.RowVersion)
 }
 
 // RetireWorkflowDefinition handles POST /v1/workflow-definitions/{workflow_definition_id}/retire.
@@ -2052,7 +2131,22 @@ func (h *Handler) RetireWorkflowDefinition(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_definition_id"})
 		return
 	}
-	if h.refuseUnknownDefinition(w, r, tenantScope, workflowDefinitionID, correlationID, "RetireWorkflowDefinition") {
+
+	def, err := h.store.GetWorkflowDefinition(r.Context(), domain.GetWorkflowDefinitionParams{
+		TenantID:             tenantScope,
+		WorkflowDefinitionID: &workflowDefinitionID,
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrWorkflowNotFound) {
+			writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "workflow_definition_not_found"})
+		} else {
+			writeStoreErr(w, r, h.log, err, correlationID, "RetireWorkflowDefinition")
+		}
+		return
+	}
+
+	// API-3: optimistic concurrency via If-Match header
+	if !requireIfMatch(w, r, def.RowVersion) {
 		return
 	}
 
@@ -2060,7 +2154,7 @@ func (h *Handler) RetireWorkflowDefinition(w http.ResponseWriter, r *http.Reques
 		writeStoreErr(w, r, h.log, err, correlationID, "RetireWorkflowDefinition")
 		return
 	}
-	writeJSON(w, r, http.StatusOK, map[string]string{"status": "retired"})
+	writeJSONWithETag(w, r, http.StatusOK, map[string]string{"status": "retired"}, def.RowVersion)
 }
 
 // EscalateToWorkflow handles POST /v1/workflows/{workflow_instance_id}/escalate-to.
@@ -2087,6 +2181,12 @@ func (h *Handler) EscalateToWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, r, h.log, err, correlationID, "EscalateToWorkflow")
 		return
 	}
+
+	// API-3: optimistic concurrency via If-Match header
+	if !requireIfMatch(w, r, instanceForAuthzCheck.RowVersion) {
+		return
+	}
+
 	if instanceForAuthzCheck.TenantID != tenantScope {
 		writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "workflow_not_found"})
 		return
@@ -2138,7 +2238,7 @@ func (h *Handler) EscalateToWorkflow(w http.ResponseWriter, r *http.Request) {
 		zap.String("actor_id", principalID),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, r, http.StatusOK, instance)
+	writeJSONWithETag(w, r, http.StatusOK, instance, instance.RowVersion)
 }
 
 // ListPendingApprovals handles GET /v1/workflows/pending.
@@ -2157,7 +2257,29 @@ func (h *Handler) ListPendingApprovals(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	instances, err := h.store.ListPendingApprovals(r.Context(), tenantScope, getIntQuery(r, "limit", 50), getIntQuery(r, "offset", 0))
+	limit := getIntQuery(r, "limit", 50)
+	if limit > 200 {
+		limit = 200
+	}
+
+	var cursor *domain.PaginationCursor
+	if cursorStr := r.URL.Query().Get("cursor"); cursorStr != "" {
+		c, err := domain.DecodePaginationCursor(cursorStr)
+		if err != nil {
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{
+				"error":   "invalid_cursor",
+				"message": "cursor is not valid",
+			})
+			return
+		}
+		cursor = c
+	}
+
+	instances, nextCursor, err := h.store.ListPendingApprovals(r.Context(), tenantScope, domain.ListPendingApprovalsParams{
+		TenantID: tenantScope,
+		Limit:    limit,
+		Cursor:   cursor,
+	})
 	if err != nil {
 		writeStoreErr(w, r, h.log, err, correlationID, "ListPendingApprovals")
 		return
@@ -2165,7 +2287,23 @@ func (h *Handler) ListPendingApprovals(w http.ResponseWriter, r *http.Request) {
 	if instances == nil {
 		instances = []*domain.WorkflowInstance{}
 	}
-	writeJSON(w, r, http.StatusOK, instances)
+
+	type listResponse struct {
+		Records    []*domain.WorkflowInstance `json:"records"`
+		NextCursor string                     `json:"next_cursor,omitempty"`
+		Watermark  string                     `json:"watermark,omitempty"`
+	}
+
+	resp := listResponse{
+		Records: instances,
+	}
+	if nextCursor != nil {
+		if encoded, err := domain.EncodePaginationCursor(nextCursor); err == nil {
+			resp.NextCursor = encoded
+		}
+	}
+
+	writeJSON(w, r, http.StatusOK, resp)
 }
 
 // GetApprovalEvidence handles GET /v1/workflows/{workflow_instance_id}/evidence.
@@ -2408,6 +2546,21 @@ func writeJSON(w http.ResponseWriter, r *http.Request, status int, v any) {
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		_ = err
 	}
+}
+
+// writeJSONWithETag writes a JSON response with an ETag header based on the
+// provided record version. Per API-3 (ZS-API-001 §9), every GET on a mutable
+// aggregate returns ETag, and every mutation requires If-Match.
+func writeJSONWithETag(w http.ResponseWriter, r *http.Request, status int, v any, version int) {
+	apicontract.WriteETag(w, int64(version))
+	writeJSON(w, r, status, v)
+}
+
+// requireIfMatch checks the If-Match header against the current version.
+// Returns true if the request should proceed, false if it was rejected
+// (428 Precondition Required or 412 Precondition Failed already written).
+func requireIfMatch(w http.ResponseWriter, r *http.Request, currentVersion int) bool {
+	return apicontract.CheckIfMatch(w, r, int64(currentVersion))
 }
 
 // stageApprovers lists every principal a stage names as an approver: the one

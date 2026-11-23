@@ -219,10 +219,23 @@ type Handler struct {
 	ledger        RecognitionLedgerClient
 	periodChecker PeriodChecker
 	log           *zap.Logger
+
+	// revenueMappingKey/wipMappingKey are the ACC-02 mapping keys PRJ-03
+	// posts recognition against. They are intentionally empty unless wired
+	// from deployment config, so a missing configuration fails closed rather
+	// than falling back to a caller-supplied account code.
+	revenueMappingKey string
+	wipMappingKey     string
 }
 
 func New(store Store, publisher Publisher, authz AuthZClient, log *zap.Logger) *Handler {
 	return &Handler{store: store, publisher: publisher, authz: authz, log: log}
+}
+
+// WithMappingKeys sets the ACC-02 mapping keys PRJ-03 posts against.
+func (h *Handler) WithMappingKeys(revenueKey, wipKey string) *Handler {
+	h.revenueMappingKey, h.wipMappingKey = revenueKey, wipKey
+	return h
 }
 
 // WithLedgerClient sets PRJ-03's own real dependency on general-ledger-svc.

@@ -13,6 +13,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,9 +23,8 @@ import (
 	"zoiko.io/governance-decision-log-svc/internal/domain"
 )
 
-// DecisionRecordedType is the event name Doc 03 §8.7 publishes. The Event
-// Catalogue's com.zoikosuite.* pattern is not used: which naming is the wire
-// contract is an open group-level question (audit C3).
+// DecisionRecordedType is the event name Doc 03 §8.7 publishes: the wire name
+// every consumer reads today.
 const DecisionRecordedType = "governance.decision.recorded"
 
 // DecisionReplayedType records that a decision was re-evaluated against its
@@ -32,28 +33,82 @@ const DecisionRecordedType = "governance.decision.recorded"
 // any other (invariant #10). Listed with Doc 03 §8.7's published events.
 const DecisionReplayedType = "governance.decision.replayed"
 
+// The Event Catalogue's canonical names (§5.1,
+// com.zoikosuite.<domain>.<aggregate>.<past-tense-fact>). Group decision C3
+// (plan §5) and rule R9: keep the wire names and emit the canonical name
+// alongside during the deprecation window. Each decision therefore queues two
+// outbox rows: the wire event, and the same event under its canonical name
+// (same payload and payload_hash, its own event_id, alias_of_event_id naming
+// the wire event), so a consumer on either name sees every fact exactly once.
+const (
+	DecisionRecordedCanonicalType = "com.zoikosuite.governance.decision.recorded"
+	DecisionReplayedCanonicalType = "com.zoikosuite.governance.decision.replayed"
+)
+
+var canonicalName = map[string]string{
+	DecisionRecordedType: DecisionRecordedCanonicalType,
+	DecisionReplayedType: DecisionReplayedCanonicalType,
+}
+
+// Queued is one outbox row: an event type and its complete envelope.
+type Queued struct {
+	Type     string
+	Envelope []byte
+}
+
+// WithCanonicalAlias returns the wire event followed by its canonical-name
+// alias. An envelope whose type has no canonical name is returned alone.
+func WithCanonicalAlias(wire []byte) ([]Queued, error) {
+	var env envelope
+	if err := json.Unmarshal(wire, &env); err != nil {
+		return nil, fmt.Errorf("events: parse envelope: %w", err)
+	}
+	if env.EventType == "" {
+		return nil, errors.New("events: envelope has no event_type")
+	}
+	out := []Queued{{Type: env.EventType, Envelope: wire}}
+	canonical, ok := canonicalName[env.EventType]
+	if !ok {
+		return out, nil
+	}
+	alias := env
+	alias.EventID = "evt-" + uuid.New().String()
+	alias.EventType = canonical
+	alias.AliasOf = env.EventID
+	b, err := json.Marshal(alias)
+	if err != nil {
+		return nil, err
+	}
+	return append(out, Queued{Type: canonical, Envelope: b}), nil
+}
+
 // envelope is this platform's event contract (Doc 03 §19) plus the linkage and
 // integrity fields of the Event Catalogue example envelope: causation id,
 // workflow instance, the aggregate the event is about, and a hash of the
 // payload so a consumer can detect a payload altered in transit or at rest.
 type envelope struct {
-	EventID            string          `json:"event_id"`
-	EventType          string          `json:"event_type"`
-	EventVersion       string          `json:"event_version"`
-	EmittedAt          time.Time       `json:"emitted_at"`
-	SchemaVersion      string          `json:"schema_version"`
-	SourceService      string          `json:"source_service"`
-	TenantID           string          `json:"tenant_id,omitempty"`
-	LegalEntityID      string          `json:"legal_entity_id,omitempty"`
-	ActorID            string          `json:"actor_id,omitempty"`
-	CorrelationID      string          `json:"correlation_id"`
-	Jurisdiction       *string         `json:"jurisdiction_context,omitempty"`
-	CausationID        *string         `json:"causation_id,omitempty"`
-	WorkflowInstanceID *string         `json:"workflow_instance_id,omitempty"`
-	AggregateType      string          `json:"aggregate_type"`
-	AggregateID        string          `json:"aggregate_id"`
-	PayloadHash        string          `json:"payload_hash"`
-	Payload            json.RawMessage `json:"payload"`
+	EventID            string    `json:"event_id"`
+	EventType          string    `json:"event_type"`
+	EventVersion       string    `json:"event_version"`
+	EmittedAt          time.Time `json:"emitted_at"`
+	SchemaVersion      string    `json:"schema_version"`
+	SourceService      string    `json:"source_service"`
+	TenantID           string    `json:"tenant_id,omitempty"`
+	LegalEntityID      string    `json:"legal_entity_id,omitempty"`
+	ActorID            string    `json:"actor_id,omitempty"`
+	CorrelationID      string    `json:"correlation_id"`
+	Jurisdiction       *string   `json:"jurisdiction_context,omitempty"`
+	CausationID        *string   `json:"causation_id,omitempty"`
+	WorkflowInstanceID *string   `json:"workflow_instance_id,omitempty"`
+	AggregateType      string    `json:"aggregate_type"`
+	AggregateID        string    `json:"aggregate_id"`
+	// RetentionClass is the Event Catalogue §16 class of every event here
+	// (decision D2-2.F11): EV-REGULATED.
+	RetentionClass string `json:"retention_class"`
+	// AliasOf is set only on a canonical-name alias: the wire event's id.
+	AliasOf     string          `json:"alias_of_event_id,omitempty"`
+	PayloadHash string          `json:"payload_hash"`
+	Payload     json.RawMessage `json:"payload"`
 }
 
 // MessageWriter is the one method the relay needs from *kafka.Writer, narrowed
@@ -85,6 +140,16 @@ func DecisionRecorded(d domain.GovernanceDecision) ([]byte, error) {
 		"causation_id":         d.CausationID,
 		"correlation_id":       d.CorrelationID,
 		"decided_at":           d.DecidedAt,
+		// Register fields and the decision's place in the G-07 chain. Set when
+		// the event is built from the stored row (store.DecisionRecord.EventFor).
+		"title":                 d.Title,
+		"domain":                d.Domain,
+		"priority":              d.Priority,
+		"tags":                  d.Tags,
+		"related_obligation_id": d.RelatedObligationID,
+		"chain_seq":             d.ChainSeq,
+		"curr_hash":             d.CurrHash,
+		"display_ref":           d.DisplayRef,
 	}, d.ActorID, d.CorrelationID)
 }
 
@@ -118,7 +183,7 @@ func build(eventType string, d domain.GovernanceDecision, fields map[string]any,
 		EventType:          eventType,
 		EventVersion:       "1.0",
 		EmittedAt:          time.Now().UTC(),
-		SchemaVersion:      "1.2",
+		SchemaVersion:      "1.3",
 		SourceService:      "governance-decision-log-svc",
 		TenantID:           d.TenantID,
 		LegalEntityID:      d.LegalEntityID,
@@ -129,6 +194,7 @@ func build(eventType string, d domain.GovernanceDecision, fields map[string]any,
 		WorkflowInstanceID: d.WorkflowInstanceID,
 		AggregateType:      "GovernanceDecision",
 		AggregateID:        d.DecisionID,
+		RetentionClass:     domain.RetentionClass,
 		PayloadHash:        "sha256:" + hex.EncodeToString(sum[:]),
 		Payload:            payload,
 	})

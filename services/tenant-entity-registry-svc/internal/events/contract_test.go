@@ -92,6 +92,79 @@ func codeEventNames() []string {
 		events.EventWorkspaceCreated,
 		events.EventWorkspaceUpdated,
 		events.EventWorkspaceStatusChanged,
+		// ORG-07 / MDM-01 parties (party_events.go).
+		events.EventPartyCreated,
+		events.EventPartyProfileAmended,
+		events.EventPartyFactPublished,
+		events.EventPartyRoleAdded,
+		events.EventPartyRoleRemoved,
+		events.EventPartyIdentifierLinked,
+		events.EventMasterConflictOpened,
+		events.EventPartiesMerged,
+		events.EventPartySplit,
+		events.EventMasterConflictResolved,
+		// ORG-08 addresses (address_events.go).
+		events.EventAddressCreated,
+		events.EventAddressVerified,
+		events.EventAddressSuperseded,
+		events.EventAddressLinked,
+		// ORG-08 establishments (establishment_events.go).
+		events.EventEstablishmentCreated,
+		events.EventEstablishmentActivated,
+		events.EventEstablishmentDeactivated,
+		events.EventEstablishmentClosed,
+		// MDM-01 party contact points (contact_point_events.go).
+		events.EventContactPointProposed,
+		events.EventContactPointVerified,
+		events.EventContactPointRetired,
+		// ORG-09 registrations (registration_events.go).
+		events.EventRegistrationCreated,
+		events.EventRegistrationVerified,
+		events.EventRegistrationRenewed,
+		events.EventRegistrationSuspended,
+		events.EventRegistrationExpiring,
+		events.EventRegistrationExpired,
+		events.EventRegistrationRevoked,
+		events.EventRegistrationSuperseded,
+		// ORG-09 / MDM-03 identifier verification (identifier_events.go).
+		events.EventPartyIdentifierVerified,
+		// REF-03 exchange rates (fx_events.go).
+		events.EventFXRateObserved,
+		events.EventFXRateApproved,
+		events.EventFXRateSetClosed,
+		events.EventFXRateSetSuperseded,
+		events.EventFXRateSuperseded,
+		// REF-06 accounting books (book_events.go).
+		events.EventBookCreated,
+		events.EventBookActivated,
+		events.EventBookBasisChanged,
+		events.EventBookPostingSuspend,
+		events.EventBookRetired,
+		// REF-08 financial dimensions (dimension_events.go).
+		events.EventDimensionTypeCreated,
+		events.EventDimensionValueCreated,
+		events.EventDimensionValueActivated,
+		events.EventDimensionValueDeactivated,
+		events.EventDimensionHierarchyProposed,
+		events.EventDimensionHierarchyChanged,
+		events.EventDimensionSourceMapped,
+		// REF-09 units of measure (unit_events.go).
+		events.EventQuantityDimensionCreated,
+		events.EventUnitCreated,
+		events.EventConversionProposed,
+		events.EventConversionActivated,
+		events.EventConversionSuperseded,
+		events.EventUnitRetired,
+		// MDM-04 reference releases (reference_events.go).
+		events.EventReferenceSetCreated,
+		events.EventReferenceReleaseStaged,
+		events.EventReferenceReleasePublished,
+		// ORG-9 master imports (master_import_events.go).
+		events.EventMasterImportUploaded,
+		events.EventMasterImportValidated,
+		events.EventMasterImportApproved,
+		events.EventMasterImportCompleted,
+		events.EventMasterImportCancelled,
 	}
 }
 

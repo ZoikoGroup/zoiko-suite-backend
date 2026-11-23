@@ -136,7 +136,8 @@ func TestStructuredRefusalHasNoFollowUps(t *testing.T) {
 
 func TestEnvelopeRejectsBadStructuredFields(t *testing.T) {
 	base := contract.Envelope{SchemaVersion: "1.0", TurnSequence: 1, Status: contract.Answered, IntentID: "I05", KnowledgeReleaseID: "kb",
-		PolicyVersion: "p", AnswerClass: contract.ProcessExplanation, Citations: []contract.Citation{{SourceVersionID: "s", URLKey: "k"}}}
+		PolicyVersion: "p", AnswerClass: contract.ProcessExplanation, Citations: []contract.Citation{{SourceVersionID: "s", URLKey: "k"}},
+		SafetyDisposition: contract.DispositionAllow}
 	bad := []func(*contract.Envelope){
 		func(e *contract.Envelope) { e.Outcome = contract.OutcomeRefused }, // does not match status
 		func(e *contract.Envelope) { e.FollowUps = make([]contract.FollowUp, 5) },

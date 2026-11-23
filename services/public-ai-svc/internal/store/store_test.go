@@ -67,6 +67,22 @@ func TestPostgresMigrationsRoundTrip(t *testing.T) {
 }
 
 // The revocation ledger is append-only in the database itself (Doc 08 RB-02).
+// Doc 06 §21: the control audit is append-only (migration 004 trigger).
+func TestPostgresControlAuditAppendOnly(t *testing.T) {
+	pool := openTestDB(t)
+	s := store.NewPostgres(pool)
+	ctx := context.Background()
+	if err := s.AppendAudit(ctx, store.AuditEntry{Action: "release.promote", Target: "kb", Actor: "sre-1", Approval: "CHG-1", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM public_ai.control_audit`); err == nil {
+		t.Fatal("deleting an audit entry must be rejected")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE public_ai.control_audit SET actor = 'someone-else'`); err == nil {
+		t.Fatal("updating an audit entry must be rejected")
+	}
+}
+
 func TestPostgresRevocationsAppendOnly(t *testing.T) {
 	pool := openTestDB(t)
 	s := store.NewPostgres(pool)

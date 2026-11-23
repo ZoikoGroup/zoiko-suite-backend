@@ -56,7 +56,8 @@ const notificationColumns = `
 	COALESCE(purpose_context, ''), COALESCE(idempotency_key, ''),
 	resend_count, COALESCE(last_resend_reason, ''), last_resent_at, COALESCE(last_resent_by_principal_id, ''),
 	COALESCE(communication_class, ''), COALESCE(message_intent_id::text, ''), COALESCE(intent_version_id::text, ''),
-	job_id::text, not_before, expires_at, COALESCE(cancelled_by, ''), cancelled_at, COALESCE(cancel_reason, '')`
+	job_id::text, not_before, expires_at, COALESCE(cancelled_by, ''), cancelled_at, COALESCE(cancel_reason, ''),
+	record_version`
 
 // scannable is satisfied by both pgx.Row and pgx.Rows.
 type scannable interface{ Scan(dest ...any) error }
@@ -76,6 +77,7 @@ func scanNotification(s scannable, n *domain.Notification) error {
 		&n.ResendCount, &n.LastResendReason, &n.LastResentAt, &n.LastResentByPrincipalID,
 		&n.CommunicationClass, &n.MessageIntentID, &n.IntentVersionID,
 		&n.JobID, &n.NotBefore, &n.ExpiresAt, &n.CancelledBy, &n.CancelledAt, &n.CancelReason,
+		&n.RecordVersion,
 	)
 }
 
@@ -85,10 +87,25 @@ type PgStore struct {
 	// quotaLimits is nil unless send quotas are on (WithQuota); nowFn is the clock they use.
 	quotaLimits *quota.Limits
 	nowFn       func() time.Time
+
+	// eventRegion is the residency region stamped on shared-outbox events (BIZ-03).
+	eventRegion string
 }
 
-func New(pool *pgxpool.Pool) *PgStore {
-	return &PgStore{pool: pool}
+// Option configures a PgStore.
+type Option func(*PgStore)
+
+// WithEventRegion sets the residency region carried by every shared-outbox event.
+func WithEventRegion(region string) Option {
+	return func(s *PgStore) { s.eventRegion = region }
+}
+
+func New(pool *pgxpool.Pool, opts ...Option) *PgStore {
+	s := &PgStore{pool: pool}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.Tx) error) error {

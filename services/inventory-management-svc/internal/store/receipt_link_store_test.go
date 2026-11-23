@@ -17,7 +17,7 @@ import (
 // receipt is refused, and the link row can never be updated or deleted.
 func TestPgStore_ReceiptLink_IdempotentConflictAndImmutable(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -49,7 +49,7 @@ func TestPgStore_ReceiptLink_IdempotentConflictAndImmutable(t *testing.T) {
 // the rest is reported as unlinked, never silently posted.
 func TestPgStore_GetRunInboundValue_SplitsLinkedAndUnlinked(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -73,7 +73,7 @@ func TestPgStore_GetRunInboundValue_SplitsLinkedAndUnlinked(t *testing.T) {
 
 	run := &domain.ValuationRun{
 		RunID: uuid.New().String(), LegalEntityID: legalEntityID, FiscalPeriod: linked.FiscalPeriod,
-		InventoryAccountCode: "INV-ASSET", COGSAccountCode: "COGS",
+		InventoryMappingKey: "INV-ASSET", COGSMappingKey: "COGS",
 		CreatedAt: now, CreatedByPrincipalID: "preparer-1",
 	}
 	if frozen, err := s.CreateValuationRun(ctx, run); err != nil || frozen != 2 {
@@ -91,7 +91,7 @@ func TestPgStore_GetRunInboundValue_SplitsLinkedAndUnlinked(t *testing.T) {
 
 func TestPgStore_ValuationRun_KernelPosting_SplitsInboundByStockAndRecordsEveryJournal(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -111,7 +111,7 @@ func TestPgStore_ValuationRun_KernelPosting_SplitsInboundByStockAndRecordsEveryJ
 	if _, _, err := s.ValueMovement(ctx, unlinked.MovementID, "preparer-1", &costB, now); err != nil {
 		t.Fatal(err)
 	}
-	run := &domain.ValuationRun{RunID: uuid.New().String(), LegalEntityID: legalEntityID, FiscalPeriod: linked.FiscalPeriod, InventoryAccountCode: "INV-ASSET", COGSAccountCode: "COGS",
+	run := &domain.ValuationRun{RunID: uuid.New().String(), LegalEntityID: legalEntityID, FiscalPeriod: linked.FiscalPeriod, InventoryMappingKey: "INV-ASSET", COGSMappingKey: "COGS",
 		CreatedAt: now, CreatedByPrincipalID: "preparer-1"}
 	if _, err := s.CreateValuationRun(ctx, run); err != nil {
 		t.Fatal(err)

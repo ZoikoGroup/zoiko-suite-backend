@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"zoiko.io/configuration-feature-flag-svc/internal/vaultref"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -48,9 +49,11 @@ type ConfigStore interface {
 	CreateChange(ctx context.Context, params domain.CreateChangeParams) (*domain.ConfigChange, error)
 	ApproveChange(ctx context.Context, changeID string, approval domain.ChangeApproval, callerTenantID string) (*domain.ConfigChange, error)
 	ActivateChange(ctx context.Context, changeID, callerTenantID, actor string) (*domain.ConfigChange, error)
+	GetChange(ctx context.Context, changeID string) (*domain.ConfigChange, error)
 
 	CreateEmergencyChange(ctx context.Context, params domain.CreateEmergencyChangeParams) (*domain.EmergencyChange, error)
 	ActivateEmergencyChange(ctx context.Context, emergencyChangeID, callerTenantID, actor string) (*domain.EmergencyChange, error)
+	GetEmergencyChange(ctx context.Context, emergencyChangeID string) (*domain.EmergencyChange, error)
 
 	RecordAttestation(ctx context.Context, params domain.RecordAttestationParams) (*domain.AttestationResult, error)
 
@@ -83,6 +86,9 @@ type Handler struct {
 	// flags, which are platform-scoped rather than entity-scoped.
 	// authorization-svc rejects an empty legal_entity_id.
 	authzPlatformScopeID string
+
+	// secretRefs checks that a secret reference names a vault-governed path (S3-B3). Nil checks shape only.
+	secretRefs vaultref.Verifier
 }
 
 // New constructs a Handler.
@@ -125,11 +131,12 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Put("/v1/config/overrides/{scope}", h.ActivateOverride)
 
 	r.Post("/v1/config/changes", h.CreateChange)
+	r.Get("/v1/config/changes/{change_id}", h.GetChange)
 	r.Post("/v1/config/changes/{change_id}/approve", h.ApproveChange)
 	r.Post("/v1/config/changes/{change_id}/activate", h.ActivateChange)
 	r.Post("/v1/config/changes/{change_id}/rollback", h.RollbackChange)
-
 	r.Post("/v1/emergency-changes", h.CreateEmergencyChange)
+	r.Get("/v1/emergency-changes/{emergency_change_id}", h.GetEmergencyChange)
 	r.Post("/v1/emergency-changes/{emergency_change_id}/activate", h.ActivateEmergencyChange)
 	r.Post("/v1/emergency-changes/{emergency_change_id}/retrospective", h.CloseEmergencyRetrospective)
 
@@ -216,7 +223,7 @@ func (h *Handler) UpsertConfigEntry(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "missing_field", missing)
 		return
 	}
-	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		h.metrics.ConfigWrites.WithLabelValues(telemetry.WriteTenantMismatch).Inc()
 		return
 	}
@@ -238,6 +245,11 @@ func (h *Handler) UpsertConfigEntry(w http.ResponseWriter, r *http.Request) {
 		if global {
 			h.metrics.GlobalScopeWrites.WithLabelValues("config", telemetry.WriteForbidden).Inc()
 		}
+		return
+	}
+
+	if !h.verifySecretRefs(w, r, tenantScope, correlationID, req.Value) {
+		h.metrics.ConfigWrites.WithLabelValues(telemetry.WriteInvalidRequest).Inc()
 		return
 	}
 
@@ -338,7 +350,7 @@ func (h *Handler) GetConfigEntry(w http.ResponseWriter, r *http.Request) {
 	}
 	// Omitting ?tenant_id= still asks for the GLOBAL default for this
 	// environment, which is a real scope. Naming another tenant is refused.
-	if 	h.refuseForeignTenant(w, r, tenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, tenantID, tenantScope) {
 		return
 	}
 
@@ -486,7 +498,7 @@ func (h *Handler) UpsertFeatureFlag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		h.metrics.FlagWrites.WithLabelValues(telemetry.WriteTenantMismatch).Inc()
 		return
 	}
@@ -594,7 +606,7 @@ func (h *Handler) GetFeatureFlag(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("tenant_id"); v != "" {
 		tenantID = &v
 	}
-	if 	h.refuseForeignTenant(w, r, tenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, tenantID, tenantScope) {
 		return
 	}
 
@@ -720,7 +732,7 @@ func (h *Handler) refuseForeignTenant(w http.ResponseWriter, r *http.Request, cl
 	if claimed == nil || *claimed == "" || *claimed == tenantID {
 		return false
 	}
-		writeError(w, r, http.StatusForbidden, "tenant_scope_mismatch", "request tenant_id does not match the caller's verified tenant scope")
+	writeError(w, r, http.StatusForbidden, "tenant_scope_mismatch", "request tenant_id does not match the caller's verified tenant scope")
 	return true
 }
 
@@ -771,6 +783,21 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 // client is willing to send -- no auth needed, and nothing in the metrics to
 // distinguish it from load.
 const maxRequestBytes = 256 << 10 // 256 KiB
+
+// writeJSONWithETag writes a JSON response with an ETag header based on the
+// provided record version. Per API-3 (ZS-SVC-AA-001 §9), every GET on a
+// mutable aggregate returns ETag, and every mutation requires If-Match.
+func writeJSONWithETag(w http.ResponseWriter, status int, v any, version int64) {
+	apicontract.WriteETag(w, version)
+	writeJSON(w, status, v)
+}
+
+// requireIfMatch checks the If-Match header against the current version.
+// Returns true if the request should proceed, false if it was rejected
+// (428 Precondition Required or 412 Precondition Failed already written).
+func requireIfMatch(w http.ResponseWriter, r *http.Request, currentVersion int64) bool {
+	return apicontract.CheckIfMatch(w, r, currentVersion)
+}
 
 // decodeJSON reads a size-capped JSON body, answering 413 rather than 400 when
 // the cap is what stopped it: "too large" and "malformed" are different faults
@@ -1116,6 +1143,97 @@ func (h *Handler) FindConfigDefinition(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, def)
 }
 
+// ── GET /v1/config/changes/{change_id} ──────────────────────────────────────
+
+// GetChange returns a governed change with its ETag, which the caller sends
+// back as If-Match on activate (API-3). Authorized like the commands it
+// precedes: by the change's own scope, so a tenant writer cannot read a
+// global change's version and a foreign tenant's change answers 403.
+//
+// Response:
+//
+//	200 → the change, ETag = record_version
+//	404 → change_not_found
+//	403 → tenant_scope_mismatch / authorization_denied
+//	503 → store or authz unavailable
+func (h *Handler) GetChange(w http.ResponseWriter, r *http.Request) {
+	changeID := chi.URLParam(r, "change_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.authorizeTarget(w, r, principalID, tenantScope, "change", changeID); !ok {
+		return
+	}
+
+	change, err := h.store.GetChange(r.Context(), changeID)
+	if err != nil {
+		if errors.Is(err, domain.ErrChangeNotFound) {
+			writeError(w, r, http.StatusNotFound, "change_not_found", changeID)
+			return
+		}
+		h.log.Error("GetChange: store unavailable",
+			zap.String("change_id", changeID),
+			zap.String("correlation_id", correlationID),
+			zap.Error(err),
+		)
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	writeJSONWithETag(w, http.StatusOK, change, change.RecordVersion)
+}
+
+// ── GET /v1/emergency-changes/{emergency_change_id} ──────────────────────────
+
+// GetEmergencyChange returns an emergency change with its ETag, sent back as
+// If-Match on activate (API-3). Authorized by the emergency change's scope, as
+// GetChange is.
+//
+// Response:
+//
+//	200 → the emergency change, ETag = record_version
+//	404 → change_not_found
+//	403 → tenant_scope_mismatch / authorization_denied
+//	503 → store or authz unavailable
+func (h *Handler) GetEmergencyChange(w http.ResponseWriter, r *http.Request) {
+	emergencyChangeID := chi.URLParam(r, "emergency_change_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.authorizeTarget(w, r, principalID, tenantScope, "emergency", emergencyChangeID); !ok {
+		return
+	}
+
+	ec, err := h.store.GetEmergencyChange(r.Context(), emergencyChangeID)
+	if err != nil {
+		if errors.Is(err, domain.ErrChangeNotFound) {
+			writeError(w, r, http.StatusNotFound, "change_not_found", emergencyChangeID)
+			return
+		}
+		h.log.Error("GetEmergencyChange: store unavailable",
+			zap.String("emergency_change_id", emergencyChangeID),
+			zap.String("correlation_id", correlationID),
+			zap.Error(err),
+		)
+		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	writeJSONWithETag(w, http.StatusOK, ec, ec.RecordVersion)
+}
+
 // ── POST /v1/config/definitions/{key}/publish ────────────────────────────────
 
 // publishDefinitionRequest is the wire shape for POST /v1/config/definitions/{key}/publish.
@@ -1243,7 +1361,7 @@ func (h *Handler) ResolveConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "missing_field", "environment")
 		return
 	}
-	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 
@@ -1407,7 +1525,7 @@ func (h *Handler) ActivateOverride(w http.ResponseWriter, r *http.Request) {
 	// here, before anything is written.
 	switch {
 	case layer == domain.ScopeTenant:
-		if 	h.refuseForeignTenant(w, r, req.ScopeID, tenantScope) {
+		if h.refuseForeignTenant(w, r, req.ScopeID, tenantScope) {
 			return
 		}
 	case domain.IsExtendedLayer(layer):
@@ -1425,6 +1543,10 @@ func (h *Handler) ActivateOverride(w http.ResponseWriter, r *http.Request) {
 	action := governedAction("config", tenantIDForOverride(layer, req, tenantScope))
 	if outcome := h.authorizeGoverned(w, r, principalID, action); outcome != "" {
 		h.metrics.GovernedWrites.WithLabelValues(action, outcome).Inc()
+		return
+	}
+
+	if !h.verifySecretRefs(w, r, tenantScope, correlationID, req.Value) {
 		return
 	}
 
@@ -1549,13 +1671,21 @@ func (h *Handler) CreateChange(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "missing_field", missing)
 		return
 	}
-	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 
 	action := governedAction("config", req.TenantID)
 	if outcome := h.authorizeGoverned(w, r, principalID, action); outcome != "" {
 		h.metrics.GovernedWrites.WithLabelValues(action, outcome).Inc()
+		return
+	}
+
+	partValues := make([]json.RawMessage, 0, len(req.Parts))
+	for _, p := range req.Parts {
+		partValues = append(partValues, p.NewValue)
+	}
+	if !h.verifySecretRefs(w, r, tenantScope, r.Header.Get("X-Correlation-ID"), partValues...) {
 		return
 	}
 
@@ -1713,6 +1843,25 @@ func (h *Handler) ActivateChange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// If-Match (API-3), checked only once the caller is authorized for this
+	// change, so an unauthorized caller learns nothing about its version.
+	change, err := h.store.GetChange(r.Context(), changeID)
+	if err != nil {
+		if errors.Is(err, domain.ErrChangeNotFound) {
+			writeError(w, r, http.StatusNotFound, "change_not_found", changeID)
+		} else {
+			h.log.Error("ActivateChange: store unavailable",
+				zap.String("change_id", changeID),
+				zap.String("correlation_id", correlationID),
+				zap.Error(err))
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
+		}
+		return
+	}
+	if !requireIfMatch(w, r, change.RecordVersion) {
+		return
+	}
+
 	updated, err := h.store.ActivateChange(r.Context(), changeID, tenantScope, principalID)
 	if err != nil {
 		if errors.Is(err, domain.ErrChangeNotFound) {
@@ -1798,13 +1947,17 @@ func (h *Handler) CreateEmergencyChange(w http.ResponseWriter, r *http.Request) 
 		writeError(w, r, http.StatusBadRequest, "missing_field", missing)
 		return
 	}
-	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 
 	action := governedAction("config", req.TenantID)
 	if outcome := h.authorizeGoverned(w, r, principalID, action); outcome != "" {
 		h.metrics.GovernedWrites.WithLabelValues(action, outcome).Inc()
+		return
+	}
+
+	if !h.verifySecretRefs(w, r, tenantScope, correlationID, req.NewValue) {
 		return
 	}
 
@@ -1862,6 +2015,24 @@ func (h *Handler) ActivateEmergencyChange(w http.ResponseWriter, r *http.Request
 
 	action, ok := h.authorizeTarget(w, r, principalID, tenantScope, "emergency", emergencyChangeID)
 	if !ok {
+		return
+	}
+
+	// If-Match (API-3), after authorization, as in ActivateChange.
+	ec, err := h.store.GetEmergencyChange(r.Context(), emergencyChangeID)
+	if err != nil {
+		if errors.Is(err, domain.ErrChangeNotFound) {
+			writeError(w, r, http.StatusNotFound, "emergency_change_not_found", emergencyChangeID)
+		} else {
+			h.log.Error("ActivateEmergencyChange: store unavailable",
+				zap.String("emergency_change_id", emergencyChangeID),
+				zap.String("correlation_id", correlationID),
+				zap.Error(err))
+			writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "")
+		}
+		return
+	}
+	if !requireIfMatch(w, r, ec.RecordVersion) {
 		return
 	}
 
@@ -1944,7 +2115,7 @@ func (h *Handler) RecordAttestation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "missing_field", missing)
 		return
 	}
-	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 	// §10.1 "workload identity": a runtime attests for itself. runtime_id
@@ -2052,7 +2223,7 @@ func (h *Handler) CreateReleasePlan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "missing_field", "strategy")
 		return
 	}
-	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 
@@ -2134,7 +2305,7 @@ func (h *Handler) EvaluateFlag(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "missing_field", "subject_key")
 		return
 	}
-	if 	h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantScope) {
 		return
 	}
 

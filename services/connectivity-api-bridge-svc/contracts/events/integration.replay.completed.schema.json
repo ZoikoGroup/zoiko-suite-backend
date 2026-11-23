@@ -1,0 +1,52 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.integration.replay.completed (connectivity-api-bridge-svc, schema 1.0.0). OBSERVED contract inferred from 3 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "connection_id": {
+      "type": "string"
+    },
+    "contract_version_id": {
+      "type": "string"
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "items": {
+      "type": "integer"
+    },
+    "mapping_version_id": {
+      "type": "string"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "replay_job_id": {
+      "type": "string"
+    },
+    "risk": {
+      "type": "string"
+    },
+    "source_scope": {
+      "type": "string"
+    },
+    "state": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "connection_id",
+    "contract_version_id",
+    "dry_run",
+    "items",
+    "mapping_version_id",
+    "reason",
+    "replay_job_id",
+    "risk",
+    "source_scope",
+    "state",
+    "tenant_id"
+  ],
+  "type": "object"
+}

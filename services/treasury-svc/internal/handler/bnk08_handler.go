@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -34,49 +35,100 @@ func (h *Handler) writeCashPositionErr(w http.ResponseWriter, err error) {
 	}
 }
 
-// composeCashPosition is the exact bank-balance/AP/obligations
+// composeErr carries the HTTP status/code a ctx-based compose* helper
+// would have written directly before this refactor, so both the HTTP
+// handlers (which still need to writeError) and the event-driven
+// RecalculateAndPublishCashPosition path (which has no http.ResponseWriter
+// at all) can share one implementation.
+type composeErr struct {
+	status int
+	code   string
+	err    error
+}
+
+func (e *composeErr) Error() string { return e.err.Error() }
+func (e *composeErr) Unwrap() error { return e.err }
+
+// composeCashPosition is the HTTP-facing wrapper around
+// composeCashPositionCtx — see that function's doc comment for the real
+// logic. Kept so CalculateCashPosition/RefreshCashPosition's existing
+// writeError call sites are untouched.
+func (h *Handler) composeCashPosition(w http.ResponseWriter, r *http.Request, tenantID, legalEntityID, currencyCode string) (*domain.CashPositionCalculation, bool) {
+	calc, err := h.composeCashPositionCtx(r.Context(), tenantID, legalEntityID, currencyCode)
+	if err != nil {
+		h.writeComposeErr(w, err)
+		return nil, false
+	}
+	return calc, true
+}
+
+func (h *Handler) writeComposeErr(w http.ResponseWriter, err error) {
+	var ce *composeErr
+	if errors.As(err, &ce) {
+		if ce.status >= 500 {
+			h.log.Error("cash position compose failed", zap.Error(ce.err))
+		}
+		writeError(w, ce.status, ce.code, ce.err.Error())
+		return
+	}
+	h.log.Error("cash position compose failed", zap.Error(err))
+	writeError(w, http.StatusServiceUnavailable, "store_error", err.Error())
+}
+
+// composeCashPositionCtx is the exact bank-balance/AP/obligations
 // composition GetEffectiveCash already performs (handler.go's
 // GetEffectiveCash), now also returning the per-account breakdown a
-// snapshot needs for GetAccountDrilldown. Reused by both
-// CalculateCashPosition and RefreshCashPosition rather than duplicated.
-func (h *Handler) composeCashPosition(w http.ResponseWriter, r *http.Request, tenantID, legalEntityID, currencyCode string) (*domain.CashPositionCalculation, bool) {
-	breakdown, bankSum, bankBalanceStale, ok := h.composeBankBalances(w, r, legalEntityID, currencyCode)
-	if !ok {
-		return nil, false
+// snapshot needs for GetAccountDrilldown. Reused by CalculateCashPosition,
+// RefreshCashPosition and the BankStatementAccepted consumer
+// (RecalculateAndPublishCashPosition) rather than duplicated — a plain
+// context.Context dependency so none of those three call sites need an
+// *http.Request.
+func (h *Handler) composeCashPositionCtx(ctx context.Context, tenantID, legalEntityID, currencyCode string) (*domain.CashPositionCalculation, error) {
+	breakdown, bankSum, bankBalanceStale, err := h.composeBankBalancesCtx(ctx, legalEntityID, currencyCode)
+	if err != nil {
+		return nil, err
 	}
 
-	apSum, err := h.clients.GetPendingAPCommitments(r.Context(), tenantID, legalEntityID, currencyCode)
+	apSum, err := h.clients.GetPendingAPCommitments(ctx, tenantID, legalEntityID, currencyCode)
 	if err != nil {
-		h.log.Error("AP service unavailable — failing closed on cash position", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "upstream_dependency_unavailable", "accounts-payable-svc is unreachable; cash position cannot be calculated reliably")
-		return nil, false
+		return nil, &composeErr{http.StatusServiceUnavailable, "upstream_dependency_unavailable",
+			fmt.Errorf("accounts-payable-svc is unreachable; cash position cannot be calculated reliably: %w", err)}
 	}
-	payrollSum, taxSum, err := h.clients.GetOutstandingObligations(r.Context(), tenantID, legalEntityID, currencyCode)
+	payrollSum, taxSum, err := h.clients.GetOutstandingObligations(ctx, tenantID, legalEntityID, currencyCode)
 	if err != nil {
-		h.log.Error("Obligations service unavailable — failing closed on cash position", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "upstream_dependency_unavailable", "obligations-svc is unreachable; cash position cannot be calculated reliably")
-		return nil, false
+		return nil, &composeErr{http.StatusServiceUnavailable, "upstream_dependency_unavailable",
+			fmt.Errorf("obligations-svc is unreachable; cash position cannot be calculated reliably: %w", err)}
 	}
 
 	return &domain.CashPositionCalculation{
 		BankBalance: bankSum, PendingAPCommitments: apSum, PayrollObligations: payrollSum, TaxLiabilities: taxSum,
 		AccountBreakdown: breakdown, HasStaleComponent: bankBalanceStale, AsOfTimestamp: time.Now().UTC(),
-	}, true
+	}, nil
 }
 
-// composeBankBalances is the bank-balance half of a cash position: the
+// composeBankBalances is the HTTP-facing wrapper around
+// composeBankBalancesCtx.
+func (h *Handler) composeBankBalances(w http.ResponseWriter, r *http.Request, legalEntityID, currencyCode string) (breakdown []domain.CashPositionAccountLine, bankSum domain.Decimal, stale bool, ok bool) {
+	breakdown, bankSum, stale, err := h.composeBankBalancesCtx(r.Context(), legalEntityID, currencyCode)
+	if err != nil {
+		h.writeComposeErr(w, err)
+		return nil, "0", false, false
+	}
+	return breakdown, bankSum, stale, true
+}
+
+// composeBankBalancesCtx is the bank-balance half of a cash position: the
 // latest balance of every ACTIVE account the legal entity holds in
-// currencyCode, read in one query. A store failure fails closed (503)
-// rather than dropping accounts from the sum, and an ACTIVE account with
-// no balance at all marks the position stale (partial) instead of being
+// currencyCode, read in one query. A store failure fails closed rather
+// than dropping accounts from the sum, and an ACTIVE account with no
+// balance at all marks the position stale (partial) instead of being
 // skipped silently. Before, both cases were a silent `continue`, so a
 // failed read understated cash with nothing to show the figure was
 // incomplete.
-func (h *Handler) composeBankBalances(w http.ResponseWriter, r *http.Request, legalEntityID, currencyCode string) (breakdown []domain.CashPositionAccountLine, bankSum domain.Decimal, stale bool, ok bool) {
-	accts, err := h.store.ListBankAccounts(r.Context(), legalEntityID)
+func (h *Handler) composeBankBalancesCtx(ctx context.Context, legalEntityID, currencyCode string) (breakdown []domain.CashPositionAccountLine, bankSum domain.Decimal, stale bool, err error) {
+	accts, err := h.store.ListBankAccounts(ctx, legalEntityID)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "store_error", err.Error())
-		return nil, "0", false, false
+		return nil, "0", false, &composeErr{http.StatusServiceUnavailable, "store_error", err}
 	}
 	var eligible []domain.BankAccount
 	var ids []string
@@ -86,11 +138,10 @@ func (h *Handler) composeBankBalances(w http.ResponseWriter, r *http.Request, le
 			ids = append(ids, acct.BankAccountID)
 		}
 	}
-	balances, err := h.store.GetLatestCashBalances(r.Context(), ids)
+	balances, err := h.store.GetLatestCashBalances(ctx, ids)
 	if err != nil {
-		h.log.Error("cash position: bank balances unavailable — failing closed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_error", "bank balances cannot be read; cash position cannot be calculated reliably")
-		return nil, "0", false, false
+		return nil, "0", false, &composeErr{http.StatusServiceUnavailable, "store_error",
+			fmt.Errorf("bank balances cannot be read; cash position cannot be calculated reliably: %w", err)}
 	}
 	bankSum = "0"
 	missing := false
@@ -104,9 +155,7 @@ func (h *Handler) composeBankBalances(w http.ResponseWriter, r *http.Request, le
 		}
 		bankSum, err = bankSum.Add(bal.AvailableBalance)
 		if err != nil {
-			h.log.Error("cash position: invalid stored balance", zap.Error(err))
-			writeError(w, http.StatusInternalServerError, "invalid_amount", err.Error())
-			return nil, "0", false, false
+			return nil, "0", false, &composeErr{http.StatusInternalServerError, "invalid_amount", err}
 		}
 		breakdown = append(breakdown, domain.CashPositionAccountLine{
 			BankAccountID: acct.BankAccountID, AccountName: acct.AccountName, Balance: bal.AvailableBalance, AsOfTimestamp: bal.AsOfTimestamp,
@@ -116,7 +165,68 @@ func (h *Handler) composeBankBalances(w http.ResponseWriter, r *http.Request, le
 	if stale {
 		h.log.Warn("cash position: bank balance component is stale or partial", zap.String("legal_entity_id", legalEntityID))
 	}
-	return breakdown, bankSum, stale, true
+	return breakdown, bankSum, stale, nil
+}
+
+// RecalculateAndPublishCashPosition is BNK-08's event-driven recompute
+// path: the in-process equivalent of calling RefreshCashPosition over
+// HTTP, invoked by the BankStatementAccepted consumer
+// (internal/events/bank_statement_consumer.go) so that "fast reads" +
+// "recalculation on material bank/payment events" (the doc's own NFR) are
+// both true at once — GetCashPosition keeps reading a cached, already-
+// published snapshot (no live banking-connector-svc call on the read
+// path), and that snapshot is kept current by recalculating here whenever
+// a statement is accepted, not by polling.
+//
+// Best-effort beyond the cash_balances write the consumer already made
+// durably in its own inbox transaction: if accounts-payable-svc or
+// obligations-svc are unreachable, this returns an error and the caller
+// (the consumer) logs and moves on rather than failing the whole delivery
+// — the real, non-zero bank balance is already durably on file by the
+// time this runs, and an explicit CalculateCashPosition/RefreshCashPosition
+// call (or the next accepted statement) will catch the snapshot up. A
+// snapshot is never published with a stale component — PublishCashPosition
+// Snapshot already refuses that; here it is simply skipped.
+func (h *Handler) RecalculateAndPublishCashPosition(ctx context.Context, tenantID, legalEntityID, currencyCode, correlationID, actorID string) (*domain.CashPositionSnapshot, error) {
+	calc, err := h.composeCashPositionCtx(ctx, tenantID, legalEntityID, currencyCode)
+	if err != nil {
+		return nil, fmt.Errorf("compose cash position: %w", err)
+	}
+	available, err := domain.NetDecimals(calc.BankBalance, "0", calc.PendingAPCommitments, calc.PayrollObligations, calc.TaxLiabilities)
+	if err != nil {
+		return nil, fmt.Errorf("net cash position: %w", err)
+	}
+	calc.AvailableCash = available
+
+	prior, err := h.store.GetLatestCashPosition(ctx, tenantID, legalEntityID, currencyCode)
+	if err != nil {
+		return nil, fmt.Errorf("load prior cash position: %w", err)
+	}
+	params := domain.CalculateCashPositionParams{
+		TenantID: tenantID, LegalEntityID: legalEntityID, ReportingCurrency: currencyCode,
+		RestrictedAmount: "0", CorrelationID: correlationID, ActorPrincipalID: actorID,
+	}
+	var snap *domain.CashPositionSnapshot
+	if prior != nil && domain.CanSupersedeCashPosition(prior.Status) {
+		snap, err = h.store.RefreshCashPositionSnapshot(ctx, domain.RefreshCashPositionParams{CalculateCashPositionParams: params, PriorSnapshotID: prior.SnapshotID}, *calc)
+	} else {
+		snap, err = h.store.CreateCashPositionSnapshot(ctx, params, *calc)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("persist cash position snapshot: %w", err)
+	}
+	if calc.HasStaleComponent {
+		// The doc's own "never silently carry forward old bank balance as
+		// current" rule: a snapshot calculated from a stale/partial bank
+		// balance is left CALCULATED, not PUBLISHED — GetCashPosition still
+		// serves the prior PUBLISHED one (if any) rather than this one.
+		return snap, nil
+	}
+	published, err := h.store.PublishCashPositionSnapshot(ctx, domain.PublishCashPositionParams{TenantID: tenantID, SnapshotID: snap.SnapshotID, ActorPrincipalID: actorID})
+	if err != nil {
+		return nil, fmt.Errorf("publish cash position snapshot: %w", err)
+	}
+	return published, nil
 }
 
 type calculateCashPositionRequest struct {

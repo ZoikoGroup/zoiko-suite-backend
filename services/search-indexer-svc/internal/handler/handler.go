@@ -585,7 +585,7 @@ func (h *Handler) ApplyRestriction(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("restriction could not be recorded in the projection ledger — refusing to report it applied",
 			zap.String("scope", req.Scope), zap.String("source_id", req.SourceID), zap.Error(err))
 		_ = h.store.MarkTombstoneState(r.Context(), tomb.TenantID, tomb.SourceType, tomb.SourceID,
-			tomb.SourceEventID, domain.PropagationFailed, "ledger not updated: "+err.Error())
+			tomb.SourceEventID, domain.PropagationFailed, "ledger not updated: "+err.Error(), 0)
 		writeErrorCode(w, r, http.StatusServiceUnavailable, "restriction_not_recorded",
 			"the restriction could not be made durable against later updates; retry", domain.ReasonRestrictionPropFailed)
 		return
@@ -604,7 +604,7 @@ func (h *Handler) ApplyRestriction(w http.ResponseWriter, r *http.Request) {
 			zap.String("scope", req.Scope), zap.String("source_id", req.SourceID), zap.Error(err))
 	}
 	_ = h.store.MarkTombstoneState(r.Context(), tomb.TenantID, tomb.SourceType, tomb.SourceID,
-		tomb.SourceEventID, state, detail)
+		tomb.SourceEventID, state, detail, 0)
 	h.metrics.RestrictionsTotal.WithLabelValues(req.Scope, string(state)).Inc()
 
 	status := http.StatusAccepted
@@ -1126,4 +1126,15 @@ func uuidParam(w http.ResponseWriter, r *http.Request, name string) (string, boo
 		return "", false
 	}
 	return raw, true
+}
+
+// writeJSONWithETag writes a JSON response with an ETag header.
+func writeJSONWithETag(w http.ResponseWriter, status int, body any, version int64) {
+	apicontract.WriteETag(w, version)
+	writeJSON(w, status, body)
+}
+
+// requireIfMatch checks the If-Match header and returns false if the request should be rejected.
+func (h *Handler) requireIfMatch(w http.ResponseWriter, r *http.Request, currentVersion int64) bool {
+	return apicontract.CheckIfMatch(w, r, currentVersion)
 }

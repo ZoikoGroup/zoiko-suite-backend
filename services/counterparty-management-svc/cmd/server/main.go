@@ -26,6 +26,8 @@ import (
 	"zoiko.io/counterparty-management-svc/internal/mtls"
 	"zoiko.io/counterparty-management-svc/internal/store"
 	"zoiko.io/counterparty-management-svc/internal/telemetry"
+	"zoiko.io/eventing/kafkaout"
+	"zoiko.io/eventing/outbox"
 )
 
 func main() {
@@ -61,7 +63,39 @@ func main() {
 		logger.Info("connected to postgres database")
 	}
 
-	pgStore := store.NewPgStore(pool)
+	// The eventing outbox table must exist before the first write tries to
+	// enqueue into it; fail here, at deploy time, not on a request.
+	if pool == nil {
+		logger.Fatal("database pool unavailable: the eventing outbox cannot run without it")
+	}
+	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := outbox.VerifySchema(verifyCtx, pool); err != nil {
+		logger.Fatal("eventing outbox schema missing", zap.Error(err))
+	}
+	verifyCancel()
+
+	pgStore := store.NewPgStore(pool, store.WithEventRegion(cfg.EventResidencyRegion))
+
+	outboxWriter, err := kafkaout.New(kafkaout.Config{
+		Brokers:                strings.Split(cfg.KafkaBrokers, ","),
+		Topic:                  cfg.KafkaEventsTopic,
+		AllowAutoTopicCreation: cfg.Env == "local",
+	})
+	if err != nil {
+		logger.Fatal("outbox kafka writer", zap.Error(err))
+	}
+	defer func() { _ = outboxWriter.Close() }()
+	relay, err := outbox.NewRelay(pool, outboxWriter, outbox.DefaultConfig(), logger)
+	if err != nil {
+		logger.Fatal("outbox relay", zap.Error(err))
+	}
+	relayCtx, cancelRelay := context.WithCancel(context.Background())
+	defer cancelRelay()
+	relayDone := make(chan struct{}, 1)
+	go func() {
+		relay.Run(relayCtx)
+		relayDone <- struct{}{}
+	}()
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
 	var authzClient *authz.Client
@@ -126,6 +160,15 @@ func main() {
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("server shutdown forced", zap.Error(err))
+	}
+	// Stop the relay after the server: requests finishing during Shutdown may
+	// still commit events. Anything not delivered stays in the outbox for the
+	// next process.
+	cancelRelay()
+	select {
+	case <-relayDone:
+	case <-shutdownCtx.Done():
+		logger.Warn("outbox relay did not stop before the shutdown deadline")
 	}
 	if pool != nil {
 		pool.Close()

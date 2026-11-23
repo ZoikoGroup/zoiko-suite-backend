@@ -24,6 +24,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
@@ -35,8 +36,10 @@ import (
 	"zoiko.io/evidence-requirements-svc/internal/config"
 	"zoiko.io/evidence-requirements-svc/internal/documentvault"
 	svcenvelope "zoiko.io/evidence-requirements-svc/internal/envelope"
+	"zoiko.io/evidence-requirements-svc/internal/esignature"
 	"zoiko.io/evidence-requirements-svc/internal/handler"
 	"zoiko.io/evidence-requirements-svc/internal/health"
+	"zoiko.io/evidence-requirements-svc/internal/manifest"
 	svcmiddleware "zoiko.io/evidence-requirements-svc/internal/middleware"
 	"zoiko.io/evidence-requirements-svc/internal/mtls"
 	"zoiko.io/evidence-requirements-svc/internal/outbox"
@@ -71,6 +74,8 @@ func main() {
 		zap.String("db_host", cfg.DB.Host),
 		zap.String("authz_url", cfg.AuthZServiceURL),
 		zap.String("document_vault_url", cfg.DocumentVaultServiceURL),
+		zap.String("evidence_manifest_url", cfg.EvidenceManifestServiceURL),
+		zap.String("esignature_url", cfg.EsignatureServiceURL),
 	)
 
 	// ── 2b. Tracing (Observability Baseline, 03-microservices.md §3.8) ─────────
@@ -87,6 +92,7 @@ func main() {
 	}()
 
 	metrics := telemetry.NewMetrics("evidence-requirements-svc")
+	evidenceMetrics := telemetry.NewEvidenceMetrics(prometheus.DefaultRegisterer, "evidence-requirements-svc")
 
 	// ── 3. Database pool ──────────────────────────────────────────────────────
 	// Tier 0 pool sizing — same values as policy-svc/jurisdiction-rules-svc/
@@ -161,8 +167,30 @@ func main() {
 	}
 	docsClient := documentvault.NewHTTPClient(cfg.DocumentVaultServiceURL, log)
 
+	// Manifest and esignature clients. They are optional locally (unset means
+	// the evidence type is verified as unavailable → 503), but required outside
+	// local/dev. The handler will fail closed if they are nil and a reference
+	// of that type is presented.
+	var manifestClient *manifest.HTTPClient
+	if cfg.EvidenceManifestServiceURL != "" {
+		manifestClient = manifest.NewHTTPClient(cfg.EvidenceManifestServiceURL, log)
+	} else if !cfg.LocalEnv() {
+		log.Fatal("EVIDENCE_MANIFEST_SERVICE_URL is required outside local/dev: EVIDENCE_MANIFEST references cannot be verified")
+	} else {
+		log.Warn("EVIDENCE_MANIFEST_SERVICE_URL unset — EVIDENCE_MANIFEST references will be verified as unavailable (local/dev only)")
+	}
+
+	var esignatureClient *esignature.HTTPClient
+	if cfg.EsignatureServiceURL != "" {
+		esignatureClient = esignature.NewHTTPClient(cfg.EsignatureServiceURL, log)
+	} else if !cfg.LocalEnv() {
+		log.Fatal("ESIGNATURE_SERVICE_URL is required outside local/dev: SIGNATURE references cannot be verified")
+	} else {
+		log.Warn("ESIGNATURE_SERVICE_URL unset — SIGNATURE references will be verified as unavailable (local/dev only)")
+	}
+
 	// ── 4b. Outbox worker ──────────────────────────────────────────────────────
-	outboxWorker := outbox.NewWorker(pool, kafkaWriter, log)
+	outboxWorker := outbox.NewWorker(pool, kafkaWriter, log).WithBacklogGauge(evidenceMetrics.SetOutboxUnpublished)
 	outboxWorker.Start(context.Background())
 	defer outboxWorker.Stop()
 
@@ -221,9 +249,23 @@ func main() {
 	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
+	// Console read models (API-4): every next_cursor is signed with this key.
+	cursorSigner, err := apicontract.NewCursorSigner(cfg.CursorSigningKey)
+	if err != nil {
+		log.Fatal("cursor signer", zap.Error(err))
+	}
+
 	h := handler.New(pgStore, authzClient, docsClient, log).
 		WithRegistry(entityChecker).
-		WithGateModes(evaluateMode, readMode)
+		WithGateModes(evaluateMode, readMode).
+		WithCursors(cursorSigner).
+		WithMetrics(evidenceMetrics)
+	if manifestClient != nil {
+		h = h.WithManifestClient(manifestClient)
+	}
+	if esignatureClient != nil {
+		h = h.WithEsignatureClient(esignatureClient)
+	}
 	handler.RegisterRoutes(r, h)
 	handler.RegisterPBCRoutes(r, h, pgStore)
 

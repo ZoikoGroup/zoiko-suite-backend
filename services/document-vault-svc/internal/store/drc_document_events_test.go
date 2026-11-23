@@ -28,7 +28,7 @@ func newEventDoc(region *string, title string) (*domain.Document, *domain.Docume
 
 func TestEvents_CreateDocument_EmitsDocumentCreatedAndVersionCommitted(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	region := "eu-west-1"
 	doc, v := newEventDoc(&region, "evt-create")
 	clearOutbox(t, pool)
@@ -52,13 +52,14 @@ func TestEvents_CreateDocument_EmitsDocumentCreatedAndVersionCommitted(t *testin
 	// The old names are gone: neither document.uploaded nor document.version_created.
 	assert.Empty(t, eventsOfType(t, pool, "document.uploaded"))
 	assert.Empty(t, eventsOfType(t, pool, "document.version_created"))
-	// BIZ-02's own event is unchanged.
-	assert.Len(t, eventsOfType(t, pool, "classification.proposed"), 1)
+	// BIZ-02's own event now goes to the shared eventing outbox, not outbox_events.
+	assert.Empty(t, eventsOfType(t, pool, "classification.proposed"))
+	assert.Equal(t, 1, eventingCount(t, pool, "com.zoikosuite.business.classification.proposed", doc.DocumentID))
 }
 
 func TestEvents_NoRegion_IsNullInTheEvent(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc, v := newEventDoc(nil, "evt-noregion")
 	clearOutbox(t, pool)
 	require.NoError(t, s.CreateDocument(tenantCtx(), doc, v, "corr"))
@@ -70,7 +71,7 @@ func TestEvents_NoRegion_IsNullInTheEvent(t *testing.T) {
 
 func TestEvents_AddVersion_EmitsVersionCommitted(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc, v1 := newEventDoc(nil, "evt-addversion")
 	require.NoError(t, s.CreateDocument(tenantCtx(), doc, v1, "corr"))
 	clearOutbox(t, pool)
@@ -89,7 +90,7 @@ func TestEvents_AddVersion_EmitsVersionCommitted(t *testing.T) {
 
 func TestEvents_FailedCreate_LeavesNoEvents(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc, v := newEventDoc(nil, "evt-fail")
 	doc.Classification = "BOGUS" // violates the table CHECK: the whole transaction fails
 	clearOutbox(t, pool)
@@ -97,11 +98,12 @@ func TestEvents_FailedCreate_LeavesNoEvents(t *testing.T) {
 	for _, name := range []string{"document_created", "document_version_committed", "classification.proposed"} {
 		assert.Empty(t, eventsOfType(t, pool, name), name)
 	}
+	assert.Zero(t, eventingCount(t, pool, "com.zoikosuite.business.classification.proposed", doc.DocumentID), "a failed create must leave no eventing-outbox event either")
 }
 
 func TestEvents_Supersession_IsRecordSuperseded_OtherRelationshipsAreNot(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	prior := createTestRecord(t, s, "evt-prior", string(domain.RecordClassLegalContract), "US-DE")
 	next := createTestRecord(t, s, "evt-next", string(domain.RecordClassLegalContract), "US-DE")
 	third := createTestRecord(t, s, "evt-third", string(domain.RecordClassLegalContract), "US-DE")

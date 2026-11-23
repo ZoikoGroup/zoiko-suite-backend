@@ -294,6 +294,35 @@ func Compile(in CompileInput) CompileOutput {
 		}
 	}
 
+	// s16 cross-references (JUR-W031): a registration type should name obligations and a threshold monitor this pack can answer. A warning, not
+	// an error, because a jurisdiction's rules may legitimately be split across packs; the runtime reports a missing one explicitly.
+	definedObligation, definedMonitor := map[string]bool{}, map[string]bool{}
+	for _, o := range in.Obligations {
+		definedObligation[o.JurisdictionID+"|"+o.ObligationCode] = true
+	}
+	for _, r := range rules {
+		if r.RuleDomain == ThresholdDomain {
+			definedMonitor[r.JurisdictionID+"|"+r.RuleCode] = true
+		}
+	}
+	for _, r := range rules {
+		if r.RuleDomain != RegistrationTypeDomain || len(r.Parameters) == 0 {
+			continue
+		}
+		pp, perr := ParseRuleParameters(r.Parameters)
+		if perr != nil || pp.Registration == nil {
+			continue
+		}
+		for _, code := range pp.Registration.Obligations {
+			if !definedObligation[r.JurisdictionID+"|"+code] {
+				f.warn("JUR-W031", r.RuleID, "registration type %s names obligation %s but this pack defines no such obligation rule for the jurisdiction", r.RuleCode, code)
+			}
+		}
+		if m := pp.Registration.ThresholdMonitor; m != "" && !definedMonitor[r.JurisdictionID+"|"+m] {
+			f.warn("JUR-W031", r.RuleID, "registration type %s names threshold monitor %s but this pack defines no such monitor for the jurisdiction", r.RuleCode, m)
+		}
+	}
+
 	// Conflict detection (s10): overlapping rules need declared, distinct
 	// precedence or an explicit supersedes link.
 	for a := 0; a < len(rules); a++ {

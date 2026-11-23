@@ -120,7 +120,7 @@ func TestKernelWriteDown_PostsAnNRVEventWithItsEvidence(t *testing.T) {
 	ledger := &stubLedger{kernel: true}
 	r := newRouterWithLedger(s, &stubPublisher{}, &stubAuthZ{}, ledger)
 	itemID, locID := kernelFixture(t, s, r)
-	req := domain.RecordWriteDownRequest{ItemID: itemID, LocationID: locID, Amount: 100, ValuationEvidenceRef: "NRV-1", ExpenseAccountCode: "X", InventoryAccountCode: "Y", FiscalPeriod: "2026-09"}
+	req := domain.RecordWriteDownRequest{ItemID: itemID, LocationID: locID, Amount: 100, ValuationEvidenceRef: "NRV-1", FiscalPeriod: "2026-09"}
 	rr := doReq(r, http.MethodPost, "/v1/valuation/write-downs/", req, "preparer-1")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("%d %s", rr.Code, rr.Body.String())

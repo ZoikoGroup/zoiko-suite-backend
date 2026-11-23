@@ -1,0 +1,732 @@
+{
+  "asyncapi": "3.1.0",
+  "channels": {
+    "authority-attempt": {
+      "address": "zoikosuite.tax.authority-attempt.v1",
+      "messages": {
+        "blocked": {
+          "$ref": "#/components/messages/authority-attempt.blocked"
+        },
+        "deadline-at-risk": {
+          "$ref": "#/components/messages/authority-attempt.deadline-at-risk"
+        },
+        "prepared": {
+          "$ref": "#/components/messages/authority-attempt.prepared"
+        },
+        "response-received": {
+          "$ref": "#/components/messages/authority-attempt.response-received"
+        },
+        "submitted": {
+          "$ref": "#/components/messages/authority-attempt.submitted"
+        },
+        "unknown-outcome": {
+          "$ref": "#/components/messages/authority-attempt.unknown-outcome"
+        }
+      }
+    },
+    "authority-callback": {
+      "address": "zoikosuite.tax.authority-callback.v1",
+      "messages": {
+        "quarantined": {
+          "$ref": "#/components/messages/authority-callback.quarantined"
+        }
+      }
+    },
+    "authority-profile": {
+      "address": "zoikosuite.tax.authority-profile.v1",
+      "messages": {
+        "certified": {
+          "$ref": "#/components/messages/authority-profile.certified"
+        },
+        "deprecated": {
+          "$ref": "#/components/messages/authority-profile.deprecated"
+        },
+        "published": {
+          "$ref": "#/components/messages/authority-profile.published"
+        },
+        "withdrawn": {
+          "$ref": "#/components/messages/authority-profile.withdrawn"
+        }
+      }
+    },
+    "e-invoice": {
+      "address": "zoikosuite.tax.e-invoice.v1",
+      "messages": {
+        "cleared": {
+          "$ref": "#/components/messages/e-invoice.cleared"
+        },
+        "rejected": {
+          "$ref": "#/components/messages/e-invoice.rejected"
+        },
+        "submitted": {
+          "$ref": "#/components/messages/e-invoice.submitted"
+        }
+      }
+    },
+    "saft-export": {
+      "address": "zoikosuite.tax.saft-export.v1",
+      "messages": {
+        "generated": {
+          "$ref": "#/components/messages/saft-export.generated"
+        }
+      }
+    },
+    "tax-determination": {
+      "address": "zoikosuite.tax.tax-determination.v1",
+      "messages": {
+        "completed": {
+          "$ref": "#/components/messages/tax-determination.completed"
+        },
+        "overridden": {
+          "$ref": "#/components/messages/tax-determination.overridden"
+        }
+      }
+    },
+    "tax-liability": {
+      "address": "zoikosuite.tax.tax-liability.v1",
+      "messages": {
+        "recognized": {
+          "$ref": "#/components/messages/tax-liability.recognized"
+        }
+      }
+    },
+    "tax-payment": {
+      "address": "zoikosuite.tax.tax-payment.v1",
+      "messages": {
+        "due": {
+          "$ref": "#/components/messages/tax-payment.due"
+        },
+        "recorded": {
+          "$ref": "#/components/messages/tax-payment.recorded"
+        }
+      }
+    },
+    "tax-return": {
+      "address": "zoikosuite.tax.tax-return.v1",
+      "messages": {
+        "accepted": {
+          "$ref": "#/components/messages/tax-return.accepted"
+        },
+        "amended": {
+          "$ref": "#/components/messages/tax-return.amended"
+        },
+        "approved": {
+          "$ref": "#/components/messages/tax-return.approved"
+        },
+        "prepared": {
+          "$ref": "#/components/messages/tax-return.prepared"
+        },
+        "rejected": {
+          "$ref": "#/components/messages/tax-return.rejected"
+        },
+        "submitted": {
+          "$ref": "#/components/messages/tax-return.submitted"
+        }
+      }
+    }
+  },
+  "components": {
+    "messages": {
+      "authority-attempt.blocked": {
+        "contentType": "application/json",
+        "description": "Producer: Tax Authority Interface Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Tax (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.tax.authority-attempt.blocked",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Authority Attempt: blocked.",
+        "title": "authority-attempt blocked",
+        "x-zoiko-event-type": "com.zoikosuite.tax.authority-attempt.blocked",
+        "x-zoiko-origin": "extension"
+      },
+      "authority-attempt.deadline-at-risk": {
+        "contentType": "application/json",
+        "description": "Producer: Tax Authority Interface Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Tax (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.tax.authority-attempt.deadline-at-risk",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Authority Attempt: deadline-at-risk.",
+        "title": "authority-attempt deadline-at-risk",
+        "x-zoiko-event-type": "com.zoikosuite.tax.authority-attempt.deadline-at-risk",
+        "x-zoiko-origin": "extension"
+      },
+      "authority-attempt.prepared": {
+        "contentType": "application/json",
+        "description": "Producer: Tax Authority Interface Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Tax (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.tax.authority-attempt.prepared",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Authority Attempt: prepared.",
+        "title": "authority-attempt prepared",
+        "x-zoiko-event-type": "com.zoikosuite.tax.authority-attempt.prepared",
+        "x-zoiko-origin": "extension"
+      },
+      "authority-attempt.response-received": {
+        "contentType": "application/json",
+        "description": "Producer: Tax Authority Interface Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Tax (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.tax.authority-attempt.response-received",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Authority Attempt: response-received.",
+        "title": "authority-attempt response-received",
+        "x-zoiko-event-type": "com.zoikosuite.tax.authority-attempt.response-received",
+        "x-zoiko-origin": "extension"
+      },
+      "authority-attempt.submitted": {
+        "contentType": "application/json",
+        "description": "Producer: Tax Authority Interface Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Tax (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.tax.authority-attempt.submitted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Authority Attempt: submitted.",
+        "title": "authority-attempt submitted",
+        "x-zoiko-event-type": "com.zoikosuite.tax.authority-attempt.submitted",
+        "x-zoiko-origin": "extension"
+      },
+      "authority-attempt.unknown-outcome": {
+        "contentType": "application/json",
+        "description": "Producer: Tax Authority Interface Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Tax (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.tax.authority-attempt.unknown-outcome",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Authority Attempt: unknown-outcome.",
+        "title": "authority-attempt unknown-outcome",
+        "x-zoiko-event-type": "com.zoikosuite.tax.authority-attempt.unknown-outcome",
+        "x-zoiko-origin": "extension"
+      },
+      "authority-callback.quarantined": {
+        "contentType": "application/json",
+        "description": "Producer: Tax Authority Interface Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Tax & Electronic Invoicing (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.tax.authority-callback.quarantined",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Authority Callback: quarantined.",
+        "title": "authority-callback quarantined",
+        "x-zoiko-event-type": "com.zoikosuite.tax.authority-callback.quarantined",
+        "x-zoiko-origin": "extension"
+      },
+      "authority-profile.certified": {
+        "contentType": "application/json",
+        "description": "Producer: Tax Authority Interface Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Tax (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.tax.authority-profile.certified",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Authority Profile: certified.",
+        "title": "authority-profile certified",
+        "x-zoiko-event-type": "com.zoikosuite.tax.authority-profile.certified",
+        "x-zoiko-origin": "extension"
+      },
+      "authority-profile.deprecated": {
+        "contentType": "application/json",
+        "description": "Producer: Tax Authority Interface Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Tax (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.tax.authority-profile.deprecated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Authority Profile: deprecated.",
+        "title": "authority-profile deprecated",
+        "x-zoiko-event-type": "com.zoikosuite.tax.authority-profile.deprecated",
+        "x-zoiko-origin": "extension"
+      },
+      "authority-profile.published": {
+        "contentType": "application/json",
+        "description": "Producer: Tax Authority Interface Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Tax (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.tax.authority-profile.published",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Authority Profile: published.",
+        "title": "authority-profile published",
+        "x-zoiko-event-type": "com.zoikosuite.tax.authority-profile.published",
+        "x-zoiko-origin": "extension"
+      },
+      "authority-profile.withdrawn": {
+        "contentType": "application/json",
+        "description": "Producer: Tax Authority Interface Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Tax (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.tax.authority-profile.withdrawn",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Authority Profile: withdrawn.",
+        "title": "authority-profile withdrawn",
+        "x-zoiko-event-type": "com.zoikosuite.tax.authority-profile.withdrawn",
+        "x-zoiko-origin": "extension"
+      },
+      "e-invoice.cleared": {
+        "contentType": "application/json",
+        "description": "Producer: Tax/E-Invoice. Primary consumers / intent: AR/evidence. Family: Tax & Electronic Invoicing. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.tax.e-invoice.cleared",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "E-invoice submission: cleared.",
+        "title": "e-invoice cleared",
+        "x-zoiko-event-type": "com.zoikosuite.tax.e-invoice.cleared",
+        "x-zoiko-origin": "spec"
+      },
+      "e-invoice.rejected": {
+        "contentType": "application/json",
+        "description": "Producer: Tax/E-Invoice. Primary consumers / intent: AR/exception. Family: Tax & Electronic Invoicing. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.tax.e-invoice.rejected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "E-invoice submission: rejected.",
+        "title": "e-invoice rejected",
+        "x-zoiko-event-type": "com.zoikosuite.tax.e-invoice.rejected",
+        "x-zoiko-origin": "spec"
+      },
+      "e-invoice.submitted": {
+        "contentType": "application/json",
+        "description": "Producer: Tax/E-Invoice. Primary consumers / intent: AR/ops. Family: Tax & Electronic Invoicing. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.tax.e-invoice.submitted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "E-invoice submission: submitted.",
+        "title": "e-invoice submitted",
+        "x-zoiko-event-type": "com.zoikosuite.tax.e-invoice.submitted",
+        "x-zoiko-origin": "spec"
+      },
+      "saft-export.generated": {
+        "contentType": "application/json",
+        "description": "Producer: Tax. Primary consumers / intent: Audit/filing evidence. Family: Tax & Electronic Invoicing. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.tax.saft-export.generated",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "SAF-T export: generated.",
+        "title": "saft-export generated",
+        "x-zoiko-event-type": "com.zoikosuite.tax.saft-export.generated",
+        "x-zoiko-origin": "spec"
+      },
+      "tax-determination.completed": {
+        "contentType": "application/json",
+        "description": "Producer: Tax Engine. Primary consumers / intent: AR/AP/accounting. Family: Tax & Electronic Invoicing. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.tax.tax-determination.completed",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Tax determination: completed.",
+        "title": "tax-determination completed",
+        "x-zoiko-event-type": "com.zoikosuite.tax.tax-determination.completed",
+        "x-zoiko-origin": "spec"
+      },
+      "tax-determination.overridden": {
+        "contentType": "application/json",
+        "description": "Producer: Tax Engine. Primary consumers / intent: Evidence/accounting. Family: Tax & Electronic Invoicing. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.tax.tax-determination.overridden",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Tax determination: overridden.",
+        "title": "tax-determination overridden",
+        "x-zoiko-event-type": "com.zoikosuite.tax.tax-determination.overridden",
+        "x-zoiko-origin": "spec"
+      },
+      "tax-liability.recognized": {
+        "contentType": "application/json",
+        "description": "Producer: Tax. Primary consumers / intent: Accounting/obligation calendar. Family: Tax & Electronic Invoicing. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.tax.tax-liability.recognized",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Tax liability: recognized.",
+        "title": "tax-liability recognized",
+        "x-zoiko-event-type": "com.zoikosuite.tax.tax-liability.recognized",
+        "x-zoiko-origin": "spec"
+      },
+      "tax-payment.due": {
+        "contentType": "application/json",
+        "description": "Producer: Tax. Primary consumers / intent: AP/treasury/calendar. Family: Tax & Electronic Invoicing. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.tax.tax-payment.due",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Tax obligation: due.",
+        "title": "tax-payment due",
+        "x-zoiko-event-type": "com.zoikosuite.tax.tax-payment.due",
+        "x-zoiko-origin": "spec"
+      },
+      "tax-payment.recorded": {
+        "contentType": "application/json",
+        "description": "Producer: Tax. Primary consumers / intent: Tax ledger/reconciliation. Family: Tax & Electronic Invoicing. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.tax.tax-payment.recorded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Tax payment: recorded.",
+        "title": "tax-payment recorded",
+        "x-zoiko-event-type": "com.zoikosuite.tax.tax-payment.recorded",
+        "x-zoiko-origin": "spec"
+      },
+      "tax-return.accepted": {
+        "contentType": "application/json",
+        "description": "Producer: Tax. Primary consumers / intent: Ledger/obligations/evidence. Family: Tax & Electronic Invoicing. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.tax.tax-return.accepted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Tax return: accepted.",
+        "title": "tax-return accepted",
+        "x-zoiko-event-type": "com.zoikosuite.tax.tax-return.accepted",
+        "x-zoiko-origin": "spec"
+      },
+      "tax-return.amended": {
+        "contentType": "application/json",
+        "description": "Producer: Tax. Primary consumers / intent: Ledger/evidence. Family: Tax & Electronic Invoicing. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.tax.tax-return.amended",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Tax return: amended.",
+        "title": "tax-return amended",
+        "x-zoiko-event-type": "com.zoikosuite.tax.tax-return.amended",
+        "x-zoiko-origin": "spec"
+      },
+      "tax-return.approved": {
+        "contentType": "application/json",
+        "description": "Producer: Tax. Primary consumers / intent: Submission. Family: Tax & Electronic Invoicing. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.tax.tax-return.approved",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Tax return: approved.",
+        "title": "tax-return approved",
+        "x-zoiko-event-type": "com.zoikosuite.tax.tax-return.approved",
+        "x-zoiko-origin": "spec"
+      },
+      "tax-return.prepared": {
+        "contentType": "application/json",
+        "description": "Producer: Tax. Primary consumers / intent: Approval. Family: Tax & Electronic Invoicing. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.tax.tax-return.prepared",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Tax return: prepared.",
+        "title": "tax-return prepared",
+        "x-zoiko-event-type": "com.zoikosuite.tax.tax-return.prepared",
+        "x-zoiko-origin": "spec"
+      },
+      "tax-return.rejected": {
+        "contentType": "application/json",
+        "description": "Producer: Tax. Primary consumers / intent: Exception workflow. Family: Tax & Electronic Invoicing. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.tax.tax-return.rejected",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Tax return: rejected.",
+        "title": "tax-return rejected",
+        "x-zoiko-event-type": "com.zoikosuite.tax.tax-return.rejected",
+        "x-zoiko-origin": "spec"
+      },
+      "tax-return.submitted": {
+        "contentType": "application/json",
+        "description": "Producer: Tax. Primary consumers / intent: Ops/evidence. Family: Tax & Electronic Invoicing. Origin: ZS-EVENT-001 section 19.",
+        "name": "com.zoikosuite.tax.tax-return.submitted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Tax return: submitted.",
+        "title": "tax-return submitted",
+        "x-zoiko-event-type": "com.zoikosuite.tax.tax-return.submitted",
+        "x-zoiko-origin": "spec"
+      }
+    },
+    "schemas": {
+      "CloudEventEnvelope": {
+        "properties": {
+          "aggregateid": {
+            "type": "string"
+          },
+          "aggregateversion": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bookid": {
+            "type": "string"
+          },
+          "causationid": {
+            "type": "string"
+          },
+          "classification": {
+            "enum": [
+              "public",
+              "internal",
+              "confidential",
+              "restricted"
+            ],
+            "type": "string"
+          },
+          "correlationid": {
+            "type": "string"
+          },
+          "data": {
+            "description": "Event-specific fact payload; its schema is registered in schema-registry-svc.",
+            "type": "object"
+          },
+          "datacontenttype": {
+            "const": "application/json",
+            "type": "string"
+          },
+          "dataschema": {
+            "description": "Registered payload schema (schema-registry-svc).",
+            "type": "string"
+          },
+          "effectiveat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "description": "UUIDv7, immutable event fact id.",
+            "type": "string"
+          },
+          "legalentityid": {
+            "type": "string"
+          },
+          "payloadhash": {
+            "pattern": "^sha256:",
+            "type": "string"
+          },
+          "publishedat": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "requestid": {
+            "type": "string"
+          },
+          "residencyregion": {
+            "type": "string"
+          },
+          "schemaversion": {
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+            "type": "string"
+          },
+          "source": {
+            "description": "urn:zoikosuite:service:<service>",
+            "type": "string"
+          },
+          "specversion": {
+            "const": "1.0",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "tenantid": {
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "traceparent": {
+            "type": "string"
+          },
+          "type": {
+            "pattern": "^com\\.zoikosuite\\.[a-z0-9-]+\\.[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "specversion",
+          "id",
+          "source",
+          "type",
+          "time",
+          "datacontenttype",
+          "dataschema",
+          "tenantid",
+          "publishedat",
+          "residencyregion",
+          "classification",
+          "schemaversion",
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from services/eventing/catalogue/catalogue.json (ZS-EVENT-001 section 19). Do not edit by hand: run `go generate ./catalogue` in services/eventing.",
+    "title": "ZoikoSuite tax domain events",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "publish.authority-attempt": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/authority-attempt"
+      },
+      "description": "Producer(s): Tax Authority Interface Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/authority-attempt/messages/blocked"
+        },
+        {
+          "$ref": "#/channels/authority-attempt/messages/deadline-at-risk"
+        },
+        {
+          "$ref": "#/channels/authority-attempt/messages/prepared"
+        },
+        {
+          "$ref": "#/channels/authority-attempt/messages/response-received"
+        },
+        {
+          "$ref": "#/channels/authority-attempt/messages/submitted"
+        },
+        {
+          "$ref": "#/channels/authority-attempt/messages/unknown-outcome"
+        }
+      ],
+      "summary": "Publish authority-attempt facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.authority-callback": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/authority-callback"
+      },
+      "description": "Producer(s): Tax Authority Interface Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/authority-callback/messages/quarantined"
+        }
+      ],
+      "summary": "Publish authority-callback facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.authority-profile": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/authority-profile"
+      },
+      "description": "Producer(s): Tax Authority Interface Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/authority-profile/messages/certified"
+        },
+        {
+          "$ref": "#/channels/authority-profile/messages/deprecated"
+        },
+        {
+          "$ref": "#/channels/authority-profile/messages/published"
+        },
+        {
+          "$ref": "#/channels/authority-profile/messages/withdrawn"
+        }
+      ],
+      "summary": "Publish authority-profile facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.e-invoice": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/e-invoice"
+      },
+      "description": "Producer(s): Tax/E-Invoice. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/e-invoice/messages/cleared"
+        },
+        {
+          "$ref": "#/channels/e-invoice/messages/rejected"
+        },
+        {
+          "$ref": "#/channels/e-invoice/messages/submitted"
+        }
+      ],
+      "summary": "Publish e-invoice facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.saft-export": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/saft-export"
+      },
+      "description": "Producer(s): Tax. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/saft-export/messages/generated"
+        }
+      ],
+      "summary": "Publish saft-export facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.tax-determination": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/tax-determination"
+      },
+      "description": "Producer(s): Tax Engine. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/tax-determination/messages/completed"
+        },
+        {
+          "$ref": "#/channels/tax-determination/messages/overridden"
+        }
+      ],
+      "summary": "Publish tax-determination facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.tax-liability": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/tax-liability"
+      },
+      "description": "Producer(s): Tax. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/tax-liability/messages/recognized"
+        }
+      ],
+      "summary": "Publish tax-liability facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.tax-payment": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/tax-payment"
+      },
+      "description": "Producer(s): Tax. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/tax-payment/messages/due"
+        },
+        {
+          "$ref": "#/channels/tax-payment/messages/recorded"
+        }
+      ],
+      "summary": "Publish tax-payment facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.tax-return": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/tax-return"
+      },
+      "description": "Producer(s): Tax. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/tax-return/messages/accepted"
+        },
+        {
+          "$ref": "#/channels/tax-return/messages/amended"
+        },
+        {
+          "$ref": "#/channels/tax-return/messages/approved"
+        },
+        {
+          "$ref": "#/channels/tax-return/messages/prepared"
+        },
+        {
+          "$ref": "#/channels/tax-return/messages/rejected"
+        },
+        {
+          "$ref": "#/channels/tax-return/messages/submitted"
+        }
+      ],
+      "summary": "Publish tax-return facts after the authoritative commit (transactional outbox)."
+    }
+  }
+}

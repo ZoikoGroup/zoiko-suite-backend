@@ -1828,6 +1828,7 @@ components:
         `value_constraint_failed` — the value fails the key's declared validation.
         `secret_value_prohibited` — the value is (or contains) secret material; configuration stores references only, of the form `secret://<environment>/<path>`.
         `secret_reference_environment_mismatch` — the secret reference names a different environment than the one being written.
+        `secret_reference_unresolved` (422) — no active vault policy governs the referenced path (S3-B3); `secret_vault_unavailable` (503) — the vault could not confirm it, so nothing was stored.
         `invalid_snapshot_id` — the snapshot id is not a UUID.
         `environment_boundary_violation` — the value crosses its environment's boundary rule.
         `emergency_change_no_expiry` — a break-glass change must carry `expires_at`.

@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestValidateInbound_RestrictedEnvRefusesServerOnlyTLS(t *testing.T) {
@@ -29,7 +30,8 @@ func TestValidateInbound_RestrictedEnvRefusesIdentityCheckOff(t *testing.T) {
 }
 
 func TestValidateInbound_MutualTLSWithIdentityCheckAccepted(t *testing.T) {
-	c := &Config{Env: "production", TLSCertFile: "c", TLSKeyFile: "k", TLSClientCAFile: "ca", MTLSIdentityCheck: true}
+	c := &Config{Env: "production", TLSCertFile: "c", TLSKeyFile: "k", TLSClientCAFile: "ca", MTLSIdentityCheck: true,
+		MTLSMaxClientCertLifetime: 24 * time.Hour, MTLSRequiredURIPrefix: "spiffe://zoiko/production/"}
 	if err := c.ValidateInbound(); err != nil {
 		t.Fatalf("full mTLS must be accepted: %v", err)
 	}
@@ -106,5 +108,34 @@ func TestValidateLeaseCeiling(t *testing.T) {
 	}
 	if err := (&Config{Env: "production", MaxLeaseDurationSeconds: 3600}).ValidateLeaseCeiling(); err != nil {
 		t.Fatalf("a positive ceiling is accepted: %v", err)
+	}
+}
+
+// S4-C1: in staging and production a workload certificate must be short-lived and bound to an environment.
+func TestValidateInbound_RestrictedEnvRequiresTheWorkloadCertificatePolicy(t *testing.T) {
+	base := Config{Env: "production", TLSCertFile: "c", TLSKeyFile: "k", TLSClientCAFile: "ca", MTLSIdentityCheck: true,
+		MTLSMaxClientCertLifetime: 24 * time.Hour, MTLSRequiredURIPrefix: "spiffe://zoiko/production/"}
+	cases := map[string]struct {
+		mut  func(c *Config)
+		want string
+	}{
+		"no lifetime":    {func(c *Config) { c.MTLSMaxClientCertLifetime = 0 }, "MTLS_MAX_CLIENT_CERT_LIFETIME"},
+		"no prefix":      {func(c *Config) { c.MTLSRequiredURIPrefix = "" }, "MTLS_REQUIRED_URI_PREFIX"},
+		"foreign prefix": {func(c *Config) { c.MTLSRequiredURIPrefix = "spiffe://other/production/" }, "MTLS_REQUIRED_URI_PREFIX"},
+		"no trailing /":  {func(c *Config) { c.MTLSRequiredURIPrefix = "spiffe://zoiko/production" }, "MTLS_REQUIRED_URI_PREFIX"},
+	}
+	for name, tc := range cases {
+		c := base
+		tc.mut(&c)
+		if err := c.ValidateInbound(); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: want a refusal naming %s, got %v", name, tc.want, err)
+		}
+	}
+	if err := base.ValidateInbound(); err != nil {
+		t.Fatalf("a full policy is accepted: %v", err)
+	}
+	// Development is not forced to carry the policy.
+	if err := (&Config{Env: "local", TLSCertFile: "c", TLSKeyFile: "k", TLSClientCAFile: "ca"}).ValidateInbound(); err != nil {
+		t.Fatalf("local mTLS without the policy must still start: %v", err)
 	}
 }

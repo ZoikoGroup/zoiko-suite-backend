@@ -56,8 +56,10 @@ info:
     missing_field`. With `warn` it is admitted and marked
     `X-Command-Contract: violated`.
 
-    **Optimistic concurrency.** Commands marked **V** take an optional
-    `expected_version`; a stale one is `409 version_conflict`.
+    **Optimistic concurrency (API-3).** Commands marked **V** need the version
+    they were made against: `If-Match: "v<version>"` (the ETag of the last read),
+    or `expected_version` in the body. Missing is `428 precondition_required`;
+    stale is `412 stale_version`.
 
     **Tenant resolution.** The tenant of an evaluation is resolved on the
     server, from `X-Tenant-Id` / body `tenant_id` and
@@ -498,6 +500,8 @@ paths:
       summary: List the tenant's roles
       description: '`iam.role.read`. Tenant-scoped catalogue.'
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/LegalEntityHeader'
       responses:
@@ -522,6 +526,7 @@ paths:
       summary: Retire a role (R, V)
       description: '`iam.role.manage`. Takes `reason_code` or `purpose` and optional `expected_version`.'
       parameters:
+        - $ref: '#/components/parameters/IfMatch'
         - name: role_id
           in: path
           required: true
@@ -529,6 +534,10 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '200':
           description: Role retired.
           content:
@@ -547,7 +556,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: 'Conflict — `version_conflict`, or `sod_conflict` naming the holders.'
+          description: 'Conflict — `sod_conflict` naming the holders.'
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -558,6 +567,7 @@ paths:
       summary: Reactivate a role (R, V)
       description: '`iam.role.manage`. Reactivating a role you hold is `403 self_grant_not_allowed`; reactivating one that would give a holder an SoD conflict is `409 sod_conflict` listing the holders.'
       parameters:
+        - $ref: '#/components/parameters/IfMatch'
         - name: role_id
           in: path
           required: true
@@ -565,6 +575,10 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '200':
           description: Role reactivated.
           content:
@@ -583,7 +597,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: 'Conflict — `version_conflict` or `sod_conflict`.'
+          description: 'Conflict — `sod_conflict`.'
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -637,6 +651,8 @@ paths:
       summary: List a role's permission bundles
       description: '`iam.role.read`. Includes retired bundles.'
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - name: role_id
           in: path
           required: true
@@ -665,6 +681,7 @@ paths:
       summary: Retire a permission bundle (R, V)
       description: '`iam.permission_bundle.manage`.'
       parameters:
+        - $ref: '#/components/parameters/IfMatch'
         - name: permission_bundle_id
           in: path
           required: true
@@ -672,6 +689,10 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '200':
           description: Bundle retired.
           content:
@@ -695,6 +716,7 @@ paths:
       summary: Reactivate a permission bundle (R, V)
       description: '`iam.permission_bundle.manage`. Reactivation checks self-grant and SoD as creation does.'
       parameters:
+        - $ref: '#/components/parameters/IfMatch'
         - name: permission_bundle_id
           in: path
           required: true
@@ -702,6 +724,10 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '200':
           description: Bundle reactivated.
           content:
@@ -771,14 +797,29 @@ paths:
               schema: { $ref: '#/components/schemas/Problem' }
     get:
       tags: [Role Assignments]
-      summary: List role assignments
-      description: '`iam.assignment.read`. Shows `approval_status`.'
+      summary: List role assignments (ListPrincipalAssignments, GetAssignmentsAsOf)
+      description: |
+        `iam.assignment.read`. Shows `approval_status` and `suspended_at`.
+        ORG-06 ListPrincipalAssignments is this list with `principal_id`.
+        With `as_of`, ORG-06 GetAssignmentsAsOf: the assignments that granted
+        at that instant (approved, not suspended, within their dates),
+        reconstructed from the append-only history (000038) rather than the
+        current rows; a future `as_of` is `400 invalid_as_of`.
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/LegalEntityHeader'
         - name: principal_id
           in: query
           schema: { type: string }
+        - name: role_id
+          in: query
+          schema: { type: string }
+        - name: as_of
+          in: query
+          schema: { type: string, format: date-time }
+          description: RFC 3339 instant, not in the future.
       responses:
         '200':
           description: The tenant's assignments.
@@ -809,6 +850,7 @@ paths:
           in: path
           required: true
           schema: { type: string }
+        - $ref: '#/components/parameters/IfMatch'
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
@@ -829,8 +871,10 @@ paths:
               schema: { $ref: '#/components/schemas/Problem' }
         '404':
           $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '409':
-          description: 'Conflict — `approval_expired`, `sod_conflict` after re-check, or `version_conflict`.'
+          description: 'Conflict — `approval_expired`, or `sod_conflict` after re-check.'
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -845,6 +889,7 @@ paths:
           in: path
           required: true
           schema: { type: string }
+        - $ref: '#/components/parameters/IfMatch'
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
@@ -862,6 +907,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '409':
           $ref: '#/components/responses/Conflict'
 
@@ -875,6 +922,7 @@ paths:
           in: path
           required: true
           schema: { type: string }
+        - $ref: '#/components/parameters/IfMatch'
       requestBody:
         required: true
         content:
@@ -904,8 +952,189 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '409':
           $ref: '#/components/responses/Conflict'
+
+  /v1/admin/role-assignments/as-of:
+    get:
+      tags: [Role Assignments]
+      summary: GetAssignmentsAsOf, the assignments that were authorizing at an instant (ORG-06)
+      description: |
+        `iam.assignment.read`. Reconstructs which assignments were AUTHORIZING
+        at `as_of`: approved by then, inside their effective window and not
+        suspended. An assignment counts from the moment it was approved, not from
+        a backdated `effective_from`, because the question is what the principal
+        could do and nothing was granted before the grant existed. PENDING,
+        REJECTED and EXPIRED assignments never authorized, so never appear.
+        A suspended period is excluded; a revoked assignment is shown up to the
+        moment it was revoked. `GET /v1/admin/role-assignments?as_of=` answers
+        the same question from the append-only assignment history (000038).
+      parameters:
+        - name: as_of
+          in: query
+          required: false
+          description: RFC 3339 timestamp or a YYYY-MM-DD date (read as midnight UTC). Defaults to now.
+          schema: { type: string }
+        - name: principal_id
+          in: query
+          required: false
+          description: Limit to one principal. Omit for every principal in the tenant.
+          schema: { type: string }
+      responses:
+        '200':
+          description: The assignments in force at as_of.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssignmentsAsOf'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/admin/role-assignments/{assignment_id}/suspend:
+    post:
+      tags: [Role Assignments]
+      summary: SuspendAssignment, withhold an approved assignment without ending it (ORG-06)
+      description: |
+        `iam.assignment.suspend` (*platform* for a platform-scope assignment).
+        The assignment grants nothing from this moment on every decision path
+        and on every replica, and anything delegated from it stops flowing. It
+        is still held: it can be resumed, revoked or expire. Only an APPROVED
+        assignment that has not ended can be suspended (`409
+        assignment_not_suspendable`). A reason is always required and is
+        recorded as `suspension_reason`. If-Match is honoured, not yet
+        required; the response carries the new ETag. Emits
+        `iam.assignment.suspended`.
+      parameters:
+        - name: assignment_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason_code: { type: string }
+                purpose: { type: string }
+                expected_version:
+                  type: integer
+                  format: int64
+                  description: For callers that predate API-3; If-Match is preferred.
+              additionalProperties: true
+      responses:
+        '200':
+          description: Assignment suspended.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleAssignment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/admin/role-assignments/{assignment_id}/resume:
+    post:
+      tags: [Role Assignments]
+      summary: Resume a suspended assignment (ORG-06)
+      description: |
+        `iam.assignment.resume` (*platform* for a platform-scope assignment).
+        Restores access, so it takes what granting takes: never on one's own
+        assignment (`403 self_resume_not_allowed`),
+        `iam.assignment.approve_privileged` for a privileged role, and no SoD
+        conflict with what the principal holds now (`409 sod_conflict`). Not
+        suspended: `409 assignment_not_suspended`; a suspended assignment whose
+        window has since closed: `409 assignment_ended`. If-Match is honoured,
+        not yet required; the response carries the new ETag. Emits
+        `iam.assignment.resumed`, not a second grant.
+      parameters:
+        - name: assignment_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason_code: { type: string }
+                purpose: { type: string }
+                expected_version:
+                  type: integer
+                  format: int64
+                  description: For callers that predate API-3; If-Match is preferred.
+              additionalProperties: true
+      responses:
+        '200':
+          description: Assignment resumed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleAssignment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: 'Forbidden — including `self_resume_not_allowed`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
+        '409':
+          description: 'Conflict — `assignment_not_suspended`, `assignment_ended` or `sod_conflict`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/admin/role-assignments/{assignment_id}/suspensions:
+    get:
+      tags: [Role Assignments]
+      summary: List an assignment's suspensions, oldest first, including lifted ones (ORG-06)
+      description: '`iam.assignment.read`. The append-only evidence of who suspended it, when and why, and who lifted it.'
+      parameters:
+        - name: assignment_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The suspensions.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AssignmentSuspension'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
 
   /v1/admin/delegated-authorities:
     post:
@@ -949,6 +1178,8 @@ paths:
       summary: List delegations
       description: '`iam.delegation.read`.'
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/LegalEntityHeader'
       responses:
@@ -971,6 +1202,132 @@ paths:
     post:
       tags: [Delegations]
       summary: Revoke a delegation (R)
+      description: '`iam.delegation.revoke`. Delegator only.'
+      parameters:
+        - name: delegation_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Delegation revoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Delegation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  # ZS-IAM-001 §21 names for the delegation commands (tracker D2-5.F19).
+  # Aliases of /v1/admin/delegated-authorities: same handler, same checks,
+  # same responses. The colon form is the documented one; the slash form
+  # exists because some HTTP tooling percent-encodes a colon.
+  /v1/iam/delegations:
+    post:
+      tags: [Delegations]
+      summary: Grant delegated authority (ZS-IAM-001 §11) — ZS-IAM-001 §21 alias
+      description: |
+        `iam.delegation.grant`. The delegator must be the caller; no
+        self-delegation. `delegated_actions` may not name an `iam.*` or
+        protected platform action (`400 protected_privilege_not_delegable`),
+        and a full-authority delegation never confers them. `effective_to` is
+        required under `enforce`; under `warn` it defaults to 90 days.
+        `reason` (R) and `approval_reference` are recorded.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/LegalEntityHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/SourceChannel'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDelegationRequest'
+      responses:
+        '201':
+          description: Delegation granted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Delegation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    get:
+      tags: [Delegations]
+      summary: List delegations — ZS-IAM-001 §21 alias
+      description: '`iam.delegation.read`.'
+      parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/LegalEntityHeader'
+      responses:
+        '200':
+          description: The tenant's delegations.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  delegations:
+                    type: array
+                    items: { $ref: '#/components/schemas/Delegation' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/iam/delegations/{delegation_id}:revoke:
+    post:
+      tags: [Delegations]
+      summary: Revoke a delegation (R) — ZS-IAM-001 §21 alias
+      description: '`iam.delegation.revoke`. Delegator only.'
+      parameters:
+        - name: delegation_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        $ref: '#/components/requestBodies/CommandBody'
+      responses:
+        '200':
+          description: Delegation revoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Delegation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/iam/delegations/{delegation_id}/revoke:
+    post:
+      tags: [Delegations]
+      summary: Revoke a delegation (R) — ZS-IAM-001 §21 alias
       description: '`iam.delegation.revoke`. Delegator only.'
       parameters:
         - name: delegation_id
@@ -1035,6 +1392,8 @@ paths:
       summary: List SoD rules
       description: '`iam.sod_rule.read`. Tenant and platform-wide rules.'
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/TenantHeader'
       responses:
         '200':
@@ -1058,6 +1417,7 @@ paths:
       summary: Retire a SoD rule (R, V)
       description: '`iam.sod_rule.manage`. A principal holding either action of the rule cannot retire it (`403 sod_self_interest`).'
       parameters:
+        - $ref: '#/components/parameters/IfMatch'
         - name: sod_rule_id
           in: path
           required: true
@@ -1065,6 +1425,10 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '202':
           description: Change requested; the rule is unchanged until published by someone else (AU-17). 200 when already in that state.
           content:
@@ -1091,6 +1455,7 @@ paths:
       summary: Reactivate a SoD rule (R, V)
       description: '`iam.sod_rule.manage`.'
       parameters:
+        - $ref: '#/components/parameters/IfMatch'
         - name: sod_rule_id
           in: path
           required: true
@@ -1098,6 +1463,10 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '202':
           description: Change requested; the rule is unchanged until published by someone else (AU-17). 200 when already in that state.
           content:
@@ -1178,6 +1547,8 @@ paths:
       summary: List SoD exceptions
       description: '`iam.sod_rule.read`.'
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - name: principal_id
           in: query
           schema: { type: string }
@@ -1334,6 +1705,8 @@ paths:
       summary: List ABAC rules
       description: '`iam.policy.read`.'
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/TenantHeader'
       responses:
         '200':
@@ -1357,6 +1730,7 @@ paths:
       summary: Retire an ABAC rule (R, V)
       description: '`iam.abac_rule.manage`.'
       parameters:
+        - $ref: '#/components/parameters/IfMatch'
         - name: abac_rule_id
           in: path
           required: true
@@ -1364,6 +1738,10 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '202':
           description: Change requested; the rule is unchanged until published by someone else (AU-17). 200 when already in that state.
           content:
@@ -1387,6 +1765,7 @@ paths:
       summary: Reactivate an ABAC rule (R, V)
       description: '`iam.abac_rule.manage`.'
       parameters:
+        - $ref: '#/components/parameters/IfMatch'
         - name: abac_rule_id
           in: path
           required: true
@@ -1394,6 +1773,10 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '202':
           description: Change requested; the rule is unchanged until published by someone else (AU-17). 200 when already in that state.
           content:
@@ -1458,6 +1841,8 @@ paths:
       summary: List workload bindings
       description: '`iam.workload.manage`. The tenant''s bindings, active and not.'
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/TenantHeader'
       responses:
         '200':
@@ -1485,6 +1870,7 @@ paths:
           in: path
           required: true
           schema: { type: string }
+        - $ref: '#/components/parameters/IfMatch'
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
@@ -1502,6 +1888,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
 
   /v1/admin/workload-bindings/{workload_id}/reactivate:
     post:
@@ -1513,6 +1901,7 @@ paths:
           in: path
           required: true
           schema: { type: string }
+        - $ref: '#/components/parameters/IfMatch'
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
@@ -1530,6 +1919,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
 
   /admin/v1/privileged-sessions:
     post:
@@ -1578,6 +1969,8 @@ paths:
       summary: List privileged sessions
       description: Registers need `iam.pam.manage`; your own sessions are readable without it, another principal's session by id is `404`.
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/TenantHeader'
       responses:
         '200':
@@ -1634,6 +2027,8 @@ paths:
       summary: List privileged sessions — /v1/admin spelling
       description: Identical to `GET /admin/v1/privileged-sessions`.
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/TenantHeader'
       responses:
         '200':
@@ -1941,6 +2336,8 @@ paths:
       summary: List break-glass sessions
       description: Registers need the administering permission; your own are readable without it.
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/TenantHeader'
       responses:
         '200':
@@ -1991,6 +2388,8 @@ paths:
       summary: List break-glass sessions — /v1/admin spelling
       description: Identical to `GET /admin/v1/break-glass-sessions`.
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/TenantHeader'
       responses:
         '200':
@@ -2223,6 +2622,8 @@ paths:
       summary: List support sessions
       description: Registers need the administering permission; your own are readable without it.
       parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/TenantHeader'
       responses:
         '200':
@@ -2656,6 +3057,9 @@ paths:
 
   /v1/admin/authority-limits:
     get:
+      parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
       tags: [Authority Limits]
       summary: List approval and signing authority limits
       description: '`iam.policy.read`. Every version, newest first. `?status=` (PENDING_APPROVAL, ACTIVE, REJECTED, RETIRED, SUPERSEDED, or PENDING for anything awaiting a decision), `?principal_id=`, `?role_id=`, `?authority_type=` narrow it.'
@@ -2700,6 +3104,7 @@ paths:
       summary: Request a change to a limit in force
       description: '`iam.authority_limit.manage`. Proposes new amounts or dates as a new PENDING_APPROVAL version naming the one it supersedes; the current limit applies until the change is approved. Who and where it applies to cannot change. One open change per limit (409 `change_pending`).'
       parameters:
+        - $ref: '#/components/parameters/IfMatch'
         - name: authority_limit_id
           in: path
           required: true
@@ -2711,6 +3116,10 @@ paths:
             schema:
               $ref: '#/components/schemas/CreateAuthorityLimitRequest'
       responses:
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '202':
           description: Change requested.
           content:
@@ -2734,6 +3143,7 @@ paths:
       summary: Request a limit''s retirement
       description: '`iam.authority_limit.manage` and a §16 reason. Marks the ACTIVE limit `pending_action: RETIRE`; it keeps applying until the retirement is approved.'
       parameters:
+        - $ref: '#/components/parameters/IfMatch'
         - name: authority_limit_id
           in: path
           required: true
@@ -2741,6 +3151,10 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/CommandBody'
       responses:
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '412':
+          $ref: '#/components/responses/StaleVersion'
         '202':
           description: Retirement requested.
           content:
@@ -2976,6 +3390,28 @@ components:
       schema: { type: integer }
       description: Age of the caller's last authentication; required for step-up-gated actions under `AUTHZ_STEP_UP_UNKNOWN_AGE=step_up`.
 
+    PageSize:
+      name: page_size
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      description: 'API-4 cursor paging, opt-in. Sending page_size or cursor returns {"records": [...], "next_cursor": "..."} ordered by record id (next_cursor absent on the last page; "truncated": true when the store row cap was reached). Without either the register is returned as before.'
+
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema: { type: string }
+      description: The next_cursor of the previous page. Bound to the query it was issued for (path, tenant, filters); replayed on another query it is 400 invalid_cursor.
+
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      schema: { type: string }
+      description: 'The ETag ("v<version>") of the representation the change was made against (API-3). expected_version in the body is accepted in its place; * makes the change unconditional. Missing is 428 precondition_required; stale is 412 stale_version.'
+
+
   requestBodies:
     CommandBody:
       required: true
@@ -2991,6 +3427,18 @@ components:
       description: A16 command fields; `reason_code` or `purpose` required where the route is marked R, `expected_version` honoured where marked V.
 
   responses:
+    PreconditionRequired:
+      description: 'Precondition required — 428 precondition_required: a mutation of an existing aggregate needs If-Match (or expected_version).'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    StaleVersion:
+      description: 'Precondition failed — 412 stale_version: the object changed since the version sent. Re-read it and retry.'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
     BadRequest:
       description: 'Bad request — `400`. Codes include `missing_field`, `envelope_incomplete`, `invalid_json`, `duration_exceeds_maximum`, `protected_privilege_not_delegable`, `missing_tenant_scope`.'
       content:
@@ -3016,7 +3464,7 @@ components:
           schema:
             $ref: '#/components/schemas/Problem'
     Conflict:
-      description: 'Conflict — `409`. Codes include `sod_conflict`, `version_conflict`, `idempotency_mismatch`, `approval_expired`.'
+      description: 'Conflict — `409`. Codes include `sod_conflict`, `idempotency_mismatch`, `approval_expired`.'
       content:
         application/problem+json:
           schema:
@@ -3236,11 +3684,37 @@ components:
         org_unit_id: { type: string }
         effective_from: { type: string, format: date-time }
         effective_to: { type: string, format: date-time }
-        approval_status: { type: string, enum: [APPROVED, PENDING_APPROVAL, REJECTED, EXPIRED] }
+        approval_status: { type: string, enum: [APPROVED, PENDING_APPROVAL, REJECTED, EXPIRED, SUSPENDED] }
         approved_by: { type: string }
         approval_reference: { type: string }
-        version: { type: integer }
+        suspended_at: { type: string, format: date-time, description: Set while suspended; a suspended assignment grants nothing. }
+        suspended_by: { type: string }
+        suspension_reason: { type: string }
+        version: { type: integer, description: Bumped on every change; the response ETag is "v<version>". }
       additionalProperties: true
+
+    AssignmentSuspension:
+      type: object
+      required: [suspension_id, principal_role_assignment_id, suspended_by, suspended_at, suspension_reason]
+      properties:
+        suspension_id: { type: string, format: uuid }
+        principal_role_assignment_id: { type: string, format: uuid }
+        suspended_by: { type: string }
+        suspended_at: { type: string, format: date-time }
+        suspension_reason: { type: string }
+        resumed_by: { type: string }
+        resumed_at: { type: string, format: date-time }
+        resume_reason: { type: string }
+
+    AssignmentsAsOf:
+      type: object
+      required: [as_of, assignments]
+      properties:
+        as_of: { type: string, format: date-time }
+        assignments:
+          type: array
+          items:
+            $ref: '#/components/schemas/RoleAssignment'
 
     CreateRoleAssignmentRequest:
       type: object
@@ -3381,6 +3855,7 @@ components:
         allowed_audience: { type: string }
         allowed_actions: { type: array, items: { type: string } }
         active: { type: boolean }
+        version: { type: integer }
       additionalProperties: true
 
     PrivilegedSession:
@@ -3578,7 +4053,8 @@ components:
         legal_entity_id: { type: string, nullable: true }
         book_id: { type: string, nullable: true }
         org_unit_id: { type: string, nullable: true }
-        currency: { type: string }
+        limit_kind: { type: string, enum: [MONETARY, QUANTITY], description: 'MONETARY bounds the request''s `amount` in `currency`; QUANTITY bounds its `quantity` attribute (a whole count, no currency).' }
+        currency: { type: string, description: Absent on a QUANTITY limit. }
         lower_limit: { type: string }
         upper_limit: { type: string }
         effective_from: { type: string, format: date-time }
@@ -3608,7 +4084,8 @@ components:
         legal_entity_id: { type: string }
         book_id: { type: string }
         org_unit_id: { type: string }
-        currency: { type: string, enum: [GBP, USD, EUR, CAD, AUD, JPY, CHF] }
+        limit_kind: { type: string, enum: [MONETARY, QUANTITY], default: MONETARY, description: Create only; a change keeps the kind. }
+        currency: { type: string, enum: [GBP, USD, EUR, CAD, AUD, JPY, CHF], description: MONETARY only (default GBP); must be absent on QUANTITY. }
         lower_limit: { type: string, example: '0' }
         upper_limit: { type: string, example: '25000.00' }
         effective_from: { type: string, format: date-time }

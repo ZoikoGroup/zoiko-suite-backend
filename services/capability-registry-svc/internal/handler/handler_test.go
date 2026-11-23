@@ -19,7 +19,7 @@ import (
 	authzpkg "zoiko.io/capability-registry-svc/internal/authz"
 	"zoiko.io/capability-registry-svc/internal/domain"
 	svcenvelope "zoiko.io/capability-registry-svc/internal/envelope"
-	"zoiko.io/capability-registry-svc/internal/events"
+	jurisdictionpkg "zoiko.io/capability-registry-svc/internal/jurisdiction"
 	svcmiddleware "zoiko.io/capability-registry-svc/internal/middleware"
 )
 
@@ -32,7 +32,20 @@ type stubStore struct {
 	integrations  map[string][]domain.IntegrationCapability
 	releases      map[string][]domain.Release
 	claims        map[string][]domain.CapabilityClaim
-	published     []events.PublishParams
+	published     []stubEvent
+}
+
+// stubEvent is what the real store enqueues in eventing_outbox alongside each
+// committed write (store.enqueueEvent). The stub mirrors that contract — one
+// event per committed write, keyed on the parent capability, none on a
+// replay or a failed write — so these tests pin which write a handler drives.
+// store/eventing_outbox_test.go proves the real store meets the same
+// contract against Postgres.
+type stubEvent struct {
+	EventType     string
+	EntityID      string
+	ActorID       string
+	CorrelationID string
 }
 
 type stubIdempotencyKey struct {
@@ -61,7 +74,7 @@ func newStubStore() *stubStore {
 	}
 }
 
-func (s *stubStore) withIdempotency(claim domain.IdempotencyClaim, write func() error) error {
+func (s *stubStore) withIdempotency(claim domain.IdempotencyClaim, eventType string, aggregateID func() string, write func() error) error {
 	s.idempotencyMu.Lock()
 	defer s.idempotencyMu.Unlock()
 
@@ -77,16 +90,10 @@ func (s *stubStore) withIdempotency(claim domain.IdempotencyClaim, write func() 
 	if err := write(); err != nil {
 		return err
 	}
-	if len(claim.OutboxPayload) > 0 {
-		var event events.Event
-		if err := json.Unmarshal(claim.OutboxPayload, &event); err != nil {
-			return err
-		}
-		s.published = append(s.published, events.PublishParams{
-			EventType: event.EventType, EntityID: event.EntityID, TenantID: event.TenantID,
-			ActorID: event.ActorID, CorrelationID: event.CorrelationID, Payload: event.Payload,
-		})
-	}
+	s.published = append(s.published, stubEvent{
+		EventType: eventType, EntityID: aggregateID(),
+		ActorID: claim.PrincipalID, CorrelationID: claim.CorrelationID,
+	})
 	s.idempotency[key] = stubIdempotencyResult{
 		requestHash: claim.RequestSHA256, resourceID: claim.ResourceID,
 		status: claim.ResponseStatus, body: append([]byte(nil), claim.ResponseBody...),
@@ -95,7 +102,7 @@ func (s *stubStore) withIdempotency(claim domain.IdempotencyClaim, write func() 
 }
 
 func (s *stubStore) CreateCapability(_ context.Context, c *domain.Capability, claim domain.IdempotencyClaim) error {
-	return s.withIdempotency(claim, func() error {
+	return s.withIdempotency(claim, "capability.created", func() string { return c.CapabilityID }, func() error {
 		if _, exists := s.byCode[c.CapabilityCode]; exists {
 			return domain.ErrConflict
 		}
@@ -120,7 +127,7 @@ func (s *stubStore) GetCapabilityByCode(_ context.Context, code string) (*domain
 }
 
 func (s *stubStore) CreateMarketRelease(_ context.Context, m *domain.MarketRelease, claim domain.IdempotencyClaim) error {
-	return s.withIdempotency(claim, func() error {
+	return s.withIdempotency(claim, "market_release.created", func() string { return m.CapabilityID }, func() error {
 		if _, ok := s.capabilities[m.CapabilityID]; !ok {
 			return domain.ErrCapabilityNotFound
 		}
@@ -146,7 +153,7 @@ func (s *stubStore) GetMarketReleaseByID(_ context.Context, id string) (*domain.
 }
 
 func (s *stubStore) CreateIntegrationCapability(_ context.Context, i *domain.IntegrationCapability, claim domain.IdempotencyClaim) error {
-	return s.withIdempotency(claim, func() error {
+	return s.withIdempotency(claim, "integration_capability.created", func() string { return i.CapabilityID }, func() error {
 		if _, ok := s.capabilities[i.CapabilityID]; !ok {
 			return domain.ErrCapabilityNotFound
 		}
@@ -171,11 +178,13 @@ func (s *stubStore) GetIntegrationCapabilityByID(_ context.Context, id string) (
 }
 
 func (s *stubStore) UpdateIntegrationHealth(_ context.Context, id, status string, claim domain.IdempotencyClaim) error {
-	return s.withIdempotency(claim, func() error {
+	var parent string
+	return s.withIdempotency(claim, "integration_capability.health_updated", func() string { return parent }, func() error {
 		for capID, list := range s.integrations {
 			for i := range list {
 				if list[i].IntegrationCapabilityID == id {
 					list[i].HealthStatus = status
+					parent = capID
 					s.integrations[capID] = list
 					return nil
 				}
@@ -186,7 +195,7 @@ func (s *stubStore) UpdateIntegrationHealth(_ context.Context, id, status string
 }
 
 func (s *stubStore) CreateRelease(_ context.Context, r *domain.Release, claim domain.IdempotencyClaim) error {
-	return s.withIdempotency(claim, func() error {
+	return s.withIdempotency(claim, "capability_release.state_changed", func() string { return r.CapabilityID }, func() error {
 		if _, ok := s.capabilities[r.CapabilityID]; !ok {
 			return domain.ErrCapabilityNotFound
 		}
@@ -221,7 +230,7 @@ func (s *stubStore) GetReleaseByID(_ context.Context, id string) (*domain.Releas
 }
 
 func (s *stubStore) CreateCapabilityClaim(_ context.Context, c *domain.CapabilityClaim, claim domain.IdempotencyClaim) error {
-	return s.withIdempotency(claim, func() error {
+	return s.withIdempotency(claim, "capability_claim.created", func() string { return c.CapabilityID }, func() error {
 		if _, ok := s.capabilities[c.CapabilityID]; !ok {
 			return domain.ErrCapabilityNotFound
 		}
@@ -243,6 +252,30 @@ func (s *stubStore) GetCapabilityClaimByID(_ context.Context, id string) (*domai
 		}
 	}
 	return nil, domain.ErrClaimNotFound
+}
+
+func (s *stubStore) DecideCapabilityClaim(_ context.Context, claimID, decision, deciderPrincipalID string, decidedAt time.Time, claim domain.IdempotencyClaim) error {
+	var capabilityID string
+	return s.withIdempotency(claim, "capability_claim.decided", func() string { return capabilityID }, func() error {
+		for capID, list := range s.claims {
+			for i := range list {
+				if list[i].ClaimID == claimID {
+					if list[i].ApprovalStatus != string(domain.ClaimApprovalPending) {
+						return domain.ErrClaimDecisionInvalid
+					}
+					list[i].ApprovalStatus = decision
+					decider := deciderPrincipalID
+					list[i].ApprovedByPrincipalID = &decider
+					at := decidedAt
+					list[i].ApprovedAt = &at
+					capabilityID = capID
+					s.claims[capID] = list
+					return nil
+				}
+			}
+		}
+		return domain.ErrClaimNotFound
+	})
 }
 
 // ResolveCapability mirrors pg_store.go's fail-closed logic exactly (2026-10-05
@@ -324,11 +357,34 @@ func (s *stubAuthz) recordedCalls() []stubAuthzCall {
 
 var _ AuthzChecker = (*stubAuthz)(nil)
 
+// stubJurisdictionValidator accepts any market_code by default (every
+// existing test in this file uses arbitrary codes like "US"/"GB" that
+// predate Gap 3's real jurisdiction check) — unless codes is non-nil, in
+// which case only market codes listed in it are accepted. This mirrors the
+// swap-at-construction convention other services in this platform already
+// use (e.g. tenant-entity-registry-svc's StubJurisdictionValidator vs.
+// HTTPJurisdictionValidator).
+type stubJurisdictionValidator struct {
+	codes map[string]bool // nil means "accept everything"
+}
+
+func (v *stubJurisdictionValidator) ValidateExists(_ context.Context, marketCode string) error {
+	if v.codes == nil {
+		return nil
+	}
+	if v.codes[marketCode] {
+		return nil
+	}
+	return jurisdictionpkg.ErrMarketCodeNotFound
+}
+
+var _ JurisdictionValidator = (*stubJurisdictionValidator)(nil)
+
 var testRequestSequence atomic.Uint64
 
 func newTestHandler() *Handler {
 	logger, _ := zap.NewDevelopment()
-	return New(newStubStore(), &stubAuthz{}, logger)
+	return New(newStubStore(), &stubAuthz{}, &stubJurisdictionValidator{}, logger)
 }
 
 // newTestHandlerWithStore returns the test store so event-outbox records can
@@ -336,7 +392,7 @@ func newTestHandler() *Handler {
 func newTestHandlerWithPublisher() (*Handler, *stubStore) {
 	logger, _ := zap.NewDevelopment()
 	st := newStubStore()
-	return New(st, &stubAuthz{}, logger), st
+	return New(st, &stubAuthz{}, &stubJurisdictionValidator{}, logger), st
 }
 
 func newTestRouter(h *Handler) *chi.Mux {
@@ -432,8 +488,9 @@ func TestResolveCapability_IncidentRestrictedOverridesEverything(t *testing.T) {
 
 	wRelease := httptest.NewRecorder()
 	r.ServeHTTP(wRelease, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/release-state", domain.SetReleaseStateRequest{
-		State:  "INCIDENT_RESTRICTED",
-		Reason: "provider outage",
+		State:                      "INCIDENT_RESTRICTED",
+		Reason:                     "provider outage",
+		ReconciliationProcedureRef: "RUNBOOK-INC-4471",
 	}))
 	if wRelease.Code != http.StatusCreated {
 		t.Fatalf("expected 201 setting release state, got %d — %s", wRelease.Code, wRelease.Body.String())
@@ -501,42 +558,103 @@ func TestCreateCapability_DuplicateCodeConflict(t *testing.T) {
 	}
 }
 
-func TestCreateCapabilityClaim_SoDDistinctPrincipalsEnforced(t *testing.T) {
+// TestCreateCapabilityClaim_WordingOwnerIsAlwaysTheAuthenticatedCreator
+// proves the Gap 1 fix: wording_owner_principal_id is never accepted as
+// free text any more — it is always the principal who authenticated the
+// create call, even if the (now removed) old fields were somehow still
+// present on the wire.
+func TestCreateCapabilityClaim_WordingOwnerIsAlwaysTheAuthenticatedCreator(t *testing.T) {
 	h := newTestHandler()
 	r := newTestRouter(h)
 	cap := createTestCapability(t, r, "PAYMENT_ROUTING")
 
-	// Negative Case: wording_owner == approved_by (SoD violation) -> Expect 400 Bad Request.
-	wSame := httptest.NewRecorder()
-	r.ServeHTTP(wSame, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/claims", domain.CreateCapabilityClaimRequest{
-		ClaimText:               "Instant settlement capability across EEA markets.",
-		WordingOwnerPrincipalID: "principal-user-01",
-		ApprovedByPrincipalID:   "principal-user-01",
-	}))
-	if wSame.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 Bad Request when wording owner equals approver, got %d: %s", wSame.Code, wSame.Body.String())
-	}
-	if !bytes.Contains(wSame.Body.Bytes(), []byte("must be distinct principals")) {
-		t.Errorf("expected error message to mention distinct principals, got %s", wSame.Body.String())
-	}
-
-	// Positive Case: wording_owner != approved_by (SoD satisfied) -> Expect 201 Created.
-	wDistinct := httptest.NewRecorder()
-	r.ServeHTTP(wDistinct, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/claims", domain.CreateCapabilityClaimRequest{
-		ClaimText:               "Instant settlement capability across EEA markets.",
-		WordingOwnerPrincipalID: "principal-wording-owner",
-		ApprovedByPrincipalID:   "principal-legal-approver",
-	}))
-	if wDistinct.Code != http.StatusCreated {
-		t.Fatalf("expected 201 Created when wording owner and approver are distinct, got %d: %s", wDistinct.Code, wDistinct.Body.String())
+	w := httptest.NewRecorder()
+	req := buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/claims", domain.CreateCapabilityClaimRequest{
+		ClaimText: "Instant settlement capability across EEA markets.",
+	})
+	req.Header.Set("X-Principal-Id", "principal-wording-owner")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d: %s", w.Code, w.Body.String())
 	}
 
 	var claim domain.CapabilityClaim
-	if err := json.NewDecoder(wDistinct.Body).Decode(&claim); err != nil {
+	if err := json.NewDecoder(w.Body).Decode(&claim); err != nil {
 		t.Fatalf("failed to decode created claim: %v", err)
 	}
-	if claim.WordingOwnerPrincipalID != "principal-wording-owner" || claim.ApprovedByPrincipalID != "principal-legal-approver" {
-		t.Errorf("claim contains unexpected principals: %+v", claim)
+	if claim.WordingOwnerPrincipalID != "principal-wording-owner" {
+		t.Fatalf("expected wording owner to be the authenticated creator, got %+v", claim)
+	}
+	if claim.ApprovalStatus != string(domain.ClaimApprovalPending) {
+		t.Fatalf("expected a freshly created claim to be PENDING, got %+v", claim)
+	}
+	if claim.ApprovedByPrincipalID != nil {
+		t.Fatalf("expected no approver recorded at creation time, got %+v", claim)
+	}
+}
+
+// TestDecideCapabilityClaim_SelfApprovalBlockedDifferentApproverSucceeds is
+// this gap's real SoD proof: the same caller who created the claim cannot
+// also decide it, and a different, properly authenticated principal can —
+// the same self-approval-refused / different-approver-succeeds pattern
+// ai-governance-svc's DecideAutomationAction test uses.
+func TestDecideCapabilityClaim_SelfApprovalBlockedDifferentApproverSucceeds(t *testing.T) {
+	h := newTestHandler()
+	r := newTestRouter(h)
+	cap := createTestCapability(t, r, "SOD_CLAIM_DECISION")
+
+	create := httptest.NewRecorder()
+	createReq := buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/claims", domain.CreateCapabilityClaimRequest{
+		ClaimText: "Instant settlement capability across EEA markets.",
+	})
+	createReq.Header.Set("X-Principal-Id", "principal-wording-owner")
+	r.ServeHTTP(create, createReq)
+	if create.Code != http.StatusCreated {
+		t.Fatalf("failed to create claim: %d %s", create.Code, create.Body.String())
+	}
+	var claim domain.CapabilityClaim
+	if err := json.NewDecoder(create.Body).Decode(&claim); err != nil {
+		t.Fatalf("decode created claim: %v", err)
+	}
+
+	// Same caller attempts to decide their own claim -> refused, 403.
+	selfDecide := httptest.NewRecorder()
+	selfReq := buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/claims/"+claim.ClaimID+"/decision",
+		domain.DecideCapabilityClaimRequest{Decision: "APPROVED"})
+	selfReq.Header.Set("X-Principal-Id", "principal-wording-owner")
+	r.ServeHTTP(selfDecide, selfReq)
+	if selfDecide.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 on self-approval, got %d: %s", selfDecide.Code, selfDecide.Body.String())
+	}
+	if !bytes.Contains(selfDecide.Body.Bytes(), []byte("self-approval")) {
+		t.Errorf("expected error message to mention self-approval, got %s", selfDecide.Body.String())
+	}
+
+	// A different, authenticated principal decides -> succeeds, 200.
+	approve := httptest.NewRecorder()
+	approveReq := buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/claims/"+claim.ClaimID+"/decision",
+		domain.DecideCapabilityClaimRequest{Decision: "APPROVED"})
+	approveReq.Header.Set("X-Principal-Id", "principal-legal-approver")
+	r.ServeHTTP(approve, approveReq)
+	if approve.Code != http.StatusOK {
+		t.Fatalf("expected 200 for a different approver, got %d: %s", approve.Code, approve.Body.String())
+	}
+	var decided domain.CapabilityClaim
+	if err := json.NewDecoder(approve.Body).Decode(&decided); err != nil {
+		t.Fatalf("decode decided claim: %v", err)
+	}
+	if decided.ApprovalStatus != "APPROVED" || decided.ApprovedByPrincipalID == nil || *decided.ApprovedByPrincipalID != "principal-legal-approver" {
+		t.Fatalf("expected claim approved by principal-legal-approver, got %+v", decided)
+	}
+
+	// A second decision attempt on an already-decided claim -> refused, 409.
+	again := httptest.NewRecorder()
+	againReq := buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/claims/"+claim.ClaimID+"/decision",
+		domain.DecideCapabilityClaimRequest{Decision: "APPROVED"})
+	againReq.Header.Set("X-Principal-Id", "principal-another-approver")
+	r.ServeHTTP(again, againReq)
+	if again.Code != http.StatusConflict {
+		t.Fatalf("expected 409 deciding an already-decided claim, got %d: %s", again.Code, again.Body.String())
 	}
 }
 
@@ -558,10 +676,8 @@ func TestCreateCapabilityClaim_ExpiryReviewDateCurrentBoundaryBehavior(t *testin
 		t.Run(test.name, func(t *testing.T) {
 			w := httptest.NewRecorder()
 			r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/claims", domain.CreateCapabilityClaimRequest{
-				ClaimText:               "Review date boundary test",
-				WordingOwnerPrincipalID: "principal-wording-owner",
-				ApprovedByPrincipalID:   "principal-legal-approver",
-				ExpiryReviewDate:        test.date,
+				ClaimText:        "Review date boundary test",
+				ExpiryReviewDate: test.date,
 			}))
 			if w.Code != test.wantStatus {
 				t.Fatalf("expected %d for expiry_review_date %q, got %d: %s",
@@ -581,6 +697,78 @@ func TestCreateCapabilityClaim_ExpiryReviewDateCurrentBoundaryBehavior(t *testin
 				t.Fatalf("valid RFC3339 date was not preserved: %v", claim.ExpiryReviewDate)
 			}
 		})
+	}
+}
+
+// ── Gap 3: market_code validated against jurisdiction-rules-svc
+// (2026-11-19 audit) ─────────────────────────────────────────────────────
+
+// newTestHandlerWithJurisdiction wires a handler against a
+// stubJurisdictionValidator that only accepts the given codes — unlike
+// newTestHandler's default permissive stub — so these tests actually
+// exercise the real/unknown-code distinction rather than the existing
+// tests' "anything goes" posture.
+func newTestHandlerWithJurisdiction(codes ...string) *Handler {
+	logger, _ := zap.NewDevelopment()
+	accepted := make(map[string]bool, len(codes))
+	for _, c := range codes {
+		accepted[c] = true
+	}
+	return New(newStubStore(), &stubAuthz{}, &stubJurisdictionValidator{codes: accepted}, logger)
+}
+
+func TestCreateMarketRelease_KnownJurisdictionCode_Succeeds(t *testing.T) {
+	h := newTestHandlerWithJurisdiction("GB")
+	r := newTestRouter(h)
+	cap := createTestCapability(t, r, "JURISDICTION_KNOWN")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/market-releases", domain.CreateMarketReleaseRequest{
+		MarketCode: "GB", LegalApprovalStatus: "APPROVED", State: "GA", EffectiveFrom: "2026-01-01T00:00:00Z",
+	}))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for a real, valid jurisdiction code, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateMarketRelease_UnknownJurisdictionCode_Rejected(t *testing.T) {
+	h := newTestHandlerWithJurisdiction("GB") // "ZZ" is deliberately not in the accepted set.
+	r := newTestRouter(h)
+	cap := createTestCapability(t, r, "JURISDICTION_UNKNOWN")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/market-releases", domain.CreateMarketReleaseRequest{
+		MarketCode: "ZZ", LegalApprovalStatus: "APPROVED", State: "GA", EffectiveFrom: "2026-01-01T00:00:00Z",
+	}))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an unknown jurisdiction code, got %d: %s", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("not a known jurisdiction code")) {
+		t.Errorf("expected error to mention the unknown jurisdiction code, got %s", w.Body.String())
+	}
+}
+
+// jurisdictionUnavailable always reports the jurisdiction service as
+// unreachable — proves the fail-closed path independent of whether a code
+// happens to be known or unknown.
+type jurisdictionUnavailable struct{}
+
+func (jurisdictionUnavailable) ValidateExists(context.Context, string) error {
+	return jurisdictionpkg.ErrServiceUnavailable
+}
+
+func TestCreateMarketRelease_JurisdictionServiceUnavailable_FailsClosed(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	h := New(newStubStore(), &stubAuthz{}, jurisdictionUnavailable{}, logger)
+	r := newTestRouter(h)
+	cap := createTestCapability(t, r, "JURISDICTION_UNAVAILABLE")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/market-releases", domain.CreateMarketReleaseRequest{
+		MarketCode: "GB", LegalApprovalStatus: "APPROVED", State: "GA", EffectiveFrom: "2026-01-01T00:00:00Z",
+	}))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when jurisdiction-rules-svc is unreachable, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
@@ -756,6 +944,107 @@ func TestSetReleaseState_InvalidState_Rejected(t *testing.T) {
 	}
 }
 
+// ── Gap 2: kill-switch rigor on emergency release-state transitions ───────
+// (2026-11-19 audit) — INCIDENT_RESTRICTED and DISABLED now require both a
+// reason and a reconciliation_procedure_ref, matching
+// kill-switch-registry-svc's required-on-engage field; routine promotions
+// (GA/BETA/PILOT/INTERNAL) stay exempt from both.
+
+func TestSetReleaseState_EmergencyStateWithoutReconciliationRef_Rejected(t *testing.T) {
+	h := newTestHandler()
+	r := newTestRouter(h)
+	cap := createTestCapability(t, r, "KILL_SWITCH_NO_REF")
+
+	for _, state := range []string{"INCIDENT_RESTRICTED", "DISABLED"} {
+		t.Run(state, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/release-state", domain.SetReleaseStateRequest{
+				State:  state,
+				Reason: "provider outage",
+				// ReconciliationProcedureRef deliberately omitted.
+			}))
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for %s with no reconciliation_procedure_ref, got %d: %s", state, w.Code, w.Body.String())
+			}
+			if !bytes.Contains(w.Body.Bytes(), []byte("reconciliation_procedure_ref")) {
+				t.Errorf("expected error to mention reconciliation_procedure_ref, got %s", w.Body.String())
+			}
+		})
+	}
+}
+
+func TestSetReleaseState_EmergencyStateWithoutReason_Rejected(t *testing.T) {
+	h := newTestHandler()
+	r := newTestRouter(h)
+	cap := createTestCapability(t, r, "KILL_SWITCH_NO_REASON")
+
+	for _, state := range []string{"INCIDENT_RESTRICTED", "DISABLED"} {
+		t.Run(state, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/release-state", domain.SetReleaseStateRequest{
+				State:                      state,
+				ReconciliationProcedureRef: "RUNBOOK-INC-1",
+				// Reason deliberately omitted.
+			}))
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for %s with no reason, got %d: %s", state, w.Code, w.Body.String())
+			}
+			if !bytes.Contains(w.Body.Bytes(), []byte("reason is required")) {
+				t.Errorf("expected error to mention reason is required, got %s", w.Body.String())
+			}
+		})
+	}
+}
+
+func TestSetReleaseState_EmergencyStateWithReconciliationRef_Succeeds(t *testing.T) {
+	h := newTestHandler()
+	r := newTestRouter(h)
+	cap := createTestCapability(t, r, "KILL_SWITCH_WITH_REF")
+
+	for _, state := range []string{"INCIDENT_RESTRICTED", "DISABLED"} {
+		t.Run(state, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/release-state", domain.SetReleaseStateRequest{
+				State:                      state,
+				Reason:                     "provider outage",
+				ReconciliationProcedureRef: "RUNBOOK-INC-" + state,
+			}))
+			if w.Code != http.StatusCreated {
+				t.Fatalf("expected 201 for %s with a reconciliation_procedure_ref, got %d: %s", state, w.Code, w.Body.String())
+			}
+			var rel domain.Release
+			if err := json.NewDecoder(w.Body).Decode(&rel); err != nil {
+				t.Fatalf("decode release: %v", err)
+			}
+			if rel.ReconciliationProcedureRef == nil || *rel.ReconciliationProcedureRef != "RUNBOOK-INC-"+state {
+				t.Fatalf("expected reconciliation_procedure_ref to round-trip, got %+v", rel)
+			}
+		})
+	}
+}
+
+// TestSetReleaseState_RoutinePromotionsExemptFromReconciliationRef proves the
+// other half of Gap 2: GA/BETA/PILOT/INTERNAL still work with neither reason
+// nor reconciliation_procedure_ref — this rigor is specific to the two
+// emergency-style states, not every transition.
+func TestSetReleaseState_RoutinePromotionsExemptFromReconciliationRef(t *testing.T) {
+	h := newTestHandler()
+	r := newTestRouter(h)
+	cap := createTestCapability(t, r, "ROUTINE_PROMOTIONS_EXEMPT")
+
+	for _, state := range []string{"GA", "BETA", "PILOT", "INTERNAL"} {
+		t.Run(state, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/release-state", domain.SetReleaseStateRequest{
+				State: state,
+			}))
+			if w.Code != http.StatusCreated {
+				t.Fatalf("expected 201 for routine state %s with neither field, got %d: %s", state, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
 func TestCreateIntegrationCapability_InvalidHealthStatus_Rejected(t *testing.T) {
 	h := newTestHandler()
 	r := newTestRouter(h)
@@ -814,7 +1103,7 @@ func TestUpdateIntegrationHealth_InvalidHealthStatus_Rejected(t *testing.T) {
 func TestResolveCapability_FailsClosedOnCorruptedState(t *testing.T) {
 	st := newStubStore()
 	logger, _ := zap.NewDevelopment()
-	h := New(st, &stubAuthz{}, logger)
+	h := New(st, &stubAuthz{}, &stubJurisdictionValidator{}, logger)
 	r := newTestRouter(h)
 	cap := createTestCapability(t, r, "CORRUPTED_RELEASE_STATE")
 
@@ -861,7 +1150,7 @@ func TestGetCapability_NoPrincipal_Returns401(t *testing.T) {
 
 func TestGetCapability_AuthzDenied_Returns403(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
-	h := New(newStubStore(), &stubAuthz{err: authzpkg.ErrAuthorizationDenied}, logger)
+	h := New(newStubStore(), &stubAuthz{err: authzpkg.ErrAuthorizationDenied}, &stubJurisdictionValidator{}, logger)
 	r := newTestRouter(h)
 
 	w := httptest.NewRecorder()
@@ -921,7 +1210,7 @@ func TestListCapabilityClaims_NoPrincipal_Returns401(t *testing.T) {
 
 func TestListCapabilityClaims_AuthzDenied_Returns403(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
-	h := New(newStubStore(), &stubAuthz{err: authzpkg.ErrAuthorizationDenied}, logger)
+	h := New(newStubStore(), &stubAuthz{err: authzpkg.ErrAuthorizationDenied}, &stubJurisdictionValidator{}, logger)
 	r := newTestRouter(h)
 
 	w := httptest.NewRecorder()
@@ -974,7 +1263,7 @@ func TestResolveCapability_NoPrincipal_Returns401(t *testing.T) {
 
 func TestResolveCapability_AuthzDenied_Returns403(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
-	h := New(newStubStore(), &stubAuthz{err: authzpkg.ErrAuthorizationDenied}, logger)
+	h := New(newStubStore(), &stubAuthz{err: authzpkg.ErrAuthorizationDenied}, &stubJurisdictionValidator{}, logger)
 	r := newTestRouter(h)
 
 	w := httptest.NewRecorder()
@@ -988,7 +1277,7 @@ func TestResolveCapability_Authorized_UsesPlatformScopeAction(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	st := newStubStore()
 	az := &stubAuthz{}
-	h := New(st, az, logger)
+	h := New(st, az, &stubJurisdictionValidator{}, logger)
 	seedCapability(st, "RESOLVE_AUTHORIZED")
 	r := newTestRouter(h)
 
@@ -1029,7 +1318,7 @@ func TestResolveCapability_DeployedEnvelopePosture(t *testing.T) {
 		t.Run(string(mode), func(t *testing.T) {
 			logger, _ := zap.NewDevelopment()
 			st := newStubStore()
-			h := New(st, &stubAuthz{}, logger)
+			h := New(st, &stubAuthz{}, &stubJurisdictionValidator{}, logger)
 			capability := seedCapability(st, "RESOLVE_ENVELOPE")
 			r := newEnvelopeRouter(h, mode)
 			path := "/v1/capability-resolution/" + capability.CapabilityCode
@@ -1143,7 +1432,7 @@ func TestCreateCapabilityClaim_PublishesEvent(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/claims", domain.CreateCapabilityClaimRequest{
-		ClaimText: "Claim for event test.", WordingOwnerPrincipalID: "owner-1", ApprovedByPrincipalID: "approver-1",
+		ClaimText: "Claim for event test.",
 	}))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
@@ -1209,7 +1498,7 @@ func TestCreateCapabilityClaim_InvalidCapabilityID_Returns404(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/capabilities/does-not-exist/claims", domain.CreateCapabilityClaimRequest{
-		ClaimText: "x", WordingOwnerPrincipalID: "a", ApprovedByPrincipalID: "b",
+		ClaimText: "x",
 	}))
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 for nonexistent capability_id, got %d: %s", w.Code, w.Body.String())
@@ -1316,7 +1605,7 @@ func TestAllWrites_IdempotencyReplayPreservesResponseAndEmitsOneEvent(t *testing
 		domain.SetReleaseStateRequest{State: "GA", Reason: "replay test"}, http.StatusCreated)
 	performReplay(http.MethodPost, "/v1/capabilities/"+capability.CapabilityID+"/claims", "all-claim-key",
 		domain.CreateCapabilityClaimRequest{
-			ClaimText: "Replay-safe claim.", WordingOwnerPrincipalID: "owner", ApprovedByPrincipalID: "checker",
+			ClaimText: "Replay-safe claim.",
 		}, http.StatusCreated)
 
 	wantEvents := map[string]int{
@@ -1460,7 +1749,7 @@ func TestAllWrites_StillRequireIdempotencyKey(t *testing.T) {
 		}),
 		buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/release-state", domain.SetReleaseStateRequest{State: "GA"}),
 		buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/claims", domain.CreateCapabilityClaimRequest{
-			ClaimText: "approved claim", WordingOwnerPrincipalID: "writer", ApprovedByPrincipalID: "checker",
+			ClaimText: "approved claim",
 		}),
 	}
 	for i, req := range requests {

@@ -71,6 +71,12 @@ type FindRulesParams struct {
 	// Zero value is treated as time.Now() inside FindRules.
 	EffectiveAt time.Time
 
+	// AllVersions lists every rule recorded on the jurisdiction — DRAFT,
+	// future-dated, ended and superseded included — newest first, and ignores
+	// EffectiveAt. It is the register view an author and an approver work
+	// from: a DRAFT awaiting activation is in no point-in-time answer.
+	AllVersions bool
+
 	// Limit is the page size. 0 defaults to 50; max enforced at 100.
 	Limit int
 
@@ -198,7 +204,7 @@ func New(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
 // provided querier (a *pgx.Tx) can be used for all database operations within
 // the transaction, including writing to the event outbox.
 func (s *PgStore) WithTransaction(ctx context.Context, fn func(q Querier) error) error {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.db(ctx).Begin(ctx)
 	if err != nil {
 		s.log.Error("pg WithTransaction: begin failed", zap.Error(err))
 		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -227,8 +233,8 @@ type querier interface {
 // Querier is the public alias for querier used by other packages (e.g., events).
 type Querier = querier
 
-// Pool returns the store's pool as a Querier, for writes that run outside a
-// caller-managed transaction (e.g. registry events written to the outbox).
+// Pool returns the store's pool as a Querier. Prefer DB(ctx), which joins the
+// request's unit of work when there is one.
 func (s *PgStore) Pool() Querier { return s.pool }
 
 // ── error classification ─────────────────────────────────────────────────────
@@ -310,6 +316,9 @@ var jurisdictionColumnNames = []string{
 	"updated_at",
 	"updated_by_principal_id",
 	"row_version",
+	"retirement_reason",
+	"retirement_evidence_ref",
+	"superseded_by_jurisdiction_id",
 }
 
 var (
@@ -335,6 +344,9 @@ func jurisdictionScanTargets(j *domain.Jurisdiction) []any {
 		&j.UpdatedAt,
 		&j.UpdatedByPrincipalID,
 		&j.RowVersion,
+		&j.RetirementReason,
+		&j.RetirementEvidenceRef,
+		&j.SupersededByJurisdictionID,
 	}
 }
 
@@ -505,7 +517,7 @@ func (s *PgStore) FindByID(ctx context.Context, jurisdictionID string) (*domain.
 		  AND active_flag        = TRUE
 		  AND (effective_to IS NULL OR effective_to > NOW())`
 
-	j, err := scanJurisdiction(s.pool.QueryRow(ctx, query, jurisdictionID))
+	j, err := scanJurisdiction(s.db(ctx).QueryRow(ctx, query, jurisdictionID))
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) && !isInvalidTextRepresentation(err) {
 			s.log.Error("pg FindByID failed",
@@ -522,7 +534,7 @@ func (s *PgStore) FindByID(ctx context.Context, jurisdictionID string) (*domain.
 func (s *PgStore) FindByIDAny(ctx context.Context, jurisdictionID string) (*domain.Jurisdiction, error) {
 	query := `SELECT ` + jurisdictionColumns + ` FROM jurisdictions WHERE jurisdiction_id = $1`
 
-	j, err := scanJurisdiction(s.pool.QueryRow(ctx, query, jurisdictionID))
+	j, err := scanJurisdiction(s.db(ctx).QueryRow(ctx, query, jurisdictionID))
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) && !isInvalidTextRepresentation(err) {
 			s.log.Error("pg FindByIDAny failed",
@@ -537,7 +549,7 @@ func (s *PgStore) FindByIDAny(ctx context.Context, jurisdictionID string) (*doma
 
 // List returns a paginated, optionally-filtered slice of jurisdictions.
 func (s *PgStore) List(ctx context.Context, params ListParams) ([]*domain.Jurisdiction, error) {
-	limit := clampLimit(params.Limit, 50, 200)
+	limit := clampLimit(params.Limit, 50, maxPage)
 	offset := params.Offset
 	if offset < 0 {
 		offset = 0
@@ -574,7 +586,7 @@ func (s *PgStore) List(ctx context.Context, params ListParams) ([]*domain.Jurisd
 	)
 	args = append(args, limit, offset)
 
-	rows, err := s.pool.Query(ctx, query, args...)
+	rows, err := s.db(ctx).Query(ctx, query, args...)
 	if err != nil {
 		s.log.Error("pg List failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -630,7 +642,7 @@ func (s *PgStore) findChain(ctx context.Context, jurisdictionID string) ([]*doma
 		jurisdictionColumnsJ,
 	)
 
-	rows, err := s.pool.Query(ctx, query, jurisdictionID, maxAncestorDepth)
+	rows, err := s.db(ctx).Query(ctx, query, jurisdictionID, maxAncestorDepth)
 	if err != nil {
 		if isInvalidTextRepresentation(err) {
 			return nil, domain.ErrJurisdictionNotFound
@@ -685,7 +697,7 @@ func (s *PgStore) FindAncestors(ctx context.Context, jurisdictionID string) ([]*
 
 // CreateJurisdiction inserts a new jurisdiction or returns existing on dedup match.
 func (s *PgStore) CreateJurisdiction(ctx context.Context, params domain.CreateJurisdictionParams) (*domain.Jurisdiction, bool, error) {
-	return s.CreateJurisdictionWithQuerier(ctx, s.pool, params)
+	return s.CreateJurisdictionWithQuerier(ctx, s.db(ctx), params)
 }
 
 // CreateJurisdictionWithQuerier is the same as CreateJurisdiction but uses the provided querier (transaction).
@@ -708,7 +720,7 @@ func (s *PgStore) CreateJurisdictionWithQuerier(ctx context.Context, q Querier, 
 		if parentID == params.JurisdictionID {
 			return nil, false, domain.ErrCyclicHierarchy
 		}
-		if _, err := s.FindByIDAny(ctx, parentID); err != nil {
+		if _, err := s.findAnyWith(ctx, q, parentID); err != nil {
 			if errors.Is(err, domain.ErrJurisdictionNotFound) {
 				return nil, false, domain.ErrParentNotFound
 			}
@@ -759,7 +771,7 @@ func (s *PgStore) CreateJurisdictionWithQuerier(ctx context.Context, q Querier, 
 		  AND jurisdiction_type = $2
 		  AND COALESCE(parent_jurisdiction_id, '00000000-0000-0000-0000-000000000000'::UUID) = COALESCE($3::uuid, '00000000-0000-0000-0000-000000000000'::UUID);`
 
-	row = s.pool.QueryRow(ctx, lookupQuery, params.JurisdictionCode, params.JurisdictionType, params.ParentJurisdictionID)
+	row = q.QueryRow(ctx, lookupQuery, params.JurisdictionCode, params.JurisdictionType, params.ParentJurisdictionID)
 	j, err = scanJurisdiction(row)
 	if err != nil {
 		s.log.Error("pg CreateJurisdiction lookup existing failed", zap.Error(err))
@@ -786,7 +798,7 @@ func (s *PgStore) CreateJurisdictionWithQuerier(ctx context.Context, q Querier, 
 // satisfying every effective_to-based query in this service and in callers
 // that read the record directly.
 func (s *PgStore) DeactivateJurisdiction(ctx context.Context, jurisdictionID, actorID string) (*domain.Jurisdiction, bool, error) {
-	return s.DeactivateJurisdictionWithQuerier(ctx, s.pool, jurisdictionID, actorID)
+	return s.DeactivateJurisdictionWithQuerier(ctx, s.db(ctx), jurisdictionID, actorID, nil)
 }
 
 // DeactivateJurisdictionWithQuerier is the same as DeactivateJurisdiction but uses the provided querier (transaction).
@@ -794,7 +806,8 @@ func (s *PgStore) DeactivateJurisdiction(ctx context.Context, jurisdictionID, ac
 // false when it was already deactivated (the trg_prevent_duplicate_deactivation
 // trigger skips the UPDATE, so no row is returned): an idempotent replay that a
 // caller must not re-announce.
-func (s *PgStore) DeactivateJurisdictionWithQuerier(ctx context.Context, q Querier, jurisdictionID, actorID string) (*domain.Jurisdiction, bool, error) {
+// expectedRowVersion: when non-nil, the UPDATE only succeeds if the current row_version matches.
+func (s *PgStore) DeactivateJurisdictionWithQuerier(ctx context.Context, q Querier, jurisdictionID, actorID string, expectedRowVersion *int64) (*domain.Jurisdiction, bool, error) {
 	query := `
 		UPDATE jurisdictions
 		SET active_flag             = FALSE,
@@ -802,16 +815,29 @@ func (s *PgStore) DeactivateJurisdictionWithQuerier(ctx context.Context, q Queri
 		    updated_at              = NOW(),
 		    updated_by_principal_id = $2
 		WHERE jurisdiction_id = $1
-		RETURNING ` + jurisdictionColumns + `;`
+	`
+	if expectedRowVersion != nil {
+		query += " AND row_version = $3"
+	}
+	query += " RETURNING " + jurisdictionColumns + ";"
 
-	j, err := scanJurisdiction(q.QueryRow(ctx, query, jurisdictionID, actorID))
+	var args []any
+	if expectedRowVersion != nil {
+		args = []any{jurisdictionID, actorID, *expectedRowVersion}
+	} else {
+		args = []any{jurisdictionID, actorID}
+	}
+
+	j, err := scanJurisdiction(q.QueryRow(ctx, query, args...))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Trigger skipped the update because already deactivated.
-			// Fetch the existing jurisdiction; nothing changed.
+			// Trigger skipped the update because already deactivated, or row_version didn't match.
 			existing, findErr := s.FindByIDAny(ctx, jurisdictionID)
 			if findErr != nil {
 				return nil, false, findErr
+			}
+			if expectedRowVersion != nil && existing.RowVersion != *expectedRowVersion {
+				return nil, false, domain.ErrVersionConflict
 			}
 			return existing, false, nil
 		}
@@ -832,7 +858,7 @@ func (s *PgStore) FindRuleByID(ctx context.Context, ruleID string) (*domain.Juri
 		FROM jurisdiction_rules
 		WHERE jurisdiction_rule_id = $1;`
 
-	r, err := scanJurisdictionRule(s.pool.QueryRow(ctx, query, ruleID))
+	r, err := scanJurisdictionRule(s.db(ctx).QueryRow(ctx, query, ruleID))
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) && !isInvalidTextRepresentation(err) {
 			s.log.Error("pg FindRuleByID failed", zap.String("id", ruleID), zap.Error(err))
@@ -859,7 +885,7 @@ func (s *PgStore) FindRules(ctx context.Context, params FindRulesParams) ([]*dom
 		at = time.Now().UTC()
 	}
 
-	limit := clampLimit(params.Limit, 50, 100)
+	limit := clampLimit(params.Limit, 50, maxPage)
 	offset := params.Offset
 	if offset < 0 {
 		offset = 0
@@ -875,8 +901,19 @@ func (s *PgStore) FindRules(ctx context.Context, params FindRulesParams) ([]*dom
 		  AND  (effective_to IS NULL OR effective_to > $3)
 		ORDER BY rule_domain ASC, effective_from ASC, jurisdiction_rule_id ASC
 		LIMIT  $4 OFFSET $5`
+	args := []any{params.JurisdictionID, params.Domain, at, limit, offset}
+	if params.AllVersions {
+		query = `
+		SELECT ` + ruleColumns + `
+		FROM   jurisdiction_rules
+		WHERE  jurisdiction_id = $1
+		  AND  ($2 = '' OR rule_domain = $2)
+		ORDER BY created_at DESC, jurisdiction_rule_id ASC
+		LIMIT  $3 OFFSET $4`
+		args = []any{params.JurisdictionID, params.Domain, limit, offset}
+	}
 
-	rows, err := s.pool.Query(ctx, query, params.JurisdictionID, params.Domain, at, limit, offset)
+	rows, err := s.db(ctx).Query(ctx, query, args...)
 	if err != nil {
 		s.log.Error("pg FindRules failed",
 			zap.String("jurisdiction_id", params.JurisdictionID),
@@ -1045,7 +1082,7 @@ func (s *PgStore) ResolveRulePack(ctx context.Context, rq domain.RulePackQuery) 
 		ruleColumnsR, predicate,
 	)
 
-	rows, err := s.pool.Query(ctx, query, args...)
+	rows, err := s.db(ctx).Query(ctx, query, args...)
 	if err != nil {
 		s.log.Error("pg FindRulePack failed",
 			zap.String("jurisdiction_id", jurisdictionID),
@@ -1228,7 +1265,7 @@ func periodsOverlap(from1 time.Time, to1 *time.Time, from2 time.Time, to2 *time.
 
 // CreateRule inserts a new rule idempotently.
 func (s *PgStore) CreateRule(ctx context.Context, params domain.CreateRuleParams) (*domain.JurisdictionRule, bool, error) {
-	return s.CreateRuleWithQuerier(ctx, s.pool, params)
+	return s.CreateRuleWithQuerier(ctx, s.db(ctx), params)
 }
 
 // CreateRuleWithQuerier is the same as CreateRule but uses the provided querier (transaction).
@@ -1379,7 +1416,7 @@ func (s *PgStore) CreateRuleWithQuerier(ctx context.Context, q Querier, params d
 //     (params.EndDate). Without that a superseded rule keeps matching every
 //     point-in-time query forever, side by side with its own replacement.
 func (s *PgStore) TransitionRuleStatus(ctx context.Context, params TransitionParams) (*domain.JurisdictionRule, bool, error) {
-	return s.TransitionRuleStatusWithQuerier(ctx, s.pool, params)
+	return s.TransitionRuleStatusWithQuerier(ctx, s.db(ctx), params)
 }
 
 // TransitionRuleStatusWithQuerier is the same as TransitionRuleStatus but uses the provided querier (transaction).
@@ -1485,7 +1522,7 @@ func (s *PgStore) TransitionRuleStatusWithQuerier(ctx context.Context, q Querier
 // it, despite "legal drift indicators" being owned by this service and
 // legal.drift.detected being one of its published events.
 func (s *PgStore) RecordDrift(ctx context.Context, params domain.RecordDriftParams) (*domain.JurisdictionRule, *domain.DriftEvent, bool, error) {
-	return s.RecordDriftWithQuerier(ctx, s.pool, params)
+	return s.RecordDriftWithQuerier(ctx, s.db(ctx), params)
 }
 
 // RecordDriftWithQuerier is the same as RecordDrift but uses the provided querier.
@@ -1494,9 +1531,9 @@ func (s *PgStore) RecordDriftWithQuerier(ctx context.Context, q Querier, params 
 	// If q is the pool (not a transaction), start a new transaction
 	var tx pgx.Tx
 	var ownsTx bool
-	if q == s.pool {
+	if !isTx(q) {
 		var err error
-		tx, err = s.pool.Begin(ctx)
+		tx, err = s.db(ctx).Begin(ctx)
 		if err != nil {
 			s.log.Error("pg RecordDrift: begin failed", zap.Error(err))
 			return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -1589,7 +1626,7 @@ func (s *PgStore) FindDriftEvents(ctx context.Context, ruleID string, limit, off
 		return nil, err
 	}
 
-	limit = clampLimit(limit, 50, 200)
+	limit = clampLimit(limit, 50, maxPage)
 	if offset < 0 {
 		offset = 0
 	}
@@ -1601,7 +1638,7 @@ func (s *PgStore) FindDriftEvents(ctx context.Context, ruleID string, limit, off
 		ORDER BY effective_at DESC, drift_event_id DESC
 		LIMIT  $2 OFFSET $3;`
 
-	rows, err := s.pool.Query(ctx, query, ruleID, limit, offset)
+	rows, err := s.db(ctx).Query(ctx, query, ruleID, limit, offset)
 	if err != nil {
 		s.log.Error("pg FindDriftEvents failed", zap.String("rule_id", ruleID), zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -1632,7 +1669,7 @@ func (s *PgStore) FindRuleStatusHistory(ctx context.Context, ruleID string, limi
 		return nil, err
 	}
 
-	limit = clampLimit(limit, 50, 200)
+	limit = clampLimit(limit, 50, maxPage)
 	if offset < 0 {
 		offset = 0
 	}
@@ -1644,7 +1681,7 @@ func (s *PgStore) FindRuleStatusHistory(ctx context.Context, ruleID string, limi
 		ORDER BY known_from DESC, history_id DESC
 		LIMIT  $2 OFFSET $3;`
 
-	rows, err := s.pool.Query(ctx, query, ruleID, limit, offset)
+	rows, err := s.db(ctx).Query(ctx, query, ruleID, limit, offset)
 	if err != nil {
 		s.log.Error("pg FindRuleStatusHistory failed", zap.String("rule_id", ruleID), zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -1732,6 +1769,10 @@ func jsonEquivalent(a, b []byte) bool {
 	return reflect.DeepEqual(av, bv)
 }
 
+// maxPage is the most rows a list reads: the API-4 maximum page (200) plus
+// the one look-ahead row that tells a paged list another page exists.
+const maxPage = 201
+
 func clampLimit(limit, def, max int) int {
 	if limit <= 0 {
 		return def
@@ -1793,7 +1834,7 @@ func (s *PgStore) GetPendingOutboxEvents(ctx context.Context, limit int) ([]Outb
 		ORDER BY created_at ASC
 		LIMIT $1;`
 
-	rows, err := s.pool.Query(ctx, query, limit, MaxOutboxAttempts)
+	rows, err := s.db(ctx).Query(ctx, query, limit, MaxOutboxAttempts)
 	if err != nil {
 		s.log.Error("pg GetPendingOutboxEvents failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -1819,7 +1860,7 @@ func (s *PgStore) MarkOutboxEventPublished(ctx context.Context, outboxID string)
 		SET published_at = NOW()
 		WHERE outbox_id = $1;`
 
-	_, err := s.pool.Exec(ctx, query, outboxID)
+	_, err := s.db(ctx).Exec(ctx, query, outboxID)
 	if err != nil {
 		s.log.Error("pg MarkOutboxEventPublished failed", zap.Error(err))
 		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -1835,7 +1876,7 @@ func (s *PgStore) MarkOutboxEventFailed(ctx context.Context, outboxID, errMsg st
 		    last_error = $2
 		WHERE outbox_id = $1;`
 
-	_, err := s.pool.Exec(ctx, query, outboxID, errMsg)
+	_, err := s.db(ctx).Exec(ctx, query, outboxID, errMsg)
 	if err != nil {
 		s.log.Error("pg MarkOutboxEventFailed failed", zap.Error(err))
 		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)

@@ -31,6 +31,8 @@ func baseEnv(t *testing.T) {
 	// Required in staging and production since 000012 (the TOTP factor).
 	t.Setenv("MFA_SECRET_KEY", "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=")
 	t.Setenv("OIDC_ISSUER", "https://auth.example.com")
+	t.Setenv("CURSOR_SIGNING_KEY_HEX", "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+	t.Setenv("COMMERCIAL_ACCOUNT_URL", "http://commercial-account-svc:8144")
 }
 
 func TestAuthzEnvDefaultsToTheDeploymentEnvironment(t *testing.T) {

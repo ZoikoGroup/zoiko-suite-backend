@@ -12,10 +12,18 @@ semicolon-separated requirements, the relevant clause is quoted in full.
 
 Overall: the six named commands, their state transitions, account masking, the
 transactional outbox, tenant RLS and the real ORG-07 party lookup exist. The
-authoritative four-object model, most server-resolved context, independent
-verification, read authorization/purpose limitation, the verified event,
-event-driven AP invalidation and at-rest tokenisation are not present. Command
-idempotency and the activation auto-supersede event are closed in this pass.
+authoritative four-object model, independent verification (BNK provider
+validation), read authorization/purpose limitation, the verified event,
+event-driven AP invalidation, at-rest tokenisation of backfilled rows, and
+break-glass are not present. Command idempotency, the activation
+auto-supersede event, and the uniqueness indexes' tenant scoping were closed
+in an earlier pass. This pass (2026-11-19) closes most of A3 (format/
+account-country validation, party status/compliance enforcement, change-risk
+classification), closes A4 (VERIFICATION_PENDING is now reached by every new
+proposal), and closes the verifier/activator half of A6 — see B13/B14/B15.
+Sanctions/fraud screening (the remaining clause of A3) and break-glass (the
+remaining clause of A6) are explicitly still open, with the reasoning
+recorded below rather than a forced integration.
 
 ## A. Not implemented / weaker than the spec
 
@@ -46,27 +54,53 @@ idempotency and the activation auto-supersede event are closed in this pass.
    implemented on one row whose identity fields are protected by an
    immutability trigger, not on the authoritative object set the spec names.
 
-3. **A3 — Most "Server-resolved context" is not resolved.** §4.10 requires
-   "Server-resolved context | Format validation; account-country rules;
-   sanctions/fraud hooks; party status; change-risk classification; prior
-   version." The implementation only checks that required fields are non-empty
-   and that `source_type` is one of four enum values. It does not validate
-   account/IBAN formats, apply account-country rules, call any sanctions/fraud
-   hook, classify change risk, or consult the prior version before proposing a
-   candidate. The ORG-07 lookup does retrieve `Status` and `ComplianceStatus`,
-   but `ProposePayeeDestination` discards the result: it only checks that the
-   party exists and belongs to the legal entity. A blocked/inactive or
-   non-compliant party can therefore still get a destination candidate.
+3. **A3 — Most "Server-resolved context" is not resolved. Format validation,
+   party status, and change-risk/prior-version are now closed (B13); the
+   sanctions/fraud hook remains open — see B14 for why it was not forced.**
+   §4.10 requires "Server-resolved context | Format validation; account-country
+   rules; sanctions/fraud hooks; party status; change-risk classification;
+   prior version." Before this pass the implementation only checked that
+   required fields were non-empty and that `source_type` was one of four enum
+   values; it validated no account/IBAN format, applied no account-country
+   rule, called no sanctions/fraud hook, classified no change risk, and
+   consulted no prior version. The ORG-07 lookup retrieved `Status` and
+   `ComplianceStatus` but `ProposePayeeDestination` discarded the result. B13
+   closes four of the six clauses:
+   - **Format validation / account-country rules:**
+     `domain.ValidateAccountFormat` — a real IBAN mod-97 (ISO 7064) checksum,
+     structure and per-country length check for every IBAN-using country in
+     the published IBAN registry, and a minimal alphanumeric-length sanity
+     rule for every other country (no per-country routing/account-number
+     validator exists anywhere in this codebase to call instead — see A14).
+   - **Party status:** `domain.PartyEligibleForDestination` refuses a
+     candidate for a `SUSPENDED`/`TERMINATED` party or `REJECTED` compliance
+     status; `ONBOARDING` status and `PENDING` compliance are allowed (neither
+     is "blocked/inactive" or "non-compliant" in ORG-07's own status model).
+   - **Change-risk classification / prior version:** every proposal is now
+     classified `NEW_DESTINATION` or `DESTINATION_CHANGE` against the
+     party/scope's current `ACTIVE` row, with `PriorDestinationID` recording
+     which one — see B13 for the representation and why a new
+     `ChangeRiskRecord` object (A2) was not built for it.
+   - **Sanctions/fraud hooks:** still not wired. See B14.
 
-4. **A4 — `VERIFICATION_PENDING` is unreachable; verification skips it.**
-   §4.10's state model is "Candidate → VerificationPending → Verified →
-   ApprovalPending → Active → Suspended/Superseded." `VerifyDestination` updates
-   `status` directly from `CANDIDATE` (or the never-entered
-   `VERIFICATION_PENDING`) to `VERIFIED`. No command or store path ever writes
-   `VERIFICATION_PENDING`. The constant and the `CanProposeVerification` guard
-   exist, but the state is dead. This also means there is no place to represent
-   "verification requested but independent evidence not yet received", which is
-   exactly the state the spec's mandatory control implies.
+4. **A4 — `VERIFICATION_PENDING` was unreachable; verification skipped it.
+   Closed (B15).** §4.10's state model is "Candidate → VerificationPending →
+   Verified → ApprovalPending → Active → Suspended/Superseded." Before this
+   pass, `VerifyDestination` updated `status` directly from `CANDIDATE` (or the
+   never-entered `VERIFICATION_PENDING`) to `VERIFIED`; no command or store
+   path ever wrote `VERIFICATION_PENDING`. `ProposeDestination` now inserts the
+   row directly into `VERIFICATION_PENDING` — the spec names no separate
+   command (e.g. a "RequestVerification") to move `CANDIDATE` into
+   `VERIFICATION_PENDING` as a distinct step, so the candidate's one real
+   resting state between proposal and verification is now provably
+   `VERIFICATION_PENDING`, not an unreachable `CANDIDATE`. `VerifyDestination`'s
+   own `WHERE status IN ('CANDIDATE', 'VERIFICATION_PENDING')` guard is left
+   unchanged (accepting both) for backward compatibility with any row a
+   pre-this-pass binary already committed as `CANDIDATE`. Test:
+   `internal/store/verification_pending_integration_test.go`
+   (`TestProposeDestination_LandsInVerificationPending` reads the row back in a
+   fresh query after Propose, before ever calling Verify, and asserts
+   `VERIFICATION_PENDING` — then verifies it reaches `VERIFIED` from there).
 
 5. **A5 — `VerifyAuthorizationFingerprintInput` does not exist.** §4.10 lists
    "Read/query surfaces | GetActivePayeeDestination; ListPayeeVersions;
@@ -77,18 +111,31 @@ idempotency and the activation auto-supersede event are closed in this pass.
    no purpose-built surface that takes an authorization's captured fingerprint
    input and answers whether the active destination still matches it.
 
-6. **A6 — Segregation of duties is only the maker/approver half; break-glass is
-   absent.** §4.10 requires "Maker/approver separation; supplier-profile editor
-   cannot alone activate changed beneficiary details; break-glass separately
-   controlled." `ApprovePayeeDestination` does enforce that the destination's
-   proposer cannot also approve it (own-object SoD via authorization-svc), which
-   is real. But `VerifyPayeeDestination` and `ActivateDestination` have no
-   own-object check, so the proposer may verify the destination and may activate
-   it once someone else has approved it; there is no distinct verifier or
-   activator separation. There is also no break-glass mechanism, no separate
-   break-glass principal/action, and no audit path for one. The minimum
-   "cannot alone activate" is therefore met narrowly (a second principal must
-   approve), but the full SoD line is not.
+6. **A6 — Segregation of duties was only the maker/approver half. The
+   verifier/activator half is now closed (B15); break-glass is still
+   absent — explicitly out of scope for that pass, not attempted.** §4.10
+   requires "Maker/approver separation; supplier-profile editor cannot alone
+   activate changed beneficiary details; break-glass separately controlled."
+   `ApprovePayeeDestination` already enforced that the destination's proposer
+   cannot also approve it (own-object SoD via authorization-svc), which is
+   real and untouched by this pass. Before this pass, `VerifyPayeeDestination`
+   and `ActivateDestination` had no own-object check at all, so the proposer
+   could verify their own destination and activate it once anyone else
+   approved. Both handlers now call `authorizeOwnObject` with
+   `d.ProposedByPrincipalID` as the resource owner — the exact same call
+   `ApprovePayeeDestination` already made, with the same action
+   (`PAYEE_MASTER_ADMIN`) each handler already checked, so no new
+   authorization-svc action or rule shape was introduced. There is still no
+   distinct action per role (verifier vs. activator vs. ordinary admin — all
+   three currently share `PAYEE_MASTER_ADMIN`'s SoD check), and there is still
+   no break-glass mechanism, no separate break-glass principal/action, and no
+   audit path for one — that is a larger, separate feature and was not
+   attempted. Tests:
+   `TestVerifyPayeeDestination_SelfVerification_Denied`,
+   `TestActivateDestination_SelfActivation_Denied` (each proves both the
+   403-on-self and 200-on-independent-principal halves), plus every existing
+   lifecycle test updated to walk through an independent verifier/activator
+   principal now that self-verification/self-activation is refused.
 
 7. **A7 — Read paths do not gate access on an authorization decision, and have
    no purpose limitation.** §4.10 requires "Payee-master admin; masked access;
@@ -149,20 +196,34 @@ idempotency and the activation auto-supersede event are closed in this pass.
     attempts one, so this is a spec-semantics/defence-in-depth gap rather than a
     reachable bypass through supported commands.
 
-11. **A11 — The uniqueness indexes are not tenant-scoped.** §4.10's
-    "Idempotency / concurrency" row requires "Destination candidate fingerprint
-    detects duplicates; activation only one active version per party/scope
-    unless explicit multi-destination policy." The two database invariants are
+11. **A11 — The uniqueness indexes are not tenant-scoped. Closed (migration
+    000006).** §4.10's "Idempotency / concurrency" row requires "Destination
+    candidate fingerprint detects duplicates; activation only one active
+    version per party/scope unless explicit multi-destination policy." The two
+    database invariants were
     `uq_payee_destinations_fingerprint (party_ref, fingerprint) WHERE status <> 'SUPERSEDED'`
     and `uq_payee_destinations_active_scope (party_ref, scope) WHERE status = 'ACTIVE'`
-    — neither includes `tenant_id`. RLS confines reads
-    and writes, but a PostgreSQL unique index is global, so the database treats
+    — neither included `tenant_id`. RLS confined reads
+    and writes, but a PostgreSQL unique index is global, so the database treated
     equal `(party_ref, fingerprint)` or `(party_ref, scope)` values in two
     tenants as a conflict. `party_ref` is an ORG-07 UUID and is very likely
-    globally unique in practice, which is why this is not an everyday failure;
-    it is still not a structural tenant boundary. A migration should add
-    `tenant_id` to both indexes (with the same partial predicates) before this
-    service is relied on for cross-tenant isolation.
+    globally unique in practice, which is why this was not an everyday failure;
+    it was still not a structural tenant boundary. Closed by
+    `deployments/migrations/000006_tenant_scoped_uniqueness.{up,down}.sql`,
+    which rebuilds both indexes as
+    `(COALESCE(tenant_id::text, ''), party_ref, fingerprint)` and
+    `(COALESCE(tenant_id::text, ''), party_ref, scope)` with the same partial
+    predicates — the same idiom `payment-status-svc`'s migration 000009 already
+    uses for the identical nullable-`tenant_id` situation, so every legacy
+    NULL-tenant row still shares one bucket (preserving pre-migration global
+    dedup for them) while every tenant-tagged row now gets a real per-tenant
+    boundary. No store-layer change was needed: unique-violation handling in
+    `isUniqueViolation`/`isCommandIdempotencyViolation` dispatches on the
+    Postgres error code and, for the idempotency-table case, the constraint
+    name — neither index's name changed. Tests:
+    `internal/store/tenant_scoped_uniqueness_integration_test.go`
+    (`TestTenantScopedUniqueness_SameFingerprintAcrossTenantsDoesNotConflict`,
+    `TestTenantScopedUniqueness_SameActiveScopeAcrossTenantsDoesNotConflict`).
 
 12. **A12 — Full account identifiers are masked on output but not tokenized or
     encrypted at rest.** The mandatory control says "Full account identifiers
@@ -340,6 +401,299 @@ idempotency and the activation auto-supersede event are closed in this pass.
   reconstruct the full before/after object from the event alone. This is an
   interpretation, not a spec violation, but it constrains what an AP-10 event
   consumer could do without a follow-up read.
+- **B11. Account-identifier tokenization — client side only, off by default
+  (2026-11-11).** Security, Privacy, Residency & Cryptographic Architecture
+  Standard §14 requires tokenization of restricted identifiers, and bank
+  details are S3 Restricted. This service stores
+  `payee_destinations.account_identifier` raw, the gap `internal/domain`'s
+  package doc already records.
+  - *Client.* `internal/tokenization` holds a `Client`, a deterministic
+    `Fake` for tests and local development, and a `Tokenizer` interface,
+    shaped like `internal/authz`.
+    - It fails closed: unreachable, non-200, an undecodable body, an empty
+      token, or a token equal to the raw value all return
+      `ErrTokenizationServiceUnavailable`.
+    - A detokenization 403 is the distinct `ErrDetokenizationDenied`.
+  - *Write path.* With `TOKENIZATION_ENFORCED=true`, `ProposeDestination`
+    tokenizes the identifier before its transaction opens. The token is
+    stored and returned.
+    - If tokenization fails or no tokenizer is configured, the command is
+      refused: no destination, no command claim and no event. There is no
+      raw fallback.
+    - The fingerprint and last-4 are still computed from the raw value, so
+      duplicate detection and masked display are unchanged.
+    - An idempotent retry matches through the fingerprint, because a stored
+      token never equals the request's raw identifier. Without this, an
+      honest retry would be refused as a key conflict.
+  - *Off by default.* Unset or `false`, behaviour is unchanged and the
+    tokenizer is never called. That is a regression test. The flag is parsed
+    strictly: a typo refuses to start rather than reading as off.
+  - *Contract — proposed 2026-11-11, implemented by key-management-svc
+    2026-11-12.* `internal/tokenization/client.go` matches the server
+    (key-management-svc `internal/handler/tokenization.go`):
+
+    ```
+    POST /v1/tokenize    headers X-Tenant-Id, X-Principal-Id, X-Legal-Entity-Id (required), X-Correlation-ID
+                         + §4 envelope (X-Request-Id, X-Source-Channel, X-Purpose-Context, Idempotency-Key)
+                         {"value", "classification": "S3_RESTRICTED"} -> 200 {"token": "<uuid>"}
+    POST /v1/detokenize  headers as tokenize
+                         {"token"} -> 200 {"value"}; 403 = denied (SEC-T15 / SEC-T29; unknown token too)
+    ```
+
+    Paths, bodies, the tenant/principal/correlation headers and the 403 are
+    as proposed. Changed on this side: the client now sends the full §4
+    envelope (without it key-management-svc's write-strict envelope refuses
+    the POST with 400), `Scope` carries the request's legal entity (the vault
+    authorizes `TOKEN_CREATE` at it and `TOKEN_DETOKENIZE` at the stored
+    one), and tokenize requires a principal.
+  - *A migration state with an end.* `TOKENIZATION_ENFORCED` stays `false`
+    (compose). key-management-svc implementing the endpoints removes only
+    the first prerequisite. Same shape as authorization-svc's
+    `ZS_ENVELOPE_ENFORCEMENT` rollout. Before it is turned on:
+    1. Proposing principals hold `TOKEN_CREATE` in authorization-svc at
+       their legal entity, or every enforced proposal is refused (fail
+       closed); `TOKEN_DETOKENIZE` goes only to readers that need the raw
+       identifier (SEC-T15).
+    2. The `PayeeMasterPrivilegedRead` path, which today returns the full
+       identifier, is wired to detokenize under the separate elevated
+       authorization SEC-T15 requires. As built, it would return the token.
+       payment-authorization-svc reads destinations too.
+    3. Existing raw rows are backfilled. The immutability trigger on
+       `account_identifier` (000002) means that needs a controlled
+       migration.
+  - *Verification.*
+    - `internal/tokenization/client_test.go` covers the request shape, every
+      fail-closed path and the Fake.
+    - `internal/store/tokenization_test.go` (`-tags integration`, real
+      Postgres): the token is stored, fingerprint and last-4 stay raw-derived
+      and only the same tenant detokenizes; an enforced retry replays and a
+      different account conflicts; a failure writes nothing; off is
+      unchanged and never calls the tokenizer.
+    - Two deliberate breakages were each caught: a raw fallback, and raw
+      replay matching.
+
+- **B12. Enforcement connected to real data (2026-11-13).** B11's
+  prerequisites, done. Enforcement is still **off by default**; it is now
+  safe to turn on.
+  - **Read precedence: a side table, not a shape.** Tokens live in
+    `payee_destination_identifier_tokens` (migration 000007), one row per
+    destination.
+    - **A row there means TOKENIZED.** `account_identifier` is never served
+      for that destination.
+    - **No row means a LEGACY raw value,** read exactly as before.
+    - The discriminator is the row's presence, never the stored string.
+    - It is not a column because 000002's trigger refuses **any** update to
+      a SUSPENDED or SUPERSEDED destination, whatever the column. A token
+      column could not be backfilled for terminal rows, which still hold raw
+      identifiers, without weakening that trigger. The side table needs
+      only INSERTs; 000002 is untouched and `account_identifier` is never
+      overwritten in place.
+    - The table is append-only (000002's own `reject_payee_event_mutation`)
+      and RLS-forced.
+    - `destReadColumns` reads it on every SELECT and RETURNING;
+      `domain.PayeeDestination.Tokenized()` is the rule in code.
+  - **Writes.** With `TOKENIZATION_ENFORCED=true`, the token row commits in
+    the proposal's own transaction. **Replay matching** now follows the
+    row's own tokenized state, not the current flag. Before, a destination
+    proposed with enforcement on was refused as a key conflict on an honest
+    retry made after enforcement was turned off.
+  - **Privileged reads.** Every path that reveals the identifier to a
+    `PAYEE_MASTER_PRIVILEGED_READ` holder now **detokenizes a tokenized
+    destination** under the reader's own principal. That covers by id,
+    versions, `/org10/parties/{party}/active`, and the verify and propose
+    responses. The vault's `TOKEN_DETOKENIZE` check, tenant binding and
+    audit therefore apply too, so the payee grant alone is not enough to see
+    a tokenized value.
+    - **On any detokenize failure the identifier is WITHHELD,** never failed
+      and never replaced by the token. It is blanked (exactly the
+      unprivileged view), and `X-Account-Identifier-Withheld` gives the
+      reason: `detokenize_denied`, `tokenization_unavailable` or
+      `tokenization_not_configured`. The rest of the destination is still
+      returned with 200.
+    - Why not fail the read: payment-authorization-svc reads destinations
+      through `/active` for its eligibility check and **never uses the
+      identifier** (its client decodes only id, legal entity, status and
+      the maker/verifier/approver). A 503 there would turn a vault outage
+      into blocked payments for no gain.
+    - `cmd/server` builds the client whenever `TOKENIZATION_SERVICE_URL` is
+      set, since tokenized rows stay tokenized after enforcement is off.
+  - **Backfill: `cmd/tokenize-backfill`.** It has the same guarantees as
+    banking-connector-svc's (its G6):
+    - round trip verified before any write;
+    - all or nothing;
+    - an RLS-bound role is refused;
+    - the Idempotency-Key is `row id + principal`;
+    - SUSPENDED and SUPERSEDED destinations are backfilled like any other.
+
+    One addition: a destination with **no tenant** (`tenant_id` NULL) stops
+    the run. A token cannot be bound to no tenant, and skipping it would
+    leave that row raw unnoticed.
+  - **Enabling it.**
+    - **Grants:** `seed-demo-rbac.ps1` gives `TOKEN_CREATE` and
+      `PAYEE_MASTER_ADMIN`/`APPROVE` to the demo principals.
+      `PAYEE_MASTER_PRIVILEGED_READ` and `TOKEN_DETOKENIZE` go only to the
+      BANK_DETAIL_READER role.
+    - **Locally:** `export TOKENIZATION_ENFORCED=true` before `docker
+      compose up`; the default stays `false`.
+    - **Compose fix:** `TOKENIZATION_SERVICE_URL` in `docker-compose.yml`
+      was `http://key-management-svc:8143`, which never resolved from the
+      main network (key-management-svc is in phase 6's compose project). It
+      is now `http://host.docker.internal:8143`.
+  - **Live run, 2026-11-13.** Native processes; real authorization-svc,
+    key-management-svc and this service; Postgres 16.
+    - **Legacy destination:** proposed raw by the pre-task binary, then
+      000007 applied and the backfill run.
+    - **Refusals first:** the RLS-bound role and the under-granted principal
+      were both refused, with nothing written.
+    - **Real backfill:** dry run, then the run, then a re-run (0
+      candidates).
+    - **New destination under enforcement:** the database holds the token,
+      no row holds the raw value, and the outbox event carries no raw value.
+    - **Payments path:** walked to ACTIVE (a different approver), then
+      `/org10/parties/{party}/active` gave the reader the exact identifier
+      and the demo principal a blank with `AccountLast4` only.
+    - **Backfilled destination:** read identically to the new one.
+  - **Still open.**
+    - `account_identifier` still holds the raw value for **backfilled**
+      rows. 000002 forbids changing it, and dropping it is a later decision.
+    - A refused backfill attempt leaves unreferenced tokens in the vault.
+  - **Verification.**
+    - **Tests:**
+      - `internal/store/backfill_integration_test.go` (`-tags
+        integration`): all legacy rows including a terminal one; a mismatch
+        writes nothing; no tenant stops the run; a failure or a dry run
+        writes nothing; the RLS role is refused; a replay still matches
+        after enforcement is turned off.
+      - `internal/handler/tokenized_read_test.go`: the reveal rules over a
+        stub store.
+      - `internal/handler/e2e_tokenized_integration_test.go`: the real
+        handler, PgStore and HTTP client against a vault-contract server.
+        It proposes, checks the database token, walks the destination to
+        ACTIVE, reads `/active` as reader, withheld and clerk, and checks
+        that a backfilled destination reads like a new one.
+    - **Deliberate breaks, each caught:**
+      - the token served on a failed detokenize;
+      - privileged readers never revealed;
+      - detokenizing under a service identity;
+      - replay keyed on raw only;
+      - the no-tenant check removed;
+      - the enforced propose skipping its token row.
+
+- **B13. Format validation, party status/compliance, and change-risk
+  classification (2026-11-19, closes most of A3).**
+  - *Format validation.* `internal/domain/account_format.go`'s
+    `ValidateAccountFormat(countryCode, accountIdentifier)` was written new —
+    no reusable IBAN/account-format validator was found anywhere else in this
+    platform (checked `banking-connector-svc` and `treasury-svc`, both of
+    which carry an `IBAN` field but no validation logic for it). For a country
+    in the published IBAN registry's length table, the identifier must be
+    exactly that country's IBAN length, have IBAN structure, start with the
+    stated country code, and pass the real ISO 7064 mod-97 checksum (computed
+    digit-by-digit, no bignum needed even for a 34-character IBAN). For every
+    other country there is a minimal alphanumeric 4–34-character sanity rule —
+    this service still has no per-country routing/account-number validator to
+    call (see A14), so this is not a claim of full account-country rule
+    coverage, only a real structural check in place of none. Called from
+    `ProposePayeeDestination` before the party lookup; a failure is `400`.
+    Test: `internal/domain/account_format_test.go` (valid/invalid real IBANs
+    including a published example IBAN, a flipped checksum digit, wrong
+    length, wrong country prefix, the non-IBAN minimal rule, empty inputs).
+  - *Party status/compliance.* `domain.PartyEligibleForDestination(status,
+    complianceStatus)` refuses `SUSPENDED`/`TERMINATED` status or `REJECTED`
+    compliance; `ONBOARDING`/`PENDING` are allowed through, since neither
+    reads as "blocked/inactive" or "non-compliant" in ORG-07's own status
+    model (`counterparty-management-svc/internal/domain/types.go`) and
+    refusing them would block a counterparty still going through normal
+    onboarding. `ProposePayeeDestination` now keeps the `*Counterparty` the
+    ORG-07 lookup already returns and checks it instead of discarding it.
+    Tests: `TestProposePayeeDestination_BlockedParty_Rejected`,
+    `TestProposePayeeDestination_NonCompliantParty_Rejected`,
+    `TestProposePayeeDestination_OnboardingPendingCompliance_Allowed`.
+  - *Change-risk classification / prior version.* Represented as two new
+    columns on the existing `payee_destinations` row (migration 000010:
+    `change_risk_classification` — `NEW_DESTINATION` or `DESTINATION_CHANGE`,
+    `CHECK`-constrained — and `prior_destination_id`, a nullable
+    self-referencing FK), not a separate `ChangeRiskRecord` object. A4.10
+    names `ChangeRiskRecord` as one of the four authoritative write objects
+    the service does not yet have (A2, still open — the real structural gap
+    this interpretation inherits); building a genuine new object type for one
+    field pair when the other three ChangeRiskRecord-shaped needs (approvers,
+    risk-check results, effective dating — A13) are already deferred to A2
+    would have split the same gap across two half-measures instead of one.
+    `ProposeDestination` computes the classification inside its own
+    transaction, comparing against the party/scope's current `ACTIVE` row
+    (the spec's own "prior version" context, named in the same clause) before
+    the INSERT, so the classification is against a consistent snapshot, not a
+    racing read. Both columns are added to the row's existing immutability
+    trigger (000002/000009) — decided once at propose time, never
+    rewritable. The safe event projection
+    (`domain.DestinationEventPayload`) also carries both fields; neither is
+    sensitive. Tests:
+    `TestProposePayeeDestination_ChangeRiskClassification_DestinationChange`
+    (handler, stub store) and
+    `TestProposeDestination_ChangeRiskClassification` (`-tags integration`,
+    real Postgres, walks a destination to ACTIVE then proposes a second one
+    for the same party and asserts `DESTINATION_CHANGE` +
+    `PriorDestinationID`).
+
+- **B14. Sanctions/fraud hook — investigated, not wired; design question for
+  the reader (2026-11-19, leaves this one clause of A3 open).**
+  `vendor-due-diligence-svc`'s `CreateCheck`
+  (`internal/handler/handler.go`) was read in full before deciding. Its own
+  comment states it plainly: "starts a due-diligence check and runs it to
+  completion synchronously (the stub screening has no I/O, so there is
+  nothing to wait on asynchronously here)" — technically a clean fit for a
+  blocking propose-time call, not the slower async case-lifecycle service the
+  task's own framing warned this might be. It was not wired anyway, for two
+  separate reasons found by reading its actual authorization and domain
+  model, not guessed at:
+  1. **Cross-service authorization coupling with no safe identity to use.**
+     `CreateCheck` calls `h.authz.CheckAllowed(ctx, principalID,
+     legalEntityID, actionInitiate)` — a `vendor-due-diligence-svc`-scoped
+     permission, distinct from this service's own `PAYEE_MASTER_ADMIN`.
+     Forwarding the proposing principal's own identity would mean every
+     principal that can propose a payee destination today silently needs a
+     *second* grant, in a *different* service's authorization scope, the
+     moment this ships — an RBAC change this task has no instruction to make
+     and no visibility into whether it is safe to make platform-wide.
+     Inventing a "system" principal to call it under instead would be
+     fabricating a trust bypass with no precedent found anywhere in this
+     codebase's cross-service calls (checked; counterparty-management-svc's
+     own `GetParty` is unauthenticated, which is not the same shape).
+     Guessing either way is exactly the kind of fraud-risk-adjacent call this
+     task said to stop on rather than force.
+  2. **Object-model mismatch.** `VendorDDCheck` is a persistent row in that
+     service's own vendor-onboarding/due-diligence case lifecycle
+     (`VendorProfile`/`DueDiligenceStatus`/`RiskRating` sit alongside it).
+     Calling `CreateCheck` fresh on every `ProposePayeeDestination` — which
+     can happen repeatedly for the same vendor, e.g. a corrected or resubmitted
+     bank detail — would write a new `VendorDDCheck` row per bank-destination
+     proposal, conflating a per-proposal risk gate with that service's
+     longer-lived vendor case history. `ListChecks`/`GetCheck` (a read-only
+     alternative) carry the identical `actionView`/`actionInitiate`-style
+     authorization coupling from point 1, so reading instead of writing does
+     not avoid the real blocker.
+  **Recommendation left for the next pass, not acted on:** if sanctions
+  screening is wanted at propose time, the cleanest shape is probably a
+  dedicated service-to-service contract (like this service's own
+  `internal/tokenization` client talking to key-management-svc, or
+  counterparty-management-svc's unauthenticated `GetParty`) rather than
+  reusing `vendor-due-diligence-svc`'s caller-authorized, case-lifecycle
+  surface as-is. That is a design decision for whoever owns both services'
+  authorization model, not one this pass should make unilaterally.
+
+- **B15. Verification-pending reachability and verifier/activator SoD
+  (2026-11-19, closes A4 and the verifier/activator half of A6).**
+  `ProposeDestination`'s INSERT now writes `'VERIFICATION_PENDING'` directly
+  instead of `'CANDIDATE'` — see A4 for why no separate command was added to
+  produce a distinct, observable `CANDIDATE` resting state first.
+  `VerifyPayeeDestination` and `ActivateDestination` now call
+  `authorizeOwnObject` with `d.ProposedByPrincipalID`, mirroring
+  `ApprovePayeeDestination`'s existing self-approval check call-for-call — see
+  A6. Every existing lifecycle test that previously verified/activated as the
+  same principal that proposed (`doRequest`'s default `"principal-proposer"`)
+  now does so as an independent principal via the new `verifyDestination`/
+  `activateDestination` helpers, since that path is genuinely refused now.
 
 ## Verification performed
 
@@ -349,10 +703,25 @@ idempotency and the activation auto-supersede event are closed in this pass.
   `TEST_DATABASE_URL` pointed at a fresh disposable `postgres:16-alpine`
   container (`payee_it` database), not the shared development database — all
   unit and store integration tests pass, including the new
-  `idempotency_integration_test.go` suite and the updated outbox assertions.
+  `idempotency_integration_test.go` suite and the updated outbox assertions;
+  re-run after migration 000006 (tenant-scoped uniqueness) adds the new
+  `tenant_scoped_uniqueness_integration_test.go` suite — all pass.
 - `payment-authorization-svc`: `go test ./internal/handler -run
   'ORG10|Payee|Destination'` passes, covering the existing pull-based
   fail-closed AP-10 path that B4/A9/A10 describe.
 - The integration harness applies every `deployments/migrations/*.up.sql` to a
   clean database and drops `command_idempotency` before `payee_destinations`
   (the foreign-key dependency) between tests.
+- **2026-11-19 pass (B13/B14/B15):** `go build ./...` and `go vet ./...`
+  clean. `go test ./...` — all unit tests pass (domain, handler, store,
+  tokenization, config). `go test -tags=integration -count=1 -timeout=600s
+  ./...` — all pass, including the new
+  `internal/domain/account_format_test.go`,
+  `internal/store/verification_pending_integration_test.go`, the updated
+  `idempotency_integration_test.go` status assertions (now
+  `VERIFICATION_PENDING` instead of the no-longer-reachable `CANDIDATE`), and
+  every existing lifecycle test in `internal/handler` updated to
+  verify/activate as an independent principal. This run used this package's
+  own embedded-Postgres harness (`internal/store/main_integration_test.go`,
+  `TEST_DATABASE_URL` unset), not a separate container, per this session's
+  "boot the minimum" convention.

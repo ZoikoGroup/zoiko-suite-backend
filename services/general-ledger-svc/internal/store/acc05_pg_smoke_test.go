@@ -55,7 +55,7 @@ func TestPgStore_ACC05_FinalizingJournal_AppendsLedgerEntries_RealDB(t *testing.
 
 	h := finalizedJournal(t, ctx, s, tenantID, legalEntityID)
 
-	entries, err := s.QueryLedger(ctx, tenantID, domain.QueryLedgerFilter{LegalEntityID: legalEntityID}, 100)
+	entries, _, err := s.QueryLedger(ctx, tenantID, domain.QueryLedgerFilter{LegalEntityID: legalEntityID}, 100)
 	if err != nil {
 		t.Fatalf("QueryLedger: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestPgStore_ACC05_DuplicateFinalize_AppendsOnce_RealDB(t *testing.T) {
 		t.Fatal("expected a second FINALIZED transition to be refused")
 	}
 
-	entries, err := s.QueryLedger(ctx, tenantID, domain.QueryLedgerFilter{LegalEntityID: legalEntityID}, 100)
+	entries, _, err := s.QueryLedger(ctx, tenantID, domain.QueryLedgerFilter{LegalEntityID: legalEntityID}, 100)
 	if err != nil {
 		t.Fatalf("QueryLedger: %v", err)
 	}

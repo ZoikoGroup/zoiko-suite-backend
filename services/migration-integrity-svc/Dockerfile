@@ -1,38 +1,51 @@
 # BUILD CONTEXT IS services/, NOT THIS DIRECTORY:
 #   docker build -f migration-integrity-svc/Dockerfile services/
-# go.mod replaces zoiko.io/eventing with ../eventing, and Docker can only COPY
-# from inside the build context. Dockerfile.dockerignore next to this file
-# trims the context to the two directories the build reads.
+# go.mod replaces zoiko.io/eventing with ../eventing, and Docker can only
+# COPY from inside the build context -- matching general-ledger-svc's
+# Dockerfile, which has the same replace directive and the same build-context
+# requirement. main independently added a builder stage for this service
+# (PR #262) but kept the old single-directory context, which cannot resolve
+# ../eventing; this keeps that fix's intent (give the service a real builder
+# stage) while using the build-context-correct form.
 
+# ─── Stage 1: builder ─────────────────────────────────────────────────────────
 FROM golang:1.25-alpine AS builder
 
-RUN apk add --no-cache git
+RUN apk add --no-cache git ca-certificates
 
-# The service sits at /app/migration-integrity-svc so the replace directive's ../eventing
-# resolves to /app/eventing.
-WORKDIR /app/migration-integrity-svc
+WORKDIR /build/migration-integrity-svc
 
-COPY eventing/ /app/eventing/
+COPY eventing/ /build/eventing/
 COPY migration-integrity-svc/go.mod migration-integrity-svc/go.sum ./
 RUN go mod download
 
 COPY migration-integrity-svc/ ./
 
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /app/server ./cmd/server
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /app/healthcheck ./cmd/healthcheck
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags="-s -w" \
+    -o /server \
+    ./cmd/server/
 
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags="-s -w" \
+    -o /healthcheck \
+    ./cmd/healthcheck/
+
+# ─── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM alpine:3.19
 
 RUN apk add --no-cache ca-certificates tzdata
 
 WORKDIR /app
 
-COPY --from=builder /app/server /app/server
-COPY --from=builder /app/healthcheck /app/healthcheck
+COPY --from=builder /server /app/server
+COPY --from=builder /healthcheck /app/healthcheck
+
+RUN chmod +x /app/server /app/healthcheck
 
 EXPOSE 8139
 
-# cmd/healthcheck probes the public /healthz endpoint.
-HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=3   CMD ["/app/healthcheck"]
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
+  CMD ["/app/healthcheck"]
 
-ENTRYPOINT ["/app/server"]
+CMD ["/app/server"]

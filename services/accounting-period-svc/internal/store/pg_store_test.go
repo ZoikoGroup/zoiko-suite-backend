@@ -45,7 +45,7 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	_, err = pool.Exec(ctx, `
-		DROP TABLE IF EXISTS accounting_period_outbox, accounting_period_idempotency, period_state_history, accounting_periods CASCADE;
+		DROP TABLE IF EXISTS eventing_outbox, accounting_period_outbox, accounting_period_idempotency, period_state_history, accounting_periods CASCADE;
 		DROP FUNCTION IF EXISTS accounting_period_guard_update() CASCADE;
 		DROP FUNCTION IF EXISTS accounting_period_forbid_delete() CASCADE;
 		DROP FUNCTION IF EXISTS accounting_period_forbid_mutation() CASCADE;`)
@@ -55,7 +55,7 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 	migDir := filepath.Join(filepath.Dir(filename), "..", "..", "deployments", "migrations")
 	migrations, err := filepath.Glob(filepath.Join(migDir, "*.up.sql"))
 	require.NoError(t, err)
-	require.Len(t, migrations, 4)
+	require.Len(t, migrations, 5)
 	sort.Strings(migrations)
 	for _, p := range migrations {
 		sqlText, err := os.ReadFile(p)
@@ -98,7 +98,7 @@ func (cal) PeriodsPreview(_ context.Context, _, vid string, year int) (*service.
 
 func newSvc(pool *pgxpool.Pool) (*service.Service, *okProv) {
 	pv := &okProv{}
-	svc := service.New(store.New(pool), cal{}, pv)
+	svc := service.New(store.New(pool), cal{}, pv).WithEventRegion("test-region")
 	return svc, pv
 }
 
@@ -240,7 +240,7 @@ func TestPg_LifecycleGateOutboxAndIdempotency(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, p.Reopen)
 	assert.True(t, gate(false).PostingAllowed)
-	expired := service.New(store.New(pool), cal{}, &okProv{}).WithClock(func() time.Time { return time.Now().UTC().Add(2 * time.Hour) })
+	expired := service.New(store.New(pool), cal{}, &okProv{}).WithEventRegion("test-region").WithClock(func() time.Time { return time.Now().UTC().Add(2 * time.Hour) })
 	r, err := expired.ResolvePeriodByDate(ctx, service.ResolveInput{TenantID: "tenant-a", LegalEntityID: "entity-a", Date: "2026-03-10"})
 	require.NoError(t, err)
 	assert.False(t, r.PostingAllowed)
@@ -249,11 +249,11 @@ func TestPg_LifecycleGateOutboxAndIdempotency(t *testing.T) {
 	// 12 PeriodOpened + SoftClosed + HardClosed + Reopened; refusals (SoD) added a control event.
 	var n int
 	tenantTx(t, pool, "tenant-a", func(_ context.Context, _ func(string, ...any) error, scan func(any, string, ...any) error) {
-		require.NoError(t, scan(&n, `SELECT count(*) FROM accounting_period_outbox WHERE event_type = 'PeriodOpened'`))
+		require.NoError(t, scan(&n, `SELECT count(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.accounting.period.opened'`))
 		assert.Equal(t, 12, n)
-		require.NoError(t, scan(&n, `SELECT count(*) FROM accounting_period_outbox WHERE event_type IN ('PeriodSoftClosed','PeriodHardClosed','PeriodReopened')`))
+		require.NoError(t, scan(&n, `SELECT count(*) FROM eventing_outbox WHERE event_type IN ('com.zoikosuite.accounting.period.soft-closed','com.zoikosuite.accounting.period.hard-closed','com.zoikosuite.accounting.period.reopened')`))
 		assert.Equal(t, 3, n)
-		require.NoError(t, scan(&n, `SELECT count(*) FROM accounting_period_outbox WHERE event_type = 'PeriodCommandRejected'`))
+		require.NoError(t, scan(&n, `SELECT count(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.accounting.period.command-rejected'`))
 		assert.Equal(t, 1, n, "the SoD refusal left a control event (its own transaction survived the rollback)")
 	})
 }
@@ -317,7 +317,7 @@ func TestPg_TenantIsolationUnderRLS(t *testing.T) {
 	command(svc, "tenant-a", "closer", "c1", res.Periods[0].PeriodID, domain.CmdSoftClose, 1, "wf1") //nolint:errcheck
 
 	// A bare query WITHOUT a tenant sees nothing at all (FORCE RLS): every table.
-	for _, tbl := range []string{"accounting_periods", "period_state_history", "accounting_period_idempotency", "accounting_period_outbox"} {
+	for _, tbl := range []string{"accounting_periods", "period_state_history", "accounting_period_idempotency", "eventing_outbox"} {
 		var n int
 		require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM `+tbl).Scan(&n))
 		assert.Zero(t, n, "%s without a tenant context", tbl)
@@ -455,7 +455,7 @@ func TestPg_ConcurrentHardCloseExactlyOneWinsAndGateStaysConsistent(t *testing.T
 	assert.Equal(t, 1, hardCloses, "one history row, one winner")
 	tenantTx(t, pool, "tenant-a", func(_ context.Context, _ func(string, ...any) error, scan func(any, string, ...any) error) {
 		var n int
-		require.NoError(t, scan(&n, `SELECT count(*) FROM accounting_period_outbox WHERE event_type = 'PeriodHardClosed'`))
+		require.NoError(t, scan(&n, `SELECT count(*) FROM eventing_outbox WHERE event_type = 'com.zoikosuite.accounting.period.hard-closed'`))
 		assert.Equal(t, 1, n)
 	})
 }
@@ -490,23 +490,65 @@ func TestPg_ConcurrentMaterializeCreatesEachPeriodOnce(t *testing.T) {
 	}
 	assert.Equal(t, 12, total, "across 4 racing materialisations each period was created exactly once")
 	assert.Equal(t, 12, count(t, pool, "tenant-a", "accounting_periods"))
-	assert.Equal(t, 12, count(t, pool, "tenant-a", "accounting_period_outbox"))
+	assert.Equal(t, 12, count(t, pool, "tenant-a", "eventing_outbox"))
 }
 
-func TestPg_ClaimOutboxPublishesOnce(t *testing.T) {
+// Migration safety: rows already in the legacy accounting_period_outbox when the
+// service moves to the eventing outbox are still drained by the legacy relay,
+// and nothing new is written to the legacy table.
+func TestPg_LegacyOutboxStillDrainsAndNewEventsBypassIt(t *testing.T) {
 	pool := requireTestDB(t)
 	ctx := context.Background()
 	st := store.New(pool)
 	svc, _ := newSvc(pool)
+
+	// A pre-migration backlog of three events.
+	tx, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	_, err = tx.Exec(ctx, `SELECT set_config('app.tenant_id', 'tenant-a', true)`)
+	require.NoError(t, err)
+	for i := 0; i < 3; i++ {
+		_, err = tx.Exec(ctx, `INSERT INTO accounting_period_outbox (tenant_id, object_id, event_type, payload)
+			VALUES ('tenant-a', gen_random_uuid(), 'PeriodOpened', '{}'::jsonb)`)
+		require.NoError(t, err)
+	}
+	require.NoError(t, tx.Commit(ctx))
+
 	materialize(t, svc, "tenant-a", "m1")
+	assert.Equal(t, 12, count(t, pool, "tenant-a", "eventing_outbox"), "new events go to the eventing outbox")
 
 	var got int
 	require.NoError(t, st.ClaimOutbox(ctx, 100, func(recs []store.OutboxRecord) error { got = len(recs); return nil }))
-	assert.Equal(t, 12, got)
+	assert.Equal(t, 3, got, "only the pre-migration backlog is in the legacy table")
 	got = 0
 	require.NoError(t, st.ClaimOutbox(ctx, 100, func(recs []store.OutboxRecord) error { got = len(recs); return nil }))
 	assert.Equal(t, 0, got, "published rows are not claimed again")
 	pending, _, err := st.OutboxDepth(ctx)
 	require.NoError(t, err)
 	assert.Zero(t, pending)
+}
+
+// Every event carries the ZS-EVENT-001 envelope: canonical type, the legacy
+// event_type consumers filter on, the region, and an aggregate version.
+func TestPg_EventsCarryCanonicalAndLegacyNames(t *testing.T) {
+	pool := requireTestDB(t)
+	svc, _ := newSvc(pool)
+	res := materialize(t, svc, "tenant-a", "m1")
+	command(svc, "tenant-a", "closer", "c1", res.Periods[0].PeriodID, domain.CmdSoftClose, 1, "wf1") //nolint:errcheck
+
+	tenantTx(t, pool, "tenant-a", func(_ context.Context, _ func(string, ...any) error, scan func(any, string, ...any) error) {
+		var typ, region, agg string
+		var ver int64
+		var payload []byte
+		require.NoError(t, scan(&typ, `SELECT event_type FROM eventing_outbox WHERE event_type = 'com.zoikosuite.accounting.period.soft-closed'`))
+		require.NoError(t, scan(&region, `SELECT region FROM eventing_outbox WHERE event_type = 'com.zoikosuite.accounting.period.soft-closed'`))
+		require.NoError(t, scan(&agg, `SELECT aggregate_id FROM eventing_outbox WHERE event_type = 'com.zoikosuite.accounting.period.soft-closed'`))
+		require.NoError(t, scan(&ver, `SELECT aggregate_version FROM eventing_outbox WHERE event_type = 'com.zoikosuite.accounting.period.soft-closed'`))
+		require.NoError(t, scan(&payload, `SELECT payload FROM eventing_outbox WHERE event_type = 'com.zoikosuite.accounting.period.soft-closed'`))
+		assert.Equal(t, "test-region", region)
+		assert.Equal(t, res.Periods[0].PeriodID, agg)
+		assert.Equal(t, int64(2), ver)
+		assert.Contains(t, string(payload), `"event_type":"PeriodSoftClosed"`, "legacy name retained for existing consumers")
+		assert.Contains(t, string(payload), `"type":"com.zoikosuite.accounting.period.soft-closed"`)
+	})
 }

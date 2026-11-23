@@ -81,7 +81,7 @@ different roles. **Nothing prevents one principal holding both compile and sign*
 
 The test/certification harness is built (see [Wave 3](jurisdiction-pack-wave3.md)); RELEASED and later states (Wave 7); the runtime resolver that consumes verified
 artifacts (Wave 2); promotion rings, rollback, withdrawal and hotfix (Wave 7); SBOM scanning of the compiler toolchain;
-cross-pack conflict detection (only conflicts inside one pack are detected); a code-list/schema registry for the external
+cross-pack conflict detection at compile time (conflicts inside one pack are detected there; conflicts between packs are now refused when a version is released, see [jurisdiction-pack-wave7-consistency.md](jurisdiction-pack-wave7-consistency.md)); a code-list/schema registry for the external
 dependencies; a runtime check that a loader actually calls `verify` before using an artifact.
 
 ## Verification

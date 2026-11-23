@@ -455,14 +455,14 @@ func TestGoverned_AuthorityLimitChangeProposesASuccessor(t *testing.T) {
 	}
 
 	s = &stubStore{authorityLimit: activeLimit("holder-1")}
-	if w := postReq(s, noConfig, scAdmin, "/v1/admin/authority-limits/al-1/change", `{"upper_limit":"5000","expected_version":2,"reason_code":"x"}`, false); w.Code != http.StatusConflict {
-		t.Fatalf("stale version: want 409, got %d", w.Code)
+	if w := postReq(s, noConfig, scAdmin, "/v1/admin/authority-limits/al-1/change", `{"upper_limit":"5000","expected_version":2,"reason_code":"x"}`, false); w.Code != http.StatusPreconditionFailed {
+		t.Fatalf("stale version: want 412, got %d", w.Code)
 	}
 	retiring := activeLimit("holder-1")
 	retire := domain.AuthorityLimitPendingRetire
 	retiring.PendingAction = &retire
 	s = &stubStore{authorityLimit: retiring}
-	if w := postReq(s, noConfig, scAdmin, "/v1/admin/authority-limits/al-1/change", `{"upper_limit":"5000","reason_code":"x"}`, false); w.Code != http.StatusConflict {
+	if w := postReq(s, noConfig, scAdmin, "/v1/admin/authority-limits/al-1/change", `{"upper_limit":"5000","expected_version":3,"reason_code":"x"}`, false); w.Code != http.StatusConflict {
 		t.Fatalf("change while a retirement is pending: want 409, got %d", w.Code)
 	}
 }

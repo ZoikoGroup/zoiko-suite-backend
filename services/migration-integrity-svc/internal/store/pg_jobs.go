@@ -26,6 +26,7 @@ const jobColumns = `
 	COALESCE(j.control_amount_field, ''), j.source_record_count, j.target_record_count,
 	j.source_amount_total::text, j.target_amount_total::text,
 	COALESCE(j.source_control_hash, ''), COALESCE(j.target_control_hash, ''), j.control_totals_matched,
+	COALESCE(j.source_extract_id::text, ''), COALESCE(j.source_extract_version, 0),
 	(SELECT COUNT(*) FROM migration_audit_entries open_entry
 	  WHERE open_entry.job_id = j.id AND open_entry.tenant_id = j.tenant_id
 	    AND open_entry.status = 'QUARANTINED')`
@@ -46,6 +47,7 @@ func scanJob(row pgx.Row) (*domain.MigrationJob, error) {
 		&amountField, &sourceCount, &targetCount,
 		&sourceAmount, &targetAmount,
 		&sourceHash, &targetHash, &matched,
+		&job.SourceExtractID, &job.SourceExtractVersion,
 		&job.OpenQuarantineCount,
 	)
 	if err != nil {
@@ -173,6 +175,12 @@ func insertJob(ctx context.Context, tx pgx.Tx, job *domain.MigrationJob) error {
 		sourceAmount, targetAmount = &totals.SourceAmountTotal, &totals.TargetAmountTotal
 		sourceHash, targetHash, matched = nullIfEmpty(totals.SourceControlHash), &totals.TargetControlHash, &totals.Matched
 	}
+	// The SourceExtract this run validated against (MIG-INV-03); NULL for a
+	// run validated directly against submitted records.
+	var extractVersion *int
+	if job.SourceExtractVersion > 0 {
+		extractVersion = &job.SourceExtractVersion
+	}
 	_, err := tx.Exec(ctx, `
 		INSERT INTO migration_jobs
 		  (id, tenant_id, legal_entity_id, migration_name, source_system, target_service, requested_by,
@@ -181,14 +189,15 @@ func insertJob(ctx context.Context, tx pgx.Tx, job *domain.MigrationJob) error {
 		   created_at, updated_at,
 		   control_amount_field, source_record_count, target_record_count,
 		   source_amount_total, target_amount_total, source_control_hash, target_control_hash,
-		   control_totals_matched)
+		   control_totals_matched, source_extract_id, source_extract_version)
 		VALUES ($1,$2,$3,$4,$5,$6,NULLIF($7,''),$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
-		        $20,$21,$22,$23::numeric,$24::numeric,$25,$26,$27)`,
+		        $20,$21,$22,$23::numeric,$24::numeric,$25,$26,$27,NULLIF($28,'')::uuid,$29)`,
 		job.ID, job.TenantID, job.LegalEntityID, job.MigrationName, job.SourceSystem, job.TargetService, job.RequestedBy,
 		job.TotalRecordsCount, job.ValidRecordsCount, job.InvalidRecordsCount, job.IntegrityScore,
 		job.IntegrityScoreThreshold, job.BlockerCount, string(job.Status), job.Version, job.StartedAt, job.CompletedAt,
 		job.CreatedAt, job.UpdatedAt,
 		amountField, sourceCount, targetCount, sourceAmount, targetAmount, sourceHash, targetHash, matched,
+		job.SourceExtractID, extractVersion,
 	)
 	if err != nil {
 		return fmt.Errorf("insert migration_job: %w", err)

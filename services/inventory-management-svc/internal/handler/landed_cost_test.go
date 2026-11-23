@@ -80,7 +80,7 @@ func (s *stubStore) GetLandedCostAllocation(_ context.Context, id string) (*doma
 func landedReq(movementID, key string, amount float64) domain.AllocateLandedCostRequest {
 	return domain.AllocateLandedCostRequest{
 		MovementID: movementID, IdempotencyKey: key, Amount: amount, ValuationEvidenceRef: "FREIGHT-INV-77",
-		FiscalPeriod: "2026-10", InventoryAccountCode: "INV-ASSET", COGSAccountCode: "COGS", OffsetAccountCode: "FREIGHT-PAYABLE",
+		FiscalPeriod: "2026-10",
 	}
 }
 
@@ -136,9 +136,9 @@ func TestAllocateLandedCost_SplitsBetweenOnHandAndConsumed(t *testing.T) {
 		t.Fatalf("expected 3 journal lines, got %+v", ledger.lastLines)
 	}
 	dr1, dr2, cr := ledger.lastLines[0], ledger.lastLines[1], ledger.lastLines[2]
-	if dr1.AccountCode != "INV-ASSET" || dr1.DebitAmount != 7.2 ||
-		dr2.AccountCode != "COGS" || dr2.DebitAmount != 4.8 ||
-		cr.AccountCode != "FREIGHT-PAYABLE" || cr.CreditAmount != 12 {
+	if dr1.MappingKey != "INV-ASSET" || dr1.DebitAmount != 7.2 ||
+		dr2.MappingKey != "COGS" || dr2.DebitAmount != 4.8 ||
+		cr.MappingKey != "FREIGHT-PAYABLE" || cr.CreditAmount != 12 {
 		t.Fatalf("unexpected journal: %+v", ledger.lastLines)
 	}
 	// On-hand value = 6 units * (2.00 + 7.20/6) = 19.20 = original 12.00 + 7.20.

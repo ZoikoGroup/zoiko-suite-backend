@@ -1,0 +1,36 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.banking.payment-execution-state.conflict-raised (payment-status-svc, schema 1.0.0). OBSERVED contract inferred from 7 emitted payload(s): a field is required only if present in every sample (and only when there were at least 2 samples), and a type is stated only where all samples agreed. Review before relying on it.",
+  "properties": {
+    "bank_rec_status": {
+      "type": "string"
+    },
+    "current_status": {
+      "type": "string"
+    },
+    "payment_id": {
+      "type": "string"
+    },
+    "provider_request_id": {
+      "type": "string"
+    },
+    "reported_status": {
+      "type": "string"
+    },
+    "statement_line_id": {
+      "type": "string"
+    },
+    "statement_reference": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "bank_rec_status",
+    "current_status",
+    "payment_id",
+    "provider_request_id",
+    "reported_status",
+    "statement_line_id",
+    "statement_reference"
+  ],
+  "type": "object"
+}

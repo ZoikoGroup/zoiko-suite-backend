@@ -25,11 +25,37 @@ var (
 type Service struct {
 	store store.Store
 	ttl   time.Duration
-	now   func() time.Time
+	idle  time.Duration // 0: no idle expiry
+	// idem is how long a session Idempotency-Key may be replayed
+	// (PUBLIC_AI_IDEMPOTENCY_TTL).
+	idem time.Duration
+	now  func() time.Time
+	// ReleaseID, when set, names the active KB release; it is stamped on
+	// each new session (Doc 04 §16).
+	ReleaseID func() string
+}
+
+// WithIdleTTL ends a session that has had no completed turn for d, before
+// its fixed maximum (Doc 06 §17).
+func (s *Service) WithIdleTTL(d time.Duration) *Service {
+	s.idle = d
+	return s
+}
+
+// DefaultIdempotencyTTL matches the config default for PUBLIC_AI_IDEMPOTENCY_TTL.
+const DefaultIdempotencyTTL = 24 * time.Hour
+
+// WithIdempotencyTTL bounds how long a create-session Idempotency-Key can be
+// replayed (Doc 05 §12). d <= 0 keeps the default.
+func (s *Service) WithIdempotencyTTL(d time.Duration) *Service {
+	if d > 0 {
+		s.idem = d
+	}
+	return s
 }
 
 func New(s store.Store, ttl time.Duration) *Service {
-	return &Service{store: s, ttl: ttl, now: func() time.Time { return time.Now().UTC() }}
+	return &Service{store: s, ttl: ttl, idem: DefaultIdempotencyTTL, now: func() time.Time { return time.Now().UTC() }}
 }
 
 // Issued is a newly created (or replayed) session and its plaintext grant.
@@ -58,9 +84,15 @@ func newGrant() string { return "pgr_" + base64.RawURLEncoding.EncodeToString(ra
 // request returns the same session_id and expiry with a freshly rotated grant:
 // the original grant is never stored, so it cannot be returned again, and the
 // rotation invalidates it (dev default recorded in ADR-005).
-func (s *Service) Create(ctx context.Context, key string, requestHash []byte, locale, market, page string) (Issued, error) {
+func (s *Service) Create(ctx context.Context, key string, requestHash []byte, locale, market, page, origin string) (Issued, error) {
 	if prev, hash, err := s.store.SessionByIdempotencyKey(ctx, key); err == nil {
 		if !bytes.Equal(hash, requestHash) {
+			return Issued{}, ErrMismatch
+		}
+		// Doc 05 §12: key reuse is not a credential. Only the same site
+		// origin, within the idempotency window, gets the replay; anyone
+		// else holding the key cannot mint a grant for this session.
+		if prev.Origin != origin || !s.now().Before(prev.CreatedAt.Add(s.idem)) {
 			return Issued{}, ErrMismatch
 		}
 		if prev.DeletedAt != nil || !s.now().Before(prev.ExpiresAt) {
@@ -85,6 +117,10 @@ func (s *Service) Create(ctx context.Context, key string, requestHash []byte, lo
 		Locale:      locale,
 		MarketCode:  market,
 		PageContext: page,
+		Origin:      origin,
+	}
+	if s.ReleaseID != nil {
+		sess.ReleaseID = s.ReleaseID()
 	}
 	if err := s.store.CreateSession(ctx, sess, key, requestHash); err != nil {
 		return Issued{}, err
@@ -118,7 +154,23 @@ func (s *Service) lookup(ctx context.Context, grant string) (store.Session, erro
 	if !s.now().Before(sess.ExpiresAt) {
 		return store.Session{}, ErrExpired
 	}
+	if s.idle > 0 {
+		last := sess.LastSeenAt
+		if last.IsZero() {
+			last = sess.CreatedAt
+		}
+		if !s.now().Before(last.Add(s.idle)) {
+			return store.Session{}, ErrExpired
+		}
+	}
 	return sess, nil
+}
+
+// FromOrigin reports whether a request from origin may use sess: a grant
+// works only on the site origin that created it (Doc 05 §08). Sessions
+// created before origins were recorded carry none and are not restricted.
+func FromOrigin(sess store.Session, origin string) bool {
+	return sess.Origin == "" || sess.Origin == origin
 }
 
 // Delete ends the session identified by grant if it owns sessionID. Deleting

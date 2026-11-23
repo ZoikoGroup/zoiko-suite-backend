@@ -1431,7 +1431,9 @@ func newRouterFull(s *stubStore, pub *stubPublisher, authz *stubAuthZ, pc *stubP
 			next.ServeHTTP(w, req)
 		})
 	})
-	h := handler.New(s, pub, authz, zap.NewNop()).WithPeriodChecker(pc).WithLedgerClient(ledger)
+	h := handler.New(s, pub, authz, zap.NewNop()).WithPeriodChecker(pc).WithLedgerClient(ledger).
+		WithValuationMappingKeys("INV-ASSET", "COGS", "WRITE-DOWN-EXPENSE").
+		WithLandedCostOffsetMappingKey("FREIGHT-PAYABLE")
 	handler.RegisterRoutes(r, h)
 	return r
 }

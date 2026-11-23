@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"zoiko.io/accounts-receivable-svc/internal/catalogref"
 	"zoiko.io/accounts-receivable-svc/internal/kit"
 )
 
@@ -660,6 +661,9 @@ func (m *Module) approveOrder(w http.ResponseWriter, r *http.Request) {
 				return errApprovalInvalidated("content_hash does not match the current version content")
 			}
 			if err := requirePriceSource(v); err != nil {
+				return err
+			}
+			if err := catalogref.Require(ctx, m.catalog, catalogref.AsSystem(c.SvcCaller()), v.CatalogVersionRef); err != nil {
 				return err
 			}
 			view, err := m.profile(ctx, c.TenantID, h.LegalEntityID, h.CustomerPartyID)

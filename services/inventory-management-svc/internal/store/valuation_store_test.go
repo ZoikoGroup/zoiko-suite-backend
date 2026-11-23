@@ -64,7 +64,7 @@ func createCommittedIssue(t *testing.T, s *store.PgStore, ctx context.Context, l
 
 func TestPgStore_ValueMovement_Inbound_CreatesCostLayer(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -101,7 +101,7 @@ func TestPgStore_ValueMovement_Inbound_CreatesCostLayer(t *testing.T) {
 // of negative path #4, "Same movement consumes two cost layers twice."
 func TestPgStore_ValueMovement_SameMovementTwice_Refused(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -124,7 +124,7 @@ func TestPgStore_ValueMovement_SameMovementTwice_Refused(t *testing.T) {
 // Postgres, including the ORDER BY created_at ASC ... FOR UPDATE query.
 func TestPgStore_ValueMovement_OutboundFIFO_ConsumesOldestFirst(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -171,7 +171,7 @@ func TestPgStore_ValueMovement_OutboundFIFO_ConsumesOldestFirst(t *testing.T) {
 // layer it touched, in the order it consumed them.
 func TestPgStore_GetLayerConsumptions_OutboundFIFO_ReturnsBothLayers(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -218,7 +218,7 @@ func TestPgStore_GetLayerConsumptions_OutboundFIFO_ReturnsBothLayers(t *testing.
 // answer at the current instant.
 func TestPgStore_GetInventoryValueAsOf_ReconstructsHistoricalValue(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -284,7 +284,7 @@ func TestPgStore_GetInventoryValueAsOf_ReconstructsHistoricalValue(t *testing.T)
 // check.
 func TestPgStore_ValueMovement_InsufficientLayers_Refused(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -304,7 +304,7 @@ func TestPgStore_ValueMovement_InsufficientLayers_Refused(t *testing.T) {
 // own population-freeze and MarkValuationRunEmitted end to end.
 func TestPgStore_ValuationRun_FullLifecycle(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -324,7 +324,7 @@ func TestPgStore_ValuationRun_FullLifecycle(t *testing.T) {
 
 	run := &domain.ValuationRun{
 		RunID: uuid.New().String(), LegalEntityID: legalEntityID, FiscalPeriod: "2026-09",
-		InventoryAccountCode: "INV-ASSET", COGSAccountCode: "COGS", CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
+		InventoryMappingKey: "INV-ASSET", COGSMappingKey: "COGS", CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
 	}
 	frozen, err := s.CreateValuationRun(ctx, run)
 	if err != nil {
@@ -350,7 +350,7 @@ func TestPgStore_ValuationRun_FullLifecycle(t *testing.T) {
 // write-down's own journal reference and status round-trip correctly.
 func TestPgStore_WriteDown_CreateAndReverse(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -360,7 +360,7 @@ func TestPgStore_WriteDown_CreateAndReverse(t *testing.T) {
 
 	wd := &domain.WriteDown{
 		WriteDownID: uuid.New().String(), LegalEntityID: legalEntityID, ItemID: itemID, LocationID: locID,
-		Amount: 100, ValuationEvidenceRef: "NRV-1", ExpenseAccountCode: "WD-EXP", InventoryAccountCode: "INV-ASSET",
+		Amount: 100, ValuationEvidenceRef: "NRV-1", ExpenseMappingKey: "WD-EXP", InventoryMappingKey: "INV-ASSET",
 		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
 	}
 	if err := s.CreateWriteDown(ctx, wd, "jrnl-wd-1"); err != nil {
@@ -387,7 +387,7 @@ func TestPgStore_WriteDown_CreateAndReverse(t *testing.T) {
 // the AST/INV/PRJ domain spec's own §9 "Inventory value → GL" assertion.
 func TestPgStore_GetInventoryValueTotal_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()

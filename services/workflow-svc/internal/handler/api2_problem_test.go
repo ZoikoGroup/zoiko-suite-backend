@@ -28,8 +28,8 @@ func TestAPI2_ErrorResponsesAreProblemDetails(t *testing.T) {
 		r.ServeHTTP(w, req)
 		return w
 	}
-	pending := &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "PENDING"}
-	cancelled := &domain.WorkflowInstance{WorkflowInstanceID: testCancelledID, LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "CANCELLED"}
+	pending := &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "PENDING", RowVersion: 1}
+	cancelled := &domain.WorkflowInstance{WorkflowInstanceID: testCancelledID, LegalEntityID: "22222222-2222-4222-8222-222222222222", WorkflowStatus: "CANCELLED", RowVersion: 1}
 	stage := &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"}
 	approve := func(id string) *http.Request {
 		return scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+id+"/actions", bytes.NewBufferString(`{"action":"APPROVE"}`)), "approver-1")

@@ -502,8 +502,57 @@ type AccountVersion struct {
 	ChangeKind              string      `json:"change_kind"`
 	ChangeReason            string      `json:"change_reason,omitempty"`
 	EvidenceRefs            []string    `json:"evidence_refs,omitempty"`
-	CreatedAt               time.Time   `json:"created_at"`
-	CreatedByPrincipalID    string      `json:"created_by_principal_id"`
+	// SourcePolicyRef is ACC-01's evidence/lineage "source policy" (A8/B18):
+	// an optional, caller-supplied free-text reference to whatever governance
+	// policy or workflow authorized this change. The spec names it but gives
+	// it no shape, so this is a free-text reference, the same posture
+	// EvidenceRefs already takes, not a foreign key into a policy table this
+	// service has no model for.
+	SourcePolicyRef      string    `json:"source_policy_ref,omitempty"`
+	CreatedAt            time.Time `json:"created_at"`
+	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+}
+
+// Account change approval lifecycle (SPEC_DEVIATIONS A4/B16): ACC-01's SoD
+// line — "Creator cannot approve material control-account or hierarchy
+// change" — names two things a single principal must never both propose and
+// approve. ReparentAccount and AmendAccountVersion still apply ordinary
+// changes in one call exactly as before; only when a control account is on
+// either side of the change (current or proposed is_control_account true, or
+// — for a reparent — the new parent is a control account) do they instead
+// record a pending AccountChangeApproval and leave the account untouched
+// until a second, different principal calls ApproveAccountChange.
+const (
+	AccountChangeStatusPending  = "PENDING"
+	AccountChangeStatusApproved = "APPROVED"
+
+	AccountChangeKindReparented = "REPARENTED"
+	AccountChangeKindAmended    = "AMENDED"
+)
+
+// AccountChangeApproval is one proposed-but-not-yet-effective material
+// change. NewParentAccountID is set for a REPARENTED change; Amendment holds
+// the fully-resolved proposed account for an AMENDED change (AmendAccountVersion
+// already merges the partial request onto the current account before this is
+// written, so approval re-applies a complete, unambiguous target state).
+type AccountChangeApproval struct {
+	ChangeID              string     `json:"change_id"`
+	TenantID              string     `json:"tenant_id"`
+	AccountID             string     `json:"account_id"`
+	AccountCode           string     `json:"account_code"`
+	ChangeKind            string     `json:"change_kind"`
+	ExpectedVersion       int64      `json:"expected_version"`
+	NewParentAccountID    *string    `json:"new_parent_account_id,omitempty"`
+	Amendment             *Account   `json:"amendment,omitempty"`
+	EffectiveFrom         time.Time  `json:"effective_from"`
+	Reason                string     `json:"reason,omitempty"`
+	EvidenceRefs          []string   `json:"evidence_refs,omitempty"`
+	SourcePolicyRef       string     `json:"source_policy_ref,omitempty"`
+	Status                string     `json:"status"`
+	ProposedAt            time.Time  `json:"proposed_at"`
+	ProposedByPrincipalID string     `json:"proposed_by_principal_id"`
+	ApprovedAt            *time.Time `json:"approved_at,omitempty"`
+	ApprovedByPrincipalID *string    `json:"approved_by_principal_id,omitempty"`
 }
 
 // AmendAccountVersionRequest is a partial amendment of an existing account:
@@ -524,6 +573,7 @@ type AmendAccountVersionRequest struct {
 	DirectPostingRestricted *bool          `json:"direct_posting_restricted,omitempty"`
 	Reason                  string         `json:"reason,omitempty"`
 	EvidenceRefs            []string       `json:"evidence_refs,omitempty"`
+	SourcePolicyRef         string         `json:"source_policy_ref,omitempty"`
 }
 
 // ActivateAccountRequest and DeactivateAccountRequest are the optional request
@@ -638,6 +688,7 @@ type ReparentAccountRequest struct {
 	EffectiveFrom      *EffectiveDate `json:"effective_from,omitempty"`
 	Reason             string         `json:"reason,omitempty"`
 	EvidenceRefs       []string       `json:"evidence_refs,omitempty"`
+	SourcePolicyRef    string         `json:"source_policy_ref,omitempty"`
 }
 
 // UnmarshalJSON accepts both parent_account_id and new_parent_account_id and
@@ -690,6 +741,15 @@ func (r *AmendAccountVersionRequest) UnmarshalJSON(b []byte) error {
 // declares it; this service never interprets it) to a real, chart-
 // registered AccountCode. Versioned, never mutated in place (see
 // migration 000008's doc comment).
+// Account mapping lifecycle states (ACC-02's state model, verbatim from
+// spec: "Draft -> Approved -> Active -> Superseded").
+const (
+	AccountMappingStatusDraft      = "DRAFT"
+	AccountMappingStatusApproved   = "APPROVED"
+	AccountMappingStatusActive     = "ACTIVE"
+	AccountMappingStatusSuperseded = "SUPERSEDED"
+)
+
 type AccountMapping struct {
 	AccountMappingID     string     `json:"account_mapping_id"`
 	TenantID             string     `json:"tenant_id"`
@@ -699,11 +759,63 @@ type AccountMapping struct {
 	EffectiveTo          *time.Time `json:"effective_to,omitempty"`
 	CreatedAt            time.Time  `json:"created_at"`
 	CreatedByPrincipalID string     `json:"created_by_principal_id"`
+
+	// Status and the fields below are migration 000029's governance
+	// lifecycle. IsHighRisk is captured at CreateMapping time from the
+	// target account's is_control_account flag — this is the "where
+	// configured" qualifier for ACC-02's maker-checker requirement.
+	Status                string     `json:"status"`
+	IsHighRisk            bool       `json:"is_high_risk"`
+	ApprovedAt            *time.Time `json:"approved_at,omitempty"`
+	ApprovedByPrincipalID string     `json:"approved_by_principal_id,omitempty"`
+	ActivatedAt           *time.Time `json:"activated_at,omitempty"`
+	SupersededAt          *time.Time `json:"superseded_at,omitempty"`
+	SupersededByMappingID *string    `json:"superseded_by_mapping_id,omitempty"`
+
+	// Reason, LegalEntityID and BookID are migration 000030's additions —
+	// ACC-02's own "rationale" and "target entity/book" required source
+	// inputs. Reason is set by whichever lifecycle command supplies one and
+	// left unchanged by any that don't. LegalEntityID/BookID nil/nil is a
+	// tenant-wide mapping — what every mapping was before this migration,
+	// and what any caller still gets by not naming a scope. A non-nil
+	// LegalEntityID scopes the mapping to one entity (optionally further to
+	// one book via BookID); this is ACC-02's "mapping precedence" as
+	// server-derived context, not a caller-supplied number — entity+book
+	// beats entity-only beats tenant-wide at resolution time.
+	Reason        string  `json:"reason,omitempty"`
+	LegalEntityID *string `json:"legal_entity_id,omitempty"`
+	BookID        *string `json:"book_id,omitempty"`
 }
 
 type SetAccountMappingRequest struct {
 	MappingKey  string `json:"mapping_key"`
 	AccountCode string `json:"account_code"`
+}
+
+// CreateMappingRequest is ACC-02's CreateMapping command: it only drafts a
+// mapping — nothing is eligible for resolution until ApproveMapping and
+// ActivateMapping have both run. LegalEntityID/BookID are optional scope
+// inputs; BookID requires LegalEntityID (a book belongs to an entity).
+type CreateMappingRequest struct {
+	MappingKey    string  `json:"mapping_key"`
+	AccountCode   string  `json:"account_code"`
+	Reason        string  `json:"reason,omitempty"`
+	LegalEntityID *string `json:"legal_entity_id,omitempty"`
+	BookID        *string `json:"book_id,omitempty"`
+}
+
+// MappingReasonRequest is the optional body ApproveMapping and
+// SupersedeMapping accept — a reason for that specific step, recorded on
+// the mapping if given.
+type MappingReasonRequest struct {
+	Reason string `json:"reason,omitempty"`
+}
+
+// ActivateMappingRequest optionally backdates/forward-dates when the
+// mapping takes effect; omitted means now.
+type ActivateMappingRequest struct {
+	EffectiveFrom *EffectiveDate `json:"effective_from,omitempty"`
+	Reason        string         `json:"reason,omitempty"`
 }
 
 // Posting execution lifecycle states (ACC-04's state model, verbatim from
@@ -756,10 +868,12 @@ type PostingExecution struct {
 }
 
 // PostingEventLineInput is one line of a caller-declared accounting event.
-// Exactly one of AccountCode/MappingKey must be set — both or neither is
-// the spec's own negative path, "Posting rule ambiguity."
+// MappingKey is the only way to name an account: ACC-02 is the sole
+// account-mapping authority, so a line naming no mapping key is the spec's
+// own negative path, "Posting rule ambiguity." Account codes are deliberately
+// absent from this contract — a caller-supplied raw account code would bypass
+// ACC-02's mapping version/resolution evidence.
 type PostingEventLineInput struct {
-	AccountCode  *string `json:"account_code,omitempty"`
 	MappingKey   *string `json:"mapping_key,omitempty"`
 	DebitAmount  float64 `json:"debit_amount,omitempty"`
 	CreditAmount float64 `json:"credit_amount,omitempty"`
@@ -820,6 +934,15 @@ type CreateReversalPostingRequest struct {
 // migration 000011's doc comment and its append-only trigger). Never
 // constructed directly by a handler; only PgStore.appendLedgerEntries,
 // called from inside TransitionJournal's own transaction, ever inserts one.
+//
+// DebitAmount/CreditAmount are exact decimal strings, never float64
+// (ZS-DATA-001 D06, the same rule LedgerBalance's own doc comment already
+// explains for this package — A15). The underlying ledger_entries columns
+// are NUMERIC; scanning them into float64 silently lost exactness above
+// about 2^53 minor units. reconciliation-intelligence-svc's client already
+// decodes these as json.Number and parses them exactly — encoding/json
+// accepts a quoted numeric string into a json.Number field exactly as it
+// accepts a bare number, so this is not a breaking change for that caller.
 type LedgerEntry struct {
 	LedgerEntryID   string     `json:"ledger_entry_id"`
 	TenantID        string     `json:"tenant_id"`
@@ -830,8 +953,8 @@ type LedgerEntry struct {
 	JournalLineID   string     `json:"journal_line_id"`
 	LineNumber      int        `json:"line_number"`
 	AccountCode     string     `json:"account_code"`
-	DebitAmount     float64    `json:"debit_amount"`
-	CreditAmount    float64    `json:"credit_amount"`
+	DebitAmount     string     `json:"debit_amount"`
+	CreditAmount    string     `json:"credit_amount"`
 	CurrencyCode    string     `json:"currency_code"`
 	Dimensions      Dimensions `json:"dimensions,omitempty"`
 	TransactionDate Date       `json:"transaction_date"`
@@ -881,6 +1004,13 @@ type QueryLedgerFilter struct {
 	FiscalPeriod  string
 	JournalID     string
 	MaxEntrySeq   *int64 // set by QueryLedgerAsOf to reconstruct a point-in-time view
+	// AfterEntrySeq is QueryLedger's own keyset cursor (A15): entries with
+	// entry_seq strictly greater than this are returned. Unlike MaxEntrySeq
+	// (a point-in-time watermark), this narrows which page of an otherwise
+	// unbounded result is being read, not which entries exist as of some
+	// moment — the two can be set together (QueryLedgerAsOf has no cursor
+	// support today, but nothing prevents it).
+	AfterEntrySeq *int64
 
 	// TransactionDateFrom/To bound entries by transaction_date, inclusive at
 	// both ends; a zero Date leaves that end open. A bank reconciliation
@@ -892,6 +1022,18 @@ type QueryLedgerFilter struct {
 	// status. ledger_entries is append-only, so a REVERSED journal's entries
 	// stay listed; a reader that needs live postings asks for FINALIZED.
 	JournalStatus JournalStatus
+}
+
+// LedgerEntryPage is one keyset page of QueryLedger (A15). NextCursor is the
+// last returned entry's own EntrySeq — pass it back as after_entry_seq to
+// fetch the next page — and is present exactly when more rows exist, so a
+// full page is never indistinguishable from the end of the result.
+// QueryLedgerAsOf does not use this type: it keeps its pre-existing bare
+// array response, since a point-in-time snapshot read does not need
+// pagination to be read correctly (see its own doc comment).
+type LedgerEntryPage struct {
+	Entries    []LedgerEntry `json:"entries"`
+	NextCursor *int64        `json:"next_cursor,omitempty"`
 }
 
 // QueryAccountBalanceRequest is QueryAccountBalance's input — reads the
@@ -1160,12 +1302,63 @@ var (
 	// invariant exists to prevent.
 	ErrControlAccountPostingRestricted = errorString("account is a control account with direct posting restricted — an explicit, authorized override is required")
 
+	// ErrAccountChangeNotFound/ErrAccountChangeNotPending/ErrAccountChangeSelfApproval
+	// are ACC-01's maker-checker lifecycle (SPEC_DEVIATIONS A4/B16): a
+	// control-account reparent or amendment is recorded as a pending
+	// AccountChangeApproval rather than applied, and ApproveAccountChange
+	// enforces that its approver differs from whoever proposed it.
+	ErrAccountChangeNotFound     = errorString("account change approval not found")
+	ErrAccountChangeNotPending   = errorString("account change is not PENDING and cannot be approved again")
+	ErrAccountChangeSelfApproval = errorString("a material control-account or hierarchy change cannot be approved by the principal who proposed it")
+	// ErrAccountChangeAlreadyPending is idx_account_change_approvals_pending
+	// surfacing as a named refusal: a second material reparent/amendment
+	// proposed for an account that already has one outstanding.
+	ErrAccountChangeAlreadyPending = errorString("this account already has a pending material change awaiting approval")
+	// ErrAccountChangeReasonRequired is ACC-01's evidence/lineage line
+	// (SPEC_DEVIATIONS A8): "reason ... retained with every material change."
+	// reason stays optional for every ordinary, ungated change (A8 is
+	// otherwise still open) — this applies only on the same materiality gate
+	// A4 already defines (a control account on either side of the change),
+	// the one place this codebase has a formal notion of "material change".
+	ErrAccountChangeReasonRequired = errorString("reason is required for a material control-account or hierarchy change")
+
 	ErrAccountMappingNotFound = errorString("no effective account mapping found for this key")
 	// ErrMappingTargetAccountInvalid is returned when a mapping names an
 	// account_code that either doesn't exist in the Chart of Accounts or
 	// exists but is INACTIVE — ACC-02 must never map a business concept
 	// onto an account that can't legitimately be posted to.
 	ErrMappingTargetAccountInvalid = errorString("account_code does not name an existing ACTIVE account in the Chart of Accounts")
+
+	// ErrMappingNotDraft/ErrMappingNotApproved/ErrMappingNotActive guard the
+	// ACC-02 state model (Draft -> Approved -> Active -> Superseded): each
+	// command only accepts a mapping already in the state it advances from.
+	ErrMappingNotDraft    = errorString("mapping is not in DRAFT status")
+	ErrMappingNotApproved = errorString("mapping is not in APPROVED status")
+	ErrMappingNotActive   = errorString("mapping is not in ACTIVE status")
+	// ErrMappingSelfApproval is ACC-02's maker-checker SoD: "mapping author
+	// cannot approve high-risk mappings to cash/tax/control accounts where
+	// configured" — high-risk here is is_high_risk, captured at CreateMapping
+	// from the target account's is_control_account flag.
+	ErrMappingSelfApproval = errorString("a high-risk mapping cannot be approved by the principal who created it")
+	ErrMappingNotFoundByID = errorString("account mapping not found")
+	// ErrMappingHighRiskRequiresGovernedLifecycle is returned by the legacy
+	// one-step SetAccountMapping when the target account is a control
+	// account: such a mapping must go through CreateMapping/ApproveMapping/
+	// ActivateMapping, where the maker-checker SoD check actually applies.
+	ErrMappingHighRiskRequiresGovernedLifecycle = errorString("mapping onto a control account requires the governed CreateMapping/ApproveMapping/ActivateMapping lifecycle, not SetAccountMapping")
+
+	// ErrMappingActivationConflict is ACC-02's negative path #1, "two active
+	// mappings with same precedence," caught at the one point it can still
+	// occur despite idx_account_mappings_active (migration 000029): two
+	// different APPROVED mappings for the same key both racing
+	// ActivateMapping. The index still guarantees only one can ever commit
+	// as ACTIVE — this is that guarantee surfacing as a clean, named refusal
+	// instead of a raw constraint-violation 503.
+	ErrMappingActivationConflict = errorString("another mapping for this key was activated concurrently; this mapping was not activated — re-check the current mapping and retry if it still needs to be")
+
+	// ErrMappingBookRequiresEntity mirrors migration 000030's own schema
+	// check: a book-scoped mapping with no named entity is meaningless.
+	ErrMappingBookRequiresEntity = errorString("book_id requires legal_entity_id")
 
 	ErrPostingExecutionNotFound = errorString("posting execution not found")
 

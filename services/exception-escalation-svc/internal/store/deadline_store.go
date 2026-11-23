@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -97,7 +98,7 @@ func (s *PgStore) CreateDeadline(ctx context.Context, p domain.CreateDeadlinePar
 	if err != nil {
 		return nil, fmt.Errorf("insert deadline: %w", err)
 	}
-	if err := enqueue(ctx, tx, EventDeadlineCreated, deadlineSubject(d), d); err != nil {
+	if err := s.enqueueDeadlineEvent(ctx, tx, deadlineCreatedEvent, p.CorrelationID, p.CreatedByPrincipalID, d.TenantID, d.LegalEntityID, d.DeadlineID, deadlineEventData(d)); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -136,24 +137,22 @@ func (s *PgStore) MirrorAuthoritativeDeadline(ctx context.Context, p domain.Mirr
 	}
 
 	if hasExisting {
-		if existing.Status != domain.DeadlineStatusScheduled {
-			// A human already acted on the prior mirror locally
-			// (completed/waived/cancelled) — silently moving its due
-			// date out from under that action would rewrite what was
-			// actually decided against. Refuse instead.
-			return nil, "", domain.ErrDeadlineSourceConflict
-		}
 		if existing.SourceVersion == p.SourceVersion {
-			// Same version already mirrored and untouched — nothing to
-			// do; return the existing row rather than creating a
-			// pointless duplicate.
-			if err := enqueue(ctx, tx, EventDeadlineCreated, deadlineSubject(existing), existing); err != nil {
-				return nil, "", err
-			}
+			// Same version already mirrored — a replay. Nothing to do whatever
+			// has happened to the row locally (a completed mirror replayed with
+			// the same version is not a conflict); return the existing row
+			// rather than creating a pointless duplicate.
 			if err := tx.Commit(ctx); err != nil {
 				return nil, "", err
 			}
 			return existing, "", nil
+		}
+		if existing.Status != domain.DeadlineStatusScheduled {
+			// A human already acted on the prior mirror locally
+			// (completed/waived/cancelled) and the source has since changed —
+			// silently moving its due date out from under that action would
+			// rewrite what was actually decided against. Refuse instead.
+			return nil, "", domain.ErrDeadlineSourceConflict
 		}
 	}
 
@@ -173,6 +172,12 @@ func (s *PgStore) MirrorAuthoritativeDeadline(ctx context.Context, p domain.Mirr
 			return nil, "", err
 		}
 		supersededID = existing.DeadlineID
+		sup := deadlineEventData(existing)
+		sup["status"] = string(domain.DeadlineStatusSuperseded)
+		sup["superseded_by_deadline_id"] = deadlineID
+		if err := s.enqueueDeadlineEvent(ctx, tx, deadlineSupersededEvent, p.CorrelationID, p.CreatedByPrincipalID, existing.TenantID, existing.LegalEntityID, existing.DeadlineID, sup); err != nil {
+			return nil, "", err
+		}
 	}
 
 	row := tx.QueryRow(ctx, `INSERT INTO deadlines (
@@ -185,18 +190,10 @@ func (s *PgStore) MirrorAuthoritativeDeadline(ctx context.Context, p domain.Mirr
 	if err != nil {
 		return nil, "", fmt.Errorf("insert deadline: %w", err)
 	}
-
-	if err := enqueue(ctx, tx, EventDeadlineCreated, deadlineSubject(d), d); err != nil {
+	if err := s.enqueueDeadlineEvent(ctx, tx, deadlineCreatedEvent, p.CorrelationID, p.CreatedByPrincipalID, d.TenantID, d.LegalEntityID, d.DeadlineID, deadlineEventData(d)); err != nil {
 		return nil, "", err
 	}
-	if supersededID != "" {
-		sub := deadlineSubject(d)
-		sub.id = supersededID
-		if err := enqueue(ctx, tx, EventDeadlineSuperseded, sub,
-			map[string]string{"deadline_id": supersededID, "superseded_by_deadline_id": d.DeadlineID}); err != nil {
-			return nil, "", err
-		}
-	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, "", err
 	}
@@ -305,7 +302,12 @@ func (s *PgStore) CompleteDeadline(ctx context.Context, p domain.CompleteDeadlin
 	if err != nil {
 		return nil, err
 	}
-	if err := enqueue(ctx, tx, EventDeadlineCompleted, deadlineSubject(d), d); err != nil {
+	done := deadlineEventData(d)
+	if d.CompletedAt != nil {
+		done["completed_at"] = d.CompletedAt.UTC().Format(time.RFC3339)
+	}
+	done["completed_by_principal_id"] = p.ActorPrincipalID
+	if err := s.enqueueDeadlineEvent(ctx, tx, deadlineCompletedEvent, p.CorrelationID, p.ActorPrincipalID, d.TenantID, d.LegalEntityID, d.DeadlineID, done); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -320,6 +322,9 @@ func (s *PgStore) CompleteDeadline(ctx context.Context, p domain.CompleteDeadlin
 // own doc comment. Resets the notification-tracking columns since the
 // due date materially changed.
 func (s *PgStore) Recalculate(ctx context.Context, p domain.RecalculateParams) (*domain.Deadline, error) {
+	if p.Reason == "" {
+		return nil, domain.ErrDeadlineReasonRequired
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -340,6 +345,13 @@ func (s *PgStore) Recalculate(ctx context.Context, p domain.RecalculateParams) (
 	}
 	if current.Status != domain.DeadlineStatusScheduled {
 		return nil, domain.ErrDeadlineInvalidState
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO deadline_due_history (change_id, deadline_id, tenant_id, previous_due_at, new_due_at,
+			previous_calc_rule, new_calc_rule, reason, changed_by)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+		"deadlinechg-"+uuid.New().String(), p.DeadlineID, p.TenantID, current.DueAt, p.DueAt,
+		current.CalcRule, p.CalcRule, p.Reason, p.ActorPrincipalID); err != nil {
+		return nil, fmt.Errorf("record due-date change: %w", err)
 	}
 	d, err := scanDeadline(tx.QueryRow(ctx, `
 		UPDATE deadlines SET due_at=$3, calc_rule=$4, calc_inputs=$5,
@@ -515,7 +527,8 @@ func (s *PgStore) ListUpcoming(ctx context.Context, p domain.ListUpcomingParams)
 		if _, err := tx.Exec(ctx, `UPDATE deadlines SET due_soon_notified_at=now() WHERE deadline_id=$1 AND tenant_id=$2`, out[i].DeadlineID, p.TenantID); err != nil {
 			return nil, nil, err
 		}
-		if err := enqueue(ctx, tx, EventDeadlineDueSoon, deadlineSubject(&out[i]), map[string]string{"deadline_id": out[i].DeadlineID}); err != nil {
+		// The event is committed with the stamp: a failed publish can no longer lose it.
+		if err := s.enqueueDeadlineEvent(ctx, tx, deadlineDueSoonEvent, p.CorrelationID, p.ActorPrincipalID, out[i].TenantID, out[i].LegalEntityID, out[i].DeadlineID, deadlineEventData(&out[i])); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -578,7 +591,7 @@ func (s *PgStore) ListOverdue(ctx context.Context, p domain.ListOverdueParams) (
 		if _, err := tx.Exec(ctx, `UPDATE deadlines SET overdue_notified_at=now() WHERE deadline_id=$1 AND tenant_id=$2`, out[i].DeadlineID, p.TenantID); err != nil {
 			return nil, nil, err
 		}
-		if err := enqueue(ctx, tx, EventDeadlineOverdue, deadlineSubject(&out[i]), map[string]string{"deadline_id": out[i].DeadlineID}); err != nil {
+		if err := s.enqueueDeadlineEvent(ctx, tx, deadlineOverdueEvent, p.CorrelationID, p.ActorPrincipalID, out[i].TenantID, out[i].LegalEntityID, out[i].DeadlineID, deadlineEventData(&out[i])); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -601,9 +614,38 @@ func (s *PgStore) ExplainCalculation(ctx context.Context, tenantID, deadlineID s
 		res.CalcRule, res.CalcInputs = d.CalcRule, d.CalcInputs
 		res.Note = "this deadline is calculated and owned by BIZ-08 directly."
 	}
+	changes, err := s.dueChanges(ctx, d.DeadlineID)
+	if err != nil {
+		return nil, err
+	}
+	res.Changes = changes
 	return res, nil
 }
 
-func deadlineSubject(d *domain.Deadline) eventSubject {
-	return eventSubject{aggregateType: "deadline", id: d.DeadlineID, tenantID: d.TenantID, legalEntityID: d.LegalEntityID}
+// dueChanges returns a deadline's manual recalculation history, oldest first.
+func (s *PgStore) dueChanges(ctx context.Context, deadlineID string) ([]domain.DueChange, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := s.deadlineSetRLS(ctx, tx); err != nil {
+		return nil, err
+	}
+	rows, err := tx.Query(ctx, `SELECT change_id, previous_due_at, new_due_at, previous_calc_rule, new_calc_rule, reason, changed_by, changed_at
+		FROM deadline_due_history WHERE deadline_id=$1 AND tenant_id=$2 ORDER BY changed_at, change_id`,
+		deadlineID, middleware.GetTenantID(ctx))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.DueChange
+	for rows.Next() {
+		var c domain.DueChange
+		if err := rows.Scan(&c.ChangeID, &c.PreviousDueAt, &c.NewDueAt, &c.PreviousRule, &c.NewRule, &c.Reason, &c.ChangedBy, &c.ChangedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }

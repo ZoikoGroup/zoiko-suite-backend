@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"reflect"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -39,6 +40,12 @@ func (h *Handler) parseResolutionQuery(w http.ResponseWriter, r *http.Request) (
 		return out, false
 	}
 	if tooLong(w, r, "policy_type", out.policyType, 64) {
+		return out, false
+	}
+	// Accounting policies of different domains, books and jurisdictions all
+	// share the type; resolving them as one set would call them ambiguous.
+	if strings.EqualFold(out.policyType, domain.PolicyTypeAccounting) {
+		refuseAccountingEndpoint(w, r)
 		return out, false
 	}
 	parseTime := func(name string) (*time.Time, bool) {

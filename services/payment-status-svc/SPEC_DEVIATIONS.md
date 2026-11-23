@@ -137,34 +137,69 @@ closed in this pass. Roughly 70% of BNK-07.
   dual-write. The new A1 commands do emit `PaymentSettled`/`PaymentRejected`
   directly through the outbox, so the first-class manual command path is no
   longer silent; the compatibility poll and `ResolveStatusConflict` still are.
-- **A4. Two spec states are unreachable or unrepresentable: `SUBMITTED` and
-  `PENDING_UNKNOWN` — still open; A1 does not depend on it.** The §7 state
-  model is "Prepared → Submitted → Accepted/Pending → Settled or
-  Rejected/Returned/Cancelled; PendingUnknown may occur". `StatusSubmitted`
-  exists in the domain, the table CHECK and
-  `CanCancel`, but no command or callback can set it: `RecordPaymentStatus`
-  hard-codes `PREPARED`, `ValidCallbackStatus` excludes `SUBMITTED`, and there
-  is no BNK-06 event consumer or explicit "mark submitted" transition. A
-  normal payment therefore jumps from `PREPARED` straight to
-  `ACCEPTED`/`PENDING`/`SETTLED`/`REJECTED`; `SUBMITTED` is observable only by
-  writing the database directly. `PENDING_UNKNOWN` is absent from the domain,
-  the CHECK constraint and `ValidCallbackStatus`, so an ambiguous outcome can
-  only be recorded as `PENDING` or left at `PREPARED`. That contradicts §8
-  ("Pending / Unknown | Outcome cannot be determined from available evidence |
-  Freeze duplicate execution; no invented failure/success; reconcile original
-  attempt") and invariant 15 ("A provider timeout or missing response is
-  Pending/Unknown, never automatically Failed"). *Why it was not fixed here:* a
-  new state changes the CHECK constraint, the terminal/regression rules,
-  `CanCancel`, `ListUnresolvedPayments`, the provider status profile and every
-  consumer's status mapping; it needs its own migration and state-machine
-  review, not an improvised enum value. A1 did not close A4: the new finality
-  commands operate from any non-final state, so they do not need
-  `PENDING_UNKNOWN` to exist first, and adding that state without a producer
-  for `SUBMITTED` would leave the state model only partly closed. Closing A4
-  still needs a BNK-06 event consumer or explicit "mark submitted" transition
-  for `SUBMITTED`, a `PENDING_UNKNOWN` transition/consumer for ambiguous
-  provider outcomes, and the corresponding terminal/regression, cancellation
-  and consumer-mapping review.
+- **A4. Two spec states were unreachable or unrepresentable: `SUBMITTED` and
+  `PENDING_UNKNOWN` — closed in this pass (2026-10-29).** The §7 state model
+  is "Prepared → Submitted → Accepted/Pending → Settled or
+  Rejected/Returned/Cancelled; PendingUnknown may occur". Before this pass,
+  `StatusSubmitted` existed in the domain, the table CHECK and `CanCancel`,
+  but nothing could ever set it: `RecordPaymentStatus` hard-coded `PREPARED`,
+  `ValidCallbackStatus` excluded `SUBMITTED`, and there was no BNK-06 event
+  consumer. `PENDING_UNKNOWN` did not exist at all.
+
+  *The fix.* A real asynchronous consumer, `internal/paymentinit`, modeled on
+  access-control-svc's `internal/hrevents` (this codebase's one other real
+  Kafka consumer): a `Reader` interface so tests never need a live broker,
+  `Handler.Handle` returning `(outcome string, error)` where a non-nil error
+  means retry, and `Run` looping with capped backoff before committing a
+  message it could never apply and counting it dropped — never stalling a
+  partition forever on one event.
+
+  It consumes payment-initiation-adapter-svc's `PAYMENT_SUBMITTED` (→
+  `SUBMITTED`) and `PAYMENT_SUBMISSION_AMBIGUOUS` (→ the new
+  `PENDING_UNKNOWN`), both already written through BNK-06's real
+  transactional outbox. *A real gap found while building this, not assumed
+  away:* neither event's payload carried any field this service could
+  correlate against — `attempt_id` and `idempotency_key` are BNK-06's own
+  internal ids, not this service's `source_reference` key. Fixed by adding
+  `source_reference` to both of BNK-06's event-payload builders
+  (`attemptEventData` in `pg_store.go`, `submittedData` in
+  `dispatch_store.go`) — an additive, backward-compatible payload field, not
+  a redesign.
+
+  `ApplySubmissionEvent` (new store method) looks up the unresolved row by
+  `(tenant_id, source_reference)` — the same natural key A5's dedupe uses —
+  and is idempotent against every out-of-order/redelivery case: a row already
+  at or past the target status (including one real provider evidence already
+  moved to `ACCEPTED`/`PENDING`) is a genuine no-op, never a regression.
+  `PENDING_UNKNOWN → SUBMITTED` is accepted (BNK-06 resolving its own
+  ambiguity by confirming the attempt did reach the provider after all); nothing
+  else reaches `SUBMITTED` or `PENDING_UNKNOWN` from `ACCEPTED`/`PENDING`/any
+  final state.
+
+  Migration `000009_pending_unknown_state`: adds `PENDING_UNKNOWN` to the
+  status CHECK and to `uq_payment_execution_states_unresolved_source_reference`'s
+  (007) predicate — a retried `RecordPaymentStatus` for the same
+  `source_reference` must still find a `PENDING_UNKNOWN` row, not create a
+  second one. Down migration refuses while any row is `PENDING_UNKNOWN`
+  (`SET LOCAL row_security = off` first, since `payment_execution_states` is
+  FORCE ROW LEVEL SECURITY).
+
+  Decisions made explicitly, not left implicit: `ValidCallbackStatus` does
+  NOT accept `PENDING_UNKNOWN` — a real provider callback reports a concrete
+  observed status by definition, never an absence of one; only this
+  consumer, standing in for BNK-06's own honest "I don't know" admission, can
+  set it. `CanCancel` now includes `PENDING_UNKNOWN`: an operator must be
+  able to abandon a stuck, ambiguous attempt the same as a `PREPARED` or
+  `SUBMITTED` one. `CanConfirmFinality` needed no change — it was already
+  written generically as `!IsFinal(s)`.
+
+  Tests: `internal/paymentinit/consumer_test.go` (both event types applying,
+  idempotent redelivery, the stale/already-progressed no-op, the
+  `PENDING_UNKNOWN → SUBMITTED` recovery path, a not-yet-existing row treated
+  as transient/retryable, malformed/ignored events never reaching the store,
+  and a `Run`-loop test proving a message that can never be applied is
+  eventually committed and dropped rather than retried forever — the one
+  failure mode this pattern exists to prevent).
 - **A5. `RecordPaymentStatus` was not idempotent — closed in this pass.** Every
   call previously generated a new UUID and inserted a new
   `payment_execution_states` row. A lost `201` followed by a retry therefore

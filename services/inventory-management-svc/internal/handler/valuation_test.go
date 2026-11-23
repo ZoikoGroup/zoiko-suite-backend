@@ -338,7 +338,7 @@ func TestEmitInventoryAccountingEvent_SelfApproval_Returns403(t *testing.T) {
 		t.Fatalf("value issue failed: %d", rr.StatusCode)
 	}
 
-	runReq := domain.CreateValuationRunRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-09", InventoryAccountCode: "INV-ASSET", COGSAccountCode: "COGS"}
+	runReq := domain.CreateValuationRunRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-09"}
 	rr := doReq(r, http.MethodPost, "/v1/valuation/runs/", runReq, "preparer-1")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("create run failed: %d %s", rr.Code, rr.Body.String())
@@ -376,7 +376,7 @@ func TestEmitInventoryAccountingEvent_DifferentApprover_PostsJournal(t *testing.
 		t.Fatalf("value issue failed: %d", rr.StatusCode)
 	}
 
-	runReq := domain.CreateValuationRunRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-09", InventoryAccountCode: "INV-ASSET", COGSAccountCode: "COGS"}
+	runReq := domain.CreateValuationRunRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-09"}
 	rr := doReq(r, http.MethodPost, "/v1/valuation/runs/", runReq, "preparer-1")
 	var runResp map[string]any
 	_ = json.NewDecoder(rr.Body).Decode(&runResp)
@@ -416,7 +416,7 @@ func receiveWithAPReceipt(t *testing.T, r chi.Router, itemID, locID, idemKey, ap
 
 func newRun(t *testing.T, r chi.Router) string {
 	t.Helper()
-	runReq := domain.CreateValuationRunRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-09", InventoryAccountCode: "INV-ASSET", COGSAccountCode: "COGS"}
+	runReq := domain.CreateValuationRunRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-09"}
 	rr := doReq(r, http.MethodPost, "/v1/valuation/runs/", runReq, "preparer-1")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("create run failed: %d %s", rr.Code, rr.Body.String())
@@ -446,11 +446,11 @@ func TestEmitInventoryAccountingEvent_APLinkedInbound_PostsGRNIReclass(t *testin
 		t.Fatalf("expected exactly the 2 reclass lines, got %+v", ledger.lastLines)
 	}
 	dr, cr := ledger.lastLines[0], ledger.lastLines[1]
-	if dr.AccountCode != "INV-ASSET" || dr.DebitAmount != 30 || dr.MappingKey != "" {
-		t.Fatalf("expected Dr INV-ASSET 30 by account code, got %+v", dr)
+	if dr.MappingKey != "INV-ASSET" || dr.DebitAmount != 30 {
+		t.Fatalf("expected Dr INV-ASSET 30 by mapping key, got %+v", dr)
 	}
-	if cr.MappingKey != "AP_GRNI_EXPENSE" || cr.CreditAmount != 30 || cr.AccountCode != "" {
-		t.Fatalf("expected Cr AP_GRNI_EXPENSE 30 by mapping key only, got %+v", cr)
+	if cr.MappingKey != "AP_GRNI_EXPENSE" || cr.CreditAmount != 30 {
+		t.Fatalf("expected Cr AP_GRNI_EXPENSE 30 by mapping key, got %+v", cr)
 	}
 }
 
@@ -515,7 +515,7 @@ func TestRecordInventoryWriteDown_MissingEvidence_Returns422(t *testing.T) {
 	itemID, locID := valuationFixture(t, s, r)
 
 	req := domain.RecordWriteDownRequest{
-		ItemID: itemID, LocationID: locID, Amount: 100, ExpenseAccountCode: "WD-EXP", InventoryAccountCode: "INV-ASSET", FiscalPeriod: "2026-09",
+		ItemID: itemID, LocationID: locID, Amount: 100, FiscalPeriod: "2026-09",
 	}
 	rr := doReq(r, http.MethodPost, "/v1/valuation/write-downs/", req, "preparer-1")
 	if rr.Code != http.StatusUnprocessableEntity {
@@ -531,7 +531,7 @@ func TestRecordInventoryWriteDown_WithEvidence_Succeeds(t *testing.T) {
 
 	req := domain.RecordWriteDownRequest{
 		ItemID: itemID, LocationID: locID, Amount: 100, ValuationEvidenceRef: "NRV-APPRAISAL-1",
-		ExpenseAccountCode: "WD-EXP", InventoryAccountCode: "INV-ASSET", FiscalPeriod: "2026-09",
+		FiscalPeriod: "2026-09",
 	}
 	rr := doReq(r, http.MethodPost, "/v1/valuation/write-downs/", req, "preparer-1")
 	if rr.Code != http.StatusCreated {
@@ -550,7 +550,7 @@ func TestReverseWriteDown_SelfReversal_Returns403(t *testing.T) {
 
 	req := domain.RecordWriteDownRequest{
 		ItemID: itemID, LocationID: locID, Amount: 50, ValuationEvidenceRef: "NRV-2",
-		ExpenseAccountCode: "WD-EXP", InventoryAccountCode: "INV-ASSET", FiscalPeriod: "2026-09",
+		FiscalPeriod: "2026-09",
 	}
 	create := doReq(r, http.MethodPost, "/v1/valuation/write-downs/", req, "preparer-1")
 	var wd domain.WriteDown
@@ -570,7 +570,7 @@ func TestReverseWriteDown_DifferentPrincipal_Succeeds(t *testing.T) {
 
 	req := domain.RecordWriteDownRequest{
 		ItemID: itemID, LocationID: locID, Amount: 50, ValuationEvidenceRef: "NRV-3",
-		ExpenseAccountCode: "WD-EXP", InventoryAccountCode: "INV-ASSET", FiscalPeriod: "2026-09",
+		FiscalPeriod: "2026-09",
 	}
 	create := doReq(r, http.MethodPost, "/v1/valuation/write-downs/", req, "preparer-1")
 	var wd domain.WriteDown

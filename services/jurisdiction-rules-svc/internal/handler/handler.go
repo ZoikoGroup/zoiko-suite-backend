@@ -15,13 +15,13 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	apicontract "zoiko.io/identity-envelope/apicontract"
 	"zoiko.io/jurisdiction-rules-svc/internal/approval"
 	"zoiko.io/jurisdiction-rules-svc/internal/authz"
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 	svcenvelope "zoiko.io/jurisdiction-rules-svc/internal/envelope"
 	"zoiko.io/jurisdiction-rules-svc/internal/events"
 	"zoiko.io/jurisdiction-rules-svc/internal/resolver"
-	apicontract "zoiko.io/identity-envelope/apicontract"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 )
 
@@ -48,7 +48,7 @@ type JurisdictionStore interface {
 	// The bool reports whether anything actually changed (false = already
 	// deactivated; an idempotent replay that must not re-publish).
 	DeactivateJurisdiction(ctx context.Context, jurisdictionID, actorID string) (*domain.Jurisdiction, bool, error)
-	DeactivateJurisdictionWithQuerier(ctx context.Context, q store.Querier, jurisdictionID, actorID string) (*domain.Jurisdiction, bool, error)
+	DeactivateJurisdictionWithQuerier(ctx context.Context, q store.Querier, jurisdictionID, actorID string, expectedRowVersion *int64) (*domain.Jurisdiction, bool, error)
 
 	// FindRuleByID looks up a rule by ID.
 	FindRuleByID(ctx context.Context, ruleID string) (*domain.JurisdictionRule, error)
@@ -97,10 +97,31 @@ type Handler struct {
 
 	// entities is the optional entity-jurisdiction applicability projection (see WithEntityApplicability).
 	entities EntityApplicabilityReader
+	// entityFacts is the optional establishment and registration projection (see WithEntityFacts).
+	entityFacts EntityFactReader
 
 	// approvals confirms the X-Approval-Reference an activation cites (see
 	// WithApprovalVerifier, J-02). Nil only in local/dev.
 	approvals approval.Verifier
+
+	// cursors signs the next_cursor of every paged list (API-4, WithCursors).
+	cursors *apicontract.CursorSigner
+
+	// outbox is the parked-event recovery store (J-16, WithOutboxRecovery).
+	outbox OutboxRecoveryStore
+
+	// versions reads aggregate versions for ETag and If-Match (WithAggregateVersions).
+	versions VersionStore
+
+	// backfill rebuilds the entity projection from the registry (J-10, WithEntityBackfill).
+	backfill *entityBackfill
+
+	// summary serves the console summary counts (JR-FE-1, WithSummary).
+	summary SummaryStore
+
+	// operations and units run API-5 asynchronous commands (WithAsyncOperations).
+	operations apicontract.OperationStore
+	units      UnitStore
 }
 
 // New constructs a Handler.
@@ -111,6 +132,7 @@ func New(store JurisdictionStore, authzClient authz.AuthorizationClient, publish
 		publisher:    publisher,
 		authzScopeID: authzScopeID,
 		log:          log,
+		cursors:      randomCursorSigner(),
 	}
 }
 
@@ -221,12 +243,20 @@ type RecordDriftRequest struct {
 // carries an X-Correlation-ID regardless of path — this makes the behaviour
 // testable in unit tests that build their own router via this function.
 func RegisterRoutes(r chi.Router, h *Handler) {
+	// Every registration below goes through the decorator, which attaches
+	// ETag and If-Match to the aggregate routes (versioned.go).
+	r = versionedRouter{Router: r, h: h}
 	r.Use(correlationIDMiddleware)
 
 	// ── Public read (no AuthZ required) ──────────────────────────────────────
 	r.Get("/v1/jurisdictions", h.ListJurisdictions)
 	r.Get("/v1/jurisdictions/{jurisdiction_id}", h.GetJurisdiction)
 	r.Get("/v1/jurisdictions/{jurisdiction_id}/ancestors", h.GetAncestors)
+	r.Get("/v1/jurisdictions/{jurisdiction_id}/as-of", h.GetJurisdictionAsOf)
+	r.Get("/v1/jurisdictions/{jurisdiction_id}/hierarchy", h.GetHierarchy)
+	r.Get("/v1/jurisdictions/{jurisdiction_id}/aliases", h.ListJurisdictionAliases)
+	r.Get("/v1/jurisdiction-resolutions", h.ResolveJurisdiction)
+	r.Get("/v1/jurisdiction-code-mappings", h.MapExternalJurisdictionCode)
 	r.Get("/v1/jurisdictions/{jurisdiction_id}/rules", h.GetRules)
 	r.Get("/v1/jurisdictions/{jurisdiction_id}/rule-pack", h.GetRulePack)
 	r.Get("/v1/rules/{jurisdiction_rule_id}", h.GetRule)
@@ -236,6 +266,13 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	// ── Admin mutations (AuthZ required on every route) ───────────────────────
 	r.Post("/v1/admin/jurisdictions", h.CreateJurisdiction)
 	r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/deactivate", h.DeactivateJurisdiction)
+	r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/aliases", h.AmendJurisdictionAlias)
+	r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/aliases/{alias_id}/end", h.EndJurisdictionAlias)
+	r.Post("/v1/admin/jurisdiction-imports", h.ImportJurisdictionUpdate)
+	r.Get("/v1/admin/jurisdiction-imports", h.ListJurisdictionImports)
+	r.Get("/v1/admin/jurisdiction-imports/{batch_id}", h.GetJurisdictionImport)
+	r.Post("/v1/admin/jurisdiction-imports/{batch_id}/approve", h.ApproveJurisdictionImport)
+	r.Post("/v1/admin/jurisdiction-imports/{batch_id}/reject", h.RejectJurisdictionImport)
 	r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/rules", h.CreateRule)
 	r.Post("/v1/admin/rules/{jurisdiction_rule_id}/transition", h.TransitionRuleStatus)
 	r.Post("/v1/admin/rules/{jurisdiction_rule_id}/drift", h.RecordDrift)
@@ -247,10 +284,25 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	// Entity applicability: mounted only when WithEntityApplicability was called.
 	if h.entities != nil {
 		r.Get("/v1/entities/{legal_entity_id}/jurisdictions", h.GetEntityJurisdictions)
+		if h.registry != nil {
+			r.Post(determinationPath, h.ResolveJurisdictionDecision)
+		}
 	}
 
 	if h.registry != nil {
 		registerRegistryRoutes(r, h)
+	}
+	if h.outbox != nil {
+		registerOutboxRoutes(r, h)
+	}
+	if h.backfill != nil {
+		r.Post(backfillPath, h.BackfillEntityApplicability)
+	}
+	if h.summary != nil {
+		r.Get("/v1/jurisdiction-summary", h.JurisdictionSummary)
+	}
+	if h.operations != nil {
+		registerOperationRoutes(r, h)
 	}
 }
 
@@ -316,6 +368,7 @@ func (h *Handler) GetJurisdiction(w http.ResponseWriter, r *http.Request) {
 		zap.String("jurisdiction_code", j.JurisdictionCode),
 		zap.String("correlation_id", correlationID),
 	)
+	setETag(w, j.RowVersion)
 	writeJSON(w, http.StatusOK, j)
 }
 
@@ -335,18 +388,17 @@ func (h *Handler) GetJurisdiction(w http.ResponseWriter, r *http.Request) {
 //	503 → store unavailable
 func (h *Handler) ListJurisdictions(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
-	q := r.URL.Query()
 
-	limit, offset, ok := h.parsePaging(w, r, q)
+	p, ok := h.beginList(w, r, []string{"type", "active"}, map[string]string{"type": "type", "active": "active"})
 	if !ok {
 		return
 	}
 
 	params := store.ListParams{
-		JurisdictionType: q.Get("type"),
-		ActiveOnly:       q.Get("active") == "true",
-		Limit:            limit,
-		Offset:           offset,
+		JurisdictionType: p.filter("type"),
+		ActiveOnly:       p.filter("active") == "true",
+		Limit:            p.fetch(),
+		Offset:           p.offset,
 	}
 
 	results, err := h.store.List(r.Context(), params)
@@ -359,15 +411,11 @@ func (h *Handler) ListJurisdictions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Always return an array — never null.
-	if results == nil {
-		results = []*domain.Jurisdiction{}
-	}
 	h.log.Debug("ListJurisdictions",
 		zap.Int("count", len(results)),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, http.StatusOK, results)
+	finishList(h, w, r, p, results)
 }
 
 // GetAncestors handles GET /v1/jurisdictions/{jurisdiction_id}/ancestors.
@@ -411,6 +459,7 @@ func (h *Handler) GetAncestors(w http.ResponseWriter, r *http.Request) {
 // Query parameters (all optional):
 //
 //	domain=PAYROLL        filter by rule_domain (VARCHAR, data driven)
+//	scope=all             every rule recorded here, any status or period (register view)
 //	effective_at=2024-01-01T00:00:00Z  point-in-time (RFC3339). Defaults to now.
 //	limit=50              page size (max 100, default 50)
 //	offset=0              zero-based page offset
@@ -430,33 +479,37 @@ func (h *Handler) GetRules(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	limit, offset, ok := h.parsePaging(w, r, q)
+	p, ok := h.beginList(w, r, []string{"domain", "scope"}, map[string]string{"domain": "domain", "scope": "scope"})
 	if !ok {
+		return
+	}
+	// scope=all is the register view: every rule recorded here, DRAFT and
+	// future-dated included, newest first (effective_at does not apply).
+	scope := p.filter("scope")
+	if scope != "" && scope != "all" {
+		writeError(w, r, http.StatusBadRequest, "invalid_scope", "scope must be all, or omitted for the rules in force at effective_at")
 		return
 	}
 
 	results, err := h.store.FindRules(r.Context(), store.FindRulesParams{
 		JurisdictionID: jurisdictionID,
-		Domain:         q.Get("domain"), // empty string means all domains
+		Domain:         p.filter("domain"), // empty string means all domains
 		EffectiveAt:    effectiveAt,
-		Limit:          limit,
-		Offset:         offset,
+		AllVersions:    scope == "all",
+		Limit:          p.fetch(),
+		Offset:         p.offset,
 	})
 	if err != nil {
 		h.writeStoreError(w, r, err, correlationID)
 		return
 	}
 
-	// Always return an array — never null.
-	if results == nil {
-		results = []*domain.JurisdictionRule{}
-	}
 	h.log.Debug("GetRules",
 		zap.String("jurisdiction_id", jurisdictionID),
 		zap.Int("count", len(results)),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, http.StatusOK, results)
+	finishList(h, w, r, p, results)
 }
 
 // GetRulePack handles GET /v1/jurisdictions/{jurisdiction_id}/rule-pack —
@@ -566,20 +619,17 @@ func (h *Handler) GetDriftEvents(w http.ResponseWriter, r *http.Request) {
 	ruleID := chi.URLParam(r, "jurisdiction_rule_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	limit, offset, ok := h.parsePaging(w, r, r.URL.Query())
+	p, ok := h.beginList(w, r, nil, nil)
 	if !ok {
 		return
 	}
 
-	history, err := h.store.FindDriftEvents(r.Context(), ruleID, limit, offset)
+	history, err := h.store.FindDriftEvents(r.Context(), ruleID, p.fetch(), p.offset)
 	if err != nil {
 		h.writeStoreError(w, r, err, correlationID)
 		return
 	}
-	if history == nil {
-		history = []*domain.DriftEvent{}
-	}
-	writeJSON(w, http.StatusOK, history)
+	finishList(h, w, r, p, history)
 }
 
 // GetRuleStatusHistory handles GET /v1/rules/{jurisdiction_rule_id}/status-history.
@@ -598,20 +648,17 @@ func (h *Handler) GetRuleStatusHistory(w http.ResponseWriter, r *http.Request) {
 	ruleID := chi.URLParam(r, "jurisdiction_rule_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	limit, offset, ok := h.parsePaging(w, r, r.URL.Query())
+	p, ok := h.beginList(w, r, nil, nil)
 	if !ok {
 		return
 	}
 
-	history, err := h.store.FindRuleStatusHistory(r.Context(), ruleID, limit, offset)
+	history, err := h.store.FindRuleStatusHistory(r.Context(), ruleID, p.fetch(), p.offset)
 	if err != nil {
 		h.writeStoreError(w, r, err, correlationID)
 		return
 	}
-	if history == nil {
-		history = []*domain.RuleStatusHistory{}
-	}
-	writeJSON(w, http.StatusOK, history)
+	finishList(h, w, r, p, history)
 }
 
 // ── Admin mutations ──────────────────────────────────────────────────────────
@@ -719,6 +766,7 @@ func (h *Handler) CreateJurisdiction(w http.ResponseWriter, r *http.Request) {
 		zap.String("principal_id", principalID),
 		zap.String("correlation_id", correlationID),
 	)
+	setETag(w, j.RowVersion)
 	writeJSON(w, status, j)
 }
 
@@ -730,6 +778,7 @@ func (h *Handler) CreateJurisdiction(w http.ResponseWriter, r *http.Request) {
 //	401 → no caller identity on the request
 //	403 → authorization denied
 //	404 → jurisdiction_id not found
+//	412 → precondition failed (stale If-Match)
 //	503 → authz or store unavailable
 func (h *Handler) DeactivateJurisdiction(w http.ResponseWriter, r *http.Request) {
 	jurisdictionID := chi.URLParam(r, "jurisdiction_id")
@@ -744,12 +793,22 @@ func (h *Handler) DeactivateJurisdiction(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Check If-Match for optimistic concurrency (API-3).
+	ifMatch, ok := parseIfMatch(w, r)
+	if !ok {
+		return
+	}
+	retireReq, ok := readRetireRequest(w, r)
+	if !ok {
+		return
+	}
+
 	var j *domain.Jurisdiction
 	var changed bool
 	err := h.store.WithTransaction(r.Context(), func(q store.Querier) error {
 		ctx := events.WithBatch(r.Context())
 		var err error
-		j, changed, err = h.store.DeactivateJurisdictionWithQuerier(r.Context(), q, jurisdictionID, principalID)
+		j, changed, err = h.retire(r.Context(), q, jurisdictionID, principalID, retireReq, ifMatch)
 		if err != nil {
 			return err
 		}
@@ -774,6 +833,7 @@ func (h *Handler) DeactivateJurisdiction(w http.ResponseWriter, r *http.Request)
 		zap.String("principal_id", principalID),
 		zap.String("correlation_id", correlationID),
 	)
+	setETag(w, j.RowVersion)
 	writeJSON(w, http.StatusOK, j)
 }
 
@@ -843,7 +903,7 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 	}
 	if !createableRuleStatuses[ruleStatus] {
 		writeError(w, r, http.StatusBadRequest, "invalid_rule_status",
-			"rule_status must be DRAFT or ACTIVE at creation; SUPERSEDED and RETIRED are reached only via transition")
+			"rule_status must be DRAFT at creation; ACTIVE, SUPERSEDED and RETIRED are reached only via transition (ACTIVE with an approval reference)")
 		return
 	}
 
@@ -919,6 +979,15 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 		h.writeStoreError(w, r, err, correlationID)
 		return
 	}
+	if created {
+		// ZS-JUR-001 s26 rule lifecycle: a rule version was recorded.
+		h.emitRegistry(r, events.EventRuleVersioned, rule.JurisdictionRuleID, principalID, map[string]any{
+			"jurisdiction_rule_id": rule.JurisdictionRuleID, "jurisdiction_id": rule.JurisdictionID,
+			"rule_domain": rule.RuleDomain, "rule_code": rule.RuleCode, "rule_version": rule.RuleVersion,
+			"supersedes_rule_id": rule.SupersedesRuleID, "rule_status": rule.RuleStatus,
+			"effective_from": rule.EffectiveFrom, "effective_to": rule.EffectiveTo,
+		})
+	}
 
 	status := http.StatusOK
 	if created {
@@ -931,6 +1000,7 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 		zap.String("principal_id", principalID),
 		zap.String("correlation_id", correlationID),
 	)
+	setETag(w, rule.RowVersion)
 	writeJSON(w, status, rule)
 }
 
@@ -1000,6 +1070,13 @@ func (h *Handler) TransitionRuleStatus(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if current.RuleStatus != "ACTIVE" {
+				// The author is refused here, before workflow-svc is asked: the
+				// answer cannot change, so it must not turn into a 503 (retry)
+				// when workflow-svc is down. The store refuses it again.
+				if current.CreatedByPrincipalID != "" && current.CreatedByPrincipalID == principalID {
+					writeError(w, r, http.StatusForbidden, "self_approval_forbidden", "the rule's author cannot activate it")
+					return
+				}
 				if err := h.approvals.Verify(r.Context(), approvalRef, ruleID, current.CreatedByPrincipalID); err != nil {
 					if errors.Is(err, approval.ErrNotValid) {
 						writeError(w, r, http.StatusForbidden, "approval_not_valid", err.Error())
@@ -1244,12 +1321,15 @@ func (h *Handler) writeStoreError(w http.ResponseWriter, r *http.Request, err er
 		status, code = http.StatusConflict, "supersedes_taken"
 	case errors.Is(err, domain.ErrRuleVersionMismatch):
 		status, code = http.StatusConflict, "rule_version_mismatch"
-	case errors.Is(err, domain.ErrPreconditionFailed):
+	// ErrVersionConflict is the jurisdiction stores' stale If-Match (API-3).
+	case errors.Is(err, domain.ErrPreconditionFailed), errors.Is(err, domain.ErrVersionConflict):
 		status, code = http.StatusPreconditionFailed, "precondition_failed"
 	case errors.Is(err, domain.ErrSelfApproval):
 		status, code = http.StatusForbidden, "self_approval_forbidden"
 	case errors.Is(err, domain.ErrInvalidEffectivePeriod):
 		status, code = http.StatusBadRequest, "invalid_effective_period"
+	case errors.Is(err, domain.ErrInvalidSuccessor):
+		status, code = http.StatusBadRequest, "invalid_successor"
 	default:
 		h.log.Error("store operation failed",
 			zap.String("correlation_id", correlationID),
@@ -1424,4 +1504,3 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 		_ = err
 	}
 }
-

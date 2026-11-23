@@ -52,7 +52,7 @@
 | `/financial-statements-svc` | financial-statements-svc | 8175 | 8175 |
 | `/fiscal-calendar-svc` | fiscal-calendar-svc | 8173 | 8173 |
 | `/forecasting-svc` | forecasting-svc | 8135 | 8191 |
-| `/gateway-auth-svc` | gateway-auth-svc | 8092 | 8092 |
+| `/gateway-auth-svc` | gateway-auth-svc | 8092 | 8192 |
 | `/general-ledger-svc` | general-ledger-svc | 8098 | 8098 |
 | `/goods-service-receipt-svc` | goods-service-receipt-svc | 8157 | 8157 |
 | `/governance-decision-log-svc` | governance-decision-log-svc | 8083 | 8083 |

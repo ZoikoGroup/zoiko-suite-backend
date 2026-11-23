@@ -149,3 +149,74 @@ func TestCheckAllowed_SendsResourceOwner(t *testing.T) {
 		t.Fatalf("each maker must be sent and not served from another's cache entry, got %v", owners)
 	}
 }
+
+// An emergency check forwards the break-glass session, returns the decision
+// basis so the caller can tell whether the grant came through that session, and
+// is never cached: the session can end between two calls.
+func TestCheckEmergency_ForwardsTheSessionReturnsTheBasisAndIsNeverCached(t *testing.T) {
+	var hits int64
+	var lastBody map[string]any
+	var lastKey string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&hits, 1)
+		lastKey = r.Header.Get("Idempotency-Key")
+		_ = json.NewDecoder(r.Body).Decode(&lastBody)
+		_ = json.NewEncoder(w).Encode(authorizeResponse{DecisionOutcome: "GRANTED", DecisionBasis: "break_glass:session=sess-1:incident=INC-9"})
+	}))
+	defer srv.Close()
+	c := NewHTTPClient(srv.URL, zap.NewNop())
+
+	for i := 0; i < 3; i++ {
+		basis, err := c.CheckEmergency(context.Background(), "p-1", "entity-1", "ACCOUNTING_POLICY_EMERGENCY_SUSPEND", "tenant-1", "sess-1")
+		if err != nil || basis != "break_glass:session=sess-1:incident=INC-9" {
+			t.Fatalf("call %d: basis %q err %v", i, basis, err)
+		}
+	}
+	if got := atomic.LoadInt64(&hits); got != 3 {
+		t.Errorf("%d live calls for 3 emergency checks: an emergency decision must never be served from the cache", got)
+	}
+	if lastBody["break_glass_session_id"] != "sess-1" || lastBody["action_type"] != "ACCOUNTING_POLICY_EMERGENCY_SUSPEND" || lastBody["principal_id"] != "p-1" {
+		t.Errorf("request = %v, want the session forwarded", lastBody)
+	}
+	if lastKey == "" || !contains(lastKey, "sess-1") {
+		t.Errorf("Idempotency-Key = %q, want one decision per session", lastKey)
+	}
+}
+
+// An ordinary check sends no session and is cached as before.
+func TestCheckAllowed_SendsNoSession(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = json.NewEncoder(w).Encode(authorizeResponse{DecisionOutcome: "GRANTED"})
+	}))
+	defer srv.Close()
+	if err := NewHTTPClient(srv.URL, zap.NewNop()).CheckAllowed(context.Background(), "p", "e", "POLICY_READ", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if _, has := body["break_glass_session_id"]; has {
+		t.Errorf("an ordinary check carried a session: %v", body)
+	}
+}
+
+func TestCheckEmergency_DeniedAndUnavailable(t *testing.T) {
+	var hits int64
+	srv := newTestServer(t, "DENIED", &hits)
+	defer srv.Close()
+	basis, err := NewHTTPClient(srv.URL, zap.NewNop()).CheckEmergency(context.Background(), "p", "e", "A", "t", "s")
+	if err != domain.ErrAuthorizationDenied || basis != "" {
+		t.Errorf("denied: basis %q err %v", basis, err)
+	}
+	if _, err := NewHTTPClient("http://127.0.0.1:1", zap.NewNop()).CheckEmergency(context.Background(), "p", "e", "A", "t", "s"); err != domain.ErrAuthorizationServiceUnavailable {
+		t.Errorf("unreachable: %v, want it to fail closed", err)
+	}
+}
+
+func contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}

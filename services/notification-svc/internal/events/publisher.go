@@ -2,7 +2,7 @@
 //
 // The package is split in two, and the split is the whole design:
 //
-//   - The builders (Sent, Failed, OutcomeUnknown, Template*) turn a state change
+//   - The builders (Sent, Failed, OutcomeUnknown) turn a state change
 //     into a sealed envelope. The store enqueues the result in event_outbox
 //     INSIDE the transaction that records the change, so the fact that
 //     something happened is committed atomically with the thing itself.
@@ -52,10 +52,6 @@ const (
 	// §3.4). The notification is PENDING_UNKNOWN until resolved.
 	TypeOutcomeUnknown = "notification.outcome_unknown"
 
-	TypeTemplateCreated         = "template.created"
-	TypeTemplateVersionApproved = "template.version_approved"
-	TypeTemplatePublished       = "template.published"
-	TypeTemplateRetired         = "template.retired"
 
 	// ZS-SVC-Y-001 §10.2 canonical attempt events (migration 000014): one per
 	// durable attempt row, enqueued in the transaction that writes it.
@@ -196,62 +192,6 @@ func OutcomeUnknown(correlationID string, n domain.Notification, reason string) 
 		"reason":                 reason,
 		"unknown_at":             n.UnknownAt,
 		"delivery_attempts":      n.DeliveryAttempts,
-	})
-}
-
-// TemplateCreated seals template.created (BIZ-03).
-func TemplateCreated(correlationID string, d domain.TemplateDefinition) (Outbound, error) {
-	return Build(TypeTemplateCreated, correlationID, d.TenantID, d.LegalEntityID, d.OwnerPrincipalID, d.TemplateID, map[string]any{
-		"template_id":        d.TemplateID,
-		"tenant_id":          d.TenantID,
-		"legal_entity_id":    d.LegalEntityID,
-		"name":               d.Name,
-		"owner_principal_id": d.OwnerPrincipalID,
-	})
-}
-
-// TemplateVersionApproved seals template.version_approved (BIZ-03).
-func TemplateVersionApproved(correlationID string, v domain.TemplateVersion) (Outbound, error) {
-	actor := ""
-	if v.ApprovedByPrincipalID != nil {
-		actor = *v.ApprovedByPrincipalID
-	}
-	return Build(TypeTemplateVersionApproved, correlationID, v.TenantID, v.LegalEntityID, actor, v.TemplateID, map[string]any{
-		"version_id":               v.VersionID,
-		"template_id":              v.TemplateID,
-		"tenant_id":                v.TenantID,
-		"legal_entity_id":          v.LegalEntityID,
-		"locale":                   v.Locale,
-		"version_number":           v.VersionNumber,
-		"approved_by_principal_id": actor,
-	})
-}
-
-// TemplatePublished seals template.published (BIZ-03). actor is the principal
-// who published, which the version row does not name on its own.
-func TemplatePublished(correlationID, actor string, v domain.TemplateVersion) (Outbound, error) {
-	return Build(TypeTemplatePublished, correlationID, v.TenantID, v.LegalEntityID, actor, v.TemplateID, map[string]any{
-		"version_id":      v.VersionID,
-		"template_id":     v.TemplateID,
-		"tenant_id":       v.TenantID,
-		"legal_entity_id": v.LegalEntityID,
-		"locale":          v.Locale,
-		"version_number":  v.VersionNumber,
-		"content_hash":    v.ContentHash,
-	})
-}
-
-// TemplateRetired seals template.retired (BIZ-03).
-func TemplateRetired(correlationID string, d domain.TemplateDefinition) (Outbound, error) {
-	actor := ""
-	if d.RetiredByPrincipalID != nil {
-		actor = *d.RetiredByPrincipalID
-	}
-	return Build(TypeTemplateRetired, correlationID, d.TenantID, d.LegalEntityID, actor, d.TemplateID, map[string]any{
-		"template_id":             d.TemplateID,
-		"tenant_id":               d.TenantID,
-		"legal_entity_id":         d.LegalEntityID,
-		"retired_by_principal_id": actor,
 	})
 }
 
