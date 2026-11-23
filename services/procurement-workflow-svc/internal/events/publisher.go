@@ -1,47 +1,96 @@
+// Package events builds this service's events and delivers them from the
+// transactional outbox.
+//
+// procurement.requested, procurement.approval.started and
+// procurement.completed are built here as outbox rows and INSERTed by the
+// store inside the same transaction as the case change they describe;
+// internal/outbox.Relay then calls PublishOutbox, retrying until the broker
+// accepts each one. They used to be written straight to Kafka after the
+// commit, with the write error logged and dropped.
+//
+// The envelope keeps the shape consumers already read (Doc 03 §19): event_id,
+// event_type, event_version, emitted_at, schema_version "1.0",
+// source_service, tenant_id, legal_entity_id, actor_id, correlation_id,
+// payload. domain.ProcurementCase carries real TenantID/LegalEntityID and
+// RequestedByPrincipalID as the natural actor for the requested /
+// approval-started events; procurement.completed takes its actor from the
+// principal who issued the purchase order, which may not be the requester. No
+// jurisdiction field exists on the domain object.
 package events
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+
 	"zoiko.io/procurement-workflow-svc/internal/domain"
+	"zoiko.io/procurement-workflow-svc/internal/outbox"
 )
 
-// envelope is this platform's event contract (Doc 03 §19): every published
-// event must carry event name, event version, timestamp, tenant ID, legal
-// entity ID, jurisdiction context, actor ID, correlation ID, source
-// service, and payload schema version. domain.ProcurementCase carries
-// real TenantID/LegalEntityID and RequestedByPrincipalID as the natural
-// actor for the requested/approval-started events; procurement.completed
-// sources its actor from the principal who issued the purchase order,
-// threaded through explicitly since that may not be the original
-// requester. No jurisdiction field exists on the domain object.
-type envelope struct {
-	EventID       string          `json:"event_id"`
-	EventType     string          `json:"event_type"`
-	EventVersion  string          `json:"event_version"`
-	EmittedAt     time.Time       `json:"emitted_at"`
-	SchemaVersion string          `json:"schema_version"`
-	SourceService string          `json:"source_service"`
-	TenantID      string          `json:"tenant_id,omitempty"`
-	LegalEntityID string          `json:"legal_entity_id,omitempty"`
-	ActorID       string          `json:"actor_id,omitempty"`
-	CorrelationID string          `json:"correlation_id"`
-	Payload       json.RawMessage `json:"payload"`
+const (
+	SourceService        = "procurement-workflow-svc"
+	EventRequested       = "procurement.requested"
+	EventApprovalStarted = "procurement.approval.started"
+	EventCompleted       = "procurement.completed"
+	aggregateProcurement = "procurement_case"
+)
+
+// Requested fires when a procurement case is first created, whether or not
+// the spend check that runs during creation allows it — the event marks the
+// request happening, not any particular outcome.
+func Requested(c domain.ProcurementCase) outbox.Event {
+	return build(EventRequested, c.RequestedByPrincipalID, c, map[string]any{
+		"case_id":         c.CaseID,
+		"legal_entity_id": c.LegalEntityID,
+		"category":        c.Category,
+		"amount":          c.Amount,
+		"currency_code":   c.CurrencyCode,
+		"status":          c.Status,
+	})
+}
+
+// ApprovalStarted fires only when the spend check lets the case enter the
+// approval stage — a spend-blocked case never reaches this event.
+func ApprovalStarted(c domain.ProcurementCase) outbox.Event {
+	return build(EventApprovalStarted, c.RequestedByPrincipalID, c, map[string]any{
+		"case_id":         c.CaseID,
+		"legal_entity_id": c.LegalEntityID,
+	})
+}
+
+// Completed fires once the real purchase order has been issued and the case
+// reaches its terminal COMPLETED state.
+func Completed(actorID string, c domain.ProcurementCase) outbox.Event {
+	return build(EventCompleted, actorID, c, map[string]any{
+		"case_id":           c.CaseID,
+		"legal_entity_id":   c.LegalEntityID,
+		"purchase_order_id": c.PurchaseOrderID,
+		"amount":            c.Amount,
+		"currency_code":     c.CurrencyCode,
+	})
+}
+
+func build(eventType, actorID string, c domain.ProcurementCase, payload map[string]any) outbox.Event {
+	id := uuid.NewString()
+	ev := outbox.Event{
+		OutboxEventID: id, AggregateType: aggregateProcurement, AggregateID: c.CaseID, EventType: eventType,
+		TenantID: c.TenantID, LegalEntityID: c.LegalEntityID, ActorID: actorID, CorrelationID: c.CorrelationID,
+		Payload: payload,
+	}
+	ev.Payload = outbox.NewEnvelope(id, SourceService, eventType, ev, 0)
+	return ev
 }
 
 // MessageWriter is the one method Publisher needs from *kafka.Writer.
-// Narrowed to an interface purely so publisher_test.go can assert
-// envelope content without a live broker.
+// Narrowed to an interface purely so tests can assert content without a broker.
 type MessageWriter interface {
 	WriteMessages(ctx context.Context, msgs ...kafka.Message) error
 }
 
+// Publisher delivers outbox rows to Kafka.
 type Publisher struct {
 	log      *zap.Logger
 	topic    string
@@ -51,8 +100,7 @@ type Publisher struct {
 func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publisher {
 	// producer may be a nil *kafka.Writer (dry-run mode) — storing that
 	// directly into the MessageWriter interface field would make the
-	// interface itself non-nil, defeating the p.producer == nil check in
-	// emit(). Keep the field genuinely nil in that case.
+	// interface itself non-nil, defeating the p.producer == nil check.
 	if producer == nil {
 		return &Publisher{log: log, topic: topic}
 	}
@@ -65,76 +113,25 @@ func NewPublisherWithWriter(log *zap.Logger, topic string, producer MessageWrite
 	return &Publisher{log: log, topic: topic, producer: producer}
 }
 
-// PublishRequested fires when a procurement case is first created, whether
-// or not the spend-check that runs synchronously during creation allows it
-// — the event marks the request happening, not any particular outcome.
-func (p *Publisher) PublishRequested(ctx context.Context, c domain.ProcurementCase) {
-	p.emit(ctx, "procurement.requested", c.CorrelationID, c.TenantID, c.LegalEntityID, c.RequestedByPrincipalID, c.CaseID, map[string]any{
-		"case_id":         c.CaseID,
-		"legal_entity_id": c.LegalEntityID,
-		"category":        c.Category,
-		"amount":          c.Amount,
-		"currency_code":   c.CurrencyCode,
-		"status":          c.Status,
-	})
-}
-
-// PublishApprovalStarted fires only when the spend-check allows the case to
-// enter the approval stage — a spend-blocked case never reaches this event.
-func (p *Publisher) PublishApprovalStarted(ctx context.Context, c domain.ProcurementCase) {
-	p.emit(ctx, "procurement.approval.started", c.CorrelationID, c.TenantID, c.LegalEntityID, c.RequestedByPrincipalID, c.CaseID, map[string]any{
-		"case_id":         c.CaseID,
-		"legal_entity_id": c.LegalEntityID,
-	})
-}
-
-// PublishCompleted fires once the real purchase order has been issued and
-// the case reaches its terminal COMPLETED state.
-func (p *Publisher) PublishCompleted(ctx context.Context, actorID string, c domain.ProcurementCase) {
-	p.emit(ctx, "procurement.completed", c.CorrelationID, c.TenantID, c.LegalEntityID, actorID, c.CaseID, map[string]any{
-		"case_id":           c.CaseID,
-		"legal_entity_id":   c.LegalEntityID,
-		"purchase_order_id": c.PurchaseOrderID,
-		"amount":            c.Amount,
-		"currency_code":     c.CurrencyCode,
-	})
-}
-
-func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID, legalEntityID, actorID, key string, payload map[string]any) {
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		p.log.Error("failed to marshal event payload", zap.String("event_type", eventType), zap.Error(err))
-		return
-	}
-	env := envelope{
-		// A fresh UUID per publish, not a deterministic string — see
-		// docs/architecture/known-gaps.md's event_id collision writeup.
-		EventID:       "evt-" + uuid.New().String(),
-		EventType:     eventType,
-		EventVersion:  "1.0",
-		EmittedAt:     time.Now().UTC(),
-		SchemaVersion: "1.0",
-		SourceService: "procurement-workflow-svc",
-		TenantID:      tenantID,
-		LegalEntityID: legalEntityID,
-		ActorID:       actorID,
-		CorrelationID: correlationID,
-		Payload:       raw,
-	}
-	body, err := json.Marshal(env)
-	if err != nil {
-		p.log.Error("failed to marshal event envelope", zap.String("event_type", eventType), zap.Error(err))
-		return
-	}
+// PublishOutbox publishes one already-built envelope, keyed by the case id as
+// before. The stable outbox event id travels as the X-Event-ID header across
+// every retry so consumers can de-duplicate at-least-once delivery. A failure
+// is RETURNED (the relay keeps the row and retries) — it is never swallowed.
+// With no producer (dry mode) it logs and reports success, as before.
+func (p *Publisher) PublishOutbox(ctx context.Context, outboxEventID, aggregateID string, payload []byte) error {
 	if p.producer == nil {
-		p.log.Info("simulating publish event in dry mode", zap.String("event_type", eventType))
-		return
+		p.log.Info("simulating publish event in dry mode", zap.String("outbox_event_id", outboxEventID))
+		return nil
 	}
-	if err := p.producer.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: body}); err != nil {
-		p.log.Error("failed to publish event",
-			zap.String("event_type", eventType),
-			zap.String("topic", p.topic),
-			zap.Error(fmt.Errorf("kafka write: %w", err)),
-		)
+	err := p.producer.WriteMessages(ctx, kafka.Message{
+		Key:     []byte(aggregateID),
+		Value:   payload,
+		Headers: []kafka.Header{{Key: "X-Event-ID", Value: []byte(outboxEventID)}},
+	})
+	if err != nil {
+		p.log.Warn("outbox kafka write failed",
+			zap.String("outbox_event_id", outboxEventID), zap.String("topic", p.topic), zap.Error(err))
+		return fmt.Errorf("kafka write: %w", err)
 	}
+	return nil
 }

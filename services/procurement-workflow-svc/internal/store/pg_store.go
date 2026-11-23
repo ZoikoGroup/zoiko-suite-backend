@@ -9,7 +9,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"zoiko.io/procurement-workflow-svc/internal/domain"
+	"zoiko.io/procurement-workflow-svc/internal/events"
 	svcmiddleware "zoiko.io/procurement-workflow-svc/internal/middleware"
+	"zoiko.io/procurement-workflow-svc/internal/outbox"
 )
 
 type PgStore struct {
@@ -96,6 +98,19 @@ func (s *PgStore) CreateCase(ctx context.Context, c *domain.ProcurementCase) (cr
 		}
 		if tag.RowsAffected() == 1 {
 			created = true
+			// The case and the notice that it was opened commit together; the
+			// relay delivers them with retry. A replayed create (the conflict
+			// branch below) emits nothing, as before.
+			emitted := *c
+			emitted.TenantID = tenantID
+			if _, err := outbox.Insert(ctx, tx, events.Requested(emitted)); err != nil {
+				return err
+			}
+			if c.Status == domain.CaseStatusApprovalPending {
+				if _, err := outbox.Insert(ctx, tx, events.ApprovalStarted(emitted)); err != nil {
+					return err
+				}
+			}
 			return nil
 		}
 
@@ -197,7 +212,7 @@ func (s *PgStore) ListCases(ctx context.Context, legalEntityID, status string) (
 // re-checking the current status inside the same transaction the update
 // runs in so a concurrent double-approve cannot race past the guard.
 func (s *PgStore) UpdateApproved(ctx context.Context, caseID, principalID string) (*domain.ProcurementCase, error) {
-	return s.transition(ctx, caseID, domain.CaseStatusApprovalPending, func(tx pgx.Tx, tenantID string, now time.Time) error {
+	return s.transition(ctx, caseID, domain.CaseStatusApprovalPending, nil, func(tx pgx.Tx, tenantID string, now time.Time) error {
 		_, err := tx.Exec(ctx, `
 			UPDATE procurement_cases
 			SET status = $1, approved_by_principal_id = $2, approved_at = $3, updated_at = $3
@@ -209,7 +224,7 @@ func (s *PgStore) UpdateApproved(ctx context.Context, caseID, principalID string
 
 // UpdateRejected transitions a case from APPROVAL_PENDING to REJECTED.
 func (s *PgStore) UpdateRejected(ctx context.Context, caseID, principalID, reason string) (*domain.ProcurementCase, error) {
-	return s.transition(ctx, caseID, domain.CaseStatusApprovalPending, func(tx pgx.Tx, tenantID string, now time.Time) error {
+	return s.transition(ctx, caseID, domain.CaseStatusApprovalPending, nil, func(tx pgx.Tx, tenantID string, now time.Time) error {
 		_, err := tx.Exec(ctx, `
 			UPDATE procurement_cases
 			SET status = $1, rejected_by_principal_id = $2, rejection_reason = $3, rejected_at = $4, updated_at = $4
@@ -220,9 +235,15 @@ func (s *PgStore) UpdateRejected(ctx context.Context, caseID, principalID, reaso
 }
 
 // UpdateOrderIssued transitions a case from APPROVED to COMPLETED, recording
-// the purchase order that was issued for it.
-func (s *PgStore) UpdateOrderIssued(ctx context.Context, caseID, purchaseOrderID string) (*domain.ProcurementCase, error) {
-	return s.transition(ctx, caseID, domain.CaseStatusApproved, func(tx pgx.Tx, tenantID string, now time.Time) error {
+// the purchase order that was issued for it, and writes procurement.completed
+// (actor: the principal who issued the order) to the outbox in the same
+// transaction.
+func (s *PgStore) UpdateOrderIssued(ctx context.Context, caseID, purchaseOrderID, actorID string) (*domain.ProcurementCase, error) {
+	emit := func(tx pgx.Tx, final *domain.ProcurementCase) error {
+		_, err := outbox.Insert(ctx, tx, events.Completed(actorID, *final))
+		return err
+	}
+	return s.transition(ctx, caseID, domain.CaseStatusApproved, emit, func(tx pgx.Tx, tenantID string, now time.Time) error {
 		_, err := tx.Exec(ctx, `
 			UPDATE procurement_cases
 			SET status = $1, purchase_order_id = $2, completed_at = $3, updated_at = $3
@@ -233,9 +254,10 @@ func (s *PgStore) UpdateOrderIssued(ctx context.Context, caseID, purchaseOrderID
 }
 
 // transition fetches the case, verifies it is currently in requiredStatus,
-// runs the caller's UPDATE, and re-fetches the final row — all inside one
-// RLS-scoped transaction so the check-then-act is atomic.
-func (s *PgStore) transition(ctx context.Context, caseID string, requiredStatus domain.CaseStatus, update func(tx pgx.Tx, tenantID string, now time.Time) error) (*domain.ProcurementCase, error) {
+// runs the caller's UPDATE, re-fetches the final row and, when emit is set,
+// writes the transition's outbox event from that final row — all inside one
+// RLS-scoped transaction so the check-then-act (and its event) is atomic.
+func (s *PgStore) transition(ctx context.Context, caseID string, requiredStatus domain.CaseStatus, emit func(tx pgx.Tx, final *domain.ProcurementCase) error, update func(tx pgx.Tx, tenantID string, now time.Time) error) (*domain.ProcurementCase, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return nil, domain.ErrIdentityMissing
@@ -260,7 +282,13 @@ func (s *PgStore) transition(ctx context.Context, caseID string, requiredStatus 
 		}
 
 		row = tx.QueryRow(ctx, "SELECT "+caseColumns+" FROM procurement_cases WHERE tenant_id = $1 AND case_id = $2", tenantID, caseID)
-		return scanCase(row, &out)
+		if err := scanCase(row, &out); err != nil {
+			return err
+		}
+		if emit != nil {
+			return emit(tx, &out)
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err

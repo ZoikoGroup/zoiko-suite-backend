@@ -24,6 +24,10 @@ import (
 type stubStore struct {
 	byID          map[string]*domain.ProcurementCase
 	byCorrelation map[string]*domain.ProcurementCase
+	// outbox stands in for the real store's outbox writes (DB-tested in
+	// internal/store): the events of a fresh create / a completion.
+	outbox          *stubPublisher
+	completionActor string
 }
 
 func newStubStore() *stubStore {
@@ -38,6 +42,12 @@ func (s *stubStore) CreateCase(_ context.Context, c *domain.ProcurementCase) (bo
 	cp := *c
 	s.byID[c.CaseID] = &cp
 	s.byCorrelation[c.CorrelationID] = &cp
+	if s.outbox != nil {
+		s.outbox.requested++
+		if c.Status == domain.CaseStatusApprovalPending {
+			s.outbox.approvalStarted++
+		}
+	}
 	return true, nil
 }
 
@@ -108,7 +118,7 @@ func (s *stubStore) UpdateRejected(_ context.Context, caseID, principalID, reaso
 	return &cp, nil
 }
 
-func (s *stubStore) UpdateOrderIssued(_ context.Context, caseID, purchaseOrderID string) (*domain.ProcurementCase, error) {
+func (s *stubStore) UpdateOrderIssued(_ context.Context, caseID, purchaseOrderID, actorID string) (*domain.ProcurementCase, error) {
 	c, ok := s.byID[caseID]
 	if !ok {
 		return nil, domain.ErrCaseNotFound
@@ -121,20 +131,17 @@ func (s *stubStore) UpdateOrderIssued(_ context.Context, caseID, purchaseOrderID
 	c.PurchaseOrderID = &purchaseOrderID
 	c.CompletedAt = &now
 	c.UpdatedAt = now
+	s.completionActor = actorID
+	if s.outbox != nil {
+		s.outbox.completed++
+	}
 	cp := *c
 	return &cp, nil
 }
 
+// stubPublisher counts the outbox events the stub store wrote.
 type stubPublisher struct {
 	requested, approvalStarted, completed int
-}
-
-func (p *stubPublisher) PublishRequested(_ context.Context, _ domain.ProcurementCase) { p.requested++ }
-func (p *stubPublisher) PublishApprovalStarted(_ context.Context, _ domain.ProcurementCase) {
-	p.approvalStarted++
-}
-func (p *stubPublisher) PublishCompleted(_ context.Context, _ string, _ domain.ProcurementCase) {
-	p.completed++
 }
 
 type stubAuthZ struct{ err error }
@@ -178,7 +185,10 @@ func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ, spend *stubSp
 			next.ServeHTTP(w, req)
 		})
 	})
-	h := handler.New(s, pub, authz, spend, order, zap.NewNop())
+	if s.outbox == nil {
+		s.outbox = pub
+	}
+	h := handler.New(s, authz, spend, order, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }

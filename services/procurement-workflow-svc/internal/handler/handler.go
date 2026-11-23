@@ -23,13 +23,9 @@ type Store interface {
 	ListCases(ctx context.Context, legalEntityID, status string) ([]domain.ProcurementCase, error)
 	UpdateApproved(ctx context.Context, caseID, principalID string) (*domain.ProcurementCase, error)
 	UpdateRejected(ctx context.Context, caseID, principalID, reason string) (*domain.ProcurementCase, error)
-	UpdateOrderIssued(ctx context.Context, caseID, purchaseOrderID string) (*domain.ProcurementCase, error)
-}
-
-type Publisher interface {
-	PublishRequested(ctx context.Context, c domain.ProcurementCase)
-	PublishApprovalStarted(ctx context.Context, c domain.ProcurementCase)
-	PublishCompleted(ctx context.Context, actorID string, c domain.ProcurementCase)
+	// UpdateOrderIssued completes the case and writes procurement.completed
+	// (actor: actorID) to the outbox in the same transaction.
+	UpdateOrderIssued(ctx context.Context, caseID, purchaseOrderID, actorID string) (*domain.ProcurementCase, error)
 }
 
 type AuthZClient interface {
@@ -58,15 +54,16 @@ const (
 
 type Handler struct {
 	store       Store
-	publisher   Publisher
 	authz       AuthZClient
 	spendCheck  SpendChecker
 	orderIssuer OrderIssuer
 	log         *zap.Logger
 }
 
-func New(store Store, publisher Publisher, authz AuthZClient, spendCheck SpendChecker, orderIssuer OrderIssuer, log *zap.Logger) *Handler {
-	return &Handler{store: store, publisher: publisher, authz: authz, spendCheck: spendCheck, orderIssuer: orderIssuer, log: log}
+// New builds the handler. Events are no longer published from here: the store
+// writes them to the transactional outbox (see internal/events).
+func New(store Store, authz AuthZClient, spendCheck SpendChecker, orderIssuer OrderIssuer, log *zap.Logger) *Handler {
+	return &Handler{store: store, authz: authz, spendCheck: spendCheck, orderIssuer: orderIssuer, log: log}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -165,19 +162,16 @@ func (h *Handler) CreateCase(w http.ResponseWriter, r *http.Request) {
 		UpdatedAt:              now,
 	}
 
-	created, err := h.store.CreateCase(r.Context(), pc)
+	_, err = h.store.CreateCase(r.Context(), pc)
 	if err != nil {
 		h.log.Error("failed to create procurement case", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 
-	if created {
-		h.publisher.PublishRequested(r.Context(), *pc)
-		if pc.Status == domain.CaseStatusApprovalPending {
-			h.publisher.PublishApprovalStarted(r.Context(), *pc)
-		}
-	}
+	// procurement.requested (and procurement.approval.started when the spend
+	// check allowed the case) were written to the outbox by CreateCase in the
+	// insert's own transaction; a replayed create writes none.
 
 	writeJSON(w, http.StatusCreated, pc)
 }
@@ -379,7 +373,7 @@ func (h *Handler) IssueOrder(w http.ResponseWriter, r *http.Request) {
 		if attempt > 0 {
 			time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
 		}
-		updated, err = h.store.UpdateOrderIssued(r.Context(), caseID, order.PurchaseOrderID)
+		updated, err = h.store.UpdateOrderIssued(r.Context(), caseID, order.PurchaseOrderID, principalID)
 		if err == nil {
 			break
 		}
@@ -394,7 +388,7 @@ func (h *Handler) IssueOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishCompleted(r.Context(), principalID, *updated)
+	// procurement.completed was written to the outbox by UpdateOrderIssued.
 	writeJSON(w, http.StatusOK, updated)
 }
 
