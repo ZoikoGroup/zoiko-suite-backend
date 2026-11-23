@@ -12,7 +12,7 @@ This file replaces the 18–19 Nov version, which cited tests that never existed
 ## Suite (23 Nov 2026, commit after `3b3de75d`)
 
 `go build ./...` and `go vet ./...` clean. `go test -count=1 -p 1 ./...` with
-`TEST_DATABASE_URL` on a scratch database (`obligations_test_ob`): **126 pass, 0 fail, 0 skip**.
+`TEST_DATABASE_URL` on a scratch database (`obligations_test_ob`): **129 pass, 0 fail, 0 skip**.
 The store suite resets the whole `public` schema before each test and runs the store as a
 NOSUPERUSER, NOBYPASSRLS role that does not own the tables (`rlsPool`).
 

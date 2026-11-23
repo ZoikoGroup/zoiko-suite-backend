@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -524,5 +525,38 @@ func TestWFC05_ConcurrentSweepsPersistOneMove(t *testing.T) {
 	}
 	if n := e.count(t, `SELECT COUNT(*) FROM event_outbox WHERE event_type = 'obligation.clock.overdue'`); n != 1 {
 		t.Fatalf("NP-37: %d overdue events after 10 concurrent sweeps", n)
+	}
+}
+
+// OB-S14 / R-INV-18: across both 2026 Europe/London transitions the stored
+// due_at and time zone are exactly jurisdiction-rules' answer (JR-DST-1:
+// 01:30 on 29 Mar does not exist and resolves to 01:00 UTC; 01:30 on 25 Oct
+// occurs twice and resolves to the earlier, 00:30 UTC), and the due day
+// starts at local midnight.
+func TestWFC05_DST_StoredInstantAndZoneAreJurisdictionsAnswer(t *testing.T) {
+	e := newClockEnv(t)
+	london, _ := time.LoadLocation("Europe/London")
+	for i, c := range []struct {
+		local    string
+		due      time.Time
+		dayStart time.Time
+	}{
+		{"2026-03-29", time.Date(2026, 3, 29, 1, 0, 0, 0, time.UTC), time.Date(2026, 3, 29, 0, 0, 0, 0, london)},
+		{"2026-10-25", time.Date(2026, 10, 25, 0, 30, 0, 0, time.UTC), time.Date(2026, 10, 25, 0, 0, 0, 0, london)},
+	} {
+		calc := calcAt(c.due, 1, "cv-1")
+		calc.Timezone, calc.DueDate = "Europe/London", c.local
+		clk, _, err := e.s.StartClock(e.ctx, domain.StartClockParams{ObligationID: e.obl.ObligationID, ClockKey: fmt.Sprintf("dst-%d", i),
+			RequestHash: "h", ClockClass: domain.ClockClassHardLegal, Calc: calc, Actor: "maker-1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, _ := e.s.GetClock(e.ctx, clk.ClockID)
+		if !got.DueAt.Equal(c.due) || got.Timezone != "Europe/London" || got.LocalDueDate != c.local {
+			t.Fatalf("%s: stored %s %s %s", c.local, got.DueAt, got.Timezone, got.LocalDueDate)
+		}
+		if !got.DueDayStart().Equal(c.dayStart) {
+			t.Fatalf("%s: due day starts %s, want %s", c.local, got.DueDayStart(), c.dayStart)
+		}
 	}
 }
