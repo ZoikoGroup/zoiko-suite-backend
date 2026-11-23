@@ -95,7 +95,7 @@ func resetSchema(t *testing.T, admin *pgxpool.Pool) {
 	for _, stmt := range []string{
 		fmt.Sprintf(`DO $$BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s) THEN CREATE ROLE %s NOLOGIN NOSUPERUSER NOBYPASSRLS; END IF; END$$`, lit, role),
 		`GRANT USAGE ON SCHEMA ` + testSchema + ` TO ` + role,
-		`GRANT SELECT, INSERT, UPDATE, DELETE ON siem_exporters, siem_events, idempotency_keys TO ` + role,
+		`GRANT SELECT, INSERT, UPDATE, DELETE ON siem_exporters, siem_events, idempotency_keys, outbox_events TO ` + role,
 	} {
 		if _, err := admin.Exec(ctx, stmt); err != nil {
 			t.Fatalf("%s: %v", stmt, err)

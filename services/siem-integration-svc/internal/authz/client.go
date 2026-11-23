@@ -8,6 +8,10 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/go-chi/chi/v5/middleware"
+
+	svcenvelope "zoiko.io/siem-integration-svc/internal/envelope"
 )
 
 var (
@@ -72,7 +76,11 @@ func NewClientWithHTTPClient(baseURL string, httpClient *http.Client) *Client {
 // It is not used by any handler; CheckAllowed enforces the real fail-closed
 // authorization contract and should be used for all write actions.
 func (c *Client) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	key := principalID + "|" + legalEntityID + "|" + actionType
+	// The tenant is part of the decision: authorization-svc applies the
+	// tenant's own SoD rules from the forwarded X-Tenant-Id (see
+	// checkAllowedLive), so a decision for tenant A must never answer the same
+	// principal/entity/action asked under tenant B.
+	key := tenantFromContext(ctx) + "|" + principalID + "|" + legalEntityID + "|" + actionType
 
 	if decision, hit := c.lookupCache(key); hit {
 		return decision
@@ -85,6 +93,15 @@ func (c *Client) CheckAllowed(ctx context.Context, principalID, legalEntityID, a
 	}
 
 	return err
+}
+
+// tenantFromContext is the tenant that checkAllowedLive forwards as
+// X-Tenant-Id, so the cache key and the live question always agree.
+func tenantFromContext(ctx context.Context) string {
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		return env.TenantID
+	}
+	return ""
 }
 
 // lookupCache returns the cached decision for key and whether it is still
@@ -143,6 +160,36 @@ func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityI
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+
+	// Forward the request's identity scope, as carta-svc's and
+	// key-management-svc's clients do. Without X-Tenant-Id authorization-svc
+	// narrows to global-only SoD rules instead of this tenant's own, and the
+	// decision cache key (which includes the tenant) would not describe the
+	// question actually asked.
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+	authzRequestID := middleware.GetReqID(ctx)
+	authzSourceChannel := "system"
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.TenantID != "" {
+			req.Header.Set("X-Tenant-Id", env.TenantID)
+		}
+		if env.RequestID != "" {
+			authzRequestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			authzSourceChannel = string(env.SourceChannel)
+		}
+		if env.CorrelationID != "" {
+			req.Header.Set("X-Correlation-ID", env.CorrelationID)
+		}
+		if env.CausationID != "" {
+			req.Header.Set("X-Causation-Id", env.CausationID)
+		}
+	}
+	req.Header.Set("X-Request-Id", authzRequestID)
+	req.Header.Set("X-Source-Channel", authzSourceChannel)
+	req.Header.Set("Idempotency-Key", authzRequestID+":"+actionType)
 
 	resp, err := c.client.Do(req)
 	if err != nil {

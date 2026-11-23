@@ -94,6 +94,7 @@ func (m *MemoryStore) StreamEvent(ctx context.Context, tenantID string, evt *dom
 	evt.TenantID = tenantID
 	evt.Status = "DELIVERED"
 	evt.Timestamp = now
+	evt.ExternalDelivery = domain.ExternalDeliveryNotPerformed
 	m.events[evt.ID] = evt
 
 	exp.EventsSent++
