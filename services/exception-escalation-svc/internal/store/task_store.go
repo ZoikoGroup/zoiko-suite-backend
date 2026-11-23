@@ -174,6 +174,9 @@ func (s *PgStore) CloseCase(ctx context.Context, p domain.CloseCaseParams) (*dom
 		}
 	}
 
+	if err := enqueue(ctx, tx, EventCaseClosed, eventSubject{aggregateType: "case", id: c.CaseID, tenantID: c.TenantID, legalEntityID: c.LegalEntityID}, c); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -221,6 +224,9 @@ func (s *PgStore) CreateTask(ctx context.Context, p domain.CreateTaskParams) (*d
 		return nil, fmt.Errorf("insert task: %w", err)
 	}
 	if err := recordTaskTransition(ctx, tx, taskID, p.TenantID, "", string(domain.TaskStatusNew), p.CreatedByPrincipalID, "task created"); err != nil {
+		return nil, err
+	}
+	if err := enqueue(ctx, tx, EventTaskCreated, taskSubject(t), t); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -277,6 +283,9 @@ func (s *PgStore) AssignTask(ctx context.Context, p domain.AssignTaskParams) (*d
 		return nil, err
 	}
 	if err := recordTaskTransition(ctx, tx, p.TaskID, p.TenantID, string(current.Status), string(domain.TaskStatusAssigned), p.ActorPrincipalID, "assigned"); err != nil {
+		return nil, err
+	}
+	if err := enqueue(ctx, tx, EventTaskAssigned, taskSubject(t), t); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -416,6 +425,9 @@ func (s *PgStore) EscalateTask(ctx context.Context, p domain.EscalateTaskParams)
 	if err := recordTaskTransition(ctx, tx, p.TaskID, p.TenantID, string(current.Status), string(domain.TaskStatusEscalated), p.ActorPrincipalID, p.Reason); err != nil {
 		return nil, err
 	}
+	if err := enqueue(ctx, tx, EventTaskEscalated, taskSubject(t), t); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -457,6 +469,9 @@ func (s *PgStore) CompleteTask(ctx context.Context, p domain.CompleteTaskParams)
 	if err := recordTaskTransition(ctx, tx, p.TaskID, p.TenantID, string(current.Status), string(domain.TaskStatusCompleted), p.ActorPrincipalID, p.CompletionNotes); err != nil {
 		return nil, err
 	}
+	if err := enqueue(ctx, tx, EventTaskCompleted, taskSubject(t), t); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -494,6 +509,9 @@ func (s *PgStore) ReopenTask(ctx context.Context, p domain.ReopenTaskParams) (*d
 		return nil, err
 	}
 	if err := recordTaskTransition(ctx, tx, p.TaskID, p.TenantID, string(current.Status), string(domain.TaskStatusInProgress), p.ActorPrincipalID, p.Reason); err != nil {
+		return nil, err
+	}
+	if err := enqueue(ctx, tx, EventTaskReopened, taskSubject(t), t); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -627,4 +645,8 @@ func (s *PgStore) GetLinkedObjectStatus(ctx context.Context, tenantID, taskID st
 		Tracked: false,
 		Note:    "BIZ-05 does not own linked-object state; this is the reference recorded on the task, not a live status lookup.",
 	}, nil
+}
+
+func taskSubject(t *domain.Task) eventSubject {
+	return eventSubject{aggregateType: "task", id: t.TaskID, tenantID: t.TenantID, legalEntityID: t.LegalEntityID}
 }

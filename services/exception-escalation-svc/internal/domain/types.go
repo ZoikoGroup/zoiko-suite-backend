@@ -19,6 +19,10 @@ var (
 	// who created a record may not be the same principal who approves,
 	// executes, or resolves it.
 	ErrSelfApprovalNotAllowed = errors.New("principal may not approve or decide on their own submission")
+
+	// ErrActorRequired is a write that reached the store without the
+	// gateway-verified principal that performs it.
+	ErrActorRequired = errors.New("acting principal is required")
 )
 
 type SeverityLevel string
