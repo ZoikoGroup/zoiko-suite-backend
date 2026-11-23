@@ -1120,10 +1120,9 @@ function Get-Envelope {
 
     # Authenticate with identity-context-svc.
     $authBody = @{
-        client_id     = "zoiko-console"
-        client_secret = "local-dev-console-client-secret"
-        username      = $Email
-        password      = $Password
+        tenant_id = "11111111-1111-1111-1111-111111111111"
+        email     = $Email
+        password  = $Password
     } | ConvertTo-Json -Compress
 
     try {
@@ -1150,7 +1149,7 @@ function Get-Envelope {
         $resolveResult = $resolveResp.Content | ConvertFrom-Json
         $identityToken = $resolveResult.identity_token
     } catch {
-        Write-Warning "Failed to resolve context for $Email: $_"
+        Write-Warning "Failed to resolve context for ${Email}: $_"
         Write-Warning "Falling back to headers-only mode (works under warn)"
         return $null
     }
