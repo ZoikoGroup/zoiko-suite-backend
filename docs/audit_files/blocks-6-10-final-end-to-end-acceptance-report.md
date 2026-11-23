@@ -80,7 +80,7 @@ Mock and stub results are kept separate from real results. No production URL exi
 | 8.1 | anomaly-detection | ✔ | ✔ | ✔ | ✔ 14/14 | ✔ 1/1 (fixed) | ✖ | — | **Accepted** |
 | 8.2 | forecasting | ✔ | ✔ | ✔ | ✔ | ✔ 1/1 (fixed) | ✖ | — | **Accepted** |
 | 8.3 | compliance-risk-scoring | ✔ | ✔ | ✔ | ✔ | ✔ 1/1 (fixed) | ✖ | — | **Accepted** |
-| 8.4 | reconciliation-intelligence | ✔ unit 138, integ 165 | ✔ (000011) | ✔ SoD, tenant predicate | ✔ **deep 93/93** (was 19/93) | ✔ 16/16 | ✖ | — | **Accepted, pending owner sign-off on contract (§3.1)** |
+| 8.4 | reconciliation-intelligence | ✔ unit 138, integ 165 | ✔ (000013, was 000011 before the merge with main) | ✔ SoD, tenant predicate | ✔ **deep 93/93** (was 19/93) | ✔ 16/16 | ✖ | — | **Accepted, pending owner sign-off on contract (§3.1)** |
 | 8.5 | reporting-orchestration | ✔ | ✔ | ✔ | ✔ deep 154/154 | ✔ 66/66 (fixed) | ✖ | — | **Partial**: report runs recorded `NOT_IMPLEMENTED` |
 | 8.6 | decision-support | ✔ | ✔ | ✔ | ✔ | ✔ 1/1 | ✖ | — | **Accepted** |
 | 8.7 | migration-integrity | ✔ integ 83 | ✔ | ✔ | ✔ deep 81/81 | ✔ 19/19 | ✖ | — | **Accepted** |
@@ -142,7 +142,7 @@ E-3 to E-5 change **audit-event-store-svc**, which is outside the 37. Its owners
 
 | Check | Result | How it was checked |
 |---|---|---|
-| RLS: tenant tables with ENABLE + FORCE + a policy | **203/203** | Real container DB, catalogue query (earlier pass; no RLS migrations changed since, except recon 000011, which adds columns only) |
+| RLS: tenant tables with ENABLE + FORCE + a policy | **203/203** | Real container DB, catalogue query (earlier pass; no RLS migrations changed since, except recon 000013 (numbered 000011 before the merge with main), which adds columns only) |
 | DB roles in use | 35/37 dedicated `app_<db>`, 2 `zoiko_app`, **0 superuser** | `pg_stat_activity` in the container stack |
 | Cross-tenant read or write → 404 | Pass for all 37 | Block 8–10 functional 218/218, plus the legal, tax and procurement suites |
 | Denied principal: no write succeeds, real 403 | 20/20 (Blocks 6–7) | `deny_sweep.py` against the policy stub |
@@ -164,7 +164,7 @@ E-3 to E-5 change **audit-event-store-svc**, which is outside the 37. Its owners
 | 1 Unit | `go test ./... -count=1 -v`, 37 + intercompany + audit-event-store, no DB env | **2,350 passed, 0 failed, 553 skipped**. The skips are DB-gated tests with no `TEST_DATABASE_URL`; the next row covers them. |
 | 1–2 Unit + DB | Same suites with `TEST_DATABASE_URL` → fresh Postgres DB per service (`scan.py`) | **39/39 modules build and vet clean. 0 failures.** First pass: 2,931 passed and 14 skipped. Two suites first failed on harness setup, not on product defects. compliance-risk-scoring (7) and reporting-orchestration (17) expect a DB with every migration already applied, plus a NOSUPERUSER role, and were given an empty DB as superuser. Re-run that way: **compliance-risk-scoring 30/30**. **reporting-orchestration 38/38**, which also needs the app role to own the tables for its rolled-back DDL negative controls. The 14 skips were RLS tests waiting for `TEST_APP_DATABASE_URL`. Re-run with a NOSUPERUSER NOBYPASSRLS role: **carta 48/48, key-management 64/64, connectivity-api-bridge 845/845**. purchase-order and purchase-request are covered by the integration row: 102 and 80, 0 skips. Only skip left: connectivity `TestDump`, a developer dump utility gated on `REGISTRYTEST_DUMP`. banking-connector's 3 "migration failures" were also harness-only: `001_init.sql` and `002_add_rls.sql` have no `.up` suffix and were not applied. In full order, all 9 apply cleanly. |
 | 2 Integration (`-tags integration`) | purchase-order 102 · purchase-request 80 · reconciliation-intelligence 165 · migration-integrity 83 · banking-connector 95 · tax-authority-interface 115 · intercompany-accounting 149 | **789 passed, 0 failed, 0 skipped** |
-| 2 Migrations | recon 000011: upgrade from main, rollback, re-apply, clean | **pass** (34/34 services with new migrations, earlier) |
+| 2 Migrations | recon 000013 (was 000011): upgrade from main, rollback, re-apply, clean | **pass** (34/34 services with new migrations, earlier) |
 | 1 Build/vet/format | the 14 changed services: build, vet, test, gofmt on changed files | **14/14 clean** |
 | 3 Service contract | recon deep suite (real container) | **93/93** (was 19/93) |
 | 3 Service contract | legal 229/229 · tax 269/269 · procurement 134/134 · reporting 154/154 · migration-integrity 81/81 | all pass (container, this pass) |
