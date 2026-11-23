@@ -23,6 +23,7 @@ import (
 	"zoiko.io/hris-connector-svc/internal/idempotency"
 	"zoiko.io/hris-connector-svc/internal/middleware"
 	"zoiko.io/hris-connector-svc/internal/mtls"
+	"zoiko.io/hris-connector-svc/internal/outbox"
 	"zoiko.io/hris-connector-svc/internal/provider"
 	"zoiko.io/hris-connector-svc/internal/store"
 	"zoiko.io/hris-connector-svc/internal/telemetry"
@@ -89,7 +90,13 @@ func main() {
 	// instead of fabricating a result.
 	providers := provider.NewRegistry()
 	logger.Warn("no HRIS provider adapters registered: sync requests will fail closed with 503 provider_not_configured")
-	h := handler.New(st, publisher, authzClient, logger).WithProviders(providers)
+	h := handler.New(st, authzClient, logger).WithProviders(providers)
+
+	// Events are written to outbox_events in the same transaction as each
+	// change; the relay delivers them to Kafka with retry.
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	go outbox.NewRelay(dbpool, publisher, 0, 0, logger).Start(relayCtx)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)

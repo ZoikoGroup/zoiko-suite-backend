@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/hris-connector-svc/internal/domain"
+	"zoiko.io/hris-connector-svc/internal/events"
 	"zoiko.io/hris-connector-svc/internal/middleware"
 	"zoiko.io/hris-connector-svc/internal/store"
 )
@@ -40,7 +41,7 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS sync_jobs, hris_integrations CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS outbox_events, sync_jobs, hris_integrations CASCADE;`)
 
 	// Every migration in filename order, never one hardcoded name — a
 	// suite that names migrations individually silently skips new ones,
@@ -157,7 +158,7 @@ func TestRLS_PgStore_TenantIsolation(t *testing.T) {
 		LegalEntityID: "le-a", ProviderName: "WORKDAY",
 		ApiEndpoint: "https://tenant-a.workday.example/api", Status: "ACTIVE",
 	}
-	if err := s.CreateIntegration(ctxA, integ); err != nil {
+	if err := s.CreateIntegration(ctxA, integ, events.PublishParams{EventType: "hris.integration.created"}); err != nil {
 		t.Fatalf("create tenant A's integration: %v", err)
 	}
 
@@ -201,14 +202,14 @@ func TestRLS_PgStore_SyncJobs_Isolated(t *testing.T) {
 		LegalEntityID: "le-a", ProviderName: "WORKDAY",
 		ApiEndpoint: "https://tenant-a.workday.example/api", Status: "ACTIVE",
 	}
-	if err := s.CreateIntegration(ctxA, integ); err != nil {
+	if err := s.CreateIntegration(ctxA, integ, events.PublishParams{EventType: "hris.integration.created"}); err != nil {
 		t.Fatalf("create integration: %v", err)
 	}
 	job := &domain.SyncJob{
 		IntegrationID: integ.IntegrationID, SyncType: "EMPLOYEE_FULL",
 		RecordsSynced: 4211, Status: "COMPLETED",
 	}
-	if err := s.CreateSyncJob(ctxA, job); err != nil {
+	if err := s.CreateSyncJob(ctxA, job, events.PublishParams{EventType: "hris.sync.triggered"}); err != nil {
 		t.Fatalf("create tenant A's sync job: %v", err)
 	}
 

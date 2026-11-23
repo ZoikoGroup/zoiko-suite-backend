@@ -12,7 +12,6 @@ import (
 
 	"zoiko.io/hris-connector-svc/internal/authz"
 	"zoiko.io/hris-connector-svc/internal/domain"
-	"zoiko.io/hris-connector-svc/internal/events"
 	"zoiko.io/hris-connector-svc/internal/middleware"
 	"zoiko.io/hris-connector-svc/internal/provider"
 	"zoiko.io/hris-connector-svc/internal/store"
@@ -30,19 +29,18 @@ func newGrantingAuthzServer(t *testing.T) *httptest.Server {
 	return srv
 }
 
-func setupTestRouter(t *testing.T) (chi.Router, *events.MockPublisher) {
+func setupTestRouter(t *testing.T) (chi.Router, *store.MemoryStore) {
 	st := store.NewMemoryStore()
-	pub := events.NewMockPublisher()
 	authzSrv := newGrantingAuthzServer(t)
 	az := authz.NewClient(authzSrv.URL)
 	logger := zap.NewNop()
 
-	h := New(st, pub, az, logger)
+	h := New(st, az, logger)
 
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext)
 	RegisterRoutes(r, h)
-	return r, pub
+	return r, st
 }
 
 // TestHrisFlow: create an integration, then sync it through a provider
