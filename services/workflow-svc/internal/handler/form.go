@@ -668,14 +668,14 @@ func (h *Handler) writeFormAuthzErr(w http.ResponseWriter, r *http.Request, err 
 // =============================================================================
 
 type createCaseRequest struct {
-	WorkflowInstanceID     *string `json:"workflow_instance_id,omitempty"`
-	CaseFamily             string  `json:"case_family"`               // FINANCIAL, PAYROLL_HR, LEGAL_COMPLIANCE, SECURITY_PRIVACY, OPERATIONAL
-	CaseType               string  `json:"case_type"`                 // INVESTIGATION, DISPUTE, EXCEPTION, etc.
-	Title                  string  `json:"title"`
-	Description            string  `json:"description"`
-	Severity               string  `json:"severity,omitempty"`        // LOW, MEDIUM, HIGH, CRITICAL
-	Confidentiality        string  `json:"confidentiality,omitempty"` // INTERNAL, RESTRICTED, PRIVILEGED
-	AssignedToPrincipalID  *string `json:"assigned_to_principal_id,omitempty"`
+	WorkflowInstanceID    *string `json:"workflow_instance_id,omitempty"`
+	CaseFamily            string  `json:"case_family"` // FINANCIAL, PAYROLL_HR, LEGAL_COMPLIANCE, SECURITY_PRIVACY, OPERATIONAL
+	CaseType              string  `json:"case_type"`   // INVESTIGATION, DISPUTE, EXCEPTION, etc.
+	Title                 string  `json:"title"`
+	Description           string  `json:"description"`
+	Severity              string  `json:"severity,omitempty"`        // LOW, MEDIUM, HIGH, CRITICAL
+	Confidentiality       string  `json:"confidentiality,omitempty"` // INTERNAL, RESTRICTED, PRIVILEGED
+	AssignedToPrincipalID *string `json:"assigned_to_principal_id,omitempty"`
 }
 
 func (req createCaseRequest) missingField() string {
@@ -828,12 +828,12 @@ func (h *Handler) ListCases(w http.ResponseWriter, r *http.Request) {
 	}
 
 	filter := domain.ListCasesFilter{
-		TenantID:       tenantID,
-		LegalEntityID:  r.URL.Query().Get("legal_entity_id"),
-		CaseType:       r.URL.Query().Get("case_type"),
-		CaseState:      domain.CaseState(r.URL.Query().Get("case_state")),
-		Limit:          limit,
-		Offset:         getIntQuery(r, "offset", 0),
+		TenantID:      tenantID,
+		LegalEntityID: r.URL.Query().Get("legal_entity_id"),
+		CaseType:      r.URL.Query().Get("case_type"),
+		CaseState:     domain.CaseState(r.URL.Query().Get("case_state")),
+		Limit:         limit,
+		Offset:        getIntQuery(r, "offset", 0),
 	}
 
 	if wfID := r.URL.Query().Get("workflow_instance_id"); wfID != "" {
@@ -853,9 +853,9 @@ func (h *Handler) ListCases(w http.ResponseWriter, r *http.Request) {
 }
 
 type transitionCaseRequest struct {
-	CaseState       string  `json:"case_state"`                    // TRIAGED, IN_PROGRESS, WAITING_INTERNAL, WAITING_EXTERNAL, RESOLVED, CLOSED, REOPENED
-	ExpectedVersion int     `json:"expected_version,omitempty"`    // If-Match version
-	Reason          *string `json:"reason,omitempty"`              // for RESOLVED, CLOSED, REOPENED
+	CaseState       string  `json:"case_state"`                 // TRIAGED, IN_PROGRESS, WAITING_INTERNAL, WAITING_EXTERNAL, RESOLVED, CLOSED, REOPENED
+	ExpectedVersion int     `json:"expected_version,omitempty"` // If-Match version
+	Reason          *string `json:"reason,omitempty"`           // for RESOLVED, CLOSED, REOPENED
 }
 
 // TransitionCase handles POST /v1/cases/{case_id}/status.
@@ -1013,7 +1013,7 @@ func (h *Handler) GetStateMachine(w http.ResponseWriter, r *http.Request) {
 
 	if len(defs) == 0 {
 		writeJSON(w, r, http.StatusNotFound, map[string]string{
-			"error": "state_machine_not_found",
+			"error":  "state_machine_not_found",
 			"detail": "no active workflow definition for type: " + workflowType,
 		})
 		return
@@ -1039,14 +1039,14 @@ func (h *Handler) GetStateMachine(w http.ResponseWriter, r *http.Request) {
 	states = append(states, "APPROVED", "REJECTED", "ESCALATED", "CANCELLED", "EXPIRED")
 
 	response := map[string]any{
-		"workflow_type":    def.WorkflowType,
-		"definition_id":    def.WorkflowDefinitionID,
-		"version":          def.Version,
-		"states":           states,
-		"transitions":      transitions,
-		"initial_state":    "PENDING",
-		"terminal_states":  []string{"APPROVED", "REJECTED", "CANCELLED", "EXPIRED"},
-		"requires_human":   true,
+		"workflow_type":   def.WorkflowType,
+		"definition_id":   def.WorkflowDefinitionID,
+		"version":         def.Version,
+		"states":          states,
+		"transitions":     transitions,
+		"initial_state":   "PENDING",
+		"terminal_states": []string{"APPROVED", "REJECTED", "CANCELLED", "EXPIRED"},
+		"requires_human":  true,
 	}
 	writeJSON(w, r, http.StatusOK, response)
 }
@@ -1180,7 +1180,7 @@ func (h *Handler) GetTransitionHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-history := make([]domain.TransitionHistoryEntry, len(transitions))
+	history := make([]domain.TransitionHistoryEntry, len(transitions))
 	for i, t := range transitions {
 		fromStage := 0
 		if t.StageOrder != nil && *t.StageOrder > 0 {
@@ -1198,7 +1198,7 @@ history := make([]domain.TransitionHistoryEntry, len(transitions))
 			FromStatus:         t.FromState,
 			ToStatus:           t.ToState,
 			ActorPrincipalID:   t.ActedBy,
-ActionType:         t.FromState + "->" + t.ToState,
+			ActionType:         t.FromState + "->" + t.ToState,
 			Rationale:          t.Rationale,
 			DecisionID:         t.AccessDecisionID,
 			Quorum:             nil,

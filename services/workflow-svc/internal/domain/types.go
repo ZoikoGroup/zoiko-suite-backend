@@ -372,36 +372,36 @@ var ErrAuthorizationDenied = errorString("authorization denied for this approval
 var ErrAuthorizationServiceUnavailable = errorString("authorization-svc unavailable")
 
 // ErrConcurrencyConflict is returned when an optimistic concurrency check fails:
-	// the workflow or stage was modified by another transaction concurrently.
-	var ErrConcurrencyConflict = errorString("concurrency conflict: workflow was modified by another request")
+// the workflow or stage was modified by another transaction concurrently.
+var ErrConcurrencyConflict = errorString("concurrency conflict: workflow was modified by another request")
 
-	// ErrIdempotencyMismatch is returned when the same idempotency key is used
-	// with a different request body — INV-08 / GCP §16 IDEMPOTENCY_MISMATCH.
-	var ErrIdempotencyMismatch = errorString("idempotency key mismatch: same key used with different request body")
+// ErrIdempotencyMismatch is returned when the same idempotency key is used
+// with a different request body — INV-08 / GCP §16 IDEMPOTENCY_MISMATCH.
+var ErrIdempotencyMismatch = errorString("idempotency key mismatch: same key used with different request body")
 
-	// ErrInitiatorCannotBeApprover is a creation-time validation error:
-	// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3)
-	// forbids a workflow's initiator from being listed as an approver in any
-	// of its own stages.
-	var ErrInitiatorCannotBeApprover = errorString("initiated_by may not appear as an approver in any stage")
+// ErrInitiatorCannotBeApprover is a creation-time validation error:
+// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3)
+// forbids a workflow's initiator from being listed as an approver in any
+// of its own stages.
+var ErrInitiatorCannotBeApprover = errorString("initiated_by may not appear as an approver in any stage")
 
-	// ErrSelfApprovalNotAllowed is the decision-time, defense-in-depth
-	// enforcement of the same Segregation of Duties doctrine: the principal who
-	// initiated a workflow may not submit an approve/reject action on it, even
-	// if they were (incorrectly) recorded as an assigned approver for the
-	// current stage.
-	var ErrSelfApprovalNotAllowed = errorString("principal may not approve or decide on their own submission")
+// ErrSelfApprovalNotAllowed is the decision-time, defense-in-depth
+// enforcement of the same Segregation of Duties doctrine: the principal who
+// initiated a workflow may not submit an approve/reject action on it, even
+// if they were (incorrectly) recorded as an assigned approver for the
+// current stage.
+var ErrSelfApprovalNotAllowed = errorString("principal may not approve or decide on their own submission")
 
-	// ErrTenantMissing is returned when a tenant-scoped operation is attempted
-	// without a valid tenant ID in the context.
-	var ErrTenantMissing = errorString("tenant ID missing from context")
+// ErrTenantMissing is returned when a tenant-scoped operation is attempted
+// without a valid tenant ID in the context.
+var ErrTenantMissing = errorString("tenant ID missing from context")
 
-	// ErrInvalidIdentifier is returned when a database identifier (UUID, etc.)
-	// cannot be parsed from the request.
-	var ErrInvalidIdentifier = errorString("invalid identifier")
+// ErrInvalidIdentifier is returned when a database identifier (UUID, etc.)
+// cannot be parsed from the request.
+var ErrInvalidIdentifier = errorString("invalid identifier")
 
-	// ErrInvalidField is returned when a request field has an invalid value.
-	var ErrInvalidField = errorString("invalid field")
+// ErrInvalidField is returned when a request field has an invalid value.
+var ErrInvalidField = errorString("invalid field")
 
 // Subject binding, invalidation & release gate errors per ZS-STATE-001.
 var ErrInvalidSubjectFingerprint = errorString("invalid subject fingerprint format")
@@ -426,8 +426,8 @@ var ErrNotEligibleQuorumApprover = errorString("actor is not an eligible approve
 // It encodes the sort key of the last item returned (started_at DESC, workflow_instance_id DESC).
 // The cursor is base64.RawURLEncoding encoded JSON.
 type PaginationCursor struct {
-	StartedAt  string `json:"started_at"`   // RFC3339 timestamp
-	InstanceID string `json:"instance_id"`  // workflow_instance_id
+	StartedAt  string `json:"started_at"`  // RFC3339 timestamp
+	InstanceID string `json:"instance_id"` // workflow_instance_id
 }
 
 // EncodePaginationCursor encodes a cursor for transport.
@@ -479,24 +479,24 @@ func (e errorString) Error() string { return string(e) }
 type CaseFamily string
 
 const (
-	CaseFamilyFinancial        CaseFamily = "FINANCIAL"
-	CaseFamilyPayrollHR        CaseFamily = "PAYROLL_HR"
-	CaseFamilyLegalCompliance  CaseFamily = "LEGAL_COMPLIANCE"
-	CaseFamilySecurityPrivacy  CaseFamily = "SECURITY_PRIVACY"
-	CaseFamilyOperational      CaseFamily = "OPERATIONAL"
+	CaseFamilyFinancial       CaseFamily = "FINANCIAL"
+	CaseFamilyPayrollHR       CaseFamily = "PAYROLL_HR"
+	CaseFamilyLegalCompliance CaseFamily = "LEGAL_COMPLIANCE"
+	CaseFamilySecurityPrivacy CaseFamily = "SECURITY_PRIVACY"
+	CaseFamilyOperational     CaseFamily = "OPERATIONAL"
 )
 
 type CaseState string
 
 const (
-	CaseStateOpen             CaseState = "OPEN"
-	CaseStateTriaged          CaseState = "TRIAGED"
-	CaseStateInProgress       CaseState = "IN_PROGRESS"
-	CaseStateWaitingInternal  CaseState = "WAITING_INTERNAL"
-	CaseStateWaitingExternal  CaseState = "WAITING_EXTERNAL"
-	CaseStateResolved         CaseState = "RESOLVED"
-	CaseStateClosed           CaseState = "CLOSED"
-	CaseStateReopened         CaseState = "REOPENED"
+	CaseStateOpen            CaseState = "OPEN"
+	CaseStateTriaged         CaseState = "TRIAGED"
+	CaseStateInProgress      CaseState = "IN_PROGRESS"
+	CaseStateWaitingInternal CaseState = "WAITING_INTERNAL"
+	CaseStateWaitingExternal CaseState = "WAITING_EXTERNAL"
+	CaseStateResolved        CaseState = "RESOLVED"
+	CaseStateClosed          CaseState = "CLOSED"
+	CaseStateReopened        CaseState = "REOPENED"
 )
 
 var CaseStates = map[CaseState]bool{
@@ -508,9 +508,9 @@ var CaseStates = map[CaseState]bool{
 type CaseConfidentiality string
 
 const (
-	CaseConfidentialityInternal      CaseConfidentiality = "INTERNAL"
-	CaseConfidentialityRestricted    CaseConfidentiality = "RESTRICTED"
-	CaseConfidentialityPrivileged    CaseConfidentiality = "PRIVILEGED"
+	CaseConfidentialityInternal   CaseConfidentiality = "INTERNAL"
+	CaseConfidentialityRestricted CaseConfidentiality = "RESTRICTED"
+	CaseConfidentialityPrivileged CaseConfidentiality = "PRIVILEGED"
 )
 
 type CaseSeverity string
@@ -523,28 +523,28 @@ const (
 )
 
 type Case struct {
-	CaseID                string              `json:"case_id"`
-	TenantID              string              `json:"tenant_id"`
-	LegalEntityID         string              `json:"legal_entity_id"`
-	WorkflowInstanceID    *string             `json:"workflow_instance_id,omitempty"` // optional link
-	CaseFamily            CaseFamily          `json:"case_family"`
-	CaseType              string              `json:"case_type"`                    // INVESTIGATION, DISPUTE, EXCEPTION, etc.
-	CaseState             CaseState           `json:"case_state"`
-	Severity              CaseSeverity        `json:"severity"`
-	Confidentiality       CaseConfidentiality `json:"confidentiality"`
-	Title                 string              `json:"title"`
-	Description           string              `json:"description"`
-	AssignedToPrincipal   *string             `json:"assigned_to_principal,omitempty"`
-	CreatedByPrincipalID  string              `json:"created_by_principal_id"`
-	CanonicalCaseID       *string             `json:"canonical_case_id,omitempty"`   // for merge lineage
-	SplitFromCaseID       *string             `json:"split_from_case_id,omitempty"`  // for split lineage
-	OpenedAt              time.Time           `json:"opened_at"`
-	TriagedAt             *time.Time          `json:"triaged_at,omitempty"`
-	ResolvedAt            *time.Time          `json:"resolved_at,omitempty"`
-	ClosedAt              *time.Time          `json:"closed_at,omitempty"`
-	CreatedAt             time.Time           `json:"created_at"`
-	UpdatedAt             time.Time           `json:"updated_at"`
-	RowVersion            int                 `json:"row_version"`
+	CaseID               string              `json:"case_id"`
+	TenantID             string              `json:"tenant_id"`
+	LegalEntityID        string              `json:"legal_entity_id"`
+	WorkflowInstanceID   *string             `json:"workflow_instance_id,omitempty"` // optional link
+	CaseFamily           CaseFamily          `json:"case_family"`
+	CaseType             string              `json:"case_type"` // INVESTIGATION, DISPUTE, EXCEPTION, etc.
+	CaseState            CaseState           `json:"case_state"`
+	Severity             CaseSeverity        `json:"severity"`
+	Confidentiality      CaseConfidentiality `json:"confidentiality"`
+	Title                string              `json:"title"`
+	Description          string              `json:"description"`
+	AssignedToPrincipal  *string             `json:"assigned_to_principal,omitempty"`
+	CreatedByPrincipalID string              `json:"created_by_principal_id"`
+	CanonicalCaseID      *string             `json:"canonical_case_id,omitempty"`  // for merge lineage
+	SplitFromCaseID      *string             `json:"split_from_case_id,omitempty"` // for split lineage
+	OpenedAt             time.Time           `json:"opened_at"`
+	TriagedAt            *time.Time          `json:"triaged_at,omitempty"`
+	ResolvedAt           *time.Time          `json:"resolved_at,omitempty"`
+	ClosedAt             *time.Time          `json:"closed_at,omitempty"`
+	CreatedAt            time.Time           `json:"created_at"`
+	UpdatedAt            time.Time           `json:"updated_at"`
+	RowVersion           int                 `json:"row_version"`
 }
 
 type CreateCaseParams struct {
@@ -561,12 +561,12 @@ type CreateCaseParams struct {
 }
 
 type TransitionCaseParams struct {
-	CaseID            string
-	NewState          CaseState
-	ExpectedVersion   int
-	ActorPrincipalID  string
-	CorrelationID     string
-	Reason            *string // for transitions
+	CaseID           string
+	NewState         CaseState
+	ExpectedVersion  int
+	ActorPrincipalID string
+	CorrelationID    string
+	Reason           *string // for transitions
 }
 
 type ListCasesFilter struct {
@@ -589,14 +589,14 @@ var ErrInvalidCaseTransition = errorString("invalid case state transition")
 
 // Case state transitions per R-001 §6.3
 var CaseStateTransitions = map[CaseState][]CaseState{
-	CaseStateOpen:             {CaseStateTriaged, CaseStateClosed},
-	CaseStateTriaged:          {CaseStateInProgress, CaseStateWaitingInternal, CaseStateWaitingExternal, CaseStateClosed},
-	CaseStateInProgress:       {CaseStateWaitingInternal, CaseStateWaitingExternal, CaseStateResolved, CaseStateClosed},
-	CaseStateWaitingInternal:  {CaseStateInProgress, CaseStateResolved, CaseStateClosed},
-	CaseStateWaitingExternal:  {CaseStateInProgress, CaseStateResolved, CaseStateClosed},
-	CaseStateResolved:         {CaseStateClosed, CaseStateReopened},
-	CaseStateClosed:           {CaseStateReopened},
-	CaseStateReopened:         {CaseStateTriaged, CaseStateInProgress, CaseStateWaitingInternal, CaseStateWaitingExternal, CaseStateClosed},
+	CaseStateOpen:            {CaseStateTriaged, CaseStateClosed},
+	CaseStateTriaged:         {CaseStateInProgress, CaseStateWaitingInternal, CaseStateWaitingExternal, CaseStateClosed},
+	CaseStateInProgress:      {CaseStateWaitingInternal, CaseStateWaitingExternal, CaseStateResolved, CaseStateClosed},
+	CaseStateWaitingInternal: {CaseStateInProgress, CaseStateResolved, CaseStateClosed},
+	CaseStateWaitingExternal: {CaseStateInProgress, CaseStateResolved, CaseStateClosed},
+	CaseStateResolved:        {CaseStateClosed, CaseStateReopened},
+	CaseStateClosed:          {CaseStateReopened},
+	CaseStateReopened:        {CaseStateTriaged, CaseStateInProgress, CaseStateWaitingInternal, CaseStateWaitingExternal, CaseStateClosed},
 }
 
 // CaseMember represents a member of a case with a role
@@ -613,49 +613,49 @@ type CaseMember struct {
 
 // CaseNote represents an append-only versioned note on a case
 type CaseNote struct {
-	CaseNoteID          string    `json:"case_note_id"`
-	CaseID              string    `json:"case_id"`
-	PrincipalID         string    `json:"principal_id"`
-	Content             string    `json:"content"`
-	Visibility          string    `json:"visibility"` // INTERNAL, RESTRICTED, PRIVILEGED
-	EvidenceRefs        []string  `json:"evidence_refs"`
-	CreatedAt           time.Time `json:"created_at"`
-	UpdatedAt           time.Time `json:"updated_at"`
-	Version             int       `json:"version"`
-	PreviousNoteID      *string   `json:"previous_note_id,omitempty"`
+	CaseNoteID     string    `json:"case_note_id"`
+	CaseID         string    `json:"case_id"`
+	PrincipalID    string    `json:"principal_id"`
+	Content        string    `json:"content"`
+	Visibility     string    `json:"visibility"` // INTERNAL, RESTRICTED, PRIVILEGED
+	EvidenceRefs   []string  `json:"evidence_refs"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+	Version        int       `json:"version"`
+	PreviousNoteID *string   `json:"previous_note_id,omitempty"`
 }
 
 // CaseLink represents a read-only link to a domain object
 type CaseLink struct {
-	CaseLinkID           string    `json:"case_link_id"`
-	CaseID               string    `json:"case_id"`
-	DomainObjectType     string    `json:"domain_object_type"`
-	DomainObjectID       string    `json:"domain_object_id"`
-	LinkedAt             time.Time `json:"linked_at"`
-	LinkedByPrincipalID  string    `json:"linked_by_principal_id"`
+	CaseLinkID          string    `json:"case_link_id"`
+	CaseID              string    `json:"case_id"`
+	DomainObjectType    string    `json:"domain_object_type"`
+	DomainObjectID      string    `json:"domain_object_id"`
+	LinkedAt            time.Time `json:"linked_at"`
+	LinkedByPrincipalID string    `json:"linked_by_principal_id"`
 }
 
 // CaseTransition represents an append-only transition log entry
 type CaseTransition struct {
-	CaseTransitionID   string     `json:"case_transition_id"`
-	CaseID             string     `json:"case_id"`
-	FromState          *CaseState `json:"from_state,omitempty"`
-	ToState            CaseState  `json:"to_state"`
-	ActorPrincipalID   string     `json:"actor_principal_id"`
-	Reason             *string    `json:"reason,omitempty"`
-	TriggeredBy        string     `json:"triggered_by"` // TRIAGE, START, WAIT_INTERNAL, WAIT_EXTERNAL, RESOLVE, CLOSE, REOPEN, MERGE, SPLIT
-	CorrelationID      *string    `json:"correlation_id,omitempty"`
-	CausationID        *string    `json:"causation_id,omitempty"`
-	CreatedAt          time.Time  `json:"created_at"`
+	CaseTransitionID string     `json:"case_transition_id"`
+	CaseID           string     `json:"case_id"`
+	FromState        *CaseState `json:"from_state,omitempty"`
+	ToState          CaseState  `json:"to_state"`
+	ActorPrincipalID string     `json:"actor_principal_id"`
+	Reason           *string    `json:"reason,omitempty"`
+	TriggeredBy      string     `json:"triggered_by"` // TRIAGE, START, WAIT_INTERNAL, WAIT_EXTERNAL, RESOLVE, CLOSE, REOPEN, MERGE, SPLIT
+	CorrelationID    *string    `json:"correlation_id,omitempty"`
+	CausationID      *string    `json:"causation_id,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
 }
 
 // CaseAlias represents a merge alias (source case merged into canonical)
 type CaseAlias struct {
-	AliasID               string    `json:"alias_id"`
-	CanonicalCaseID       string    `json:"canonical_case_id"`
-	AliasCaseID           string    `json:"alias_case_id"`
-	MergedAt              time.Time `json:"merged_at"`
-	MergedByPrincipalID   string    `json:"merged_by_principal_id"`
+	AliasID             string    `json:"alias_id"`
+	CanonicalCaseID     string    `json:"canonical_case_id"`
+	AliasCaseID         string    `json:"alias_case_id"`
+	MergedAt            time.Time `json:"merged_at"`
+	MergedByPrincipalID string    `json:"merged_by_principal_id"`
 }
 
 // =============================================================================
@@ -670,12 +670,12 @@ type StateMachineRegistry struct {
 }
 
 type StateMachineDef struct {
-	WorkflowType     string
-	States           []string
-	Transitions      map[string][]string // from_state -> []to_state
-	InitialState     string
-	TerminalStates   []string
-	RequiresHuman    bool // whether approvals require human (not service account)
+	WorkflowType   string
+	States         []string
+	Transitions    map[string][]string // from_state -> []to_state
+	InitialState   string
+	TerminalStates []string
+	RequiresHuman  bool // whether approvals require human (not service account)
 }
 
 // GetStateMachine returns the state machine for a workflow type.
@@ -725,18 +725,18 @@ type AvailableActions struct {
 // TransitionHistoryEntry is one entry in the transition history.
 // This is the ST-3 endpoint: GET /v1/workflows/{id}/transition-history
 type TransitionHistoryEntry struct {
-	TransitionID      string    `json:"transition_id"`
-	WorkflowInstanceID string   `json:"workflow_instance_id"`
-	FromStage         int       `json:"from_stage"`
-	ToStage           int       `json:"to_stage"`
-	FromStatus        string    `json:"from_status"`
-	ToStatus          string    `json:"to_status"`
-	ActorPrincipalID  string    `json:"actor_principal_id"`
-	ActionType        string    `json:"action_type"` // APPROVE, REJECT, REQUEST_CHANGES, ESCALATE, etc.
-	Rationale         *string   `json:"rationale,omitempty"`
-	DecisionID        *string   `json:"decision_id,omitempty"`
-	Quorum            any       `json:"quorum,omitempty"`
-	OccurredAt        time.Time `json:"occurred_at"`
+	TransitionID       string    `json:"transition_id"`
+	WorkflowInstanceID string    `json:"workflow_instance_id"`
+	FromStage          int       `json:"from_stage"`
+	ToStage            int       `json:"to_stage"`
+	FromStatus         string    `json:"from_status"`
+	ToStatus           string    `json:"to_status"`
+	ActorPrincipalID   string    `json:"actor_principal_id"`
+	ActionType         string    `json:"action_type"` // APPROVE, REJECT, REQUEST_CHANGES, ESCALATE, etc.
+	Rationale          *string   `json:"rationale,omitempty"`
+	DecisionID         *string   `json:"decision_id,omitempty"`
+	Quorum             any       `json:"quorum,omitempty"`
+	OccurredAt         time.Time `json:"occurred_at"`
 }
 
 // ErrNoStateMachine is returned when no state machine is registered for a workflow type.

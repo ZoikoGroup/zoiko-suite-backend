@@ -1521,6 +1521,16 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.obligations.events"
       # Every legal entity a write names must exist in the caller's tenant.
       TENANT_REGISTRY_URL: "http://tenant-entity-registry-svc:8081"
+      # WFC-05 deadline clocks (R-001 s7): closing an obligation and fulfilling
+      # a clock need an evidence evaluation (fail closed without it); waivers
+      # are verified and escalation cases opened in workflow-svc; a published
+      # calendar correction recalculates live clocks (OB-S8). The clock worker
+      # and the calendar consumer act as svc-obligations (authorization 000044).
+      EVIDENCE_REQUIREMENTS_URL: "http://evidence-requirements-svc:8130"
+      WORKFLOW_SERVICE_URL: "http://workflow-svc:8090"
+      KAFKA_CALENDAR_TOPIC: "zoiko.jurisdiction.events"
+      CLOCK_SWEEP_INTERVAL_SECONDS: "${OBLIGATIONS_CLOCK_SWEEP_INTERVAL_SECONDS:-60}"
+      SERVICE_PRINCIPAL_ID: "svc-obligations"
       # Identity gate (X5 / X-R3): the signed envelope is verified when sent
       # and a refused envelope is 401 in every mode; warn admits a request
       # that carries none until every caller forwards it. Code default

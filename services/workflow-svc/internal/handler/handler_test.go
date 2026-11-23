@@ -957,7 +957,7 @@ func TestSubmitAction_IllegalTransitionEdge_NegativeControl(t *testing.T) {
 			WorkflowInstanceID: testCancelledID,
 			LegalEntityID:      "22222222-2222-4222-8222-222222222222",
 			WorkflowStatus:     "CANCELLED",
-			RowVersion:      1,
+			RowVersion:         1,
 		},
 		currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"},
 	}
@@ -1061,7 +1061,7 @@ func TestGetNextApprover_NotFound(t *testing.T) {
 }
 
 func TestGetNextApprover_Found(t *testing.T) {
-	store := &stubStore{		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "PENDING", InitiatedBy: "requester-1", RowVersion: 1}, currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"}}
+	store := &stubStore{findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "PENDING", InitiatedBy: "requester-1", RowVersion: 1}, currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"}}
 	r := newTestRouter(store)
 
 	req := scopedAs(httptest.NewRequest(http.MethodGet, "/v1/workflows/"+testWorkflowID+"/next-approver", nil), "reader-1")
@@ -1139,7 +1139,7 @@ func TestCreateWorkflow_WithSubjectBinding_Success(t *testing.T) {
 			SubjectID:          &subjID,
 			SubjectVersion:     &subjVer,
 			SubjectFingerprint: &fp,
-			RowVersion:      1,
+			RowVersion:         1,
 		},
 		stages: []*domain.WorkflowStage{{WorkflowStageID: "s-1", StageOrder: 1}},
 	}
@@ -1566,7 +1566,7 @@ func TestListPendingApprovals_API4Cursor(t *testing.T) {
 	}
 
 	store := &stubStore{
-		pendingApprovals: insts,
+		pendingApprovals:  insts,
 		pendingNextCursor: &domain.PaginationCursor{StartedAt: "2024-01-01T00:00:00Z", InstanceID: "inst-1"},
 	}
 	r := newTestRouter(store)
@@ -1581,7 +1581,7 @@ func TestListPendingApprovals_API4Cursor(t *testing.T) {
 	}
 	var resp1 struct {
 		Records    []*domain.WorkflowInstance `json:"records"`
-		NextCursor string                       `json:"next_cursor"`
+		NextCursor string                     `json:"next_cursor"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &resp1); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -1603,7 +1603,7 @@ func TestListPendingApprovals_API4Cursor(t *testing.T) {
 	}
 	var resp2 struct {
 		Records    []*domain.WorkflowInstance `json:"records"`
-		NextCursor string                       `json:"next_cursor"`
+		NextCursor string                     `json:"next_cursor"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &resp2); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -1628,10 +1628,10 @@ func TestListPendingSubmissions_API4Cursor(t *testing.T) {
 	}
 
 	form := &domain.FormDefinition{
-		FormID:       "form-1",
-		TenantID:     "11111111-1111-4111-8111-111111111111",
+		FormID:        "form-1",
+		TenantID:      "11111111-1111-4111-8111-111111111111",
 		LegalEntityID: "22222222-2222-4222-8222-222222222222",
-		Status:       "PUBLISHED",
+		Status:        "PUBLISHED",
 	}
 
 	store := &stubStore{
@@ -1650,7 +1650,7 @@ func TestListPendingSubmissions_API4Cursor(t *testing.T) {
 	}
 	var resp1 struct {
 		Records    []*domain.FormSubmission `json:"records"`
-		NextCursor string                       `json:"next_cursor"`
+		NextCursor string                   `json:"next_cursor"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &resp1); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -1672,7 +1672,7 @@ func TestListPendingSubmissions_API4Cursor(t *testing.T) {
 	}
 	var resp2 struct {
 		Records    []*domain.FormSubmission `json:"records"`
-		NextCursor string                       `json:"next_cursor"`
+		NextCursor string                   `json:"next_cursor"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &resp2); err != nil {
 		t.Fatalf("unmarshal: %v", err)

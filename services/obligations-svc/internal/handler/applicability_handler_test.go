@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -353,5 +354,28 @@ func TestApplicabilityReads_MissingTenantIsUnauthorizedNotUnavailable(t *testing
 				t.Fatalf("expected 401 for an unscoped read, got %d: %s", w.Code, w.Body.String())
 			}
 		})
+	}
+}
+
+// OB-S3 (doc7 §E2): exactly one decider, and UNASSESSED is never stored.
+func TestOB2_BothDecidersAreRefused(t *testing.T) {
+	store := &stubStore{findObligation: &domain.Obligation{ObligationID: "o-1", LegalEntityID: "le-1"}}
+	w := postApplicability(t, newApplicabilityTestRouter(store), applicabilityBody(testPrincipal, testPrincipal, "rule-engine"), true)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("both deciders: %d %s", w.Code, w.Body.String())
+	}
+	if store.applicabilityParams.ObligationID != "" {
+		t.Fatal("a decision with two deciders reached the store")
+	}
+}
+
+func TestOB2_UnassessedIsNeverStored(t *testing.T) {
+	store := &stubStore{findObligation: &domain.Obligation{ObligationID: "o-1", LegalEntityID: "le-1"}}
+	body := strings.Replace(applicabilityBody(testPrincipal, testPrincipal, ""), `"APPLICABLE"`, `"UNASSESSED"`, 1)
+	if w := postApplicability(t, newApplicabilityTestRouter(store), body, true); w.Code != http.StatusBadRequest {
+		t.Fatalf("UNASSESSED: %d %s", w.Code, w.Body.String())
+	}
+	if store.applicabilityParams.ObligationID != "" {
+		t.Fatal("UNASSESSED reached the store")
 	}
 }

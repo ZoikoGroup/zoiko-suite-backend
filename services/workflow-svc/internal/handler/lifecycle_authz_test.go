@@ -112,18 +112,18 @@ func TestLifecycleAuthz_NonParticipantDenied(t *testing.T) {
 			if w.Code != http.StatusForbidden {
 				t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
 			}
-var got map[string]any
-		_ = json.Unmarshal(w.Body.Bytes(), &got)
-		if got["code"] != "authorization_denied" {
-			t.Errorf("expected error authorization_denied, got %v", got["code"])
-		}
-		want := "WORKFLOW_ADMINISTER"
-		if route == "invalidate" {
-			want = "WORKFLOW_INVALIDATE"
-		}
-		if got["action_type"] != want {
-			t.Errorf("expected action_type %s in the denial, got %v", want, got["action_type"])
-		}
+			var got map[string]any
+			_ = json.Unmarshal(w.Body.Bytes(), &got)
+			if got["code"] != "authorization_denied" {
+				t.Errorf("expected error authorization_denied, got %v", got["code"])
+			}
+			want := "WORKFLOW_ADMINISTER"
+			if route == "invalidate" {
+				want = "WORKFLOW_INVALIDATE"
+			}
+			if got["action_type"] != want {
+				t.Errorf("expected action_type %s in the denial, got %v", want, got["action_type"])
+			}
 		})
 	}
 }
@@ -146,11 +146,11 @@ func TestLifecycleAuthz_AuthorizationUnavailable_FailsClosed(t *testing.T) {
 			if w.Code != http.StatusServiceUnavailable {
 				t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
 			}
-var got map[string]any
-	_ = json.Unmarshal(w.Body.Bytes(), &got)
-	if got["code"] != "authorization_service_unavailable" {
-		t.Errorf("expected error authorization_service_unavailable, got %v", got["code"])
-	}
+			var got map[string]any
+			_ = json.Unmarshal(w.Body.Bytes(), &got)
+			if got["code"] != "authorization_service_unavailable" {
+				t.Errorf("expected error authorization_service_unavailable, got %v", got["code"])
+			}
 		})
 	}
 }

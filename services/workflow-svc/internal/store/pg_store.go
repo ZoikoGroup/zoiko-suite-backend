@@ -66,7 +66,7 @@ type Store interface {
 	SuspendWorkflowDefinition(ctx context.Context, workflowDefinitionID string) error
 	RetireWorkflowDefinition(ctx context.Context, workflowDefinitionID string) error
 
-// Additional workflow instance methods
+	// Additional workflow instance methods
 	ListPendingApprovals(ctx context.Context, tenantID string, params domain.ListPendingApprovalsParams) ([]*domain.WorkflowInstance, *domain.PaginationCursor, error)
 	ListPendingSubmissions(ctx context.Context, tenantID, formID string, params domain.ListPendingSubmissionsParams) ([]*domain.FormSubmission, *domain.PaginationCursor, error)
 	GetApprovalEvidence(ctx context.Context, workflowInstanceID string) ([]*domain.WorkflowTransition, error)
@@ -1354,14 +1354,14 @@ func (s *PgStore) CreateCase(ctx context.Context, params domain.CreateCaseParams
 		// Write case.created event
 		return insertOutboxEventTx(ctx, tx, tenantID, "case.created", "case", c.CaseID, params.CorrelationID,
 			params.LegalEntityID, "", params.CreatedByPrincipalID, map[string]any{
-				"case_id":             c.CaseID,
-				"case_family":         c.CaseFamily,
-				"case_type":           c.CaseType,
-				"case_state":          string(c.CaseState),
-				"severity":            c.Severity,
-				"confidentiality":     c.Confidentiality,
+				"case_id":              c.CaseID,
+				"case_family":          c.CaseFamily,
+				"case_type":            c.CaseType,
+				"case_state":           string(c.CaseState),
+				"severity":             c.Severity,
+				"confidentiality":      c.Confidentiality,
 				"workflow_instance_id": c.WorkflowInstanceID,
-				"row_version":         c.RowVersion,
+				"row_version":          c.RowVersion,
 			})
 	})
 	if err != nil {
@@ -1579,12 +1579,12 @@ func (s *PgStore) TransitionCase(ctx context.Context, params domain.TransitionCa
 
 		// Write case event
 		payload := map[string]any{
-			"case_id":         updated.CaseID,
-			"case_family":     updated.CaseFamily,
-			"case_type":       updated.CaseType,
-			"previous_state":  current.CaseState,
-			"new_state":       updated.CaseState,
-			"row_version":     updated.RowVersion,
+			"case_id":        updated.CaseID,
+			"case_family":    updated.CaseFamily,
+			"case_type":      updated.CaseType,
+			"previous_state": current.CaseState,
+			"new_state":      updated.CaseState,
+			"row_version":    updated.RowVersion,
 		}
 
 		switch params.NewState {

@@ -16,12 +16,23 @@ chain, escalation, timers, re-check and append-only log as a NOBYPASSRLS role
 
 | Stage | Description | Status | Evidence |
 |-------|-------------|--------|----------|
-| S0 | Baseline | ✅ Done | No untracked files; progress.md matrix added |
-| S1 | Backend unit tests | ✅ Done | 14 packages, all pass |
-| S2 | Store integration tests | ✅ Done | Runs on scratch Postgres (requires TEST_DATABASE_URL) |
-| S3 | Contract parity | ✅ Done | OpenAPI parity test + kin-openapi validation |
-| S4 | Frontend | ⏳ Pending | Console v2.0 rebuild |
-| S5 | Live verification | ⏳ Pending | scripts/audit.sh, e2e-workflow-deps.py |
+| S0a | Fix handler test compilation, store suite reset | 🔵 Done | d198c47c · go test -count=1 ./... 18/18 pass · go vet clean · gofmt clean |
+| S0 | Baseline matrix with real test counts, migrations up/down/up on scratch DB | 🔵 Done | This commit · go test -count=1 ./... 18/18 pass (unit) · go test -count=1 -tags=integration ./internal/store/... 131s · migrations 000001-000024 up/down/up on scratch postgres:16 clean |
+| S1 | Cases schema, commands | ⏳ Pending | |
+| S2 | Cases closure gate | ⏳ Pending | |
+| S3 | Cases merge/split | ⏳ Pending | |
+| S4 | Cases confidentiality | ⏳ Pending | |
+| S5 | Cases events, idempotent open | ⏳ Pending | |
+| S6 | WFC-01 definition lifecycle | ⏳ Pending | |
+| S7 | WFC-02 work items | ⏳ Pending | |
+| S8 | State machine registry | ⏳ Pending | |
+| S9 | Available-actions | ⏳ Pending | |
+| S10 | Transition-history | ⏳ Pending | |
+| S11 | WF-1 open rows | ⏳ Pending | |
+| S11a | Approval integrity | ⏳ Pending | |
+| S11b | Instance list/summary routes | ⏳ Pending | |
+| S12-20 | Handler tests, policy events, audit/forms, R-001 mapping, identity, contracts, live, e2e, mutants | ⏳ Pending | |
+| S21 | Hand-back | ⏳ Pending | |
 
 What changed (migration 000020):
 
@@ -113,10 +124,10 @@ correctly (N-3); the gateway route and published port (H-4).
 | D2-6.F12 | **WFC-01..03: Quorum, RLS, State Model, Authority** | | TestWF1_* | DONE |
 | D2-6.F13 | Audit Engagement module | `GET/POST /v1/audit-engagements`, transitions, workpapers | TestAUD_* | DONE |
 | D2-6.F14 | Forms module | `GET/POST /v1/forms`, submissions, routing | TestFORM_* | DONE |
-| D2-6.F15 | **WFC-04: Cases** | Case lifecycle, linking | TestWF2_* | DONE |
-| D2-6.F16 | **ST-1/2/3: State Machine Registry** | Registry, available-actions, transition-history, no generic status writes | TestST_* | DONE |
+| D2-6.F15 | **WFC-04: Cases** | Case lifecycle, linking | TestWF2_* | 🔵 WF-S0a, S0 done |
+| D2-6.F16 | **ST-1/2/3: State Machine Registry** | Registry, available-actions, transition-history, no generic status writes | TestST_* | ⏳ WF-S8-S10 pending |
 | D2-6.F17 | API-4 cursor paging | All list endpoints | TestWF1_API4Paging | DONE |
-| D2-6.F18 | Dependency E2E + console v2.0 | `e2e-workflow-deps.py`, console | WF-8, WF-FE | IN PROGRESS |
+| D2-6.F18 | Dependency E2E + console v2.0 | `e2e-workflow-deps.py`, console | WF-8, WF-FE | ⏳ WF-FE-1..3 pending |
 
 ## History: v1 built and verified end-to-end (2026-07-09)
 

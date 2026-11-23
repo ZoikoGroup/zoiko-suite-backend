@@ -72,28 +72,31 @@ CREATE TRIGGER cases_updated_at
 -- Case members table
 CREATE TABLE case_members (
     case_member_id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id               uuid NOT NULL,
     case_id                 uuid NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE,
     principal_id            text NOT NULL,
     role                    text NOT NULL,  -- OWNER, ASSIGNEE, OBSERVER, etc.
     added_at                timestamptz NOT NULL DEFAULT NOW(),
     added_by_principal_id   text NOT NULL,
     removed_at              timestamptz,
-    removed_by_principal_id text,
-    UNIQUE (case_id, principal_id, role) WHERE removed_at IS NULL
+    removed_by_principal_id text
 );
 
+CREATE UNIQUE INDEX case_members_unique_active ON case_members(case_id, principal_id, role) WHERE removed_at IS NULL;
+CREATE INDEX case_members_tenant_id_idx ON case_members(tenant_id);
 CREATE INDEX case_members_case_id_idx ON case_members(case_id);
 CREATE INDEX case_members_principal_id_idx ON case_members(principal_id);
 
 ALTER TABLE case_members ENABLE ROW LEVEL SECURITY;
 ALTER TABLE case_members FORCE ROW LEVEL SECURITY;
 CREATE POLICY case_members_tenant_isolation ON case_members
-    USING (case_id IN (SELECT case_id FROM cases WHERE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid))
-    WITH CHECK (case_id IN (SELECT case_id FROM cases WHERE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid));
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid)
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
 
 -- Case notes table (append-only, versioned)
 CREATE TABLE case_notes (
     case_note_id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id               uuid NOT NULL,
     case_id                 uuid NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE,
     principal_id            text NOT NULL,
     content                 text NOT NULL,
@@ -105,14 +108,15 @@ CREATE TABLE case_notes (
     previous_note_id        uuid REFERENCES case_notes(case_note_id) ON DELETE SET NULL
 );
 
+CREATE INDEX case_notes_tenant_id_idx ON case_notes(tenant_id);
 CREATE INDEX case_notes_case_id_idx ON case_notes(case_id);
 CREATE INDEX case_notes_principal_id_idx ON case_notes(principal_id);
 
 ALTER TABLE case_notes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE case_notes FORCE ROW LEVEL SECURITY;
 CREATE POLICY case_notes_tenant_isolation ON case_notes
-    USING (case_id IN (SELECT case_id FROM cases WHERE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid))
-    WITH CHECK (case_id IN (SELECT case_id FROM cases WHERE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid));
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid)
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
 
 CREATE TRIGGER case_notes_updated_at
     BEFORE UPDATE ON case_notes
@@ -121,6 +125,7 @@ CREATE TRIGGER case_notes_updated_at
 -- Case links table (domain refs, read-only)
 CREATE TABLE case_links (
     case_link_id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id               uuid NOT NULL,
     case_id                 uuid NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE,
     domain_object_type      text NOT NULL,  -- e.g., 'invoice', 'payroll_run', 'contract'
     domain_object_id        text NOT NULL,
@@ -129,18 +134,20 @@ CREATE TABLE case_links (
     UNIQUE (case_id, domain_object_type, domain_object_id)
 );
 
+CREATE INDEX case_links_tenant_id_idx ON case_links(tenant_id);
 CREATE INDEX case_links_case_id_idx ON case_links(case_id);
 CREATE INDEX case_links_domain_object_idx ON case_links(domain_object_type, domain_object_id);
 
 ALTER TABLE case_links ENABLE ROW LEVEL SECURITY;
 ALTER TABLE case_links FORCE ROW LEVEL SECURITY;
 CREATE POLICY case_links_tenant_isolation ON case_links
-    USING (case_id IN (SELECT case_id FROM cases WHERE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid))
-    WITH CHECK (case_id IN (SELECT case_id FROM cases WHERE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid));
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid)
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
 
 -- Case transitions table (append-only by trigger)
 CREATE TABLE case_transitions (
     case_transition_id      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id               uuid NOT NULL,
     case_id                 uuid NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE,
     from_state              case_state,
     to_state                case_state NOT NULL,
@@ -152,18 +159,20 @@ CREATE TABLE case_transitions (
     created_at              timestamptz NOT NULL DEFAULT NOW()
 );
 
+CREATE INDEX case_transitions_tenant_id_idx ON case_transitions(tenant_id);
 CREATE INDEX case_transitions_case_id_idx ON case_transitions(case_id);
 CREATE INDEX case_transitions_created_at_idx ON case_transitions(created_at);
 
 ALTER TABLE case_transitions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE case_transitions FORCE ROW LEVEL SECURITY;
 CREATE POLICY case_transitions_tenant_isolation ON case_transitions
-    USING (case_id IN (SELECT case_id FROM cases WHERE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid))
-    WITH CHECK (case_id IN (SELECT case_id FROM cases WHERE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid));
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid)
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
 
 -- Case aliases table (for merge lineage)
 CREATE TABLE case_aliases (
     alias_id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id               uuid NOT NULL,
     canonical_case_id       uuid NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE,
     alias_case_id           uuid NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE,
     merged_at               timestamptz NOT NULL DEFAULT NOW(),
@@ -171,14 +180,15 @@ CREATE TABLE case_aliases (
     UNIQUE (canonical_case_id, alias_case_id)
 );
 
+CREATE INDEX case_aliases_tenant_id_idx ON case_aliases(tenant_id);
 CREATE INDEX case_aliases_canonical_idx ON case_aliases(canonical_case_id);
 CREATE INDEX case_aliases_alias_idx ON case_aliases(alias_case_id);
 
 ALTER TABLE case_aliases ENABLE ROW LEVEL SECURITY;
 ALTER TABLE case_aliases FORCE ROW LEVEL SECURITY;
 CREATE POLICY case_aliases_tenant_isolation ON case_aliases
-    USING (canonical_case_id IN (SELECT case_id FROM cases WHERE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid))
-    WITH CHECK (canonical_case_id IN (SELECT case_id FROM cases WHERE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid));
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid)
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
 
 -- Generic work_items table (WFC-02 shape, extended for WF-S1 mandatory items)
 CREATE TABLE work_items (
@@ -201,6 +211,7 @@ CREATE TABLE work_items (
 );
 
 CREATE INDEX work_items_tenant_id_idx ON work_items(tenant_id);
+CREATE INDEX work_items_legal_entity_id_idx ON work_items(legal_entity_id);
 CREATE INDEX work_items_case_id_idx ON work_items(case_id);
 CREATE INDEX work_items_workflow_instance_id_idx ON work_items(workflow_instance_id);
 CREATE INDEX work_items_assignee_idx ON work_items(assignee_principal_id);
@@ -219,6 +230,7 @@ CREATE TRIGGER work_items_updated_at
 -- Work item assignments history (append-only)
 CREATE TABLE work_item_assignments (
     work_item_assignment_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id               uuid NOT NULL,
     work_item_id            uuid NOT NULL REFERENCES work_items(work_item_id) ON DELETE CASCADE,
     previous_assignee_id    text,
     new_assignee_id         text NOT NULL,
@@ -227,13 +239,14 @@ CREATE TABLE work_item_assignments (
     assigned_at             timestamptz NOT NULL DEFAULT NOW()
 );
 
+CREATE INDEX work_item_assignments_tenant_id_idx ON work_item_assignments(tenant_id);
 CREATE INDEX work_item_assignments_work_item_id_idx ON work_item_assignments(work_item_id);
 
 ALTER TABLE work_item_assignments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE work_item_assignments FORCE ROW LEVEL SECURITY;
 CREATE POLICY work_item_assignments_tenant_isolation ON work_item_assignments
-    USING (work_item_id IN (SELECT work_item_id FROM work_items WHERE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid))
-    WITH CHECK (work_item_id IN (SELECT work_item_id FROM work_items WHERE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid));
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid)
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
 
 COMMENT ON TABLE cases IS 'WFC-04: Cases — distinct business objects from workflows. States: OPEN→TRIAGED→IN_PROGRESS→WAITING_INTERNAL/EXTERNAL→RESOLVED/CLOSED/REOPENED.';
 COMMENT ON COLUMN cases.case_family IS 'Case family: FINANCIAL, PAYROLL_HR, LEGAL_COMPLIANCE, SECURITY_PRIVACY, OPERATIONAL';
