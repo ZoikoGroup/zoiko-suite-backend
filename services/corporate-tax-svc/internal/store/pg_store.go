@@ -12,21 +12,60 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/corporate-tax-svc/internal/domain"
+	"zoiko.io/corporate-tax-svc/internal/events"
 	"zoiko.io/corporate-tax-svc/internal/middleware"
+	"zoiko.io/corporate-tax-svc/internal/outbox"
 )
 
 // Store defines all persistence operations for corporate tax returns and nexus records.
 type Store interface {
-	Create(ctx context.Context, r *domain.TaxReturn) error
+	Create(ctx context.Context, r *domain.TaxReturn, meta EventMeta) error
 	GetByID(ctx context.Context, id string) (*domain.TaxReturn, error)
 	List(ctx context.Context, legalEntityID, jurisdictionID, status string, fiscalYear int) ([]domain.TaxReturn, error)
-	Update(ctx context.Context, r *domain.TaxReturn) error
-	Submit(ctx context.Context, id, submittedBy string) (*domain.TaxReturn, error)
-	Assess(ctx context.Context, id string, req *domain.AssessTaxReturnRequest) (*domain.TaxReturn, error)
+	Update(ctx context.Context, r *domain.TaxReturn, meta EventMeta) error
+	Submit(ctx context.Context, id, submittedBy string, meta EventMeta) (*domain.TaxReturn, error)
+	// Assess records the assessment. assessedBy must differ from the
+	// return's submitted_by (ErrSegregationOfDuties), checked under the row
+	// lock.
+	Assess(ctx context.Context, id string, req *domain.AssessTaxReturnRequest, assessedBy string, meta EventMeta) (*domain.TaxReturn, error)
 
 	CreateNexusRecord(ctx context.Context, r *domain.NexusRecord) error
 	GetNexusRecordByID(ctx context.Context, id string) (*domain.NexusRecord, error)
 	ListNexusRecords(ctx context.Context, legalEntityID, jurisdictionID string) ([]domain.NexusRecord, error)
+}
+
+// Event types written to the outbox. Unchanged from the former direct publish.
+const (
+	EventTaxReturnCreated   = "corporate_tax_return.created"
+	EventTaxReturnUpdated   = "corporate_tax_return.updated"
+	EventTaxReturnSubmitted = "corporate_tax_return.submitted"
+	EventTaxReturnAssessed  = "corporate_tax_return.assessed"
+)
+
+// EventMeta is the request context a write's domain event carries: who did it
+// and under which correlation. The store writes the event to outbox_events in
+// the same transaction as the change.
+type EventMeta struct {
+	ActorID       string
+	CorrelationID string
+}
+
+// writeEvent inserts the domain event for r into the outbox using the
+// business transaction tx, so the change and its event commit together.
+func writeEvent(ctx context.Context, tx pgx.Tx, eventType string, r *domain.TaxReturn, meta EventMeta) error {
+	tenantID := middleware.GetTenantID(ctx)
+	evt := events.NewEvent(events.PublishParams{
+		EventType: eventType, ReturnID: r.ReturnID, TenantID: tenantID,
+		LegalEntityID: r.LegalEntityID,
+		Jurisdiction:  r.JurisdictionID,
+		ActorID:       meta.ActorID, CorrelationID: meta.CorrelationID, Payload: r,
+	})
+	_, err := outbox.Insert(ctx, tx, outbox.Event{
+		AggregateType: "corporate_tax_return", AggregateID: r.ReturnID, EventType: eventType,
+		TenantID: tenantID, LegalEntityID: r.LegalEntityID, ActorID: meta.ActorID,
+		CorrelationID: meta.CorrelationID, Payload: evt,
+	})
+	return err
 }
 
 // PgStore is the PostgreSQL-backed implementation of Store.
@@ -47,7 +86,7 @@ func (s *PgStore) setRLS(ctx context.Context, tx pgx.Tx) error {
 	return err
 }
 
-func (s *PgStore) Create(ctx context.Context, r *domain.TaxReturn) error {
+func (s *PgStore) Create(ctx context.Context, r *domain.TaxReturn, meta EventMeta) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -90,6 +129,9 @@ func (s *PgStore) Create(ctx context.Context, r *domain.TaxReturn) error {
 			return domain.ErrDuplicateReturn
 		}
 		return fmt.Errorf("insert corporate tax return: %w", err)
+	}
+	if err := writeEvent(ctx, tx, EventTaxReturnCreated, r, meta); err != nil {
+		return err
 	}
 	return tx.Commit(ctx)
 }
@@ -189,7 +231,7 @@ func (s *PgStore) List(ctx context.Context, legalEntityID, jurisdictionID, statu
 	return out, nil
 }
 
-func (s *PgStore) Update(ctx context.Context, r *domain.TaxReturn) error {
+func (s *PgStore) Update(ctx context.Context, r *domain.TaxReturn, meta EventMeta) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -214,12 +256,15 @@ func (s *PgStore) Update(ctx context.Context, r *domain.TaxReturn) error {
 	if err != nil {
 		return fmt.Errorf("update corporate tax return: %w", err)
 	}
+	if err := writeEvent(ctx, tx, EventTaxReturnUpdated, r, meta); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 
 // Submit moves DRAFT -> SUBMITTED inside a single transaction with a
 // FOR UPDATE row lock, eliminating the TOCTOU race.
-func (s *PgStore) Submit(ctx context.Context, id, submittedBy string) (*domain.TaxReturn, error) {
+func (s *PgStore) Submit(ctx context.Context, id, submittedBy string, meta EventMeta) (*domain.TaxReturn, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -277,6 +322,9 @@ func (s *PgStore) Submit(ctx context.Context, id, submittedBy string) (*domain.T
 	if err != nil {
 		return nil, fmt.Errorf("submit corporate tax return: %w", err)
 	}
+	if err := writeEvent(ctx, tx, EventTaxReturnSubmitted, &r, meta); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -284,7 +332,7 @@ func (s *PgStore) Submit(ctx context.Context, id, submittedBy string) (*domain.T
 }
 
 // Assess records a tax authority assessment inside a single transaction with a FOR UPDATE row lock.
-func (s *PgStore) Assess(ctx context.Context, id string, req *domain.AssessTaxReturnRequest) (*domain.TaxReturn, error) {
+func (s *PgStore) Assess(ctx context.Context, id string, req *domain.AssessTaxReturnRequest, assessedBy string, meta EventMeta) (*domain.TaxReturn, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -328,6 +376,9 @@ func (s *PgStore) Assess(ctx context.Context, id string, req *domain.AssessTaxRe
 	if r.Status != domain.StatusSubmitted {
 		return nil, domain.ErrInvalidStatusTransition
 	}
+	if r.SubmittedBy != nil && *r.SubmittedBy == assessedBy {
+		return nil, domain.ErrSegregationOfDuties
+	}
 
 	now := time.Now().UTC()
 	r.Status = domain.StatusAssessed
@@ -346,6 +397,9 @@ func (s *PgStore) Assess(ctx context.Context, id string, req *domain.AssessTaxRe
 	)
 	if err != nil {
 		return nil, fmt.Errorf("assess corporate tax return: %w", err)
+	}
+	if err := writeEvent(ctx, tx, EventTaxReturnAssessed, &r, meta); err != nil {
+		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err

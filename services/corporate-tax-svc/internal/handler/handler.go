@@ -13,7 +13,6 @@ import (
 
 	"zoiko.io/corporate-tax-svc/internal/authz"
 	"zoiko.io/corporate-tax-svc/internal/domain"
-	"zoiko.io/corporate-tax-svc/internal/events"
 	"zoiko.io/corporate-tax-svc/internal/evidencereq"
 	"zoiko.io/corporate-tax-svc/internal/middleware"
 	"zoiko.io/corporate-tax-svc/internal/store"
@@ -27,15 +26,28 @@ const (
 	ActionTaxReturnAssess   = "TAX_RETURN_ASSESS"
 	ActionNexusRecordCreate = "NEXUS_RECORD_CREATE"
 	ActionNexusRecordRead   = "NEXUS_RECORD_READ"
+	ActionTaxReturnRead     = "TAX_RETURN_READ"
 )
 
-// Handler wires together the HTTP layer with the store and event bus.
+// Stable error code for a refused maker-checker step.
+const codeSegregationOfDuties = "segregation_of_duties"
+
+// AuthzChecker is the authorization-svc contract this handler depends on.
+// authz.Client satisfies it; tests can substitute a stub.
+type AuthzChecker interface {
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+}
+
+var _ AuthzChecker = (*authz.Client)(nil)
+
+// Handler wires together the HTTP layer with the store. Domain events are
+// written by the store to the transactional outbox inside the business
+// transaction and delivered by internal/outbox.Relay.
 type Handler struct {
-	store     store.Store
-	publisher events.Publisher
-	authz     *authz.Client
-	evidence  EvidenceChecker
-	logger    *zap.Logger
+	store    store.Store
+	authz    AuthzChecker
+	evidence EvidenceChecker
+	logger   *zap.Logger
 }
 
 // EvidenceChecker is the evidence-requirements contract the handler depends
@@ -45,8 +57,8 @@ type EvidenceChecker interface {
 	EvaluateSufficient(ctx context.Context, tenantID, legalEntityID, domainCode, actionType, correlationID, principalID string, evidenceRefs []string) error
 }
 
-func New(st store.Store, pub events.Publisher, az *authz.Client, logger *zap.Logger) *Handler {
-	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+func New(st store.Store, az AuthzChecker, logger *zap.Logger) *Handler {
+	return &Handler{store: st, authz: az, logger: logger}
 }
 
 // WithEvidenceGate wires the evidence-requirements gate into return submission.
@@ -127,8 +139,6 @@ func (h *Handler) checkAuthorized(w http.ResponseWriter, r *http.Request, princi
 }
 
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
-	tenantID := middleware.GetTenantID(r.Context())
-
 	principalID, ok := principalIDOrUnauthorized(w, r)
 	if !ok {
 		return
@@ -166,7 +176,7 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		CreatedBy:             principalID,
 	}
 
-	if err := h.store.Create(r.Context(), ret); err != nil {
+	if err := h.store.Create(r.Context(), ret, eventMeta(r, principalID)); err != nil {
 		if errors.Is(err, domain.ErrDuplicateReturn) {
 			writeError(w, http.StatusConflict, domain.ErrDuplicateReturn.Error())
 			return
@@ -176,15 +186,34 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "corporate_tax_return.created", ReturnID: ret.ReturnID, TenantID: tenantID,
-		LegalEntityID: ret.LegalEntityID, Jurisdiction: ret.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: ret,
-	})
 	writeJSON(w, http.StatusCreated, ret)
 }
 
+// authorizeRead authorizes a read of action in scope (the record's legal
+// entity, a list's legal_entity_id filter, or the tenant for a tenant-wide
+// list). Reads used to need nothing beyond X-Tenant-Id. Now: no principal is
+// 401, a denied principal is 403, an unreachable authorization-svc is 503.
+func (h *Handler) authorizeRead(w http.ResponseWriter, r *http.Request, scope, action string) bool {
+	principalID, ok := principalIDOrUnauthorized(w, r)
+	if !ok {
+		return false
+	}
+	return h.checkAuthorized(w, r, principalID, scope, action)
+}
+
+// listScope is the authorization scope of a list: its legal_entity_id
+// filter when given, else the caller's tenant.
+func listScope(r *http.Request) string {
+	if le := r.URL.Query().Get("legal_entity_id"); le != "" {
+		return le
+	}
+	return middleware.GetTenantID(r.Context())
+}
+
 func (h *Handler) GetByID(w http.ResponseWriter, r *http.Request) {
+	if _, ok := principalIDOrUnauthorized(w, r); !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	if id == "" {
 		writeError(w, http.StatusBadRequest, "id is required")
@@ -200,10 +229,16 @@ func (h *Handler) GetByID(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to fetch corporate tax return")
 		return
 	}
+	if !h.authorizeRead(w, r, ret.LegalEntityID, ActionTaxReturnRead) {
+		return
+	}
 	writeJSON(w, http.StatusOK, ret)
 }
 
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
+	if !h.authorizeRead(w, r, listScope(r), ActionTaxReturnRead) {
+		return
+	}
 	q := r.URL.Query()
 	fiscalYear, _ := strconv.Atoi(q.Get("fiscal_year"))
 
@@ -226,7 +261,6 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	principalID, ok := principalIDOrUnauthorized(w, r)
 	if !ok {
@@ -265,16 +299,11 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	existing.TaxAlreadyPaid = req.TaxAlreadyPaid
 	existing.Notes = req.Notes
 
-	if err := h.store.Update(r.Context(), existing); err != nil {
+	if err := h.store.Update(r.Context(), existing, eventMeta(r, principalID)); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to update corporate tax return")
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "corporate_tax_return.updated", ReturnID: id, TenantID: tenantID,
-		LegalEntityID: existing.LegalEntityID, Jurisdiction: existing.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: existing,
-	})
 	writeJSON(w, http.StatusOK, existing)
 }
 
@@ -305,7 +334,7 @@ func (h *Handler) Submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ret, err := h.store.Submit(r.Context(), id, principalID)
+	ret, err := h.store.Submit(r.Context(), id, principalID, eventMeta(r, principalID))
 	if err != nil {
 		if errors.Is(err, domain.ErrAlreadySubmitted) {
 			writeError(w, http.StatusConflict, "return has already been submitted")
@@ -319,17 +348,11 @@ func (h *Handler) Submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "corporate_tax_return.submitted", ReturnID: id, TenantID: tenantID,
-		LegalEntityID: ret.LegalEntityID, Jurisdiction: ret.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: ret,
-	})
 	writeJSON(w, http.StatusOK, ret)
 }
 
 func (h *Handler) Assess(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	principalID, ok := principalIDOrUnauthorized(w, r)
 	if !ok {
@@ -349,6 +372,12 @@ func (h *Handler) Assess(w http.ResponseWriter, r *http.Request) {
 	if !h.checkAuthorized(w, r, principalID, existing.LegalEntityID, ActionTaxReturnAssess) {
 		return
 	}
+	// Segregation of duties: whoever submitted the return may not also record
+	// its assessment. Re-checked by the store under the row lock.
+	if existing.SubmittedBy != nil && *existing.SubmittedBy == principalID {
+		writeCodedError(w, http.StatusForbidden, codeSegregationOfDuties, domain.ErrSegregationOfDuties.Error())
+		return
+	}
 
 	var req domain.AssessTaxReturnRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -360,8 +389,12 @@ func (h *Handler) Assess(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ret, err := h.store.Assess(r.Context(), id, &req)
+	ret, err := h.store.Assess(r.Context(), id, &req, principalID, eventMeta(r, principalID))
 	if err != nil {
+		if errors.Is(err, domain.ErrSegregationOfDuties) {
+			writeCodedError(w, http.StatusForbidden, codeSegregationOfDuties, domain.ErrSegregationOfDuties.Error())
+			return
+		}
 		if errors.Is(err, domain.ErrTaxReturnNotFound) {
 			writeError(w, http.StatusNotFound, "corporate tax return not found")
 			return
@@ -373,11 +406,6 @@ func (h *Handler) Assess(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to record assessment")
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "corporate_tax_return.assessed", ReturnID: id, TenantID: tenantID,
-		LegalEntityID: ret.LegalEntityID, Jurisdiction: ret.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: ret,
-	})
 	writeJSON(w, http.StatusOK, ret)
 }
 
@@ -422,6 +450,9 @@ func (h *Handler) CreateNexusRecord(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetNexusRecordByID(w http.ResponseWriter, r *http.Request) {
+	if _, ok := principalIDOrUnauthorized(w, r); !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	if id == "" {
 		writeError(w, http.StatusBadRequest, "id is required")
@@ -437,11 +468,17 @@ func (h *Handler) GetNexusRecordByID(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to get nexus record")
 		return
 	}
+	if !h.authorizeRead(w, r, record.LegalEntityID, ActionNexusRecordRead) {
+		return
+	}
 
 	writeJSON(w, http.StatusOK, record)
 }
 
 func (h *Handler) ListNexusRecords(w http.ResponseWriter, r *http.Request) {
+	if !h.authorizeRead(w, r, listScope(r), ActionNexusRecordRead) {
+		return
+	}
 	q := r.URL.Query()
 	records, err := h.store.ListNexusRecords(r.Context(), q.Get("legal_entity_id"), q.Get("jurisdiction_id"))
 	if err != nil {
@@ -462,4 +499,14 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// writeCodedError is writeError plus a stable machine-readable code.
+func writeCodedError(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg, "code": code})
+}
+
+// eventMeta is what the outbox event of a write records about the request.
+func eventMeta(r *http.Request, principalID string) store.EventMeta {
+	return store.EventMeta{ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID")}
 }

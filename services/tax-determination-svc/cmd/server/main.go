@@ -25,6 +25,7 @@ import (
 	"zoiko.io/tax-determination-svc/internal/jurisdiction"
 	"zoiko.io/tax-determination-svc/internal/middleware"
 	"zoiko.io/tax-determination-svc/internal/mtls"
+	"zoiko.io/tax-determination-svc/internal/outbox"
 	"zoiko.io/tax-determination-svc/internal/registry"
 	"zoiko.io/tax-determination-svc/internal/rules"
 	"zoiko.io/tax-determination-svc/internal/store"
@@ -92,7 +93,15 @@ func main() {
 	jurisdictionClient := jurisdiction.NewClient(cfg.JurisdictionRulesURL)
 	registryClient := registry.NewClient(cfg.TenantEntityRegistryURL)
 
-	h := handler.New(pgStore, publisher, authzClient, rulesClient, jurisdictionClient, registryClient, logger)
+	h := handler.New(pgStore, authzClient, rulesClient, jurisdictionClient, registryClient, logger)
+
+	// Transactional outbox relay: delivers the events the store writes in the
+	// same transaction as each change, retrying until Kafka accepts them.
+	relayCtx, relayCancel := context.WithCancel(context.Background())
+	defer relayCancel()
+	if pool != nil {
+		go outbox.NewRelay(pool, publisher, 1500*time.Millisecond, 50, logger).Start(relayCtx)
+	}
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -140,6 +149,7 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
+	relayCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("server shutdown forced", zap.Error(err))
 	}

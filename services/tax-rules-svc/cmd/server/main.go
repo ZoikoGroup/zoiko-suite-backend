@@ -24,6 +24,7 @@ import (
 	"zoiko.io/tax-rules-svc/internal/idempotency"
 	"zoiko.io/tax-rules-svc/internal/middleware"
 	"zoiko.io/tax-rules-svc/internal/mtls"
+	"zoiko.io/tax-rules-svc/internal/outbox"
 	"zoiko.io/tax-rules-svc/internal/store"
 	"zoiko.io/tax-rules-svc/internal/telemetry"
 )
@@ -81,7 +82,15 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
 
-	h := handler.New(pgStore, publisher, authzClient, logger)
+	h := handler.New(pgStore, authzClient, logger)
+
+	// Transactional outbox relay: delivers the events the store writes in the
+	// same transaction as each change, retrying until Kafka accepts them.
+	relayCtx, relayCancel := context.WithCancel(context.Background())
+	defer relayCancel()
+	if pool != nil {
+		go outbox.NewRelay(pool, publisher, 1500*time.Millisecond, 50, logger).Start(relayCtx)
+	}
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -129,6 +138,7 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
+	relayCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("server shutdown forced", zap.Error(err))
 	}

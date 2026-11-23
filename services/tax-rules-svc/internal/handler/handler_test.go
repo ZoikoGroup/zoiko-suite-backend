@@ -12,11 +12,12 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/tax-rules-svc/internal/domain"
-	"zoiko.io/tax-rules-svc/internal/events"
+	"zoiko.io/tax-rules-svc/internal/store"
 )
 
 type stubStore struct {
 	rules map[string]*domain.TaxRule
+	metas []store.EventMeta
 }
 
 func newStubStore() *stubStore {
@@ -25,7 +26,8 @@ func newStubStore() *stubStore {
 	}
 }
 
-func (s *stubStore) CreateTaxRule(_ context.Context, r *domain.TaxRule) error {
+func (s *stubStore) CreateTaxRule(_ context.Context, r *domain.TaxRule, meta store.EventMeta) error {
+	s.metas = append(s.metas, meta)
 	if r.RuleID == "" {
 		r.RuleID = "trule-test-001"
 	}
@@ -51,18 +53,11 @@ func (s *stubStore) ListTaxRules(_ context.Context, _, _, _ string) ([]domain.Ta
 	return out, nil
 }
 
-func (s *stubStore) UpdateTaxRule(_ context.Context, r *domain.TaxRule) error {
+func (s *stubStore) UpdateTaxRule(_ context.Context, r *domain.TaxRule, meta store.EventMeta) error {
+	s.metas = append(s.metas, meta)
 	s.rules[r.RuleID] = r
 	return nil
 }
-
-type stubPublisher struct{}
-
-func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error {
-	return nil
-}
-
-var _ events.Publisher = (*stubPublisher)(nil)
 
 type stubAuthz struct{}
 
@@ -74,7 +69,7 @@ var _ AuthZClient = (*stubAuthz)(nil)
 
 func newTestHandler() *Handler {
 	logger, _ := zap.NewDevelopment()
-	return New(newStubStore(), &stubPublisher{}, &stubAuthz{}, logger)
+	return New(newStubStore(), &stubAuthz{}, logger)
 }
 
 func buildRequest(method, path string, body interface{}) *http.Request {
@@ -219,3 +214,23 @@ func TestGetAndListTaxRules_Authz(t *testing.T) {
 	}
 }
 
+// The event a write emits carries the authenticated principal and the
+// request's correlation id; the store writes it to the outbox in the same
+// transaction as the change.
+func TestCreateTaxRule_PassesActorAndCorrelationToOutbox(t *testing.T) {
+	st := newStubStore()
+	logger, _ := zap.NewDevelopment()
+	h := New(st, &stubAuthz{}, logger)
+	req := buildRequest(http.MethodPost, "/v1/tax-rules", domain.CreateTaxRuleRequest{
+		JurisdictionID: "GB", RuleCode: "R1", Name: "n", Category: domain.CategoryVAT, EffectiveFrom: "2026-01-01",
+	})
+	req.Header.Set("X-Correlation-ID", "corr-42")
+	w := httptest.NewRecorder()
+	h.CreateTaxRule(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d - %s", w.Code, w.Body.String())
+	}
+	if len(st.metas) != 1 || st.metas[0].ActorID != "principal-test-01" || st.metas[0].CorrelationID != "corr-42" {
+		t.Fatalf("unexpected event meta: %+v", st.metas)
+	}
+}

@@ -8,6 +8,7 @@ package events_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/segmentio/kafka-go"
@@ -49,7 +50,7 @@ func TestPublish_EnvelopeCarriesJurisdictionAndActor(t *testing.T) {
 	w := &fakeWriter{}
 	p := events.NewKafkaPublisherWithWriter(w, "zoiko.tax-determination.events", zap.NewNop())
 
-	err := p.Publish(context.Background(), events.PublishParams{
+	err := publishVia(p, events.PublishParams{
 		EventType: "tax_determination.overridden", DeterminationID: "det-1", TenantID: "tenant-1",
 		LegalEntityID: "entity-1", Jurisdiction: "jurisdiction-1", ActorID: "overrider-1", CorrelationID: "corr-1",
 		Payload: map[string]string{"status": "OVERRIDDEN"},
@@ -73,7 +74,7 @@ func TestPublish_RepeatEventsOnSameDetermination_GetDistinctEventIDs(t *testing.
 	p := events.NewKafkaPublisherWithWriter(w, "zoiko.tax-determination.events", zap.NewNop())
 
 	for i := 0; i < 2; i++ {
-		err := p.Publish(context.Background(), events.PublishParams{
+		err := publishVia(p, events.PublishParams{
 			EventType: "tax_determination.calculated", DeterminationID: "det-1", TenantID: "tenant-1",
 			ActorID: "calculator-1", CorrelationID: "corr-x",
 			Payload: map[string]int{"attempt": i + 1},
@@ -85,4 +86,44 @@ func TestPublish_RepeatEventsOnSameDetermination_GetDistinctEventIDs(t *testing.
 	first := decode(t, w.msgs[0])
 	second := decode(t, w.msgs[1])
 	assert.NotEqual(t, first.EventID, second.EventID)
+}
+
+// publishVia exercises the delivery path the outbox uses: the envelope built
+// by NewEvent at transaction time, delivered by PublishOutbox.
+func publishVia(p *events.KafkaPublisher, params events.PublishParams) error {
+	data, err := json.Marshal(events.NewEvent(params))
+	if err != nil {
+		return err
+	}
+	return p.PublishOutbox(context.Background(), "ob-test", "agg-test", data)
+}
+
+func TestNewEvent_CarriesSchemaVersion(t *testing.T) {
+	assert.Equal(t, "1.0", events.NewEvent(events.PublishParams{EventType: "x"}).SchemaVersion)
+}
+
+func TestPublishOutbox_KeysByAggregateAndCarriesStableEventID(t *testing.T) {
+	w := &fakeWriter{}
+	p := events.NewKafkaPublisherWithWriter(w, "topic", zap.NewNop())
+
+	require.NoError(t, p.PublishOutbox(context.Background(), "ob-1", "agg-1", []byte(`{"event_type":"x"}`)))
+	require.Len(t, w.msgs, 1)
+	assert.Equal(t, "agg-1", string(w.msgs[0].Key))
+	assert.JSONEq(t, `{"event_type":"x"}`, string(w.msgs[0].Value))
+	require.Len(t, w.msgs[0].Headers, 1)
+	assert.Equal(t, "X-Event-ID", w.msgs[0].Headers[0].Key)
+	assert.Equal(t, "ob-1", string(w.msgs[0].Headers[0].Value))
+}
+
+type failingWriter struct{}
+
+func (failingWriter) WriteMessages(context.Context, ...kafka.Message) error {
+	return errors.New("broker down")
+}
+
+// The former Publish logged and returned nil on a broker failure; the outbox
+// relay must see the error so it keeps the row and retries.
+func TestPublishOutbox_ReturnsBrokerError(t *testing.T) {
+	p := events.NewKafkaPublisherWithWriter(failingWriter{}, "topic", zap.NewNop())
+	require.Error(t, p.PublishOutbox(context.Background(), "ob-1", "agg-1", []byte(`{}`)))
 }

@@ -11,15 +11,50 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/vat-gst-svc/internal/domain"
+	"zoiko.io/vat-gst-svc/internal/events"
 	"zoiko.io/vat-gst-svc/internal/middleware"
+	"zoiko.io/vat-gst-svc/internal/outbox"
 )
 
 type Store interface {
-	CreateVATReturn(ctx context.Context, r *domain.VATReturn) error
+	CreateVATReturn(ctx context.Context, r *domain.VATReturn, meta EventMeta) error
 	GetVATReturn(ctx context.Context, id string) (*domain.VATReturn, error)
 	ListVATReturns(ctx context.Context, legalEntityID, jurisdictionID, status string) ([]domain.VATReturn, error)
-	UpdateVATReturn(ctx context.Context, r *domain.VATReturn) error
-	FileVATReturn(ctx context.Context, id, filedBy string) (*domain.VATReturn, error)
+	UpdateVATReturn(ctx context.Context, r *domain.VATReturn, meta EventMeta) error
+	FileVATReturn(ctx context.Context, id, filedBy string, meta EventMeta) (*domain.VATReturn, error)
+}
+
+// Event types written to the outbox. Unchanged from the former direct publish.
+const (
+	EventVATReturnCreated = "vat_return.created"
+	EventVATReturnUpdated = "vat_return.updated"
+	EventVATReturnFiled   = "vat_return.filed"
+)
+
+// EventMeta is the request context a write's domain event carries: who did it
+// and under which correlation. The store writes the event to outbox_events in
+// the same transaction as the change.
+type EventMeta struct {
+	ActorID       string
+	CorrelationID string
+}
+
+// writeEvent inserts the domain event for r into the outbox using the
+// business transaction tx, so the change and its event commit together.
+func writeEvent(ctx context.Context, tx pgx.Tx, eventType string, r *domain.VATReturn, meta EventMeta) error {
+	tenantID := middleware.GetTenantID(ctx)
+	evt := events.NewEvent(events.PublishParams{
+		EventType: eventType, ReturnID: r.ReturnID, TenantID: tenantID,
+		LegalEntityID: r.LegalEntityID,
+		Jurisdiction:  r.JurisdictionID,
+		ActorID:       meta.ActorID, CorrelationID: meta.CorrelationID, Payload: r,
+	})
+	_, err := outbox.Insert(ctx, tx, outbox.Event{
+		AggregateType: "vat_return", AggregateID: r.ReturnID, EventType: eventType,
+		TenantID: tenantID, LegalEntityID: r.LegalEntityID, ActorID: meta.ActorID,
+		CorrelationID: meta.CorrelationID, Payload: evt,
+	})
+	return err
 }
 
 type PgStore struct {
@@ -39,7 +74,7 @@ func (s *PgStore) setRLS(ctx context.Context, tx pgx.Tx) error {
 	return err
 }
 
-func (s *PgStore) CreateVATReturn(ctx context.Context, r *domain.VATReturn) error {
+func (s *PgStore) CreateVATReturn(ctx context.Context, r *domain.VATReturn, meta EventMeta) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -76,6 +111,9 @@ func (s *PgStore) CreateVATReturn(ctx context.Context, r *domain.VATReturn) erro
 			return domain.ErrVATReturnConflict
 		}
 		return fmt.Errorf("insert vat return: %w", err)
+	}
+	if err := writeEvent(ctx, tx, EventVATReturnCreated, r, meta); err != nil {
+		return err
 	}
 
 	return tx.Commit(ctx)
@@ -164,7 +202,7 @@ func (s *PgStore) ListVATReturns(ctx context.Context, legalEntityID, jurisdictio
 	return out, nil
 }
 
-func (s *PgStore) UpdateVATReturn(ctx context.Context, r *domain.VATReturn) error {
+func (s *PgStore) UpdateVATReturn(ctx context.Context, r *domain.VATReturn, meta EventMeta) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -206,11 +244,14 @@ func (s *PgStore) UpdateVATReturn(ctx context.Context, r *domain.VATReturn) erro
 	if cmdTag.RowsAffected() == 0 {
 		return fmt.Errorf("vat return not found or already filed")
 	}
+	if err := writeEvent(ctx, tx, EventVATReturnUpdated, r, meta); err != nil {
+		return err
+	}
 
 	return tx.Commit(ctx)
 }
 
-func (s *PgStore) FileVATReturn(ctx context.Context, id, filedBy string) (*domain.VATReturn, error) {
+func (s *PgStore) FileVATReturn(ctx context.Context, id, filedBy string, meta EventMeta) (*domain.VATReturn, error) {
 	r, err := s.GetVATReturn(ctx, id)
 	if err != nil {
 		return nil, err
@@ -242,6 +283,9 @@ func (s *PgStore) FileVATReturn(ctx context.Context, id, filedBy string) (*domai
 		string(r.Status), r.FiledAt, r.FiledBy, r.UpdatedAt, id, tenantID,
 	)
 	if err != nil {
+		return nil, err
+	}
+	if err := writeEvent(ctx, tx, EventVATReturnFiled, r, meta); err != nil {
 		return nil, err
 	}
 
