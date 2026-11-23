@@ -10,7 +10,6 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/exception-escalation-svc/internal/domain"
-	"zoiko.io/exception-escalation-svc/internal/events"
 	"zoiko.io/exception-escalation-svc/internal/middleware"
 	"zoiko.io/exception-escalation-svc/internal/store"
 )
@@ -35,6 +34,7 @@ type deadlineHandler struct {
 func RegisterDeadlineRoutes(r chi.Router, h *Handler, deadlineStore store.DeadlineStore) {
 	dh := &deadlineHandler{Handler: h, store: deadlineStore}
 	r.Route("/v1/deadlines", func(r chi.Router) {
+		r.Use(withEventMeta)
 		r.Post("/", dh.CreateDeadline)
 		r.Post("/mirror", dh.MirrorAuthoritativeDeadline)
 		r.Get("/upcoming", dh.ListUpcoming)
@@ -92,12 +92,6 @@ func (h *deadlineHandler) CreateDeadline(w http.ResponseWriter, r *http.Request)
 		h.writeDeadlineErr(w, err)
 		return
 	}
-	if err := h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "deadline.created", CaseID: d.DeadlineID, TenantID: d.TenantID, LegalEntityID: d.LegalEntityID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: d,
-	}); err != nil {
-		h.logger.Warn("failed to publish deadline.created event", zap.Error(err))
-	}
 	writeJSON(w, http.StatusCreated, d)
 }
 
@@ -149,36 +143,43 @@ func (h *deadlineHandler) MirrorAuthoritativeDeadline(w http.ResponseWriter, r *
 		h.writeDeadlineErr(w, err)
 		return
 	}
-	if err := h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "deadline.created", CaseID: d.DeadlineID, TenantID: d.TenantID, LegalEntityID: d.LegalEntityID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: d,
-	}); err != nil {
-		h.logger.Warn("failed to publish deadline.created event", zap.Error(err))
-	}
 	if supersededDeadlineID != "" {
-		if err := h.publisher.Publish(r.Context(), events.PublishParams{
-			EventType: "deadline.superseded", CaseID: supersededDeadlineID, TenantID: d.TenantID, LegalEntityID: d.LegalEntityID,
-			ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
-			Payload: map[string]string{"deadline_id": supersededDeadlineID, "superseded_by_deadline_id": d.DeadlineID},
-		}); err != nil {
-			h.logger.Warn("failed to publish deadline.superseded event", zap.Error(err))
-		}
 	}
 	writeJSON(w, http.StatusCreated, d)
 }
 
 // GetDeadline — BIZ-08's own GetDeadline query.
 func (h *deadlineHandler) GetDeadline(w http.ResponseWriter, r *http.Request) {
-	d, err := h.store.GetDeadline(r.Context(), chi.URLParam(r, "deadline_id"))
-	if err != nil {
-		h.writeDeadlineErr(w, err)
+	d, ok := h.loadDeadlineForRead(w, r)
+	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, d)
 }
 
+// loadDeadlineForRead resolves {deadline_id} in the caller's tenant and
+// authorizes a DEADLINE_READ against the deadline's legal entity; every
+// per-deadline GET goes through it before serving anything about it.
+func (h *deadlineHandler) loadDeadlineForRead(w http.ResponseWriter, r *http.Request) (*domain.Deadline, bool) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return nil, false
+	}
+	d, err := h.store.GetDeadline(r.Context(), chi.URLParam(r, "deadline_id"))
+	if err != nil {
+		h.writeDeadlineErr(w, err)
+		return nil, false
+	}
+	if !h.authorizeRead(w, r, d.LegalEntityID, actionDeadlineRead) {
+		return nil, false
+	}
+	return d, true
+}
+
 // GetSourceDeadline — BIZ-08's own GetSourceDeadline query.
 func (h *deadlineHandler) GetSourceDeadline(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.loadDeadlineForRead(w, r); !ok {
+		return
+	}
 	info, err := h.store.GetSourceDeadline(r.Context(), middleware.GetTenantID(r.Context()), chi.URLParam(r, "deadline_id"))
 	if err != nil {
 		h.writeDeadlineErr(w, err)
@@ -248,12 +249,6 @@ func (h *deadlineHandler) CompleteDeadline(w http.ResponseWriter, r *http.Reques
 	if err != nil {
 		h.writeDeadlineErr(w, err)
 		return
-	}
-	if err := h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "deadline.completed", CaseID: d.DeadlineID, TenantID: d.TenantID, LegalEntityID: d.LegalEntityID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: d,
-	}); err != nil {
-		h.logger.Warn("failed to publish deadline.completed event", zap.Error(err))
 	}
 	writeJSON(w, http.StatusOK, d)
 }
@@ -422,10 +417,11 @@ func (h *deadlineHandler) Escalate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, esc)
 }
 
-// ListUpcoming — BIZ-08's own ListUpcoming query. Publishes
+// ListUpcoming — BIZ-08's own ListUpcoming query. Emits
 // DeadlineDueSoon for exactly the deadlines this call is the first to
-// observe crossing the threshold — see store.ListUpcoming's own doc
-// comment.
+// observe crossing the threshold — the store writes it to the outbox in the
+// same transaction that sets due_soon_notified_at, so the mark and the
+// notification can no longer diverge.
 func (h *deadlineHandler) ListUpcoming(w http.ResponseWriter, r *http.Request) {
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -440,20 +436,12 @@ func (h *deadlineHandler) ListUpcoming(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
-	deadlines, justNotifiedIDs, err := h.store.ListUpcoming(r.Context(), domain.ListUpcomingParams{
+	deadlines, _, err := h.store.ListUpcoming(r.Context(), domain.ListUpcomingParams{
 		TenantID: middleware.GetTenantID(r.Context()), LegalEntityID: legalEntityID, OwnerPrincipalID: r.URL.Query().Get("owner_principal_id"),
 	})
 	if err != nil {
 		h.writeDeadlineErr(w, err)
 		return
-	}
-	for _, id := range justNotifiedIDs {
-		if err := h.publisher.Publish(r.Context(), events.PublishParams{
-			EventType: "deadline.due_soon", CaseID: id, TenantID: middleware.GetTenantID(r.Context()), LegalEntityID: legalEntityID,
-			ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: map[string]string{"deadline_id": id},
-		}); err != nil {
-			h.logger.Warn("failed to publish deadline.due_soon event", zap.Error(err))
-		}
 	}
 	if deadlines == nil {
 		deadlines = []domain.Deadline{}
@@ -461,9 +449,10 @@ func (h *deadlineHandler) ListUpcoming(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, deadlines)
 }
 
-// ListOverdue — BIZ-08's own ListOverdue query. Publishes DeadlineOverdue
+// ListOverdue — BIZ-08's own ListOverdue query. Emits DeadlineOverdue
 // for exactly the deadlines this call is the first to observe as
-// overdue — see store.ListOverdue's own doc comment.
+// overdue, through the outbox in the same transaction as
+// overdue_notified_at (see ListUpcoming).
 func (h *deadlineHandler) ListOverdue(w http.ResponseWriter, r *http.Request) {
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -478,20 +467,12 @@ func (h *deadlineHandler) ListOverdue(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
-	deadlines, justNotifiedIDs, err := h.store.ListOverdue(r.Context(), domain.ListOverdueParams{
+	deadlines, _, err := h.store.ListOverdue(r.Context(), domain.ListOverdueParams{
 		TenantID: middleware.GetTenantID(r.Context()), LegalEntityID: legalEntityID, OwnerPrincipalID: r.URL.Query().Get("owner_principal_id"),
 	})
 	if err != nil {
 		h.writeDeadlineErr(w, err)
 		return
-	}
-	for _, id := range justNotifiedIDs {
-		if err := h.publisher.Publish(r.Context(), events.PublishParams{
-			EventType: "deadline.overdue", CaseID: id, TenantID: middleware.GetTenantID(r.Context()), LegalEntityID: legalEntityID,
-			ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: map[string]string{"deadline_id": id},
-		}); err != nil {
-			h.logger.Warn("failed to publish deadline.overdue event", zap.Error(err))
-		}
 	}
 	if deadlines == nil {
 		deadlines = []domain.Deadline{}
@@ -501,6 +482,9 @@ func (h *deadlineHandler) ListOverdue(w http.ResponseWriter, r *http.Request) {
 
 // ExplainCalculation — BIZ-08's own ExplainCalculation query.
 func (h *deadlineHandler) ExplainCalculation(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.loadDeadlineForRead(w, r); !ok {
+		return
+	}
 	res, err := h.store.ExplainCalculation(r.Context(), middleware.GetTenantID(r.Context()), chi.URLParam(r, "deadline_id"))
 	if err != nil {
 		h.writeDeadlineErr(w, err)

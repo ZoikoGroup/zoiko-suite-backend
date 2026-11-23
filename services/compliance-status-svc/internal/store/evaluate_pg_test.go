@@ -18,12 +18,12 @@ func TestPgStore_Evaluate_ReEvaluateReturnsPersistedStatusID(t *testing.T) {
 	s := store.NewPgStore(pool)
 	first := &domain.ComplianceHealth{LegalEntityID: "le", JurisdictionID: "GB", DomainName: "TAX",
 		TotalObligations: 10, FulfilledObligations: 9, CreatedBy: "p1"}
-	if err := s.Evaluate(ctx, first); err != nil {
+	if err := s.Evaluate(ctx, first, store.EventMeta{ActorID: "p1"}); err != nil {
 		t.Fatalf("evaluate: %v", err)
 	}
 	second := &domain.ComplianceHealth{LegalEntityID: "le", JurisdictionID: "GB", DomainName: "TAX",
 		TotalObligations: 10, FulfilledObligations: 5, OverdueObligations: 2, CreatedBy: "p1"}
-	if err := s.Evaluate(ctx, second); err != nil {
+	if err := s.Evaluate(ctx, second, store.EventMeta{ActorID: "p1"}); err != nil {
 		t.Fatalf("re-evaluate: %v", err)
 	}
 	if second.StatusID != first.StatusID {

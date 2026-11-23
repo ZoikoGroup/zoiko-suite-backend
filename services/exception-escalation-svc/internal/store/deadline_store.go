@@ -18,8 +18,9 @@ import (
 type DeadlineStore interface {
 	CreateDeadline(ctx context.Context, p domain.CreateDeadlineParams) (*domain.Deadline, error)
 	// MirrorAuthoritativeDeadline returns the superseded deadline's id
-	// when this call superseded a prior live mirror, so the caller can
-	// publish DeadlineSuperseded against it.
+	// when this call superseded a prior live mirror. DeadlineCreated and
+	// DeadlineSuperseded are written to the outbox inside the same
+	// transaction.
 	MirrorAuthoritativeDeadline(ctx context.Context, p domain.MirrorAuthoritativeDeadlineParams) (d *domain.Deadline, supersededDeadlineID string, err error)
 	GetDeadline(ctx context.Context, deadlineID string) (*domain.Deadline, error)
 	GetSourceDeadline(ctx context.Context, tenantID, deadlineID string) (*domain.DeadlineSourceInfo, error)
@@ -32,8 +33,9 @@ type DeadlineStore interface {
 	Escalate(ctx context.Context, p domain.EscalateParams) (*domain.DeadlineEscalation, error)
 	// ListUpcoming/ListOverdue return the matching deadlines plus the ids
 	// among them that were JUST observed crossing their threshold for the
-	// first time by this very call — the caller publishes
-	// DeadlineDueSoon/DeadlineOverdue for exactly those ids. See migration
+	// first time by this very call — DeadlineDueSoon/DeadlineOverdue for
+	// exactly those ids is written to the outbox in the same transaction
+	// that sets the *_notified_at mark. See migration
 	// 000005's own doc comment for why this read-triggers-write shape
 	// exists instead of a background clock service.
 	ListUpcoming(ctx context.Context, p domain.ListUpcomingParams) (deadlines []domain.Deadline, justNotifiedIDs []string, err error)
@@ -95,6 +97,9 @@ func (s *PgStore) CreateDeadline(ctx context.Context, p domain.CreateDeadlinePar
 	if err != nil {
 		return nil, fmt.Errorf("insert deadline: %w", err)
 	}
+	if err := enqueue(ctx, tx, EventDeadlineCreated, deadlineSubject(d), d); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -142,6 +147,9 @@ func (s *PgStore) MirrorAuthoritativeDeadline(ctx context.Context, p domain.Mirr
 			// Same version already mirrored and untouched — nothing to
 			// do; return the existing row rather than creating a
 			// pointless duplicate.
+			if err := enqueue(ctx, tx, EventDeadlineCreated, deadlineSubject(existing), existing); err != nil {
+				return nil, "", err
+			}
 			if err := tx.Commit(ctx); err != nil {
 				return nil, "", err
 			}
@@ -178,6 +186,17 @@ func (s *PgStore) MirrorAuthoritativeDeadline(ctx context.Context, p domain.Mirr
 		return nil, "", fmt.Errorf("insert deadline: %w", err)
 	}
 
+	if err := enqueue(ctx, tx, EventDeadlineCreated, deadlineSubject(d), d); err != nil {
+		return nil, "", err
+	}
+	if supersededID != "" {
+		sub := deadlineSubject(d)
+		sub.id = supersededID
+		if err := enqueue(ctx, tx, EventDeadlineSuperseded, sub,
+			map[string]string{"deadline_id": supersededID, "superseded_by_deadline_id": d.DeadlineID}); err != nil {
+			return nil, "", err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, "", err
 	}
@@ -284,6 +303,9 @@ func (s *PgStore) CompleteDeadline(ctx context.Context, p domain.CompleteDeadlin
 		WHERE deadline_id=$1 AND tenant_id=$2 RETURNING `+deadlineColumns,
 		p.DeadlineID, p.TenantID, p.ActorPrincipalID))
 	if err != nil {
+		return nil, err
+	}
+	if err := enqueue(ctx, tx, EventDeadlineCompleted, deadlineSubject(d), d); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -493,6 +515,9 @@ func (s *PgStore) ListUpcoming(ctx context.Context, p domain.ListUpcomingParams)
 		if _, err := tx.Exec(ctx, `UPDATE deadlines SET due_soon_notified_at=now() WHERE deadline_id=$1 AND tenant_id=$2`, out[i].DeadlineID, p.TenantID); err != nil {
 			return nil, nil, err
 		}
+		if err := enqueue(ctx, tx, EventDeadlineDueSoon, deadlineSubject(&out[i]), map[string]string{"deadline_id": out[i].DeadlineID}); err != nil {
+			return nil, nil, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, nil, err
@@ -553,6 +578,9 @@ func (s *PgStore) ListOverdue(ctx context.Context, p domain.ListOverdueParams) (
 		if _, err := tx.Exec(ctx, `UPDATE deadlines SET overdue_notified_at=now() WHERE deadline_id=$1 AND tenant_id=$2`, out[i].DeadlineID, p.TenantID); err != nil {
 			return nil, nil, err
 		}
+		if err := enqueue(ctx, tx, EventDeadlineOverdue, deadlineSubject(&out[i]), map[string]string{"deadline_id": out[i].DeadlineID}); err != nil {
+			return nil, nil, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, nil, err
@@ -574,4 +602,8 @@ func (s *PgStore) ExplainCalculation(ctx context.Context, tenantID, deadlineID s
 		res.Note = "this deadline is calculated and owned by BIZ-08 directly."
 	}
 	return res, nil
+}
+
+func deadlineSubject(d *domain.Deadline) eventSubject {
+	return eventSubject{aggregateType: "deadline", id: d.DeadlineID, tenantID: d.TenantID, legalEntityID: d.LegalEntityID}
 }

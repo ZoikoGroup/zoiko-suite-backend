@@ -24,6 +24,7 @@ import (
 	"zoiko.io/exception-escalation-svc/internal/idempotency"
 	"zoiko.io/exception-escalation-svc/internal/middleware"
 	"zoiko.io/exception-escalation-svc/internal/mtls"
+	"zoiko.io/exception-escalation-svc/internal/outbox"
 	"zoiko.io/exception-escalation-svc/internal/store"
 	"zoiko.io/exception-escalation-svc/internal/telemetry"
 )
@@ -78,7 +79,15 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
 
-	h := handler.New(pgStore, publisher, authzClient, logger)
+	h := handler.New(pgStore, authzClient, logger)
+
+	// Transactional outbox relay: every write enqueues its event in the same
+	// transaction as the change; the relay delivers it with retry.
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	if pool != nil {
+		go outbox.NewRelay(pool, publisher, 0, 0, logger).Start(relayCtx)
+	}
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)

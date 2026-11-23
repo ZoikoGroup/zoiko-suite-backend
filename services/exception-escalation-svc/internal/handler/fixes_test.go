@@ -60,7 +60,7 @@ func TestCreateException_CreatorIsThePrincipal(t *testing.T) {
 func TestCreateTask_InvalidPriorityIs400(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	r := chi.NewRouter()
-	RegisterTaskRoutes(r, New(newMockStore(), &mockPublisher{}, &mockAuthzClient{}, logger), nil)
+	RegisterTaskRoutes(r, New(newMockStore(), &mockAuthzClient{}, logger), nil)
 	w := doJSON(r, "POST", "/v1/tasks", "p1", map[string]string{"legal_entity_id": "le", "task_type": "X",
 		"linked_object_type": "Y", "linked_object_id": "z", "priority": "URGENT"})
 	if w.Code != http.StatusBadRequest {
@@ -108,7 +108,7 @@ func (f *fakeFindingStore) GetMisstatementSummary(_ context.Context, _ string) (
 func findingRouter(fs *fakeFindingStore, authzErr error) http.Handler {
 	logger, _ := zap.NewDevelopment()
 	r := chi.NewRouter()
-	RegisterFindingRoutes(r, New(newMockStore(), &mockPublisher{}, &mockAuthzClient{err: authzErr}, logger), fs)
+	RegisterFindingRoutes(r, New(newMockStore(), &mockAuthzClient{err: authzErr}, logger), fs)
 	return r
 }
 
@@ -141,6 +141,7 @@ func TestFindingLists_EmptyIsArrayNotNull(t *testing.T) {
 	r := findingRouter(&fakeFindingStore{}, nil)
 	for _, p := range []string{"/v1/audit-findings/finding-1/scope-limitations/open", "/v1/audit-findings/finding-1/misstatement-summary"} {
 		req := httptest.NewRequest("GET", p, nil)
+		req.Header.Set("X-Principal-Id", "p1")
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		if got := bytes.TrimSpace(w.Body.Bytes()); string(got) != "[]" {

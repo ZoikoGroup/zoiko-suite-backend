@@ -13,7 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/compliance-status-svc/internal/domain"
-	"zoiko.io/compliance-status-svc/internal/events"
+	"zoiko.io/compliance-status-svc/internal/store"
 )
 
 type mockStore struct {
@@ -28,7 +28,7 @@ func newMockStore() *mockStore {
 	}
 }
 
-func (m *mockStore) Evaluate(ctx context.Context, c *domain.ComplianceHealth) error {
+func (m *mockStore) Evaluate(ctx context.Context, c *domain.ComplianceHealth, _ store.EventMeta) error {
 	if c.StatusID == "" {
 		c.StatusID = "cstat-test-01"
 	}
@@ -68,7 +68,9 @@ func (m *mockStore) List(ctx context.Context, legalEntityID, jurisdictionID, dom
 	return out, nil
 }
 
-func (m *mockStore) CreateGap(ctx context.Context, g *domain.ComplianceGap) error {
+func (m *mockStore) CreateGap(ctx context.Context, g *domain.ComplianceGap, meta store.EventMeta) error {
+	creator := meta.ActorID
+	g.CreatedBy = &creator
 	if g.GapID == "" {
 		g.GapID = "cgap-test-01"
 	}
@@ -110,7 +112,7 @@ func (m *mockStore) GetGapByID(ctx context.Context, id string) (*domain.Complian
 	return g, nil
 }
 
-func (m *mockStore) ResolveGap(ctx context.Context, id string, req *domain.ResolveGapRequest) (*domain.ComplianceGap, error) {
+func (m *mockStore) ResolveGap(ctx context.Context, id string, req *domain.ResolveGapRequest, _ store.EventMeta) (*domain.ComplianceGap, error) {
 	g, ok := m.gaps[id]
 	if !ok {
 		return nil, domain.ErrGapNotFound
@@ -123,12 +125,6 @@ func (m *mockStore) ResolveGap(ctx context.Context, id string, req *domain.Resol
 	g.ResolvedAt = &now
 	g.UpdatedAt = now
 	return g, nil
-}
-
-type mockPublisher struct{}
-
-func (p *mockPublisher) Publish(ctx context.Context, params events.PublishParams) error {
-	return nil
 }
 
 // mockAuthzClient grants every request by default, so existing handler
@@ -144,10 +140,9 @@ func (m *mockAuthzClient) CheckAllowed(ctx context.Context, principalID, legalEn
 
 func setupTestRouter() (*chi.Mux, *mockStore) {
 	st := newMockStore()
-	pub := &mockPublisher{}
 	az := &mockAuthzClient{}
 	logger, _ := zap.NewDevelopment()
-	h := New(st, pub, az, logger)
+	h := New(st, az, logger)
 
 	r := chi.NewRouter()
 	RegisterRoutes(r, h)
@@ -167,7 +162,7 @@ func TestEvaluateAndResolveComplianceGap(t *testing.T) {
 		OverdueObligations:   0,
 		OpenExceptions:       0,
 		EffectiveFrom:        "2026-01-01",
-		CreatedBy:            "risk_officer",
+		CreatedBy:            "principal-test-01",
 	}
 	body, _ := json.Marshal(evalReqPayload)
 
@@ -227,7 +222,9 @@ func TestEvaluateAndResolveComplianceGap(t *testing.T) {
 
 	resReq := httptest.NewRequest("POST", "/v1/compliance-status/gaps/"+createdGap.GapID+"/resolve", bytes.NewBuffer(resBody))
 	resReq.Header.Set("Content-Type", "application/json")
-	resReq.Header.Set("X-Principal-Id", "principal-test-01")
+	// Resolved by a different principal than the one who logged the gap
+	// (segregation of duties).
+	resReq.Header.Set("X-Principal-Id", "principal-test-02")
 	resW := httptest.NewRecorder()
 
 	r.ServeHTTP(resW, resReq)
@@ -247,7 +244,7 @@ func TestEvaluateAndResolveComplianceGap(t *testing.T) {
 	// Resolve Gap Second Time -> 409 Conflict
 	resReq2 := httptest.NewRequest("POST", "/v1/compliance-status/gaps/"+createdGap.GapID+"/resolve", bytes.NewBuffer(resBody))
 	resReq2.Header.Set("Content-Type", "application/json")
-	resReq2.Header.Set("X-Principal-Id", "principal-test-01")
+	resReq2.Header.Set("X-Principal-Id", "principal-test-02")
 	resW2 := httptest.NewRecorder()
 	r.ServeHTTP(resW2, resReq2)
 	if resW2.Code != http.StatusConflict {
@@ -266,7 +263,7 @@ func TestGetAndListComplianceStatusRecords(t *testing.T) {
 		TotalObligations:     5,
 		FulfilledObligations: 5,
 		EffectiveFrom:        "2026-01-01",
-		CreatedBy:            "auditor",
+		CreatedBy:            "principal-test-01",
 	}
 	body1, _ := json.Marshal(req1)
 	r1 := httptest.NewRequest("POST", "/v1/compliance-status/evaluate", bytes.NewBuffer(body1))
@@ -280,6 +277,7 @@ func TestGetAndListComplianceStatusRecords(t *testing.T) {
 
 	// Get by ID
 	rGet := httptest.NewRequest("GET", "/v1/compliance-status/"+rec1.StatusID, nil)
+	rGet.Header.Set("X-Principal-Id", "principal-test-01")
 	wGet := httptest.NewRecorder()
 	r.ServeHTTP(wGet, rGet)
 	if wGet.Code != http.StatusOK {
@@ -288,6 +286,7 @@ func TestGetAndListComplianceStatusRecords(t *testing.T) {
 
 	// List records
 	rList := httptest.NewRequest("GET", "/v1/compliance-status?legal_entity_id=entity-101", nil)
+	rList.Header.Set("X-Principal-Id", "principal-test-01")
 	wList := httptest.NewRecorder()
 	r.ServeHTTP(wList, rList)
 	if wList.Code != http.StatusOK {

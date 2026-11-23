@@ -10,17 +10,54 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/compliance-status-svc/internal/domain"
+	"zoiko.io/compliance-status-svc/internal/events"
 	"zoiko.io/compliance-status-svc/internal/middleware"
+	"zoiko.io/compliance-status-svc/internal/outbox"
 )
 
+// EventMeta is the request identity recorded on the event a write emits, and
+// the acting principal of that write. The event is written to the
+// transactional outbox inside the write's own transaction, so it exists if
+// and only if the change committed.
+type EventMeta struct {
+	ActorID       string
+	CorrelationID string
+}
+
+// Event types this store emits (topic, type and payload unchanged from the
+// former direct publish in the handler).
+const (
+	EventStatusChanged = "compliance.status.changed"
+	EventGapDetected   = "compliance.gap.detected"
+	EventGapResolved   = "compliance.gap.resolved"
+)
+
+// enqueue writes one event to the outbox using the caller's transaction.
+func enqueue(ctx context.Context, tx pgx.Tx, eventType, aggregateType, subjectID, tenantID, legalEntityID, jurisdiction string, payload any, meta EventMeta) error {
+	id := uuid.NewString()
+	envelope := events.BuildEvent(events.PublishParams{
+		EventType: eventType, SubjectID: subjectID, TenantID: tenantID,
+		LegalEntityID: legalEntityID, Jurisdiction: jurisdiction, ActorID: meta.ActorID,
+		CorrelationID: meta.CorrelationID, Payload: payload,
+	}, "evt-"+id, time.Now())
+	return outbox.Insert(ctx, tx, outbox.Event{
+		OutboxEventID: id, AggregateType: aggregateType, AggregateID: subjectID,
+		EventType: eventType, TenantID: tenantID, LegalEntityID: legalEntityID,
+		ActorID: meta.ActorID, CorrelationID: meta.CorrelationID, Payload: envelope,
+	})
+}
+
 type Store interface {
-	Evaluate(ctx context.Context, c *domain.ComplianceHealth) error
+	Evaluate(ctx context.Context, c *domain.ComplianceHealth, meta EventMeta) error
 	GetByID(ctx context.Context, id string) (*domain.ComplianceHealth, error)
 	List(ctx context.Context, legalEntityID, jurisdictionID, domainName, status string) ([]domain.ComplianceHealth, error)
-	CreateGap(ctx context.Context, g *domain.ComplianceGap) error
+	// CreateGap records meta.ActorID as the gap's creator.
+	CreateGap(ctx context.Context, g *domain.ComplianceGap, meta EventMeta) error
 	ListGaps(ctx context.Context, legalEntityID, domainName, severity, status string) ([]domain.ComplianceGap, error)
 	GetGapByID(ctx context.Context, id string) (*domain.ComplianceGap, error)
-	ResolveGap(ctx context.Context, id string, req *domain.ResolveGapRequest) (*domain.ComplianceGap, error)
+	// ResolveGap records meta.ActorID as the resolver; it must differ from the
+	// gap's creator (domain.ErrSegregationOfDuties), checked under the row lock.
+	ResolveGap(ctx context.Context, id string, req *domain.ResolveGapRequest, meta EventMeta) (*domain.ComplianceGap, error)
 }
 
 type PgStore struct {
@@ -40,7 +77,7 @@ func (s *PgStore) setRLS(ctx context.Context, tx pgx.Tx) error {
 	return err
 }
 
-func (s *PgStore) Evaluate(ctx context.Context, c *domain.ComplianceHealth) error {
+func (s *PgStore) Evaluate(ctx context.Context, c *domain.ComplianceHealth, meta EventMeta) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -96,6 +133,9 @@ func (s *PgStore) Evaluate(ctx context.Context, c *domain.ComplianceHealth) erro
 	).Scan(&c.StatusID, &c.CreatedAt)
 	if err != nil {
 		return fmt.Errorf("upsert compliance status: %w", err)
+	}
+	if err := enqueue(ctx, tx, EventStatusChanged, "compliance_status", c.StatusID, c.TenantID, c.LegalEntityID, c.JurisdictionID, c, meta); err != nil {
+		return err
 	}
 	return tx.Commit(ctx)
 }
@@ -182,7 +222,10 @@ func (s *PgStore) List(ctx context.Context, legalEntityID, jurisdictionID, domai
 	return out, nil
 }
 
-func (s *PgStore) CreateGap(ctx context.Context, g *domain.ComplianceGap) error {
+func (s *PgStore) CreateGap(ctx context.Context, g *domain.ComplianceGap, meta EventMeta) error {
+	if meta.ActorID == "" {
+		return domain.ErrActorRequired
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -206,19 +249,24 @@ func (s *PgStore) CreateGap(ctx context.Context, g *domain.ComplianceGap) error 
 	if g.Severity == "" {
 		g.Severity = domain.SeverityMedium
 	}
+	creator := meta.ActorID
+	g.CreatedBy = &creator
 
 	_, err = tx.Exec(ctx, `
 		INSERT INTO compliance_gaps
 			(gap_id, tenant_id, legal_entity_id, jurisdiction_id, domain_name,
 			 gap_type, severity, source_reference, description, remediation_plan,
-			 status, detected_at, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+			 status, detected_at, created_by, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
 		g.GapID, g.TenantID, g.LegalEntityID, g.JurisdictionID, g.DomainName,
 		g.GapType, string(g.Severity), g.SourceReference, g.Description, g.RemediationPlan,
-		string(g.Status), g.DetectedAt, g.CreatedAt, g.UpdatedAt,
+		string(g.Status), g.DetectedAt, g.CreatedBy, g.CreatedAt, g.UpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("insert compliance gap: %w", err)
+	}
+	if err := enqueue(ctx, tx, EventGapDetected, "compliance_gap", g.GapID, g.TenantID, g.LegalEntityID, g.JurisdictionID, g, meta); err != nil {
+		return err
 	}
 	return tx.Commit(ctx)
 }
@@ -236,7 +284,7 @@ func (s *PgStore) ListGaps(ctx context.Context, legalEntityID, domainName, sever
 	rows, err := tx.Query(ctx, `
 		SELECT gap_id, tenant_id, legal_entity_id, jurisdiction_id, domain_name,
 		       gap_type, severity, source_reference, description, remediation_plan,
-		       status, detected_at, resolved_at, created_at, updated_at
+		       status, detected_at, resolved_at, created_by, resolved_by, created_at, updated_at
 		FROM compliance_gaps
 		WHERE ($1 = '' OR legal_entity_id = $1)
 		  AND ($2 = '' OR domain_name = $2)
@@ -257,7 +305,7 @@ func (s *PgStore) ListGaps(ctx context.Context, legalEntityID, domainName, sever
 		if err := rows.Scan(
 			&g.GapID, &g.TenantID, &g.LegalEntityID, &g.JurisdictionID, &g.DomainName,
 			&g.GapType, &sevStr, &g.SourceReference, &g.Description, &g.RemediationPlan,
-			&statStr, &g.DetectedAt, &g.ResolvedAt, &g.CreatedAt, &g.UpdatedAt,
+			&statStr, &g.DetectedAt, &g.ResolvedAt, &g.CreatedBy, &g.ResolvedBy, &g.CreatedAt, &g.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -284,12 +332,12 @@ func (s *PgStore) GetGapByID(ctx context.Context, id string) (*domain.Compliance
 	err = tx.QueryRow(ctx, `
 		SELECT gap_id, tenant_id, legal_entity_id, jurisdiction_id, domain_name,
 		       gap_type, severity, source_reference, description, remediation_plan,
-		       status, detected_at, resolved_at, created_at, updated_at
+		       status, detected_at, resolved_at, created_by, resolved_by, created_at, updated_at
 		FROM compliance_gaps WHERE gap_id = $1`, id,
 	).Scan(
 		&g.GapID, &g.TenantID, &g.LegalEntityID, &g.JurisdictionID, &g.DomainName,
 		&g.GapType, &sevStr, &g.SourceReference, &g.Description, &g.RemediationPlan,
-		&statStr, &g.DetectedAt, &g.ResolvedAt, &g.CreatedAt, &g.UpdatedAt,
+		&statStr, &g.DetectedAt, &g.ResolvedAt, &g.CreatedBy, &g.ResolvedBy, &g.CreatedAt, &g.UpdatedAt,
 	)
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -303,7 +351,10 @@ func (s *PgStore) GetGapByID(ctx context.Context, id string) (*domain.Compliance
 	return &g, nil
 }
 
-func (s *PgStore) ResolveGap(ctx context.Context, id string, req *domain.ResolveGapRequest) (*domain.ComplianceGap, error) {
+func (s *PgStore) ResolveGap(ctx context.Context, id string, req *domain.ResolveGapRequest, meta EventMeta) (*domain.ComplianceGap, error) {
+	if meta.ActorID == "" {
+		return nil, domain.ErrActorRequired
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -318,12 +369,13 @@ func (s *PgStore) ResolveGap(ctx context.Context, id string, req *domain.Resolve
 	err = tx.QueryRow(ctx, `
 		SELECT gap_id, tenant_id, legal_entity_id, jurisdiction_id, domain_name,
 		       gap_type, severity, source_reference, description, remediation_plan,
-		       status, detected_at, resolved_at, created_at, updated_at
-		FROM compliance_gaps WHERE gap_id = $1`, id,
+		       status, detected_at, resolved_at, created_by, resolved_by, created_at, updated_at
+		FROM compliance_gaps WHERE gap_id = $1
+		FOR UPDATE`, id,
 	).Scan(
 		&g.GapID, &g.TenantID, &g.LegalEntityID, &g.JurisdictionID, &g.DomainName,
 		&g.GapType, &sevStr, &g.SourceReference, &g.Description, &g.RemediationPlan,
-		&statStr, &g.DetectedAt, &g.ResolvedAt, &g.CreatedAt, &g.UpdatedAt,
+		&statStr, &g.DetectedAt, &g.ResolvedAt, &g.CreatedBy, &g.ResolvedBy, &g.CreatedAt, &g.UpdatedAt,
 	)
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -336,6 +388,12 @@ func (s *PgStore) ResolveGap(ctx context.Context, id string, req *domain.Resolve
 	if g.Status == domain.GapResolved {
 		return nil, domain.ErrGapAlreadyResolved
 	}
+	// Segregation of duties, under the row lock: the principal who logged the
+	// gap may not resolve it. A gap logged before creators were recorded
+	// (created_by NULL) has no creator to compare against.
+	if g.CreatedBy != nil && *g.CreatedBy == meta.ActorID {
+		return nil, domain.ErrSegregationOfDuties
+	}
 
 	now := time.Now().UTC()
 	g.Status = domain.GapResolved
@@ -344,15 +402,20 @@ func (s *PgStore) ResolveGap(ctx context.Context, id string, req *domain.Resolve
 		g.RemediationPlan = g.RemediationPlan + " | Resolved: " + req.RemediationNotes
 	}
 	g.UpdatedAt = now
+	resolver := meta.ActorID
+	g.ResolvedBy = &resolver
 
 	_, err = tx.Exec(ctx, `
 		UPDATE compliance_gaps
-		SET status=$1, remediation_plan=$2, resolved_at=$3, updated_at=$4
-		WHERE gap_id=$5`,
-		string(g.Status), g.RemediationPlan, g.ResolvedAt, g.UpdatedAt, id,
+		SET status=$1, remediation_plan=$2, resolved_at=$3, resolved_by=$4, updated_at=$5
+		WHERE gap_id=$6`,
+		string(g.Status), g.RemediationPlan, g.ResolvedAt, g.ResolvedBy, g.UpdatedAt, id,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("resolve compliance gap: %w", err)
+	}
+	if err := enqueue(ctx, tx, EventGapResolved, "compliance_gap", g.GapID, g.TenantID, g.LegalEntityID, g.JurisdictionID, &g, meta); err != nil {
+		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err

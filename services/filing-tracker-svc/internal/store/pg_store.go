@@ -12,17 +12,40 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/filing-tracker-svc/internal/domain"
+	"zoiko.io/filing-tracker-svc/internal/events"
 	"zoiko.io/filing-tracker-svc/internal/middleware"
+	"zoiko.io/filing-tracker-svc/internal/outbox"
+)
+
+// EventMeta is the request identity recorded on the event a write emits. The
+// event is written to the transactional outbox inside the write's own
+// transaction, so it exists if and only if the change committed.
+type EventMeta struct {
+	ActorID       string
+	CorrelationID string
+}
+
+// Event types this store emits (topic, type and payload unchanged from the
+// former direct publish in the handler).
+const (
+	EventFilingDue                = "filing.due"
+	EventFilingRequirementUpdated = "filing.requirement.updated"
+	EventFilingSubmitted          = "filing.submitted"
+	EventFilingConfirmed          = "filing.confirmed"
+	EventFilingOverdue            = "filing.overdue"
 )
 
 type Store interface {
-	Create(ctx context.Context, f *domain.FilingRequirement) error
+	Create(ctx context.Context, f *domain.FilingRequirement, meta EventMeta) error
 	GetByID(ctx context.Context, id string) (*domain.FilingRequirement, error)
 	List(ctx context.Context, legalEntityID, jurisdictionID, filingAuthority, status string) ([]domain.FilingRequirement, error)
-	Update(ctx context.Context, f *domain.FilingRequirement) error
-	Submit(ctx context.Context, id string, req *domain.SubmitFilingRequest) (*domain.FilingRequirement, error)
-	Confirm(ctx context.Context, id string, req *domain.ConfirmFilingRequest) (*domain.FilingRequirement, error)
-	MarkOverdue(ctx context.Context, id, todayStr string) (*domain.FilingRequirement, error)
+	Update(ctx context.Context, f *domain.FilingRequirement, meta EventMeta) error
+	Submit(ctx context.Context, id string, req *domain.SubmitFilingRequest, meta EventMeta) (*domain.FilingRequirement, error)
+	// Confirm records the authority acknowledgement. meta.ActorID is the
+	// confirming principal; it must differ from the submitter
+	// (domain.ErrSegregationOfDuties), checked under the row lock.
+	Confirm(ctx context.Context, id string, req *domain.ConfirmFilingRequest, meta EventMeta) (*domain.FilingRequirement, error)
+	MarkOverdue(ctx context.Context, id, todayStr string, meta EventMeta) (*domain.FilingRequirement, error)
 }
 
 type PgStore struct {
@@ -42,7 +65,23 @@ func (s *PgStore) setRLS(ctx context.Context, tx pgx.Tx) error {
 	return err
 }
 
-func (s *PgStore) Create(ctx context.Context, f *domain.FilingRequirement) error {
+// enqueue writes the event describing f's new state to the outbox using the
+// caller's transaction.
+func enqueue(ctx context.Context, tx pgx.Tx, eventType string, f *domain.FilingRequirement, meta EventMeta) error {
+	id := uuid.NewString()
+	envelope := events.BuildEvent(events.PublishParams{
+		EventType: eventType, FilingID: f.FilingID, TenantID: f.TenantID,
+		LegalEntityID: f.LegalEntityID, Jurisdiction: f.JurisdictionID, ActorID: meta.ActorID,
+		CorrelationID: meta.CorrelationID, Payload: f,
+	}, id, time.Now())
+	return outbox.Insert(ctx, tx, outbox.Event{
+		OutboxEventID: id, AggregateType: "filing_requirement", AggregateID: f.FilingID,
+		EventType: eventType, TenantID: f.TenantID, LegalEntityID: f.LegalEntityID,
+		ActorID: meta.ActorID, CorrelationID: meta.CorrelationID, Payload: envelope,
+	})
+}
+
+func (s *PgStore) Create(ctx context.Context, f *domain.FilingRequirement, meta EventMeta) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -81,6 +120,9 @@ func (s *PgStore) Create(ctx context.Context, f *domain.FilingRequirement) error
 			return domain.ErrDuplicateRequirement
 		}
 		return fmt.Errorf("insert filing requirement: %w", err)
+	}
+	if err := enqueue(ctx, tx, EventFilingDue, f, meta); err != nil {
+		return err
 	}
 	return tx.Commit(ctx)
 }
@@ -167,7 +209,7 @@ func (s *PgStore) List(ctx context.Context, legalEntityID, jurisdictionID, filin
 	return out, nil
 }
 
-func (s *PgStore) Update(ctx context.Context, f *domain.FilingRequirement) error {
+func (s *PgStore) Update(ctx context.Context, f *domain.FilingRequirement, meta EventMeta) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -187,10 +229,13 @@ func (s *PgStore) Update(ctx context.Context, f *domain.FilingRequirement) error
 	if err != nil {
 		return fmt.Errorf("update filing requirement: %w", err)
 	}
+	if err := enqueue(ctx, tx, EventFilingRequirementUpdated, f, meta); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 
-func (s *PgStore) Submit(ctx context.Context, id string, req *domain.SubmitFilingRequest) (*domain.FilingRequirement, error) {
+func (s *PgStore) Submit(ctx context.Context, id string, req *domain.SubmitFilingRequest, meta EventMeta) (*domain.FilingRequirement, error) {
 	f, err := s.GetByID(ctx, id)
 	if err != nil {
 		return nil, err
@@ -227,13 +272,16 @@ func (s *PgStore) Submit(ctx context.Context, id string, req *domain.SubmitFilin
 	if err != nil {
 		return nil, fmt.Errorf("submit filing requirement: %w", err)
 	}
+	if err := enqueue(ctx, tx, EventFilingSubmitted, f, meta); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return f, nil
 }
 
-func (s *PgStore) Confirm(ctx context.Context, id string, req *domain.ConfirmFilingRequest) (*domain.FilingRequirement, error) {
+func (s *PgStore) Confirm(ctx context.Context, id string, req *domain.ConfirmFilingRequest, meta EventMeta) (*domain.FilingRequirement, error) {
 	f, err := s.GetByID(ctx, id)
 	if err != nil {
 		return nil, err
@@ -252,9 +300,13 @@ func (s *PgStore) Confirm(ctx context.Context, id string, req *domain.ConfirmFil
 	}
 
 	// An authority acknowledgement confirms a submission: only a SUBMITTED
-	// filing can be confirmed. Re-checked under the row lock.
+	// filing can be confirmed. Re-checked under the row lock, together with
+	// segregation of duties: the submitter may not confirm their own filing.
+	// Checking here (not only in the handler) closes the race where the same
+	// principal submits and confirms concurrently.
 	var current string
-	if err := tx.QueryRow(ctx, `SELECT status FROM filing_requirements WHERE filing_id=$1 FOR UPDATE`, id).Scan(&current); err != nil {
+	var submittedBy *string
+	if err := tx.QueryRow(ctx, `SELECT status, submitted_by FROM filing_requirements WHERE filing_id=$1 FOR UPDATE`, id).Scan(&current, &submittedBy); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.ErrRequirementNotFound
 		}
@@ -266,6 +318,12 @@ func (s *PgStore) Confirm(ctx context.Context, id string, req *domain.ConfirmFil
 		return nil, domain.ErrAlreadyConfirmed
 	default:
 		return nil, domain.ErrNotSubmitted
+	}
+	if meta.ActorID == "" {
+		return nil, domain.ErrActorRequired
+	}
+	if submittedBy != nil && *submittedBy == meta.ActorID {
+		return nil, domain.ErrSegregationOfDuties
 	}
 
 	now := time.Now().UTC()
@@ -286,13 +344,16 @@ func (s *PgStore) Confirm(ctx context.Context, id string, req *domain.ConfirmFil
 	if err != nil {
 		return nil, fmt.Errorf("confirm filing requirement: %w", err)
 	}
+	if err := enqueue(ctx, tx, EventFilingConfirmed, f, meta); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return f, nil
 }
 
-func (s *PgStore) MarkOverdue(ctx context.Context, id, todayStr string) (*domain.FilingRequirement, error) {
+func (s *PgStore) MarkOverdue(ctx context.Context, id, todayStr string, meta EventMeta) (*domain.FilingRequirement, error) {
 	f, err := s.GetByID(ctx, id)
 	if err != nil {
 		return nil, err
@@ -324,6 +385,13 @@ func (s *PgStore) MarkOverdue(ctx context.Context, id, todayStr string) (*domain
 	)
 	if err != nil {
 		return nil, fmt.Errorf("mark filing overdue: %w", err)
+	}
+	// Only a transition to OVERDUE is an event (a not-yet-due filing is
+	// written back unchanged, as before).
+	if f.Status == domain.StatusOverdue {
+		if err := enqueue(ctx, tx, EventFilingOverdue, f, meta); err != nil {
+			return nil, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
