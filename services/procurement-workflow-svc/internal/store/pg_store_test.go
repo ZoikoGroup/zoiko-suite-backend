@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -36,16 +37,22 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	base := filepath.Dir(filename)
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS procurement_cases CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS outbox_events CASCADE;`)
 
-	for _, name := range []string{
-		"000001_initial_schema.up.sql",
-	} {
-		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", name))
+	// Every *.up.sql, sorted: this applied 000001 alone, so neither FORCE RLS
+	// (000002) nor the outbox (000004) was in the schema under test.
+	migrations, err := filepath.Glob(filepath.Join(base, "../../deployments/migrations", "*.up.sql"))
+	if err != nil || len(migrations) == 0 {
+		t.Fatalf("no *.up.sql migrations found: %v", err)
+	}
+	sort.Strings(migrations)
+	for _, path := range migrations {
+		sql, err := os.ReadFile(path)
 		if err != nil {
-			t.Fatalf("failed to read migration %s: %v", name, err)
+			t.Fatalf("failed to read migration %s: %v", filepath.Base(path), err)
 		}
 		if _, err := pool.Exec(ctx, string(sql)); err != nil {
-			t.Fatalf("failed to apply migration %s: %v", name, err)
+			t.Fatalf("failed to apply migration %s: %v", filepath.Base(path), err)
 		}
 	}
 

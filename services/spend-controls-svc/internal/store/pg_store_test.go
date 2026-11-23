@@ -50,6 +50,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	// consumptions first: it has an FK onto policies.
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS spend_consumptions CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS spend_policies CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS outbox_events CASCADE;`)
 
 	// EVERY *.up.sql, BY GLOB, NOT ONE NAMED FILE. This applied 000001 alone and
 	// the service has two, so 000002_force_rls was never present in the schema

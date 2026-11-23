@@ -11,7 +11,9 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"zoiko.io/spend-controls-svc/internal/domain"
+	"zoiko.io/spend-controls-svc/internal/events"
 	svcmiddleware "zoiko.io/spend-controls-svc/internal/middleware"
+	"zoiko.io/spend-controls-svc/internal/outbox"
 )
 
 type PgStore struct {
@@ -417,6 +419,17 @@ func (s *PgStore) EvaluateSpend(ctx context.Context, in domain.SpendEvaluation) 
 			return err
 		}
 		decision.ConsumptionID = consumptionID
+		// A fresh refusal emits its events in THIS transaction: the BLOCKED row
+		// and the notice that it happened commit or roll back together, and the
+		// relay delivers them with retry. A replay (above) never reaches here,
+		// so a retried check does not report a second breach.
+		if decision.Outcome == "BLOCKED" {
+			for _, ev := range events.BlockedEvents(tenantID, in.EventCorrelationID, in, *policy, projected) {
+				if _, err := outbox.Insert(ctx, tx, ev); err != nil {
+					return err
+				}
+			}
+		}
 		return nil
 	})
 	// A concurrent call with the same correlation_id won the insert. Its decision

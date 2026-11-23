@@ -1029,6 +1029,48 @@ func TestGetRequest_NoPrincipal_RefusedUnlessSystemChannel_AndAlwaysTenantScoped
 	}
 }
 
+// Documents the limit of the X-Source-Channel: system path (hardening audit
+// of 23402ba0, finding 2): the declaration only ever substitutes for a MISSING
+// principal. A request carrying a principal — every request through the edge,
+// where gateway-auth-svc always sets X-Principal-Id — is authorized with
+// PR_REQUEST_READ even when it also claims the system channel, so an edge
+// caller cannot use the header to skip authorization. A principal-less
+// in-cluster call that sets the header is still served without any check:
+// there is no verifiable service identity on inbound calls to this service
+// (its mTLS identity is client-side only, toward authorization-svc), so
+// replacing the header needs a platform decision. This test pins today's
+// behaviour so that change is deliberate.
+func TestGetRequest_SystemChannelNeverOverridesAPrincipal(t *testing.T) {
+	e := newEnv()
+	e.store.seed(withStatus(pending("r1", "requester"), domain.RequestStatusApproved))
+	e.authz.err = domain.ErrAuthorizationDenied
+	r := e.router()
+	req := httptest.NewRequest(http.MethodGet, base+"r1", nil)
+	req.Header.Set("X-Tenant-Id", tenantA)
+	req.Header.Set("X-Principal-Id", "outsider")
+	req.Header.Set("X-Source-Channel", "system")
+	req.Header.Set("X-Source-Channel-Basis", "asserted")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("a principal claiming the system channel must still be authorized (403 on deny), got %d", rec.Code)
+	}
+	if len(e.authz.actions) != 1 || e.authz.actions[0] != "PR_REQUEST_READ" {
+		t.Fatalf("expected one PR_REQUEST_READ check, got %v", e.authz.actions)
+	}
+
+	// The unverifiable part, pinned: no principal + the header = served.
+	e.authz.actions = nil
+	req = httptest.NewRequest(http.MethodGet, base+"r1", nil)
+	req.Header.Set("X-Tenant-Id", tenantA)
+	req.Header.Set("X-Source-Channel", "system")
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || len(e.authz.actions) != 0 {
+		t.Fatalf("principal-less system read: %d, authz checks %v (behaviour changed: update the report)", rec.Code, e.authz.actions)
+	}
+}
+
 func TestGetRequest_OtherTenant_IsNotFound_NotForbidden(t *testing.T) {
 	e := newEnv()
 	e.store.seed(pending("r1", "requester"))
