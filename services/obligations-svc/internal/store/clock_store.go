@@ -1361,3 +1361,54 @@ func (s *PgStore) Summary(ctx context.Context, now time.Time) (*domain.Obligatio
 
 // clockKeyFromHeader normalises an Idempotency-Key into a clock key.
 func ClockKeyFromHeader(key string) string { return strings.TrimSpace(key) }
+
+// GetApplicabilityDecision reads one applicability decision by id.
+func (s *PgStore) GetApplicabilityDecision(ctx context.Context, id string) (*domain.ApplicabilityDecision, error) {
+	var d domain.ApplicabilityDecision
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, _ string) error {
+		err := tx.QueryRow(ctx, `SELECT applicability_decision_id::text, obligation_id::text, decision
+			FROM applicability_decisions WHERE applicability_decision_id = $1`, id).Scan(&d.ApplicabilityDecisionID, &d.ObligationID, &d.Decision)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrApplicabilityMismatch
+		}
+		return storeErr(err)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
+// OverdueCount is one cell of the overdue-clock gauge.
+type OverdueCount struct {
+	ClockClass   string
+	Jurisdiction string
+	Count        int
+}
+
+// ClockStats reads, across tenants, the running clocks past due_at by class
+// and jurisdiction, and the age of the oldest one whose OVERDUE state is not
+// yet persisted (the sweep lag).
+func (s *PgStore) ClockStats(ctx context.Context, now time.Time) ([]OverdueCount, float64, error) {
+	var out []OverdueCount
+	var lag float64
+	err := s.withSweepTx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT clock_class, COALESCE(jurisdiction_code, ''), COUNT(*) FROM obligation_clocks
+			WHERE clock_state IN ('ACTIVE','DUE_SOON','DUE','OVERDUE') AND due_at < $1 GROUP BY 1, 2`, now)
+		if err != nil {
+			return storeErr(err)
+		}
+		for rows.Next() {
+			var c OverdueCount
+			if err := rows.Scan(&c.ClockClass, &c.Jurisdiction, &c.Count); err != nil {
+				rows.Close()
+				return storeErr(err)
+			}
+			out = append(out, c)
+		}
+		rows.Close()
+		return storeErr(tx.QueryRow(ctx, `SELECT COALESCE(EXTRACT(EPOCH FROM $1 - MIN(due_at)), 0) FROM obligation_clocks
+			WHERE clock_state IN ('ACTIVE','DUE_SOON','DUE') AND due_at < $1`, now).Scan(&lag))
+	})
+	return out, lag, err
+}

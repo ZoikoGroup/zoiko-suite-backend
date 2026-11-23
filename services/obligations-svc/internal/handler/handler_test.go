@@ -139,8 +139,8 @@ func (s *stubStore) CreateFilingRequirement(_ context.Context, _ domain.CreateFi
 	return s.filingReq, s.filingErr
 }
 
-func (s *stubStore) ListFilingRequirements(_ context.Context, _ string, limit int) ([]*domain.FilingRequirement, error) {
-	s.lastLimit = limit
+func (s *stubStore) ListFilingRequirements(_ context.Context, f domain.ListFilingRequirementsFilter) ([]*domain.FilingRequirement, error) {
+	s.lastLimit = f.Limit
 	return s.filingList, s.filingListErr
 }
 

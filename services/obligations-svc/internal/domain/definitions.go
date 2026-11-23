@@ -141,6 +141,14 @@ type FilingTransition struct {
 // ObligationStatuses are the values obligation_status may take.
 var ObligationStatuses = map[string]bool{"OPEN": true, "IN_PROGRESS": true, "OVERDUE": true, "CLOSED": true}
 
+// ObligationTransitions enumerates the obligation_status state machine.
+// CLOSED is terminal: never a key. Enforced in the store under a row lock.
+var ObligationTransitions = map[string][]string{
+	"OPEN":        {"IN_PROGRESS", "OVERDUE", "CLOSED"},
+	"IN_PROGRESS": {"OVERDUE", "CLOSED"},
+	"OVERDUE":     {"CLOSED"},
+}
+
 // ApplicabilityDecisionValues are the decisions that may be stored. UNASSESSED
 // is the absence of a decision and is never stored (000006 CHECK).
 var ApplicabilityDecisionValues = map[string]bool{"APPLICABLE": true, "NOT_APPLICABLE": true, "UNCERTAIN": true}

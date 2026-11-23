@@ -319,8 +319,9 @@ func TestCreateApplicabilityDecision_IdempotencyMismatch(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &bodyMap); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if bodyMap["error"] != "idempotency_key_conflict" {
-		t.Fatalf("expected error idempotency_key_conflict, got %v", bodyMap["error"])
+	// RFC 9457: the stable code is the problem's "code" member.
+	if bodyMap["code"] != "IDEMPOTENCY_KEY_CONFLICT" {
+		t.Fatalf("expected code IDEMPOTENCY_KEY_CONFLICT, got %v (%v)", bodyMap["code"], bodyMap)
 	}
 }
 

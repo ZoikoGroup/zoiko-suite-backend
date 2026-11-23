@@ -65,6 +65,14 @@ type Metrics struct {
 	OutboxPending              prometheus.Gauge
 	OutboxFailed               prometheus.Gauge
 	OutboxOldestPendingSeconds prometheus.Gauge
+
+	// WFC-05 deadline clocks (R-001 s12.1, tracker OB-S13 / B16).
+	ClocksOverdue          *prometheus.GaugeVec   // overdue clocks by class and jurisdiction
+	ClockSweepLagSeconds   prometheus.Gauge       // how far the persisted state lags the computed one
+	ClockSweepMoves        *prometheus.CounterVec // persisted computed moves by target state
+	MilestonesFired        *prometheus.CounterVec // escalation / warning milestones fired by action
+	EscalationFailures     *prometheus.CounterVec // escalation deliveries that failed by action
+	CalendarRecalculations *prometheus.CounterVec // calendar-driven recalculations by result
 }
 
 // SetOutbox implements outbox.Gauges.
@@ -113,8 +121,22 @@ func NewMetrics(serviceName string) *Metrics {
 			ConstLabels: prometheus.Labels{"service": serviceName},
 		}),
 	}
+	cl := prometheus.Labels{"service": serviceName}
+	m.ClocksOverdue = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "obligation_clocks_overdue",
+		Help: "Running deadline clocks past due_at, by clock class and jurisdiction.", ConstLabels: cl}, []string{"clock_class", "jurisdiction"})
+	m.ClockSweepLagSeconds = prometheus.NewGauge(prometheus.GaugeOpts{Name: "obligation_clock_sweep_lag_seconds",
+		Help: "Age of the oldest overdue clock whose OVERDUE state is not yet persisted (reads are never affected).", ConstLabels: cl})
+	m.ClockSweepMoves = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "obligation_clock_sweep_moves_total",
+		Help: "Computed clock moves persisted by the sweep, by target state.", ConstLabels: cl}, []string{"to_state"})
+	m.MilestonesFired = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "obligation_clock_milestones_fired_total",
+		Help: "Clock milestones fired, by action.", ConstLabels: cl}, []string{"action"})
+	m.EscalationFailures = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "obligation_escalation_failures_total",
+		Help: "Escalation actions that failed (case requests refused, milestones that errored), by action.", ConstLabels: cl}, []string{"action"})
+	m.CalendarRecalculations = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "obligation_calendar_recalculations_total",
+		Help: "Clock recalculations after a calendar correction, by result.", ConstLabels: cl}, []string{"result"})
 	prometheus.MustRegister(m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp, m.EventPublishFailures,
-		m.OutboxPending, m.OutboxFailed, m.OutboxOldestPendingSeconds)
+		m.OutboxPending, m.OutboxFailed, m.OutboxOldestPendingSeconds,
+		m.ClocksOverdue, m.ClockSweepLagSeconds, m.ClockSweepMoves, m.MilestonesFired, m.EscalationFailures, m.CalendarRecalculations)
 	return m
 }
 

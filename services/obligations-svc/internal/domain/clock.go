@@ -443,8 +443,8 @@ type StartClockParams struct {
 	// on a clock outside any request.
 	SystemTenantID string
 	Actor          string
-	CorrelationID      string
-	CausationID        string
+	CorrelationID  string
+	CausationID    string
 }
 
 // ClockCommandParams carries one named command on one clock.
@@ -518,15 +518,15 @@ func AuthoritySubjectFingerprint(clockID, action, reasonCode string, evidenceRef
 
 // Clock errors.
 var (
-	ErrClockNotFound           = errorString("clock not found")
-	ErrClockCommandNotAllowed  = errorString("the clock's state does not allow this command")
-	ErrClockVersionMismatch    = errorString("clock version mismatch: the clock has been modified by another request")
-	ErrClockKeyConflict        = errorString("clock key already used for a different request")
-	ErrEvidenceMissing         = errorString("required evidence is missing")
-	ErrApprovalRequired        = errorString("an approved workflow decided by another principal is required")
-	ErrCalculationRefused      = errorString("jurisdiction-rules-svc did not calculate a due date")
-	ErrWorkflowUnavailable     = errorString("workflow-svc unavailable")
-	ErrEvidenceUnavailable     = errorString("evidence-requirements-svc unavailable")
+	ErrClockNotFound            = errorString("clock not found")
+	ErrClockCommandNotAllowed   = errorString("the clock's state does not allow this command")
+	ErrClockVersionMismatch     = errorString("clock version mismatch: the clock has been modified by another request")
+	ErrClockKeyConflict         = errorString("clock key already used for a different request")
+	ErrEvidenceMissing          = errorString("required evidence is missing")
+	ErrApprovalRequired         = errorString("an approved workflow decided by another principal is required")
+	ErrCalculationRefused       = errorString("jurisdiction-rules-svc did not calculate a due date")
+	ErrWorkflowUnavailable      = errorString("workflow-svc unavailable")
+	ErrEvidenceUnavailable      = errorString("evidence-requirements-svc unavailable")
 	ErrEscalationPolicyNotFound = errorString("escalation policy not found")
-	ErrApplicabilityMismatch   = errorString("the applicability decision does not resolve this obligation as not applicable")
+	ErrApplicabilityMismatch    = errorString("the applicability decision does not resolve this obligation as not applicable")
 )

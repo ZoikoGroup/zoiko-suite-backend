@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: obligations-svc
-  version: 1.2.0
+  version: 1.3.0
   description: |
     Obligations Service (Doc 03 §8.5, Doc 04 §13). Owns obligation definitions,
     obligation state, due dates, obligation-to-entity and obligation-to-workflow
@@ -18,7 +18,9 @@ info:
     Events (transactional outbox, topic zoiko.obligations.events, key
     `<tenant>/<aggregate>`): obligation.created, obligation.updated,
     obligation.overdue, obligation.closed, obligation.definition.changed,
-    obligation.entity_mapping.changed.
+    obligation.entity_mapping.changed; and the WFC-05 clock events (asyncapi.yaml):
+    obligation.clock.started, .activated, .due_soon, .due, .overdue, .fulfilled,
+    .waived, .not_applicable, .superseded, and obligation.escalated.
 servers:
   - url: http://localhost:8088
 security:
@@ -28,8 +30,7 @@ tags:
   - name: filing
   - name: applicability
   - name: definitions
-  - name: compliance
-  - name: exceptions
+  - name: clocks
   - name: probes
 paths:
   /v1/obligations:
@@ -490,6 +491,293 @@ paths:
         '400': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/evaluate:
+    post:
+      tags: [clocks]
+      operationId: evaluateObligation
+      summary: Raise an obligation from a catalogue definition and start its deadline clock from a trigger (R-001 s10.1)
+      description: |
+        Every rule of POST /v1/obligations applies to `obligation` (definition pinned, entity mapped and in the registry,
+        jurisdiction validated, OBLIGATION_CREATE). `obligation.due_date` cannot be sent: it is the clock's computed local
+        due date. The clock needs OBLIGATION_CLOCK_CREATE. Idempotent on the Idempotency-Key.
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [obligation, clock]
+              additionalProperties: false
+              properties:
+                obligation: {type: object, description: 'A POST /v1/obligations body with obligation_definition_id and without due_date'}
+                clock: {$ref: '#/components/schemas/StartClock'}
+      responses:
+        '201': {description: Raised and started, content: {application/json: {schema: {$ref: '#/components/schemas/EvaluateResult'}}}}
+        '200': {description: Idempotent replay, content: {application/json: {schema: {$ref: '#/components/schemas/EvaluateResult'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/summary:
+    get:
+      tags: [clocks]
+      operationId: obligationSummary
+      summary: Console KPIs for the caller's tenant (OBLIGATION_READ at platform scope)
+      responses:
+        '200': {description: Summary, content: {application/json: {schema: {$ref: '#/components/schemas/ObligationSummary'}}}}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}/satisfy:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}]
+    post:
+      tags: [clocks]
+      operationId: satisfyObligation
+      summary: Fulfil every running clock of the obligation with one evidence evaluation (If-Match is the obligation's version)
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/IfMatch'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/SatisfyClock'}}}}
+      responses:
+        '200': {description: Fulfilled, content: {application/json: {schema: {type: object, properties: {obligation_id: {type: string}, clocks: {type: array, items: {$ref: '#/components/schemas/Clock'}}}}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/Problem'}
+        '428': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}/available-actions:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}]
+    get:
+      tags: [obligations]
+      operationId: obligationAvailableActions
+      summary: ST-2 — the commands the obligation's state allows, each checked against the caller's grant
+      responses:
+        '200': {description: Actions, content: {application/json: {schema: {$ref: '#/components/schemas/AvailableActions'}}}}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}/clocks:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}]
+    post:
+      tags: [clocks]
+      operationId: startClock
+      summary: Start a deadline clock computed by jurisdiction-rules-svc (OBLIGATION_CLOCK_CREATE)
+      description: |
+        The due instant is the answer of POST /v1/obligation-calculations:calculate, stored with its full provenance
+        (R-INV-16). Any outcome other than DUE_DATE_CALCULATED is refused with 422 naming the outcome; jurisdiction-rules-svc
+        unreachable is 503. There is no field for a due date (R-INV-15). Idempotent on the Idempotency-Key (the clock key).
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/StartClock'}}}}
+      responses:
+        '201': {description: Started, headers: {Location: {$ref: '#/components/headers/Location'}, ETag: {$ref: '#/components/headers/ETag'}}, content: {application/json: {schema: {$ref: '#/components/schemas/Clock'}}}}
+        '200': {description: Idempotent replay, content: {application/json: {schema: {$ref: '#/components/schemas/Clock'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [clocks]
+      operationId: listClocks
+      summary: The obligation's clocks, effective state resolved at read time (API-4 keyset cursor)
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+        - {name: clock_class, in: query, schema: {$ref: '#/components/schemas/ClockClass'}}
+        - {name: stored_state, in: query, schema: {$ref: '#/components/schemas/ClockState'}}
+      responses:
+        '200': {description: Clocks, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/Clock'}}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}/clocks/{clock_id}:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}, {$ref: '#/components/parameters/ClockID'}]
+    get:
+      tags: [clocks]
+      operationId: getClock
+      summary: One clock; clock_state is computed at read time (OVERDUE once now > due_at, sweep or no sweep)
+      responses:
+        '200': {description: Clock, headers: {ETag: {$ref: '#/components/headers/ETag'}}, content: {application/json: {schema: {$ref: '#/components/schemas/Clock'}}}}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}/clocks/{clock_id}/transitions:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}, {$ref: '#/components/parameters/ClockID'}]
+    get:
+      tags: [clocks]
+      operationId: listClockTransitions
+      summary: ST-2 — the clock's append-only history
+      responses:
+        '200': {description: Transitions, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/ClockTransition'}}}}}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}/clocks/{clock_id}/milestones:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}, {$ref: '#/components/parameters/ClockID'}]
+    get:
+      tags: [clocks]
+      operationId: listClockMilestones
+      summary: The clock's warning and escalation schedule
+      responses:
+        '200': {description: Milestones, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/Milestone'}}}}}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}/clocks/{clock_id}/escalations:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}, {$ref: '#/components/parameters/ClockID'}]
+    get:
+      tags: [clocks]
+      operationId: listClockEscalations
+      summary: The clock's append-only escalation record
+      responses:
+        '200': {description: Escalation events, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/EscalationEvent'}}}}}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}/clocks/{clock_id}/available-actions:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}, {$ref: '#/components/parameters/ClockID'}]
+    get:
+      tags: [clocks]
+      operationId: clockAvailableActions
+      summary: ST-2 — the named commands the clock's effective state allows, each checked against the caller's grant
+      responses:
+        '200': {description: Actions, content: {application/json: {schema: {$ref: '#/components/schemas/AvailableActions'}}}}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}/clocks/{clock_id}/activate:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}, {$ref: '#/components/parameters/ClockID'}]
+    post:
+      tags: [clocks]
+      operationId: activateClock
+      summary: PLANNED → ACTIVE (OBLIGATION_CLOCK_CREATE)
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/IfMatch'}]
+      requestBody: {required: false, content: {application/json: {schema: {type: object, additionalProperties: false, properties: {expected_version: {type: integer}}}}}}
+      responses: &clockCommandResponses
+        '200': {description: Moved, headers: {ETag: {$ref: '#/components/headers/ETag'}}, content: {application/json: {schema: {$ref: '#/components/schemas/Clock'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/Problem'}
+        '428': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}/clocks/{clock_id}/satisfy:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}, {$ref: '#/components/parameters/ClockID'}]
+    post:
+      tags: [clocks]
+      operationId: satisfyClock
+      summary: FULFILLED with evidence accepted by evidence-requirements-svc, or an approved exemption (R-INV-14; MISSING is 409 evidence_missing)
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/IfMatch'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/SatisfyClock'}}}}
+      responses: *clockCommandResponses
+  /v1/obligations/{obligation_id}/clocks/{clock_id}/waive:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}, {$ref: '#/components/parameters/ClockID'}]
+    post:
+      tags: [clocks]
+      operationId: waiveClock
+      summary: WAIVED under OBLIGATION_CLOCK_WAIVE and an APPROVED OBLIGATION_WAIVER workflow decided by another principal (409 approval_required otherwise)
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/IfMatch'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AuthorityCommand'}}}}
+      responses: *clockCommandResponses
+  /v1/obligations/{obligation_id}/clocks/{clock_id}/not-applicable:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}, {$ref: '#/components/parameters/ClockID'}]
+    post:
+      tags: [clocks]
+      operationId: notApplicableClock
+      summary: NOT_APPLICABLE under OBLIGATION_CLOCK_NOT_APPLICABLE, an APPROVED OBLIGATION_NOT_APPLICABLE workflow and a NOT_APPLICABLE applicability decision
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/IfMatch'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AuthorityCommand'}}}}
+      responses: *clockCommandResponses
+  /v1/obligations/{obligation_id}/clocks/{clock_id}/recalculate:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}, {$ref: '#/components/parameters/ClockID'}]
+    post:
+      tags: [clocks]
+      operationId: recalculateClock
+      summary: Ask jurisdiction-rules-svc again; a changed due instant or calendar version supersedes the clock with a successor (R-INV-17)
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/IfMatch'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason_code]
+              additionalProperties: false
+              properties:
+                reason_code: {type: string}
+                reason_text: {type: string}
+                expected_version: {type: integer}
+      responses:
+        '200': {description: Recalculated, content: {application/json: {schema: {type: object, properties: {superseded: {type: boolean}, clock: {$ref: '#/components/schemas/Clock'}, successor: {$ref: '#/components/schemas/Clock'}}}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+        '428': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}/clocks/{clock_id}/status:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}, {$ref: '#/components/parameters/ClockID'}]
+    post:
+      tags: [clocks]
+      operationId: clockStatusAlias
+      deprecated: true
+      summary: Deprecated (ST-3). ACTIVE runs activate; any other target answers 409 naming the command to use
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/IfMatch'}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [clock_state], properties: {clock_state: {$ref: '#/components/schemas/ClockState'}, expected_version: {type: integer}}}}}}
+      responses: *clockCommandResponses
+  /v1/escalation-policies:
+    post:
+      tags: [clocks]
+      operationId: createEscalationPolicy
+      summary: Create the next immutable version of an escalation policy (OBLIGATION_ESCALATION_POLICY_MANAGE)
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [policy_code, milestones]
+              additionalProperties: false
+              properties:
+                policy_code: {type: string, pattern: '^[A-Z0-9_]{2,64}$'}
+                milestones: {type: array, minItems: 1, maxItems: 20, items: {$ref: '#/components/schemas/MilestoneSpec'}}
+      responses:
+        '201': {description: Created, headers: {Location: {$ref: '#/components/headers/Location'}}, content: {application/json: {schema: {$ref: '#/components/schemas/EscalationPolicy'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [clocks]
+      operationId: listEscalationPolicies
+      summary: Escalation policy versions by code then version (cursor = code.version)
+      parameters: [{$ref: '#/components/parameters/Limit'}, {$ref: '#/components/parameters/Cursor'}, {name: policy_code, in: query, schema: {type: string}}]
+      responses:
+        '200': {description: Policies, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/EscalationPolicy'}}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+  /v1/escalation-policies/{escalation_policy_id}:
+    parameters: [{$ref: '#/components/parameters/EscalationPolicyID'}]
+    get:
+      tags: [clocks]
+      operationId: getEscalationPolicy
+      summary: One escalation policy version
+      responses:
+        '200': {description: Policy, content: {application/json: {schema: {$ref: '#/components/schemas/EscalationPolicy'}}}}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+  /v1/escalation-policies/{escalation_policy_id}/retire:
+    parameters: [{$ref: '#/components/parameters/EscalationPolicyID'}]
+    post:
+      tags: [clocks]
+      operationId: retireEscalationPolicy
+      summary: Retire a policy version; clocks already on it keep their milestones
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/IfMatch'}]
+      responses:
+        '200': {description: Retired, content: {application/json: {schema: {$ref: '#/components/schemas/EscalationPolicy'}}}}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/Problem'}
+        '428': {$ref: '#/components/responses/Problem'}
   /healthz:
     get:
       tags: [probes]
@@ -523,6 +811,8 @@ components:
     ObligationID: {name: obligation_id, in: path, required: true, schema: {type: string, format: uuid}}
     FilingRequirementID: {name: filing_requirement_id, in: path, required: true, schema: {type: string, format: uuid}}
     DefinitionID: {name: definition_id, in: path, required: true, schema: {type: string, format: uuid}}
+    ClockID: {name: clock_id, in: path, required: true, schema: {type: string, format: uuid}}
+    EscalationPolicyID: {name: escalation_policy_id, in: path, required: true, schema: {type: string, format: uuid}}
     IdempotencyKey: {name: Idempotency-Key, in: header, required: true, schema: {type: string}}
     LegalEntityHeader: {name: X-Legal-Entity-Id, in: header, required: true, description: Must equal the body's legal_entity_id, schema: {type: string}}
     IfMatch: {name: If-Match, in: header, required: true, description: 'The version this change is based on, e.g. "3"', schema: {type: string}}
@@ -710,3 +1000,216 @@ components:
         created_at: {type: string, format: date-time}
         created_by_principal_id: {type: string}
         ended_by_principal_id: {type: [string, 'null']}
+    ClockClass: {type: string, enum: [HARD_LEGAL, REGULATORY, CONTRACTUAL, INTERNAL_SLA, ADVISORY]}
+    ClockState: {type: string, enum: [PLANNED, ACTIVE, DUE_SOON, DUE, OVERDUE, FULFILLED, WAIVED, NOT_APPLICABLE, SUPERSEDED]}
+    MilestoneSpec:
+      type: object
+      required: [kind, offset_seconds, action]
+      additionalProperties: false
+      properties:
+        kind: {type: string, enum: [WARNING, ESCALATION]}
+        offset_seconds: {type: integer, description: Relative to due_at; negative is before it}
+        action: {type: string, enum: [MARK_DUE_SOON, RAISE_PRIORITY, ADD_OWNER, OPEN_CASE, NOTIFY, REQUIRE_APPROVAL]}
+        params: {type: object}
+    StartClock:
+      type: object
+      required: [clock_class, jurisdiction_code, rule_obligation_code, facts, trigger]
+      additionalProperties: false
+      properties:
+        clock_class: {$ref: '#/components/schemas/ClockClass'}
+        jurisdiction_code: {type: string}
+        rule_obligation_code: {type: string, description: The jurisdiction rule's obligation code (e.g. VAT_RETURN)}
+        facts:
+          type: object
+          additionalProperties: false
+          properties:
+            period_end: {type: string, format: date}
+            event_date: {type: string, format: date}
+            registration_date: {type: string, format: date}
+            anniversary_date: {type: string, format: date}
+            anchor_year: {type: integer}
+            extension_days: {type: integer}
+            extension_evidence_ref: {type: string}
+        pack_ref: {type: string}
+        pack_version: {type: string}
+        trigger:
+          type: object
+          required: [event_id, event_type, event_time, source_object_type, source_object_id]
+          additionalProperties: false
+          properties:
+            event_id: {type: string}
+            event_type: {type: string}
+            event_time: {type: string, format: date-time}
+            business_event_time: {type: string, format: date-time}
+            source_object_type: {type: string}
+            source_object_id: {type: string}
+            source_object_version: {type: string}
+        planned: {type: boolean}
+        due_soon_days: {type: integer, minimum: 0, maximum: 366, default: 7}
+        escalation_policy_id: {type: string, format: uuid}
+        milestones: {type: array, items: {$ref: '#/components/schemas/MilestoneSpec'}}
+    SatisfyClock:
+      type: object
+      additionalProperties: false
+      description: evidence_refs are <EVIDENCE_TYPE>:<reference_id>[:<subtype>]; without them, evidence_exempt_reason and an approved OBLIGATION_EVIDENCE_EXEMPTION workflow
+      properties:
+        evidence_refs: {type: array, items: {type: string}}
+        evidence_exempt_reason: {type: string}
+        approval_reference: {type: string, format: uuid}
+        domain_confirmation_ref: {type: string}
+        subject_state: {type: string}
+        expected_version: {type: integer}
+    AuthorityCommand:
+      type: object
+      required: [reason_code, evidence_refs, approval_reference]
+      additionalProperties: false
+      properties:
+        reason_code: {type: string}
+        reason_text: {type: string}
+        evidence_refs: {type: array, minItems: 1, items: {type: string}}
+        approval_reference: {type: string, format: uuid, description: 'The approval workflow; its subject is OBLIGATION_CLOCK/<clock_id> with the fingerprint of (clock, action, reason_code, evidence_refs)'}
+        applicability_decision_id: {type: string, format: uuid, description: Required for not-applicable}
+        expected_version: {type: integer}
+    Clock:
+      type: object
+      description: A deadline clock with its full provenance (R-001 s7.1, R-INV-16). clock_state is the effective state at read time; stored_state is what is persisted.
+      properties:
+        clock_id: {type: string, format: uuid}
+        clock_key: {type: string}
+        obligation_id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        legal_entity_id: {type: string}
+        clock_class: {$ref: '#/components/schemas/ClockClass'}
+        stored_state: {$ref: '#/components/schemas/ClockState'}
+        clock_state: {$ref: '#/components/schemas/ClockState'}
+        jurisdiction_code: {type: string}
+        rule_obligation_code: {type: string}
+        obligation_rule_id: {type: string}
+        rule_version: {type: integer}
+        rule_content_digest: {type: string}
+        calendar_code: {type: [string, 'null']}
+        calendar_version: {type: [integer, 'null']}
+        calendar_version_id: {type: [string, 'null']}
+        timezone: {type: string}
+        business_day_adjustment: {type: [string, 'null']}
+        anchor_date: {type: [string, 'null']}
+        unadjusted_date: {type: [string, 'null']}
+        local_due_date: {type: string, format: date}
+        due_at: {type: string, format: date-time}
+        due_soon_at: {type: [string, 'null'], format: date-time}
+        extension_days_granted: {type: integer}
+        pack_ref: {type: [string, 'null']}
+        pack_version: {type: [string, 'null']}
+        pack_version_id: {type: [string, 'null']}
+        calculation_ref: {type: string, description: jurisdiction-rules-svc decision_id}
+        calculation_explanation: {type: array, items: {type: string}}
+        trigger: {type: object}
+        supersedes_clock_id: {type: [string, 'null']}
+        superseded_by_clock_id: {type: [string, 'null']}
+        superseded_at: {type: [string, 'null'], format: date-time}
+        supersession_reason: {type: [string, 'null']}
+        satisfied_at: {type: [string, 'null'], format: date-time}
+        satisfied_by: {type: [string, 'null']}
+        evidence_refs: {type: array, items: {type: string}}
+        evidence_evaluation_id: {type: [string, 'null']}
+        evidence_outcome: {type: [string, 'null']}
+        evidence_exempt_reason: {type: [string, 'null']}
+        authority_action: {type: [string, 'null'], enum: [WAIVE, NOT_APPLICABLE, null]}
+        requested_by: {type: [string, 'null']}
+        approved_by: {type: [string, 'null']}
+        approval_reference: {type: [string, 'null']}
+        reason_code: {type: [string, 'null']}
+        authority_evidence_refs: {type: array, items: {type: string}}
+        applicability_decision_id: {type: [string, 'null']}
+        overdue_since: {type: [string, 'null'], format: date-time, description: Kept after fulfilment (NP-38)}
+        priority: {type: string, enum: [NORMAL, HIGH, CRITICAL]}
+        additional_owners: {type: array, items: {type: string}}
+        plane: {type: string}
+        data_class: {type: string}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        row_version: {type: integer}
+    ClockTransition:
+      type: object
+      properties:
+        transition_id: {type: string, format: uuid}
+        clock_id: {type: string, format: uuid}
+        from_state: {type: [string, 'null']}
+        to_state: {type: string}
+        command: {type: string}
+        actor: {type: string}
+        reason_code: {type: [string, 'null']}
+        evidence_refs: {type: array, items: {type: string}}
+        row_version: {type: integer}
+        effective_at: {type: string, format: date-time, description: 'When the state began (due_at for OVERDUE), not when it was noticed'}
+        recorded_at: {type: string, format: date-time}
+    Milestone:
+      type: object
+      properties:
+        milestone_id: {type: string, format: uuid}
+        clock_id: {type: string, format: uuid}
+        kind: {type: string}
+        offset_seconds: {type: integer}
+        fire_at: {type: string, format: date-time}
+        action: {type: string}
+        params: {type: object}
+        fired_at: {type: [string, 'null'], format: date-time}
+    EscalationEvent:
+      type: object
+      properties:
+        escalation_event_id: {type: string, format: uuid}
+        clock_id: {type: string, format: uuid}
+        milestone_id: {type: [string, 'null']}
+        action: {type: string}
+        outcome: {type: string, enum: [REQUESTED, APPLIED, COMPLETED, FAILED, SKIPPED]}
+        result_ref: {type: [string, 'null']}
+        detail: {type: object}
+        occurred_at: {type: string, format: date-time}
+    EscalationPolicy:
+      type: object
+      properties:
+        escalation_policy_id: {type: string, format: uuid}
+        policy_code: {type: string}
+        version: {type: integer}
+        status: {type: string, enum: [ACTIVE, RETIRED]}
+        milestones: {type: array, items: {$ref: '#/components/schemas/MilestoneSpec'}}
+        effective_from: {type: string, format: date-time}
+        effective_to: {type: [string, 'null'], format: date-time}
+        created_by: {type: string}
+        row_version: {type: integer}
+    AvailableActions:
+      type: object
+      properties:
+        actions:
+          type: array
+          items:
+            type: object
+            properties:
+              command: {type: string}
+              method: {type: string}
+              path: {type: string}
+              authorization_action: {type: string}
+              allowed: {type: boolean}
+              reason: {type: string}
+              requires: {type: string}
+    ObligationSummary:
+      type: object
+      properties:
+        as_of: {type: string, format: date-time}
+        obligations_by_status: {type: object, additionalProperties: {type: integer}}
+        obligations_by_source: {type: object, additionalProperties: {type: integer}}
+        applicable_obligations: {type: integer}
+        due_within_30_days: {type: integer}
+        overdue_clocks: {type: integer}
+        clocks_by_state: {type: object, additionalProperties: {type: integer}}
+        clocks_by_class: {type: object, additionalProperties: {type: integer}}
+        fulfilled_clocks: {type: integer}
+        fulfilled_with_evidence: {type: integer}
+        fulfilled_late: {type: integer}
+        awaiting_review: {type: [integer, 'null'], description: Not counted here (approvals live in workflow-svc)}
+        awaiting_review_note: {type: string}
+    EvaluateResult:
+      type: object
+      properties:
+        obligation: {$ref: '#/components/schemas/Obligation'}
+        clock: {$ref: '#/components/schemas/Clock'}

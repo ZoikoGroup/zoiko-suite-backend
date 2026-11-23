@@ -12,8 +12,10 @@ import (
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+	idenv "zoiko.io/identity-envelope"
 
 	"zoiko.io/obligations-svc/internal/domain"
+	svcenvelope "zoiko.io/obligations-svc/internal/envelope"
 )
 
 // Client is the interface for calling evidence-requirements-svc.
@@ -22,11 +24,11 @@ type Client interface {
 }
 
 type EvaluateParams struct {
-	LegalEntityID      string
-	DomainCode         string
-	ActionType         string
-	CorrelationID      string
-	PresentArtifacts   []Artifact
+	LegalEntityID    string
+	DomainCode       string
+	ActionType       string
+	CorrelationID    string
+	PresentArtifacts []Artifact
 }
 
 type Artifact struct {
@@ -66,10 +68,10 @@ func NewHTTPClient(baseURL string, log *zap.Logger) *HTTPClient {
 }
 
 type evaluateRequest struct {
-	LegalEntityID    string    `json:"legal_entity_id"`
-	DomainCode       string    `json:"domain_code"`
-	ActionType       string    `json:"action_type"`
-	CorrelationID    string    `json:"correlation_id"`
+	LegalEntityID    string     `json:"legal_entity_id"`
+	DomainCode       string     `json:"domain_code"`
+	ActionType       string     `json:"action_type"`
+	CorrelationID    string     `json:"correlation_id"`
 	PresentArtifacts []Artifact `json:"present_artifacts,omitempty"`
 }
 
@@ -89,11 +91,15 @@ func (c *HTTPClient) Evaluate(ctx context.Context, params EvaluateParams) (*Eval
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/evidence/evaluate", bytes.NewReader(body))
 	if err != nil {
-		return nil, domain.ErrAuthorizationUnavailable
+		return nil, domain.ErrEvidenceUnavailable
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Correlation-ID", params.CorrelationID)
 	req.Header.Set("Idempotency-Key", uuid.NewString())
+	// The caller's identity travels with the evaluation: the signed envelope
+	// and the canonical headers (ER-S7 / OB-S16).
+	svcenvelope.ForwardTo(ctx, req)
+	idenv.Forward(ctx, req)
 
 	// Forward the caller's canonical envelope for downstream traceability
 	// (handled by the calling service's envelope middleware)
@@ -104,7 +110,7 @@ func (c *HTTPClient) Evaluate(ctx context.Context, params EvaluateParams) (*Eval
 			zap.String("legal_entity_id", params.LegalEntityID),
 			zap.String("action_type", params.ActionType),
 			zap.Error(err))
-		return nil, domain.ErrAuthorizationUnavailable
+		return nil, domain.ErrEvidenceUnavailable
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -113,31 +119,28 @@ func (c *HTTPClient) Evaluate(ctx context.Context, params EvaluateParams) (*Eval
 			zap.String("legal_entity_id", params.LegalEntityID),
 			zap.String("action_type", params.ActionType),
 			zap.Int("status_code", resp.StatusCode))
-		return nil, fmt.Errorf("evidence evaluation failed with status %d", resp.StatusCode)
+		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
+			return nil, domain.ErrAuthorizationDenied
+		}
+		return nil, fmt.Errorf("%w: evidence evaluation answered %d", domain.ErrEvidenceUnavailable, resp.StatusCode)
 	}
 
 	var result EvaluateResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode evidence evaluation response: %w", err)
+		return nil, fmt.Errorf("%w: undecodable evaluation: %v", domain.ErrEvidenceUnavailable, err)
 	}
 
 	return &result, nil
 }
 
-// NoOpClient is a no-op implementation for local/dev where evidence-requirements-svc is not available.
-type NoOpClient struct{}
+// Unconfigured answers every evaluation with domain.ErrEvidenceUnavailable:
+// with no evidence-requirements-svc configured, nothing that needs evidence
+// can pass (fail closed; rule R14 forbids an invented SATISFIED).
+type Unconfigured struct{}
 
-func (NoOpClient) Evaluate(ctx context.Context, params EvaluateParams) (*EvaluateResponse, error) {
-	// In local/dev, return SATISFIED to not block development
-	return &EvaluateResponse{
-		EvaluationID:  "noop-" + uuid.NewString(),
-		Outcome:       "SATISFIED",
-		Unmet:         nil,
-		EvaluatedAt:   time.Now().UTC(),
-		CorrelationID: params.CorrelationID,
-		DomainCode:    params.DomainCode,
-		ActionType:    params.ActionType,
-	}, nil
+// Evaluate implements Client.
+func (Unconfigured) Evaluate(context.Context, EvaluateParams) (*EvaluateResponse, error) {
+	return nil, fmt.Errorf("%w: EVIDENCE_REQUIREMENTS_URL is not configured", domain.ErrEvidenceUnavailable)
 }
 
 var ErrEvidenceInsufficient = errors.New("evidence insufficient for obligation closure")

@@ -96,16 +96,12 @@ type workflowWire struct {
 	SubjectType        *string `json:"subject_type"`
 	SubjectID          *string `json:"subject_id"`
 	InitiatedBy        string  `json:"initiated_by"`
-	Stages             []struct {
-		ApproverPrincipalID string  `json:"approver_principal_id"`
-		StageStatus         string  `json:"stage_status"`
-		ActedBy             *string `json:"acted_by"`
-		DecidedBy           *string `json:"decided_by"`
-	} `json:"stages"`
-	Decisions []struct {
-		ActorPrincipalID string `json:"actor_principal_id"`
-		Decision         string `json:"decision"`
-	} `json:"decisions"`
+}
+
+// transitionWire is one row of GET /v1/workflows/{id}/evidence.
+type transitionWire struct {
+	ToState string `json:"to_state"`
+	ActedBy string `json:"acted_by"`
 }
 
 func (c *HTTPClient) do(ctx context.Context, method, path string, body any, hdr map[string]string) (int, []byte, error) {
@@ -179,25 +175,22 @@ func (c *HTTPClient) VerifyApproval(ctx context.Context, id, fingerprint string)
 	if w.SubjectID != nil {
 		a.SubjectID = *w.SubjectID
 	}
-	seen := map[string]bool{}
-	for _, s := range w.Stages {
-		if s.StageStatus != "APPROVED" {
-			continue
-		}
-		for _, p := range []*string{s.DecidedBy, s.ActedBy, &s.ApproverPrincipalID} {
-			if p != nil && *p != "" && !seen[*p] {
-				seen[*p] = true
-				a.Deciders = append(a.Deciders, *p)
-				break
-			}
-		}
+	es, eraw, err := c.do(ctx, http.MethodGet, path+"/evidence", nil, nil)
+	if err != nil {
+		return nil, err
 	}
-	for _, d := range w.Decisions {
-		if strings.EqualFold(d.Decision, "APPROVE") || strings.EqualFold(d.Decision, "APPROVED") {
-			if d.ActorPrincipalID != "" && !seen[d.ActorPrincipalID] {
-				seen[d.ActorPrincipalID] = true
-				a.Deciders = append(a.Deciders, d.ActorPrincipalID)
-			}
+	if es != http.StatusOK {
+		return nil, fmt.Errorf("%w: the approval evidence of workflow %s cannot be read (%d)", domain.ErrApprovalRequired, id, es)
+	}
+	var trs []transitionWire
+	if err := json.Unmarshal(eraw, &trs); err != nil {
+		return nil, domain.ErrWorkflowUnavailable
+	}
+	seen := map[string]bool{}
+	for _, tr := range trs {
+		if strings.EqualFold(tr.ToState, "APPROVED") && tr.ActedBy != "" && !seen[tr.ActedBy] {
+			seen[tr.ActedBy] = true
+			a.Deciders = append(a.Deciders, tr.ActedBy)
 		}
 	}
 	vs, vraw, err := c.do(ctx, http.MethodPost, path+"/verify-release",
@@ -218,7 +211,7 @@ func (c *HTTPClient) VerifyApproval(ctx context.Context, id, fingerprint string)
 // OpenCase implements Client.
 func (c *HTTPClient) OpenCase(ctx context.Context, req CaseRequest) (string, error) {
 	hdr := map[string]string{"Idempotency-Key": req.IdempotencyKey}
-	if idenv.FromContext(ctx) == nil {
+	if _, ok := idenv.FromContext(ctx); !ok {
 		// The escalation relay has no request envelope: it acts as the
 		// service principal in the clock's tenant. Under IDENTITY_VERIFY=require
 		// on workflow-svc this path needs the mTLS peer listener (WF-S16).

@@ -1,4 +1,4 @@
-﻿// Package store provides the PostgreSQL implementation of the obligations
+// Package store provides the PostgreSQL implementation of the obligations
 // read and write model.
 //
 // This package is the ONLY layer that touches the database directly.
@@ -239,7 +239,6 @@ type Store interface {
 	CreateApplicabilityDecision(ctx context.Context, params domain.CreateApplicabilityDecisionParams) (*domain.ApplicabilityDecision, bool, error)
 	ListApplicabilityDecisions(ctx context.Context, obligationID, jurisdictionCode, entityRef string, limit int) ([]*domain.ApplicabilityDecision, error)
 	FindCurrentApplicability(ctx context.Context, obligationID, jurisdictionCode, entityRef string) (*domain.CurrentApplicability, error)
-
 }
 
 // PgStore implements Store against a PostgreSQL cluster via pgxpool.
@@ -580,15 +579,8 @@ func (s *PgStore) ListObligations(ctx context.Context, filter domain.ListObligat
 	return results, nil
 }
 
-// legalTransitions enumerates the obligation_status state machine.
-// CLOSED is terminal — never a key in this map. Enforced here in
-// application code (like policy-svc's version_status transitions), not a
-// DB CHECK constraint.
-var legalTransitions = map[string][]string{
-	"OPEN":        {"IN_PROGRESS", "OVERDUE", "CLOSED"},
-	"IN_PROGRESS": {"OVERDUE", "CLOSED"},
-	"OVERDUE":     {"CLOSED"},
-}
+// legalTransitions is the obligation_status state machine (domain.ObligationTransitions).
+var legalTransitions = domain.ObligationTransitions
 
 // UpdateObligationStatus transitions an obligation's status. Idempotent:
 // requesting the status the obligation is already in returns the unchanged
@@ -783,7 +775,6 @@ func scanFilingRequirement(row pgx.Row) (*domain.FilingRequirement, error) {
 	return f, err
 }
 
-
 // CreateFilingRequirement inserts a new filing requirement under an
 // obligation. Validates the parent obligation exists first — mirrors
 // policy-svc's CreatePolicyVersion validating its parent policy exists,
@@ -866,28 +857,26 @@ func (s *PgStore) ListFilingRequirements(ctx context.Context, filter domain.List
 		SELECT ` + filingRequirementColumns + `
 		FROM filing_requirements
 		WHERE obligation_id = $1 AND tenant_id = $2`)
-	
-	args := []any{obligationID}
+
+	args := []any{obligationID, nil} // $2 is the tenant, bound inside the transaction
 	argIdx := 3
-	
+
+	// Keyset continuation on the (created_at, id) pair the list is ordered by:
+	// two separate "<" predicates skipped every row that was newer on one
+	// column and older on the other.
 	if filter.AfterCreatedAt != nil {
-		queryBuilder.WriteString(fmt.Sprintf(" AND created_at < $%d", argIdx))
-		args = append(args, *filter.AfterCreatedAt)
-		argIdx++
+		queryBuilder.WriteString(fmt.Sprintf(" AND (created_at, filing_requirement_id) < ($%d, $%d::uuid)", argIdx, argIdx+1))
+		args = append(args, *filter.AfterCreatedAt, filter.AfterID)
+		argIdx += 2
 	}
-	if filter.AfterID != "" {
-		queryBuilder.WriteString(fmt.Sprintf(" AND filing_requirement_id < $%d", argIdx))
-		args = append(args, filter.AfterID)
-		argIdx++
-	}
-	
+
 	queryBuilder.WriteString(fmt.Sprintf(" ORDER BY created_at DESC, filing_requirement_id DESC LIMIT $%d OFFSET $%d;", argIdx, argIdx+1))
 	args = append(args, limit, offset)
 
 	var results []*domain.FilingRequirement
 	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
-		argsWithTenant := append([]any{tenantID}, args[1:]...)
-		rows, qErr := tx.Query(ctx, queryBuilder.String(), argsWithTenant...)
+		args[1] = tenantID
+		rows, qErr := tx.Query(ctx, queryBuilder.String(), args...)
 		if qErr != nil {
 			s.log.Error("pg ListFilingRequirements failed", zap.String("obligation_id", obligationID), zap.Error(qErr))
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, qErr)
@@ -1199,11 +1188,11 @@ func (s *PgStore) FindOverdueObligations(ctx context.Context, tenantID string) (
 			}
 			return rows.Err()
 		})
-	if err != nil {
-		return nil, err
+		if err != nil {
+			return nil, err
+		}
+		return results, nil
 	}
-	return results, nil
-}
 
 	// Cross-tenant query (for scheduler) - no tenant scoping
 	const crossTenantQuery = `

@@ -35,8 +35,8 @@ import (
 	"zoiko.io/obligations-svc/internal/clock"
 	"zoiko.io/obligations-svc/internal/config"
 	svcenvelope "zoiko.io/obligations-svc/internal/envelope"
-	"zoiko.io/obligations-svc/internal/evidencereq"
 	"zoiko.io/obligations-svc/internal/events"
+	"zoiko.io/obligations-svc/internal/evidencereq"
 	"zoiko.io/obligations-svc/internal/handler"
 	"zoiko.io/obligations-svc/internal/health"
 	"zoiko.io/obligations-svc/internal/jurisdiction"
@@ -45,6 +45,7 @@ import (
 	"zoiko.io/obligations-svc/internal/registry"
 	"zoiko.io/obligations-svc/internal/store"
 	"zoiko.io/obligations-svc/internal/telemetry"
+	"zoiko.io/obligations-svc/internal/workflowclient"
 )
 
 func main() {
@@ -142,11 +143,13 @@ func main() {
 	authzClient := authz.NewHTTPClient(cfg.AuthZServiceURL, log)
 
 	// Evidence requirements client for pre-closure evidence validation
-	var evidenceReqClient evidencereq.Client = evidencereq.NoOpClient{}
+	var evidenceReqClient evidencereq.Client = evidencereq.Unconfigured{}
 	if cfg.EvidenceRequirementsURL != "" {
 		evidenceReqClient = evidencereq.NewHTTPClient(cfg.EvidenceRequirementsURL, log)
 	} else if !cfg.LocalEnv() {
-		log.Warn("EVIDENCE_REQUIREMENTS_URL unset — evidence sufficiency checks before CLOSED are disabled (local/dev only)")
+		log.Fatal("EVIDENCE_REQUIREMENTS_URL is required outside local/dev: closing an obligation and fulfilling a clock need an evidence evaluation")
+	} else {
+		log.Warn("EVIDENCE_REQUIREMENTS_URL unset: every evidence check fails closed (503) until it is set")
 	}
 
 	// ── 4a. Outbox relay ──────────────────────────────────────────────────────
@@ -167,21 +170,36 @@ func main() {
 	defer overdueCancel()
 	go runOverdueScheduler(overdueCtx, pgStore, log)
 
-	// ── 4d. Clock sweep worker (WF-3 / WFC-05) ──────────────────────────────
-	// Evaluates all ACTIVE clocks against their computed deadlines and transitions
-	// them through states: PLANNED → ACTIVE → DUE_SOON → DUE → OVERDUE.
-	// Also handles calendar corrections (jurisdiction-rules feed drift) by
-	// superseding clocks whose calendar rule has changed.
+	// ── 4d. WFC-05 deadline clocks (R-001 s7) ────────────────────────────────
+	// Due dates come from jurisdiction-rules-svc's calculation API; waivers
+	// and escalation cases go to workflow-svc. The worker persists computed
+	// moves and fires milestones; reads never wait for it (R-INV-26).
+	calculator := jurisdiction.NewHTTPCalculator(cfg.JurisdictionRulesURL, log)
+	var workflow workflowclient.Client
+	switch {
+	case cfg.WorkflowURL != "":
+		workflow = workflowclient.New(cfg.WorkflowURL, log)
+	case !cfg.LocalEnv():
+		log.Fatal("WORKFLOW_SERVICE_URL is required outside local/dev: waivers are verified there and escalation cases are opened there")
+	default:
+		log.Warn("WORKFLOW_SERVICE_URL unset: waivers answer 503 and escalation case requests stay queued (local/dev only)")
+	}
 	clockCtx, clockCancel := context.WithCancel(context.Background())
 	defer clockCancel()
-	clockWorker := clock.NewWorker(clock.WorkerConfig{
-		SweepInterval:         1 * time.Minute,
-		JurisdictionValidator: jurisdictionValidator,
-		Store:                 pgStore,
-		Log:                   log,
-	})
+	clockWorker := clock.NewWorker(pgStore, workflow, metrics, log, time.Duration(cfg.ClockSweepIntervalSeconds)*time.Second)
 	clockWorker.Start(clockCtx)
 	defer clockWorker.Stop()
+
+	if cfg.CalendarTopic != "" {
+		calendarReader := kafka.NewReader(kafka.ReaderConfig{
+			Brokers: cfg.Kafka.Brokers, GroupID: cfg.Kafka.GroupID + "-calendar", Topic: cfg.CalendarTopic,
+			MinBytes: 1, MaxBytes: 10e6, MaxWait: time.Second,
+		})
+		go clock.NewCalendarConsumer(pgStore, calculator, cfg.ServicePrincipal, metrics, log).Run(clockCtx, calendarReader)
+		log.Info("calendar consumer started", zap.String("topic", cfg.CalendarTopic))
+	} else {
+		log.Warn("KAFKA_CALENDAR_TOPIC unset: calendar corrections do not recalculate clocks (OB-S8)")
+	}
 
 	// ── 4c. Identity gate and legal-entity registry ──────────────────────────
 	// X-Principal-Id / X-Tenant-Id were read exactly as sent, and host port
@@ -231,7 +249,8 @@ func main() {
 
 	h := handler.New(pgStore, jurisdictionValidator, authzClient, log).
 		WithRegistry(entityChecker).
-		WithEvidenceRequirementsClient(evidenceReqClient)
+		WithEvidenceRequirementsClient(evidenceReqClient).
+		WithClocks(pgStore, calculator, workflow)
 	handler.RegisterRoutes(r, h)
 	handler.RegisterApplicabilityRoutes(r, h)
 

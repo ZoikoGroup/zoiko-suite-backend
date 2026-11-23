@@ -1,315 +1,170 @@
-// Package clock provides the deadline clock sweep worker for WF-3 (WFC-05).
+// Package clock runs the background work of R-001 WFC-05 deadline clocks:
 //
-// The worker periodically evaluates all ACTIVE clocks against their computed
-// deadlines and transitions them through states:
-//   PLANNED → ACTIVE → DUE_SOON → DUE → OVERDUE
-//
-// Terminal states: FULFILLED, WAIVED, NOT_APPLICABLE, SUPERSEDED.
-//
-// The worker also handles calendar corrections (jurisdiction-rules feed drift)
-// by superseding clocks whose calendar rule has changed.
+//   - the sweep persists computed state moves (ACTIVE -> DUE_SOON -> DUE ->
+//     OVERDUE) and emits their events. Reads never wait for it: a clock past
+//     due_at reads OVERDUE whether or not the sweep has run (R-INV-26, NP-16).
+//     Each move is guarded on the row version it read, so a restart mid-sweep
+//     writes no second transition and no second event (NP-37).
+//   - due milestones fire exactly once (guarded UPDATE on fired_at); an
+//     escalation never changes the clock's state or due_at (R-001 s7.4).
+//   - the case relay delivers WORKFLOW_CASE outbox rows to workflow-svc
+//     (POST /v1/cases, idempotent per clock and milestone) and records the
+//     case it opened.
 package clock
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"go.uber.org/zap"
 
-	"zoiko.io/obligations-svc/internal/domain"
 	"zoiko.io/obligations-svc/internal/store"
+	"zoiko.io/obligations-svc/internal/telemetry"
+	"zoiko.io/obligations-svc/internal/workflowclient"
 )
 
-// WorkerConfig holds configuration for the clock sweep worker.
-type WorkerConfig struct {
-	// SweepInterval is how often the worker runs (default 1 minute).
-	SweepInterval time.Duration
-	// JurisdictionValidator is used to check for calendar rule changes.
-	JurisdictionValidator JurisdictionValidator
-	// Store is the obligation store.
-	Store store.Store
-	// Log is the logger.
-	Log *zap.Logger
+// Store is what the workers need from persistence.
+type Store interface {
+	ClocksNeedingSweep(ctx context.Context, now time.Time, limit int) ([]store.WorkItem, error)
+	SweepClock(ctx context.Context, item store.WorkItem, now time.Time) (bool, error)
+	DueMilestones(ctx context.Context, now time.Time, limit int) ([]store.WorkItem, error)
+	FireMilestone(ctx context.Context, item store.WorkItem, now time.Time) (bool, error)
+	ClockStats(ctx context.Context, now time.Time) ([]store.OverdueCount, float64, error)
+	RelayOutboxDestination(ctx context.Context, destination string, limit int, deliver func(ctx context.Context, e store.OutboxEvent) error) (int, int, error)
+	RecordCaseOpened(ctx context.Context, req store.CaseRequest, caseID string) error
 }
 
-// JurisdictionValidator is the subset of jurisdiction.Validator needed by the clock worker.
-type JurisdictionValidator interface {
-	ValidateCalendarRule(ctx context.Context, calendarCode, calendarRuleID string, calendarRuleVersion int) error
-}
-
-// Worker runs the clock sweep.
+// Worker runs the sweep, the milestones and the case relay on one ticker.
 type Worker struct {
-	cfg      WorkerConfig
-	stopChan chan struct{}
-	wg       sync.WaitGroup
+	store    Store
+	workflow workflowclient.Client
+	metrics  *telemetry.Metrics
+	log      *zap.Logger
+	interval time.Duration
+	now      func() time.Time
+
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
-// NewWorker creates a new clock sweep worker.
-func NewWorker(cfg WorkerConfig) *Worker {
-	if cfg.SweepInterval == 0 {
-		cfg.SweepInterval = 1 * time.Minute
+// NewWorker builds a worker. workflow may be nil (case requests stay queued).
+func NewWorker(st Store, wf workflowclient.Client, metrics *telemetry.Metrics, log *zap.Logger, interval time.Duration) *Worker {
+	if interval <= 0 {
+		interval = time.Minute
 	}
-	return &Worker{
-		cfg:      cfg,
-		stopChan: make(chan struct{}),
-	}
+	return &Worker{store: st, workflow: wf, metrics: metrics, log: log, interval: interval, now: func() time.Time { return time.Now().UTC() }}
 }
 
-// Start begins the sweep loop.
+// Start runs the loop until Stop.
 func (w *Worker) Start(ctx context.Context) {
+	ctx, w.cancel = context.WithCancel(ctx)
 	w.wg.Add(1)
 	go func() {
 		defer w.wg.Done()
-		w.run(ctx)
+		t := time.NewTicker(w.interval)
+		defer t.Stop()
+		for {
+			w.Tick(ctx)
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+		}
 	}()
 }
 
-// Stop signals the worker to stop and waits for it.
+// Stop ends the loop and waits for the current tick.
 func (w *Worker) Stop() {
-	close(w.stopChan)
+	if w.cancel != nil {
+		w.cancel()
+	}
 	w.wg.Wait()
 }
 
-// run is the main sweep loop.
-func (w *Worker) run(ctx context.Context) {
-	ticker := time.NewTicker(w.cfg.SweepInterval)
-	defer ticker.Stop()
-
-	// Run once immediately on start
-	w.sweep(ctx)
-
-	for {
-		select {
-		case <-w.stopChan:
-			return
-		case <-ticker.C:
-			w.sweep(ctx)
-		case <-ctx.Done():
-			return
-		}
-	}
+// TickResult counts what one tick did (tests and logs).
+type TickResult struct {
+	Moved, MilestonesFired, CasesOpened, CaseFailures int
 }
 
-// sweep evaluates all ACTIVE clocks and transitions them through states.
-func (w *Worker) sweep(ctx context.Context) {
-	w.cfg.Log.Info("clock sweep started")
+// Tick runs one pass: sweep, milestones, case relay, gauges.
+func (w *Worker) Tick(ctx context.Context) TickResult {
+	var res TickResult
+	now := w.now()
 
-	// Get all tenants that have obligations
-	tenantIDs, err := w.getTenantIDsWithClocks(ctx)
+	items, err := w.store.ClocksNeedingSweep(ctx, now, 500)
 	if err != nil {
-		w.cfg.Log.Error("clock sweep: failed to get tenant IDs", zap.Error(err))
-		return
+		w.log.Error("clock sweep: listing failed", zap.Error(err))
 	}
-
-	for _, tenantID := range tenantIDs {
-		w.sweepTenant(ctx, tenantID)
-	}
-
-	w.cfg.Log.Info("clock sweep completed")
-}
-
-// sweepTenant sweeps all ACTIVE clocks for a single tenant.
-func (w *Worker) sweepTenant(ctx context.Context, tenantID string) {
-	// Find all ACTIVE clocks for this tenant
-	filter := domain.ListClocksFilter{
-		TenantID:    tenantID,
-		ClockState:  domain.ClockStateActive,
-		Limit:       1000, // process in batches
-		Offset:      0,
-	}
-
-	for {
-		clocks, err := w.cfg.Store.ListClocks(ctx, filter)
+	for _, it := range items {
+		moved, err := w.store.SweepClock(ctx, it, now)
 		if err != nil {
-			w.cfg.Log.Error("clock sweep: failed to list clocks for tenant",
-				zap.String("tenant_id", tenantID), zap.Error(err))
-			return
+			w.log.Error("clock sweep: move failed", zap.String("clock_id", it.ID), zap.Error(err))
+			continue
 		}
-
-		if len(clocks) == 0 {
-			break
+		if moved {
+			res.Moved++
+			if w.metrics != nil {
+				w.metrics.ClockSweepMoves.WithLabelValues("computed").Inc()
+			}
 		}
-
-		for _, clock := range clocks {
-			w.evaluateClock(ctx, clock)
-		}
-
-		// If we got fewer than limit, we're done
-		if len(clocks) < filter.Limit {
-			break
-		}
-
-		// Move to next page
-		filter.Offset += filter.Limit
 	}
-}
 
-// evaluateClock evaluates a single clock and transitions its state if needed.
-func (w *Worker) evaluateClock(ctx context.Context, clock *domain.Clock) {
-	now := time.Now().UTC()
-
-	// Check for calendar correction (jurisdiction-rules feed drift)
-	if w.cfg.JurisdictionValidator != nil {
-		err := w.cfg.JurisdictionValidator.ValidateCalendarRule(ctx,
-			clock.CalendarCode, clock.CalendarRuleID, clock.CalendarRuleVersion)
+	due, err := w.store.DueMilestones(ctx, now, 500)
+	if err != nil {
+		w.log.Error("clock milestones: listing failed", zap.Error(err))
+	}
+	for _, it := range due {
+		fired, err := w.store.FireMilestone(ctx, it, now)
 		if err != nil {
-			// Calendar rule has changed or is unavailable - supersede the clock
-			w.supersedeClock(ctx, clock, err)
-			return
+			w.log.Error("clock milestones: fire failed", zap.String("milestone_id", it.ID), zap.Error(err))
+			if w.metrics != nil {
+				w.metrics.EscalationFailures.WithLabelValues("milestone").Inc()
+			}
+			continue
+		}
+		if fired {
+			res.MilestonesFired++
+			if w.metrics != nil {
+				w.metrics.MilestonesFired.WithLabelValues("any").Inc()
+			}
 		}
 	}
 
-	// Determine the next state based on computed_deadline and due_soon_threshold
-	var nextState domain.ClockState
-
-	switch clock.ClockState {
-	case domain.ClockStatePlanned:
-		// PLANNED → ACTIVE when we start tracking it
-		// (In practice, clocks are created in PLANNED and activated immediately by the worker)
-		nextState = domain.ClockStateActive
-
-	case domain.ClockStateActive:
-		// ACTIVE → DUE_SOON when within due_soon_threshold
-		dueSoonAt := clock.ComputedDeadline.Add(-clock.DueSoonThreshold)
-		if now.After(dueSoonAt) || now.Equal(dueSoonAt) {
-			nextState = domain.ClockStateDueSoon
+	if w.workflow != nil {
+		opened, failed, err := w.store.RelayOutboxDestination(ctx, store.DestinationWorkflowCase, 50, func(ctx context.Context, e store.OutboxEvent) error {
+			var req store.CaseRequest
+			if err := json.Unmarshal(e.EventPayload, &req); err != nil {
+				return err
+			}
+			caseID, err := w.workflow.OpenCase(ctx, workflowclient.CaseRequest{TenantID: req.TenantID, LegalEntityID: req.LegalEntityID,
+				CaseFamily: req.CaseFamily, Severity: req.Severity, Confidentiality: req.Confidentiality, Title: req.Title,
+				Description: req.Description, SourceType: req.SourceType, SourceID: req.SourceID, Milestone: req.Milestone,
+				IdempotencyKey: req.IdempotencyKey})
+			if err != nil {
+				return err
+			}
+			return w.store.RecordCaseOpened(ctx, req, caseID)
+		})
+		if err != nil {
+			w.log.Error("escalation case relay failed", zap.Error(err))
 		}
-
-	case domain.ClockStateDueSoon:
-		// DUE_SOON → DUE on deadline day
-		if now.After(clock.ComputedDeadline) || now.Equal(clock.ComputedDeadline) {
-			nextState = domain.ClockStateDue
+		res.CasesOpened, res.CaseFailures = opened, failed
+		if failed > 0 && w.metrics != nil {
+			w.metrics.EscalationFailures.WithLabelValues("OPEN_CASE").Add(float64(failed))
 		}
+	}
 
-	case domain.ClockStateDue:
-		// DUE → OVERDUE after deadline passes
-		if now.After(clock.ComputedDeadline) {
-			nextState = domain.ClockStateOverdue
+	if w.metrics != nil {
+		if counts, lag, err := w.store.ClockStats(ctx, now); err == nil {
+			w.metrics.ClocksOverdue.Reset()
+			for _, c := range counts {
+				w.metrics.ClocksOverdue.WithLabelValues(c.ClockClass, c.Jurisdiction).Set(float64(c.Count))
+			}
+			w.metrics.ClockSweepLagSeconds.Set(lag)
 		}
-
-	case domain.ClockStateOverdue:
-		// OVERDUE stays OVERDUE until FULFILLED/WAIVED/NOT_APPLICABLE
-		// Escalation is handled separately via the escalation ladder
-		return
-
-	default:
-		// Terminal states: FULFILLED, WAIVED, NOT_APPLICABLE, SUPERSEDED
-		return
 	}
-
-	if nextState != "" && nextState != clock.ClockState {
-		w.transitionClock(ctx, clock, nextState)
-	}
+	return res
 }
-
-// transitionClock transitions a clock to a new state via the store.
-func (w *Worker) transitionClock(ctx context.Context, clock *domain.Clock, newState domain.ClockState) {
-	params := domain.ClockTransitionParams{
-		ClockID:              clock.ClockID,
-		NewState:             newState,
-		ExpectedVersion:      clock.Version, // optimistic lock
-		ActorPrincipalID:     "system:clock-worker",
-		CorrelationID:        "clock-worker-" + uuid.New().String(),
-		EvidenceEvaluationIDs: nil,
-		Reason:               nil,
-		AuthorityPrincipalID: nil,
-		NotApplicableReason:  nil,
-		NotApplicableAuthorityPrincipalID: nil,
-		SupersededByClockID:  nil,
-	}
-
-	updated, transitioned, err := w.cfg.Store.TransitionClock(ctx, params)
-	if err != nil {
-		w.cfg.Log.Error("clock sweep: failed to transition clock",
-			zap.String("clock_id", clock.ClockID),
-			zap.String("from_state", string(clock.ClockState)),
-			zap.String("to_state", string(newState)),
-			zap.Error(err))
-		return
-	}
-
-	if transitioned {
-		w.cfg.Log.Info("clock sweep: clock transitioned",
-			zap.String("clock_id", updated.ClockID),
-			zap.String("obligation_id", updated.ObligationID),
-			zap.String("from_state", string(clock.ClockState)),
-			zap.String("to_state", string(updated.ClockState)),
-		)
-	}
-}
-
-// supersedeClock supersedes a clock due to calendar correction.
-func (w *Worker) supersedeClock(ctx context.Context, clock *domain.Clock, reason error) {
-	// Create a new clock with the corrected calendar rule
-	// For now, just supersede the existing clock
-	params := domain.ClockTransitionParams{
-		ClockID:                     clock.ClockID,
-		NewState:                    domain.ClockStateSuperseded,
-		ExpectedVersion:             clock.Version,
-		ActorPrincipalID:            "system:clock-worker",
-		CorrelationID:               "clock-worker-supersede-" + uuid.New().String(),
-		EvidenceEvaluationIDs:       nil,
-		Reason:                      nil,
-		AuthorityPrincipalID:        nil,
-		NotApplicableReason:         nil,
-		NotApplicableAuthorityPrincipalID: nil,
-		SupersededByClockID:         nil, // TODO: create new clock with corrected rule
-	}
-
-	_, transitioned, err := w.cfg.Store.TransitionClock(ctx, params)
-	if err != nil {
-		w.cfg.Log.Error("clock sweep: failed to supersede clock",
-			zap.String("clock_id", clock.ClockID),
-			zap.Error(err))
-		return
-	}
-
-	if transitioned {
-		w.cfg.Log.Info("clock sweep: clock superseded due to calendar correction",
-			zap.String("clock_id", clock.ClockID),
-			zap.String("obligation_id", clock.ObligationID),
-			zap.Error(reason))
-	}
-}
-
-// getTenantIDsWithClocks returns all tenant IDs that have clocks.
-// This mirrors GetTenantIDsWithObligations for the clock sweep.
-func (w *Worker) getTenantIDsWithClocks(ctx context.Context) ([]string, error) {
-	// For now, use the obligation store's method
-	// In a real implementation, this would query the obligation_clocks table
-	// SELECT DISTINCT tenant_id FROM obligation_clocks WHERE clock_state IN (...)
-	return w.getTenantIDsFromObligations(ctx)
-}
-
-// getTenantIDsFromObligations is a temporary method that uses the obligation store.
-func (w *Worker) getTenantIDsFromObligations(ctx context.Context) ([]string, error) {
-	// This is a workaround - we need to add a method to the store interface
-	// For now, return empty to avoid breaking the build
-	return []string{}, nil
-}
-
-// --- Helper methods to implement store interface methods for the worker ---
-
-// Add these methods to store.Store interface:
-// GetTenantIDsWithClocks(ctx context.Context) ([]string, error)
-
-var _ store.Store = (*workerStoreAdapter)(nil)
-
-// workerStoreAdapter wraps a store.Store to add the worker-specific methods.
-type workerStoreAdapter struct {
-	store.Store
-}
-
-// GetTenantIDsWithClocks returns all tenant IDs that have non-terminal clocks.
-func (a *workerStoreAdapter) GetTenantIDsWithClocks(ctx context.Context) ([]string, error) {
-	// This would be implemented in pg_store.go
-	return nil, errors.New("not implemented")
-}
-
-// FindActiveClocksForObligation returns all non-terminal clocks for an obligation.
-// Already exists in store interface.
-
-// ListClocks is already in store interface.

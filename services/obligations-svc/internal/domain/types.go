@@ -266,9 +266,6 @@ var ErrCreatedByMismatch = errorString("created_by mismatch")
 // ErrLegalEntityMismatch is returned when X-Legal-Entity-Id doesn't match body legal_entity_id.
 var ErrLegalEntityMismatch = errorString("legal entity mismatch")
 
-
-
-
 type errorString string
 
 func (e errorString) Error() string { return string(e) }

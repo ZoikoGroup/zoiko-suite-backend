@@ -15,7 +15,6 @@ package jurisdiction
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -38,7 +37,6 @@ type Validator interface {
 	// Returns domain.ErrJurisdictionServiceUnavailable if jurisdiction-rules-svc
 	// cannot be reached — callers must fail-closed.
 	ValidateExists(ctx context.Context, jurisdictionID string) error
-
 }
 
 // HTTPValidator implements Validator against a real jurisdiction-rules-svc instance.
