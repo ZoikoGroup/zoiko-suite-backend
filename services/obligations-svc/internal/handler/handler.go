@@ -33,12 +33,18 @@ type ObligationStore interface {
 	FindObligationByID(ctx context.Context, obligationID string) (*domain.Obligation, error)
 	ListObligations(ctx context.Context, filter domain.ListObligationsFilter) ([]*domain.Obligation, error)
 	UpdateObligationStatus(ctx context.Context, obligationID, newStatus string, expectedVersion int, actorID, correlationID string) (*domain.Obligation, bool, error)
+
+	// ── WFC-05 consolidation: EXTENDED lifecycle (Doc 04 §2.1) ────────────────
+	ValidateExtractedObligation(ctx context.Context, obligationID, validatedBy, correlationID string) (*domain.Obligation, error)
+	TransitionExtended(ctx context.Context, obligationID, newStatus string, expectedVersion int, actorID, correlationID string, evidence domain.ExtendedTransitionEvidence) (*domain.Obligation, bool, error)
 	UpdateObligationWorkflow(ctx context.Context, obligationID, workflowID, actorID, correlationID string) (*domain.Obligation, error)
 	UpdateObligation(ctx context.Context, params domain.UpdateObligationParams) (*domain.Obligation, bool, error)
 	CreateFilingRequirement(ctx context.Context, params domain.CreateFilingRequirementParams) (*domain.FilingRequirement, error)
 	ListFilingRequirements(ctx context.Context, obligationID string, limit int) ([]*domain.FilingRequirement, error)
 	FindFilingRequirement(ctx context.Context, obligationID, filingRequirementID string) (*domain.FilingRequirement, error)
 	UpdateFilingStatus(ctx context.Context, params domain.UpdateFilingStatusParams) (*domain.FilingRequirement, bool, error)
+	SubmitFiling(ctx context.Context, params domain.SubmitFilingParams) (*domain.FilingRequirement, bool, error)
+	ConfirmFiling(ctx context.Context, params domain.ConfirmFilingParams) (*domain.FilingRequirement, bool, error)
 	ListFilingTransitions(ctx context.Context, obligationID, filingRequirementID string) ([]*domain.FilingTransition, error)
 
 	// Idempotency key methods
@@ -295,6 +301,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/obligations", h.ListObligations)
 	r.Get("/v1/obligations/{obligation_id}", h.GetObligation)
 	r.Post("/v1/obligations/{obligation_id}/status", h.UpdateObligationStatus)
+	r.Post("/v1/obligations/{obligation_id}/validate", h.ValidateExtractedObligation)
+	r.Post("/v1/obligations/{obligation_id}/transition", h.TransitionExtended)
 	r.Post("/v1/obligations/{obligation_id}/workflow", h.LinkWorkflow)
 	r.Delete("/v1/obligations/{obligation_id}/workflow", h.UnlinkWorkflow)
 	r.Post("/v1/obligations/{obligation_id}/filing-requirements", h.CreateFilingRequirement)
@@ -335,6 +343,19 @@ type createObligationRequest struct {
 	// taken from its current version) or must equal it.
 	ObligationDefinitionID string `json:"obligation_definition_id,omitempty"`
 	DefinitionVersion      int    `json:"definition_version,omitempty"`
+
+	// ── WFC-05 consolidation (Doc 04 §2.1) ────────────────────────────────
+	// LifecycleModel: omitted (or "LEGACY") preserves every existing
+	// caller's exact current behavior. "EXTENDED" opts into the WFC-05
+	// 9-state model — see domain.ExtendedStatus* and store.extendedTransitions.
+	LifecycleModel     string     `json:"lifecycle_model,omitempty"`
+	ClockClass         string     `json:"clock_class,omitempty"`
+	ExtractedByAI      bool       `json:"extracted_by_ai,omitempty"`
+	SourceClauseID     string     `json:"source_clause_id,omitempty"`
+	TriggerDescription string     `json:"trigger_description,omitempty"`
+	CalculationMethod  string     `json:"calculation_method,omitempty"`
+	EffectiveFrom      *time.Time `json:"effective_from,omitempty"`
+	EffectiveTo        *time.Time `json:"effective_to,omitempty"`
 }
 
 // applyDefinition fills the definition-held fields from version v, and names
@@ -563,6 +584,26 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.LifecycleModel != "" && req.LifecycleModel != domain.LifecycleModelLegacy && req.LifecycleModel != domain.LifecycleModelExtended {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
+			"error": "invalid_field", "field": "lifecycle_model",
+			"detail": "lifecycle_model must be LEGACY or EXTENDED",
+		})
+		return
+	}
+	if req.ClockClass != "" {
+		switch req.ClockClass {
+		case domain.ClockClassHardLegal, domain.ClockClassRegulatory, domain.ClockClassContractual,
+			domain.ClockClassInternalSLA, domain.ClockClassAdvisory:
+		default:
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{
+				"error": "invalid_field", "field": "clock_class",
+				"detail": "clock_class must be HARD_LEGAL, REGULATORY, CONTRACTUAL, INTERNAL_SLA, or ADVISORY",
+			})
+			return
+		}
+	}
+
 	params := domain.CreateObligationParams{
 		ObligationID:         req.ObligationID,
 		LegalEntityID:        req.LegalEntityID,
@@ -581,6 +622,15 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 
 		ObligationDefinitionID: req.ObligationDefinitionID,
 		DefinitionVersion:      req.DefinitionVersion,
+
+		LifecycleModel:     req.LifecycleModel,
+		ClockClass:         req.ClockClass,
+		ExtractedByAI:      req.ExtractedByAI,
+		SourceClauseID:     req.SourceClauseID,
+		TriggerDescription: req.TriggerDescription,
+		CalculationMethod:  req.CalculationMethod,
+		EffectiveFrom:      req.EffectiveFrom,
+		EffectiveTo:        req.EffectiveTo,
 	}
 
 	o, created, err := h.store.CreateObligation(r.Context(), params)
@@ -743,7 +793,7 @@ func (h *Handler) ListObligations(w http.ResponseWriter, r *http.Request) {
 		}
 		filter.DueAfter = &t
 	}
-	if filter.Status != "" && !domain.ObligationStatuses[filter.Status] {
+	if filter.Status != "" && !domain.AnyObligationStatus(filter.Status) {
 		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "status"})
 		return
 	}
@@ -920,6 +970,195 @@ func (h *Handler) UpdateObligationStatus(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, r, http.StatusOK, updated)
 }
 
+// ── POST /v1/obligations/{obligation_id}/validate ───────────────────────────
+// WFC-05 consolidation: the only path out of CANDIDATE for an AI-extracted
+// EXTENDED obligation (LEG-07 §9.1).
+
+type validateObligationRequest struct {
+	ValidatedBy string `json:"validated_by"`
+}
+
+func (req validateObligationRequest) missingField() string {
+	if req.ValidatedBy == "" {
+		return "validated_by"
+	}
+	return ""
+}
+
+// ValidateExtractedObligation handles POST /v1/obligations/{obligation_id}/validate.
+//
+// Response:
+//
+//	200 → obligation moved CANDIDATE -> PLANNED
+//	400 → missing validated_by
+//	404 → obligation_id not found
+//	409 → obligation is not an EXTENDED CANDIDATE awaiting validation
+//	503 → store unavailable
+func (h *Handler) ValidateExtractedObligation(w http.ResponseWriter, r *http.Request) {
+	obligationID := chi.URLParam(r, "obligation_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
+	var req validateObligationRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if field := req.missingField(); field != "" {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": field})
+		return
+	}
+
+	existing, err := h.store.FindObligationByID(r.Context(), obligationID)
+	if err != nil {
+		h.writeStoreErr(w, r, "ValidateExtractedObligation: lookup failed", err)
+		return
+	}
+	if !h.authorize(w, r, principalID, existing.LegalEntityID, authz.ActionObligationStatusUpdate) {
+		return
+	}
+
+	updated, err := h.store.ValidateExtractedObligation(r.Context(), obligationID, req.ValidatedBy, correlationID)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrWrongLifecycleModel):
+			writeJSON(w, r, http.StatusConflict, map[string]string{"error": "wrong_lifecycle_model"})
+		case errors.Is(err, domain.ErrNotCandidate):
+			writeJSON(w, r, http.StatusConflict, map[string]string{"error": "not_a_candidate"})
+		default:
+			h.writeStoreErr(w, r, "ValidateExtractedObligation: store unavailable", err)
+		}
+		return
+	}
+
+	h.log.Info("obligation validated",
+		zap.String("obligation_id", obligationID),
+		zap.String("validated_by", req.ValidatedBy),
+		zap.String("correlation_id", correlationID),
+	)
+	writeJSON(w, r, http.StatusOK, updated)
+}
+
+// ── POST /v1/obligations/{obligation_id}/transition ─────────────────────────
+// WFC-05 consolidation: the generic EXTENDED-lifecycle transition endpoint —
+// the single entry point for PLANNED->ACTIVE (scheduling), ACTIVE->DUE_SOON/
+// DUE/OVERDUE (deadline progression), ->FULFILLED/WAIVED/NOT_APPLICABLE/
+// SUPERSEDED (resolution), and ->BREACHED/DISPUTED (contract-obligation
+// parity with obligation-tracking-svc). See domain.extendedTransitions for
+// the legal-transition table and domain.ExtendedTransitionEvidence for which
+// fields each target status requires.
+
+type transitionExtendedRequest struct {
+	ObligationStatus string `json:"obligation_status"`
+	domain.ExtendedTransitionEvidence
+}
+
+func (req transitionExtendedRequest) missingField() string {
+	if req.ObligationStatus == "" {
+		return "obligation_status"
+	}
+	return ""
+}
+
+// TransitionExtended handles POST /v1/obligations/{obligation_id}/transition.
+//
+// Response:
+//
+//	200 → obligation transitioned (or already in the requested status — idempotent no-op)
+//	400 → missing/unknown obligation_status
+//	404 → obligation_id not found
+//	409 → wrong lifecycle model, illegal transition, version mismatch, or missing required evidence for the target status
+//	503 → store unavailable
+func (h *Handler) TransitionExtended(w http.ResponseWriter, r *http.Request) {
+	obligationID := chi.URLParam(r, "obligation_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
+	var req transitionExtendedRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if field := req.missingField(); field != "" {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": field})
+		return
+	}
+	if !domain.ExtendedObligationStatuses[req.ObligationStatus] {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{
+			"error": "invalid_field", "field": "obligation_status",
+			"detail": "obligation_status is not a valid EXTENDED-lifecycle status",
+		})
+		return
+	}
+
+	expectedVersion := 0
+	if match := r.Header.Get("If-Match"); match != "" {
+		match = strings.TrimPrefix(match, "W/")
+		match = strings.Trim(match, `"`)
+		if v, err := strconv.Atoi(match); err == nil {
+			expectedVersion = v
+		} else {
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_if_match"})
+			return
+		}
+	}
+
+	existing, err := h.store.FindObligationByID(r.Context(), obligationID)
+	if err != nil {
+		h.writeStoreErr(w, r, "TransitionExtended: lookup failed", err)
+		return
+	}
+	if !h.authorize(w, r, principalID, existing.LegalEntityID, authz.ActionObligationStatusUpdate) {
+		return
+	}
+
+	updated, transitioned, err := h.store.TransitionExtended(r.Context(), obligationID, req.ObligationStatus,
+		expectedVersion, principalID, correlationID, req.ExtendedTransitionEvidence)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrWrongLifecycleModel):
+			writeJSON(w, r, http.StatusConflict, map[string]string{"error": "wrong_lifecycle_model"})
+		case errors.Is(err, domain.ErrInvalidTransition):
+			writeJSON(w, r, http.StatusConflict, map[string]string{"error": "invalid_transition"})
+		case errors.Is(err, domain.ErrVersionMismatch):
+			writeJSON(w, r, http.StatusConflict, map[string]string{"error": "version_mismatch"})
+		case errors.Is(err, domain.ErrAmbiguousDueDateBasis):
+			writeJSON(w, r, http.StatusConflict, map[string]string{"error": "ambiguous_due_date_basis",
+				"detail": "trigger_description and calculation_method are required to certify a due date"})
+		case errors.Is(err, domain.ErrWaiverEvidenceRequired):
+			writeJSON(w, r, http.StatusConflict, map[string]string{"error": "waiver_evidence_required",
+				"detail": "waiver_authority_reference and waiver_reason_code are required"})
+		case errors.Is(err, domain.ErrNotApplicableEvidenceRequired):
+			writeJSON(w, r, http.StatusConflict, map[string]string{"error": "not_applicable_evidence_required",
+				"detail": "not_applicable_reason is required"})
+		default:
+			h.writeStoreErr(w, r, "TransitionExtended: store unavailable", err)
+		}
+		return
+	}
+
+	h.log.Info("obligation extended transition",
+		zap.String("obligation_id", obligationID),
+		zap.String("new_status", req.ObligationStatus),
+		zap.Bool("transitioned", transitioned),
+		zap.String("correlation_id", correlationID),
+	)
+	w.Header().Set("ETag", strconv.Quote(strconv.Itoa(updated.Version)))
+	writeJSON(w, r, http.StatusOK, updated)
+}
+
 // ── POST /v1/obligations/{obligation_id}/workflow ───────────────────────────
 
 type linkWorkflowRequest struct {
@@ -1057,6 +1296,11 @@ type createFilingRequirementRequest struct {
 	FilingType          string `json:"filing_type"`
 	FilingAuthority     string `json:"filing_authority"`
 	SubmissionChannel   string `json:"submission_channel"`
+
+	// ── filing-tracker-svc parity (migration 000013), all optional ────────
+	JurisdictionID string     `json:"jurisdiction_id,omitempty"`
+	PeriodKey      string     `json:"period_key,omitempty"`
+	DueDate        *time.Time `json:"due_date,omitempty"`
 }
 
 func (req createFilingRequirementRequest) missingField() string {
@@ -1122,6 +1366,9 @@ func (h *Handler) CreateFilingRequirement(w http.ResponseWriter, r *http.Request
 		FilingType:          req.FilingType,
 		FilingAuthority:     req.FilingAuthority,
 		SubmissionChannel:   req.SubmissionChannel,
+		JurisdictionID:      req.JurisdictionID,
+		PeriodKey:           req.PeriodKey,
+		DueDate:             req.DueDate,
 	})
 	if err != nil {
 		h.writeStoreErr(w, r, "CreateFilingRequirement: store unavailable", err)

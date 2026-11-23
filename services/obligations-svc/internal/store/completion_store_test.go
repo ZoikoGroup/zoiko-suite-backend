@@ -311,6 +311,101 @@ func TestPgStore_FilingLifecycleAndHistory(t *testing.T) {
 	}
 }
 
+// TestPgStore_SubmitAndConfirmFilingRequireEvidence proves filing-tracker-svc
+// command parity (migration 000013): Submit/Confirm are governed events with
+// mandatory evidence, not bare status flips, and the new SCHEDULED/
+// DRAFT_READY/OVERDUE pre-filing states reach SUBMITTED exactly like PENDING
+// does.
+func TestPgStore_SubmitAndConfirmFilingRequireEvidence(t *testing.T) {
+	admin := getTestPool(t)
+	defer admin.Close()
+	setupTestDB(t, admin)
+	s := store.New(rlsPool(t, admin), zap.NewNop())
+	ctx := tenantCtx(testTenantID)
+
+	o, _, err := s.CreateObligation(ctx, validParams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := s.CreateFilingRequirement(ctx, domain.CreateFilingRequirementParams{
+		ObligationID: o.ObligationID, FilingType: "GSTR-1", FilingAuthority: "GSTN", SubmissionChannel: "PORTAL",
+		JurisdictionID: "00000000-0000-0000-0000-000000000002", PeriodKey: "2026-10", DueDate: &o.DueDate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.PeriodKey == nil || *f.PeriodKey != "2026-10" || f.JurisdictionID == nil {
+		t.Fatalf("expected jurisdiction_id/period_key recorded, got %+v", f)
+	}
+
+	// SCHEDULED/DRAFT_READY (filing-tracker-svc's pre-filing states) must
+	// legally reach SUBMITTED, same as the original PENDING path.
+	scheduled, moved, err := s.UpdateFilingStatus(ctx, domain.UpdateFilingStatusParams{
+		ObligationID: o.ObligationID, FilingRequirementID: f.FilingRequirementID, NewStatus: "SCHEDULED",
+		ActorPrincipalID: "admin-1", CorrelationID: "corr-1"})
+	if err != nil || !moved || scheduled.FilingStatus != "SCHEDULED" {
+		t.Fatalf("PENDING -> SCHEDULED: moved=%v err=%v", moved, err)
+	}
+
+	// No submission_reference at all: refused before touching the row.
+	if _, _, err := s.SubmitFiling(ctx, domain.SubmitFilingParams{
+		ObligationID: o.ObligationID, FilingRequirementID: f.FilingRequirementID,
+		ActorPrincipalID: "admin-1", CorrelationID: "corr-2"}); !errors.Is(err, domain.ErrSubmissionEvidenceRequired) {
+		t.Fatalf("expected ErrSubmissionEvidenceRequired with no reference, got %v", err)
+	}
+
+	submitted, moved, err := s.SubmitFiling(ctx, domain.SubmitFilingParams{
+		ObligationID: o.ObligationID, FilingRequirementID: f.FilingRequirementID,
+		SubmissionReference: "ARN-998877", ExpectedVersion: scheduled.RowVersion,
+		ActorPrincipalID: "admin-1", CorrelationID: "corr-3"})
+	if err != nil || !moved || submitted.FilingStatus != "SUBMITTED" {
+		t.Fatalf("submit: moved=%v status=%v err=%v", moved, submitted, err)
+	}
+	if submitted.SubmissionReference == nil || *submitted.SubmissionReference != "ARN-998877" {
+		t.Fatalf("expected submission_reference recorded, got %+v", submitted.SubmissionReference)
+	}
+	if submitted.SubmittedBy == nil || *submitted.SubmittedBy != "admin-1" || submitted.SubmittedAt == nil {
+		t.Fatalf("expected submitted_by/submitted_at recorded, got %+v / %+v", submitted.SubmittedBy, submitted.SubmittedAt)
+	}
+
+	// Re-submitting is an idempotent no-op, not a rejected re-transition.
+	again, moved, err := s.SubmitFiling(ctx, domain.SubmitFilingParams{
+		ObligationID: o.ObligationID, FilingRequirementID: f.FilingRequirementID,
+		SubmissionReference: "ARN-998877"})
+	if err != nil || moved || again.FilingStatus != "SUBMITTED" {
+		t.Fatalf("repeat submit: moved=%v err=%v", moved, err)
+	}
+
+	// No confirmation_reference: refused.
+	if _, _, err := s.ConfirmFiling(ctx, domain.ConfirmFilingParams{
+		ObligationID: o.ObligationID, FilingRequirementID: f.FilingRequirementID,
+		ActorPrincipalID: "admin-1", CorrelationID: "corr-4"}); !errors.Is(err, domain.ErrConfirmationEvidenceRequired) {
+		t.Fatalf("expected ErrConfirmationEvidenceRequired with no reference, got %v", err)
+	}
+
+	confirmed, moved, err := s.ConfirmFiling(ctx, domain.ConfirmFilingParams{
+		ObligationID: o.ObligationID, FilingRequirementID: f.FilingRequirementID,
+		ConfirmationReference: "CONF-55", ExpectedVersion: submitted.RowVersion,
+		ActorPrincipalID: "admin-1", CorrelationID: "corr-5"})
+	if err != nil || !moved || confirmed.FilingStatus != "CONFIRMED" {
+		t.Fatalf("confirm: moved=%v status=%v err=%v", moved, confirmed, err)
+	}
+	if confirmed.ConfirmationReference == nil || *confirmed.ConfirmationReference != "CONF-55" || confirmed.ConfirmedAt == nil {
+		t.Fatalf("expected confirmation_reference/confirmed_at recorded, got %+v", confirmed)
+	}
+
+	// CONFIRMED is terminal.
+	if _, _, err := s.ConfirmFiling(ctx, domain.ConfirmFilingParams{
+		ObligationID: o.ObligationID, FilingRequirementID: f.FilingRequirementID,
+		ConfirmationReference: "CONF-56"}); err != nil {
+		t.Fatalf("re-confirming an already-CONFIRMED filing must stay a no-op, got %v", err)
+	}
+	if _, _, err := s.SubmitFiling(ctx, domain.SubmitFilingParams{
+		ObligationID: o.ObligationID, FilingRequirementID: f.FilingRequirementID,
+		SubmissionReference: "ARN-999"}); !errors.Is(err, domain.ErrInvalidTransition) {
+		t.Fatalf("expected ErrInvalidTransition submitting out of terminal CONFIRMED, got %v", err)
+	}
+}
+
 func TestPgStore_UpdateObligationAttributes(t *testing.T) {
 	admin := getTestPool(t)
 	defer admin.Close()

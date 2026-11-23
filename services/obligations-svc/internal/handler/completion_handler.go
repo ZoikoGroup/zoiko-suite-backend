@@ -21,6 +21,8 @@ func registerCompletionRoutes(r chi.Router, h *Handler) {
 	r.Patch("/v1/obligations/{obligation_id}", h.UpdateObligation)
 	r.Get("/v1/obligations/{obligation_id}/filing-requirements/{filing_requirement_id}", h.GetFilingRequirement)
 	r.Post("/v1/obligations/{obligation_id}/filing-requirements/{filing_requirement_id}/status", h.UpdateFilingStatus)
+	r.Post("/v1/obligations/{obligation_id}/filing-requirements/{filing_requirement_id}/submit", h.SubmitFiling)
+	r.Post("/v1/obligations/{obligation_id}/filing-requirements/{filing_requirement_id}/confirm", h.ConfirmFiling)
 	r.Get("/v1/obligations/{obligation_id}/filing-requirements/{filing_requirement_id}/transitions", h.ListFilingTransitions)
 
 	r.Post("/v1/obligation-definitions", h.CreateDefinition)
@@ -218,6 +220,106 @@ func (h *Handler) UpdateFilingStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	h.log.Info("filing status updated", zap.String("filing_requirement_id", filingID),
 		zap.String("filing_status", f.FilingStatus), zap.Bool("moved", moved))
+	w.Header().Set("ETag", strconv.Quote(strconv.Itoa(f.RowVersion)))
+	writeJSON(w, r, http.StatusOK, f)
+}
+
+type submitFilingRequest struct {
+	SubmissionReference string `json:"submission_reference"`
+	ExpectedVersion     int    `json:"expected_version,omitempty"`
+}
+
+// SubmitFiling handles POST …/filing-requirements/{id}/submit
+// (filing-tracker-svc parity): records the submission evidence and moves
+// filing_status to SUBMITTED in one step, instead of a bare status PATCH.
+func (h *Handler) SubmitFiling(w http.ResponseWriter, r *http.Request) {
+	obligationID, filingID := chi.URLParam(r, "obligation_id"), chi.URLParam(r, "filing_requirement_id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	var req submitFilingRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.SubmissionReference) == "" {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "submission_reference"})
+		return
+	}
+	version, _, ok := ifMatch(w, r, req.ExpectedVersion)
+	if !ok {
+		return
+	}
+	parent, err := h.store.FindObligationByID(r.Context(), obligationID)
+	if err != nil {
+		h.writeStoreErr(w, r, "SubmitFiling: lookup failed", err)
+		return
+	}
+	if !h.authorize(w, r, principalID, parent.LegalEntityID, authz.ActionFilingStatusUpdate) {
+		return
+	}
+	f, moved, err := h.store.SubmitFiling(r.Context(), domain.SubmitFilingParams{
+		ObligationID: obligationID, FilingRequirementID: filingID, SubmissionReference: req.SubmissionReference,
+		ExpectedVersion: version, ActorPrincipalID: principalID, CorrelationID: correlationOf(r),
+	})
+	if err != nil {
+		h.writeStoreErr(w, r, "SubmitFiling: store unavailable", err)
+		return
+	}
+	h.log.Info("filing submitted", zap.String("filing_requirement_id", filingID), zap.Bool("moved", moved))
+	w.Header().Set("ETag", strconv.Quote(strconv.Itoa(f.RowVersion)))
+	writeJSON(w, r, http.StatusOK, f)
+}
+
+type confirmFilingRequest struct {
+	ConfirmationReference string `json:"confirmation_reference"`
+	ExpectedVersion        int   `json:"expected_version,omitempty"`
+}
+
+// ConfirmFiling handles POST …/filing-requirements/{id}/confirm
+// (filing-tracker-svc parity): records confirmation evidence and moves
+// filing_status to CONFIRMED.
+func (h *Handler) ConfirmFiling(w http.ResponseWriter, r *http.Request) {
+	obligationID, filingID := chi.URLParam(r, "obligation_id"), chi.URLParam(r, "filing_requirement_id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	var req confirmFilingRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.ConfirmationReference) == "" {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "confirmation_reference"})
+		return
+	}
+	version, _, ok := ifMatch(w, r, req.ExpectedVersion)
+	if !ok {
+		return
+	}
+	parent, err := h.store.FindObligationByID(r.Context(), obligationID)
+	if err != nil {
+		h.writeStoreErr(w, r, "ConfirmFiling: lookup failed", err)
+		return
+	}
+	if !h.authorize(w, r, principalID, parent.LegalEntityID, authz.ActionFilingStatusUpdate) {
+		return
+	}
+	f, moved, err := h.store.ConfirmFiling(r.Context(), domain.ConfirmFilingParams{
+		ObligationID: obligationID, FilingRequirementID: filingID, ConfirmationReference: req.ConfirmationReference,
+		ExpectedVersion: version, ActorPrincipalID: principalID, CorrelationID: correlationOf(r),
+	})
+	if err != nil {
+		h.writeStoreErr(w, r, "ConfirmFiling: store unavailable", err)
+		return
+	}
+	h.log.Info("filing confirmed", zap.String("filing_requirement_id", filingID), zap.Bool("moved", moved))
 	w.Header().Set("ETag", strconv.Quote(strconv.Itoa(f.RowVersion)))
 	writeJSON(w, r, http.StatusOK, f)
 }

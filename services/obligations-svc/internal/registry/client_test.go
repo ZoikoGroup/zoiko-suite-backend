@@ -58,3 +58,51 @@ func TestCheckEntity(t *testing.T) {
 		t.Fatalf("unreachable registry: %v", err)
 	}
 }
+
+func TestPrimaryJurisdiction(t *testing.T) {
+	var gotPath, gotTenant string
+	status, body := http.StatusOK, `{"legal_entity_id":"le-1","tenant_id":"T1","primary_jurisdiction_id":"00000000-0000-0000-0000-00000000000a"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotTenant = r.URL.EscapedPath(), r.Header.Get("X-Tenant-Id")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+	c := registry.New(srv.URL, zap.NewNop())
+	ctx := context.Background()
+
+	got, err := c.PrimaryJurisdiction(ctx, "T1", "le-1")
+	if err != nil || got != "00000000-0000-0000-0000-00000000000a" {
+		t.Fatalf("got=%q err=%v", got, err)
+	}
+	if gotPath != "/v1/entities/le-1" || gotTenant != "T1" {
+		t.Fatalf("request path=%q tenant=%q", gotPath, gotTenant)
+	}
+
+	// Another tenant's entity must not leak its jurisdiction.
+	body = `{"legal_entity_id":"le-1","tenant_id":"T2","primary_jurisdiction_id":"00000000-0000-0000-0000-00000000000a"}`
+	if _, err := c.PrimaryJurisdiction(ctx, "T1", "le-1"); !errors.Is(err, domain.ErrLegalEntityNotFound) {
+		t.Fatalf("cross-tenant entity: %v", err)
+	}
+
+	// A real entity record with no jurisdiction set is treated as unusable,
+	// not silently skipped — the schema says this cannot happen, but a
+	// migration tool must not trust that blindly.
+	body = `{"legal_entity_id":"le-1","tenant_id":"T1","primary_jurisdiction_id":""}`
+	if _, err := c.PrimaryJurisdiction(ctx, "T1", "le-1"); !errors.Is(err, domain.ErrRegistryUnavailable) {
+		t.Fatalf("empty primary_jurisdiction_id: %v", err)
+	}
+
+	status, body = http.StatusNotFound, ""
+	if _, err := c.PrimaryJurisdiction(ctx, "T1", "le-1"); !errors.Is(err, domain.ErrLegalEntityNotFound) {
+		t.Fatalf("404: %v", err)
+	}
+	status = http.StatusInternalServerError
+	if _, err := c.PrimaryJurisdiction(ctx, "T1", "le-1"); !errors.Is(err, domain.ErrRegistryUnavailable) {
+		t.Fatalf("500 must fail closed: %v", err)
+	}
+	srv.Close()
+	if _, err := c.PrimaryJurisdiction(ctx, "T1", "le-1"); !errors.Is(err, domain.ErrRegistryUnavailable) {
+		t.Fatalf("unreachable registry: %v", err)
+	}
+}
