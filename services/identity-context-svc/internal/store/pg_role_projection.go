@@ -141,6 +141,10 @@ func (s *PgStore) EndRoleAssignment(ctx context.Context, tenantID, assignmentID 
 // recorded by setting suspended_at. Nothing is tombstoned, since a suspension
 // is reversible. If the assignment is not yet projected, the suspension is
 // recorded in pending_role_assignment_suspensions (IC-12).
+//
+// Delivery is at least once and unordered, so suspended_at only moves forward
+// (GREATEST): a redelivered older suspension never moves it behind a newer
+// resume and lifts the hold (D1-1.F19).
 func (s *PgStore) SuspendRoleAssignment(ctx context.Context, tenantID, assignmentID string, at time.Time) error {
 	if tenantID == "" || assignmentID == "" {
 		return errors.New("SuspendRoleAssignment: tenant_id and assignment_id are required")
@@ -148,7 +152,7 @@ func (s *PgStore) SuspendRoleAssignment(ctx context.Context, tenantID, assignmen
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		// First, try to update an existing projection row
 		cmdTag, err := tx.Exec(ctx, `
-			UPDATE principal_role_assignments SET suspended_at = $1
+			UPDATE principal_role_assignments SET suspended_at = GREATEST(suspended_at, $1)
 			 WHERE assignment_id = $2 AND tenant_id = $3`, at, assignmentID, tenantID)
 		if err != nil {
 			return err
@@ -162,7 +166,7 @@ func (s *PgStore) SuspendRoleAssignment(ctx context.Context, tenantID, assignmen
 			INSERT INTO pending_role_assignment_suspensions (tenant_id, assignment_id, suspended_at)
 			VALUES ($1, $2, $3)
 			ON CONFLICT (tenant_id, assignment_id) DO UPDATE
-			   SET suspended_at = $3`, tenantID, assignmentID, at)
+			   SET suspended_at = GREATEST(pending_role_assignment_suspensions.suspended_at, EXCLUDED.suspended_at)`, tenantID, assignmentID, at)
 		return err
 	})
 }
@@ -178,7 +182,7 @@ func (s *PgStore) ResumeRoleAssignment(ctx context.Context, tenantID, assignment
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		// First, try to update an existing projection row
 		cmdTag, err := tx.Exec(ctx, `
-			UPDATE principal_role_assignments SET resumed_at = $1
+			UPDATE principal_role_assignments SET resumed_at = GREATEST(resumed_at, $1)
 			 WHERE assignment_id = $2 AND tenant_id = $3`, at, assignmentID, tenantID)
 		if err != nil {
 			return err
@@ -190,7 +194,7 @@ func (s *PgStore) ResumeRoleAssignment(ctx context.Context, tenantID, assignment
 		// No projection row: clear the pending suspension
 		_, err = tx.Exec(ctx, `
 			DELETE FROM pending_role_assignment_suspensions
-			 WHERE tenant_id = $1 AND assignment_id = $2`, tenantID, assignmentID)
+			 WHERE tenant_id = $1 AND assignment_id = $2 AND suspended_at < $3`, tenantID, assignmentID, at)
 		return err
 	})
 }

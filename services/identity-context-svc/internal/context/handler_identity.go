@@ -298,6 +298,8 @@ func (h *Handler) MergeIdentity(w http.ResponseWriter, r *http.Request) {
 			writeCoded(w, r, http.StatusConflict, "merge_conflict", err.Error())
 		case errors.Is(err, store.ErrMergeStale):
 			writeCoded(w, r, http.StatusPreconditionFailed, "stale_version", err.Error())
+		case errors.Is(err, lifecycle.ErrStepUp):
+			writeCoded(w, r, http.StatusUnauthorized, "step_up_required", "a recent second-factor step-up is required to merge identities")
 		default:
 			h.log.Error("identity merge failed", zap.Error(err))
 			writeCoded(w, r, http.StatusInternalServerError, "internal_error", "failed to merge the identity")

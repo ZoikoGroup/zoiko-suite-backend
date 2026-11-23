@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -75,7 +76,7 @@ func TestMerge_EndsTheDuplicatesSessionsAndEmitsTheEvent(t *testing.T) {
 	st := &mergeStore{created: true}
 	var ended []enderCall
 	m, created, err := mergeSvc(st, &ended).MergeDuplicate(context.Background(),
-		lifecycle.Actor{PrincipalID: "admin", TenantID: "t-1", CorrelationID: "corr"}, "p-2", "p-1", "same person", 1)
+		lifecycle.Actor{PrincipalID: "admin", TenantID: "t-1", CorrelationID: "corr", MFAVerified: true, AuthTime: time.Now()}, "p-2", "p-1", "same person", 1)
 	require.NoError(t, err)
 	assert.True(t, created)
 	assert.Equal(t, "p-2", m.SurvivorID)
@@ -97,7 +98,7 @@ func TestMerge_ReplayEndsNothing(t *testing.T) {
 	st := &mergeStore{created: false}
 	var ended []enderCall
 	_, created, err := mergeSvc(st, &ended).MergeDuplicate(context.Background(),
-		lifecycle.Actor{PrincipalID: "admin", TenantID: "t-1"}, "p-2", "p-1", "same person", 1)
+		lifecycle.Actor{PrincipalID: "admin", TenantID: "t-1", MFAVerified: true, AuthTime: time.Now()}, "p-2", "p-1", "same person", 1)
 	require.NoError(t, err)
 	assert.False(t, created)
 	assert.Empty(t, ended)
@@ -110,12 +111,31 @@ func TestMerge_MapsTheStoresAnswers(t *testing.T) {
 	} {
 		var ended []enderCall
 		_, _, err := mergeSvc(&mergeStore{err: tc.in}, &ended).MergeDuplicate(context.Background(),
-			lifecycle.Actor{PrincipalID: "admin", TenantID: "t-1"}, "p-2", "p-1", "same person", 1)
+			lifecycle.Actor{PrincipalID: "admin", TenantID: "t-1", MFAVerified: true, AuthTime: time.Now()}, "p-2", "p-1", "same person", 1)
 		assert.ErrorIs(t, err, tc.want)
 		assert.Empty(t, ended)
 	}
 	_, _, err := mergeSvc(&mergeStore{err: errors.New("db down")}, new([]enderCall)).MergeDuplicate(context.Background(),
-		lifecycle.Actor{PrincipalID: "admin", TenantID: "t-1"}, "p-2", "p-1", "same person", 1)
+		lifecycle.Actor{PrincipalID: "admin", TenantID: "t-1", MFAVerified: true, AuthTime: time.Now()}, "p-2", "p-1", "same person", 1)
 	assert.Error(t, err)
 	assert.NotErrorIs(t, err, lifecycle.ErrConflict)
+}
+
+// IC-14 (S1-14): POST /v1/identities/{id}/merge needs a recent step-up, like
+// POST /v1/subjects/{id}/merge. No second factor, or one older than the
+// step-up window, is refused before the store.
+func TestIC14_IdentitiesMergeNeedsStepUp(t *testing.T) {
+	for name, a := range map[string]lifecycle.Actor{
+		"no second factor":      {PrincipalID: "admin", TenantID: "t-1", AuthTime: time.Now()},
+		"no auth time":          {PrincipalID: "admin", TenantID: "t-1", MFAVerified: true},
+		"step-up too old (16m)": {PrincipalID: "admin", TenantID: "t-1", MFAVerified: true, AuthTime: time.Now().Add(-16 * time.Minute)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			st, ended := &mergeStore{}, []enderCall{}
+			_, _, err := mergeSvc(st, &ended).MergeDuplicate(context.Background(), a, "p-2", "p-1", "same person", 1)
+			assert.ErrorIs(t, err, lifecycle.ErrStepUp)
+			assert.Zero(t, st.calls, "nothing reaches the store")
+			assert.Empty(t, ended, "no session is ended")
+		})
+	}
 }

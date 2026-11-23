@@ -242,8 +242,8 @@ func TestIC13_StoreOutageMapsTo503(t *testing.T) {
 
 	_, err := svc.DecideReset(context.Background(), admin, "req-1", "APPROVE", "reason")
 	require.Error(t, err)
-	// The error should indicate service unavailability
-	assert.Contains(t, err.Error(), "unavailable", "store outage must map to 503")
+	// A store outage is typed, so the handler answers 503 (D1-1.F11).
+	assert.ErrorIs(t, err, lifecycle.ErrUnavailable, "store outage must map to 503")
 }
 
 func TestIC13_ExpiryCommittedBeforeRefuse(t *testing.T) {
@@ -367,5 +367,5 @@ func TestIC13_LinkDeliveryFailureReturnsError(t *testing.T) {
 
 	_, err := svc.DecideReset(context.Background(), admin, "req-1", "APPROVE", "reason")
 	require.Error(t, err, "link delivery failure must return an error")
-	assert.Contains(t, err.Error(), "delivery", "error must indicate delivery failure")
+	assert.ErrorIs(t, err, lifecycle.ErrDeliveryFailed, "a delivery failure is typed, so the handler answers 502")
 }

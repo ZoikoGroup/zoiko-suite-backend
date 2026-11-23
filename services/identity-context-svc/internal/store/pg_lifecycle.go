@@ -382,6 +382,14 @@ func (s *PgStore) GetResetRequest(ctx context.Context, tenantID, requestID strin
 // IC-13 (S1-13 K-7): Events are emitted for EVERY decision (APPROVE, REJECT,
 // expiry), not just when status changes from PENDING_APPROVAL. Expiry is
 // committed and event emitted before refusing.
+// Refusals of a reset decision. They are the request's state, not an outage
+// (D1-1.F11): the service answers them 409, and anything else 503.
+var (
+	ErrResetExpired        = errors.New("reset request expired")
+	ErrResetNotPending     = errors.New("reset request is not pending approval")
+	ErrResetAlreadyDecided = errors.New("this approver has already decided")
+)
+
 func (s *PgStore) DecideResetRequest(ctx context.Context, tenantID, requestID string, a domain.ResetApproval,
 	issue func(ctx context.Context, tx pgx.Tx, r *domain.PasswordResetRequest) error, recs ...outbox.Record) (*domain.PasswordResetRequest, error) {
 	var r domain.PasswordResetRequest
@@ -419,15 +427,15 @@ func (s *PgStore) DecideResetRequest(ctx context.Context, tenantID, requestID st
 				}
 				return s.enqueueAll(ctx, tx, append(recs, rec))
 			}
-			return errors.New("reset request expired")
+			return ErrResetExpired
 		}
 		
 		if r.Status != "PENDING_APPROVAL" {
-			return fmt.Errorf("reset request is %s", r.Status)
+			return fmt.Errorf("%w: it is %s", ErrResetNotPending, r.Status)
 		}
 		for _, prior := range r.Approvals {
 			if prior.ApproverID == a.ApproverID {
-				return errors.New("this approver has already decided")
+				return ErrResetAlreadyDecided
 			}
 		}
 		r.Approvals = append(r.Approvals, a)

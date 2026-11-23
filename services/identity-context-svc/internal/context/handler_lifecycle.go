@@ -403,6 +403,12 @@ func (h *Handler) lifecycleError(w http.ResponseWriter, r *http.Request, err err
 			"notification is not configured in this deployment")
 	case errors.Is(err, store.ErrPrincipalConflict):
 		writeCoded(w, r, http.StatusConflict, "principal_conflict", err.Error())
+	case errors.Is(err, lifecycle.ErrUnavailable):
+		h.log.Error("lifecycle dependency unavailable", zap.Error(err))
+		writeCoded(w, r, http.StatusServiceUnavailable, domain.ErrCodeUpstreamUnavailable, "the identity store is unavailable; retry")
+	case errors.Is(err, lifecycle.ErrDeliveryFailed):
+		h.log.Error("credential link delivery failed", zap.Error(err))
+		writeCoded(w, r, http.StatusBadGateway, "delivery_failed", "the decision is recorded but the link could not be delivered; re-issue it")
 	default:
 		h.log.Error("lifecycle command failed", zap.Error(err))
 		writeError(w, r, http.StatusInternalServerError, "lifecycle command failed")

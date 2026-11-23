@@ -138,3 +138,14 @@ func TestMergeDuplicateIdentity_MapsRefusals(t *testing.T) {
 		assert.NotContains(t, w.Body.String(), "db down", "an internal error is never returned")
 	}
 }
+
+// IC-14: the lifecycle's step-up refusal reaches the caller as 401
+// step_up_required, not a 500.
+func TestIC14_MergeStepUpRefusalIs401(t *testing.T) {
+	fx := newMFAFixture(t)
+	f := &fakeMerger{err: lifecycle.ErrStepUp}
+	router, _ := mergeRouter(f, nil, fx)
+	w := postMerge(router, mergeBody, `W/"v1"`, fx.session(admin, time.Hour, false))
+	require.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "step_up_required")
+}

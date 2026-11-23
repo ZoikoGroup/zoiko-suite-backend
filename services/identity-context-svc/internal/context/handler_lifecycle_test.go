@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -111,10 +113,13 @@ func (m *mockLifecycleStore) GetResetRequest(_ context.Context, _, _ string) (*d
 }
 func (m *mockLifecycleStore) DecideResetRequest(_ context.Context, _, _ string, _ domain.ResetApproval,
 	apply func(context.Context, pgx.Tx, *domain.PasswordResetRequest) error, _ ...outbox.Record) (*domain.PasswordResetRequest, error) {
-	if apply != nil {
+	if m.decideErr != nil {
+		return nil, m.decideErr // the store failed before issuing anything
+	}
+	if apply != nil && m.decideOut != nil {
 		_ = apply(context.Background(), nil, m.decideOut)
 	}
-	return m.decideOut, m.decideErr
+	return m.decideOut, nil
 }
 func (m *mockLifecycleStore) CompleteResetRequestTx(_ context.Context, _ pgx.Tx, _ string) error {
 	return nil
@@ -277,4 +282,34 @@ func TestAU09_GetReset_RequiresReadGrant(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
+}
+
+// D1-1.F11 (IC-13): a reset decision answers by cause: the request's own state
+// is 409, a store outage 503 (retryable), a committed decision whose link could
+// not be delivered 502. All three used to fall to the default 500.
+func TestIC13_ResetDecisionErrorsAnswerByCause(t *testing.T) {
+	pending := func() *domain.PasswordResetRequest {
+		return &domain.PasswordResetRequest{RequestID: "rr-1", RequestedBy: "P-OTHER", PrincipalID: alice, Status: "PENDING_APPROVAL", ApprovalsRequired: 1}
+	}
+	for _, tc := range []struct {
+		name   string
+		st     *mockLifecycleStore
+		status int
+		code   string
+	}{
+		{"read outage", &mockLifecycleStore{getResetReqErr: errors.New("connection refused")}, http.StatusServiceUnavailable, "UPSTREAM_UNAVAILABLE"},
+		{"decide outage", &mockLifecycleStore{getResetReq: pending(), decideErr: errors.New("connection reset")}, http.StatusServiceUnavailable, "UPSTREAM_UNAVAILABLE"},
+		{"already decided", &mockLifecycleStore{getResetReq: pending(), decideErr: store.ErrResetAlreadyDecided}, http.StatusConflict, "conflict"},
+		{"not pending", &mockLifecycleStore{getResetReq: pending(), decideErr: fmt.Errorf("%w: it is ISSUED", store.ErrResetNotPending)}, http.StatusConflict, "conflict"},
+		{"expired", &mockLifecycleStore{getResetReq: pending(), decideErr: store.ErrResetExpired}, http.StatusConflict, "conflict"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newMFAFixture(t)
+			r := steppedUpRouter(newLifecycleService(tc.st), &permittingAuthz{}, fx)
+			w := postAs(t, r, "/v1/password-resets/rr-1/decide", admin, fx.session(admin, 10*time.Second, true), "",
+				map[string]any{"decision": "APPROVE"})
+			assert.Equal(t, tc.status, w.Code, w.Body.String())
+			assert.Contains(t, w.Body.String(), tc.code)
+		})
+	}
 }

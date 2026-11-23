@@ -129,6 +129,11 @@ var (
 	ErrBadCredential = errors.New("current password is incorrect")
 	ErrLinkInvalid   = errors.New("link invalid, expired or already used")
 	ErrStale         = errors.New("the record changed since it was read")
+	// ErrUnavailable is a store or dependency outage: answered 503, retryable.
+	ErrUnavailable = errors.New("service temporarily unavailable")
+	// ErrDeliveryFailed is a committed decision whose link could not be
+	// delivered: answered 502; the request can be re-issued.
+	ErrDeliveryFailed = errors.New("credential link delivery failed")
 )
 
 // CreateSubjectRequest is POST /v1/principals.
@@ -454,7 +459,7 @@ func (s *Service) DecideReset(ctx context.Context, a Actor, requestID, decision,
 	}
 	r, err := s.store.GetResetRequest(ctx, a.TenantID, requestID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: password reset request: %v", ErrUnavailable, err)
 	}
 	if r == nil {
 		return nil, ErrNotFound
@@ -479,10 +484,13 @@ func (s *Service) DecideReset(ctx context.Context, a Actor, requestID, decision,
 		}, rec)
 	if err != nil {
 		// IC-13: Map store outages to service unavailable (503), not conflict (409)
-		if errors.Is(err, pgx.ErrNoRows) {
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
 			return nil, ErrNotFound
+		case errors.Is(err, store.ErrResetExpired), errors.Is(err, store.ErrResetNotPending), errors.Is(err, store.ErrResetAlreadyDecided):
+			return nil, fmt.Errorf("%w: %v", ErrConflict, err)
 		}
-		return nil, fmt.Errorf("password reset decision unavailable: %w", err)
+		return nil, fmt.Errorf("%w: password reset decision unavailable: %v", ErrUnavailable, err)
 	}
 	// IC-13: Metric incremented AFTER successful commit
 	if ic8 := metrics.Default(); ic8 != nil {
@@ -496,7 +504,7 @@ func (s *Service) DecideReset(ctx context.Context, a Actor, requestID, decision,
 		if err := s.notifier.Notify(ctx, Notice{TenantID: out.TenantID, PrincipalID: out.PrincipalID, Intent: s.cfg.IntentReset,
 			Link: s.linkFor(domain.CredentialTokenReset, issued), ExpiresAt: s.now().Add(s.cfg.ResetTTL),
 			SourceEventID: "reset-" + out.RequestID, CorrelationID: a.CorrelationID}); err != nil {
-			return nil, fmt.Errorf("password reset link delivery failed: %w", err)
+			return nil, fmt.Errorf("%w: password reset link delivery failed: %v", ErrDeliveryFailed, err)
 		}
 	}
 	return out, nil
@@ -641,6 +649,12 @@ func (s *Service) MergeDuplicate(ctx context.Context, a Actor, survivorID, dupli
 		return nil, false, fmt.Errorf("%w: a reason is required", ErrInvalid)
 	case a.PrincipalID == survivorID || a.PrincipalID == duplicateID:
 		return nil, false, fmt.Errorf("%w: you cannot merge your own identity", ErrForbidden)
+	}
+	// IC-14 / S1-14: merging disables an identity and ends its sessions, the
+	// same identity-recovery power as POST /v1/subjects/{id}/merge, so it needs
+	// the same recent step-up (the handler only proved a live session).
+	if !a.MFAVerified || a.AuthTime.IsZero() || s.now().Sub(a.AuthTime) > s.cfg.StepUpMaxAge {
+		return nil, false, ErrStepUp
 	}
 	m, created, err := s.store.MergeIdentities(ctx, a.TenantID, survivorID, duplicateID, reason, a.PrincipalID, a.CorrelationID, duplicateVersion,
 		func(m store.IdentityMerge) ([]outbox.Record, error) {
