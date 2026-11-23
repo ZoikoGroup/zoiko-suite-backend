@@ -9,6 +9,7 @@ package handler
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -80,6 +81,11 @@ func NewRouter(h *Handler, readiness health.Pinger) http.Handler {
 	// must carry tenant, principal, request id, correlation id, source channel,
 	// legal entity and Idempotency-Key.
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+	// The envelope refuses a key-less write only when enforcing; with
+	// ZS_ENVELOPE_ENFORCEMENT=observe it admits it, and the store treats an
+	// empty key as "no replay protection". The service holds the
+	// requirement itself, in every mode.
+	r.Use(requireIdempotencyKey)
 
 	r.Get("/healthz", health.LivenessHandler())
 	r.Get("/readyz", health.ReadinessHandler(readiness))
@@ -128,4 +134,21 @@ func NewRouter(h *Handler, readiness health.Pinger) http.Handler {
 	})
 
 	return r
+}
+
+// requireIdempotencyKey refuses every write (POST/PUT/PATCH/DELETE) that
+// carries no Idempotency-Key with 400 idempotency_key_required. Probes are
+// GETs and unaffected.
+func requireIdempotencyKey(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+			if strings.TrimSpace(r.Header.Get(svcenvelope.HeaderIdempotencyKey)) == "" {
+				writeProblem(w, r, http.StatusBadRequest, "idempotency_key_required",
+					"Idempotency-Key header is required for this write", "")
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }

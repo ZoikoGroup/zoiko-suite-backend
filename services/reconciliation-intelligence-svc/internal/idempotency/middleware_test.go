@@ -128,13 +128,38 @@ func TestTransientFailureIsNotReplayed(t *testing.T) {
 	}
 }
 
-func TestReadsAndKeylessWritesPassThrough(t *testing.T) {
+func TestReadsPassThroughAndKeylessWritesAreRefused(t *testing.T) {
 	next := &countingHandler{status: http.StatusOK}
 	handler := Middleware(newMemoryStore(), zap.NewNop())(next)
 	send(handler, http.MethodGet, "key-1", "p1", "")
 	send(handler, http.MethodGet, "key-1", "p1", "")
-	send(handler, http.MethodPost, "", "p1", `{}`)
-	if next.runs != 3 {
-		t.Fatalf("reads and keyless writes must not be deduplicated; runs=%d", next.runs)
+	if next.runs != 2 {
+		t.Fatalf("reads must not be deduplicated; runs=%d", next.runs)
+	}
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
+		if w := send(handler, method, "", "p1", `{}`); w.Code != http.StatusBadRequest ||
+			!strings.Contains(w.Body.String(), "idempotency_key_required") {
+			t.Fatalf("%s without Idempotency-Key: expected 400 idempotency_key_required, got %d %s", method, w.Code, w.Body.String())
+		}
+	}
+	if next.runs != 2 {
+		t.Fatalf("a key-less write must not run; runs=%d", next.runs)
+	}
+}
+
+func TestRequireKeyStandalone(t *testing.T) {
+	next := &countingHandler{status: http.StatusCreated}
+	handler := RequireKey(next)
+	if w := send(handler, http.MethodPost, "", "p1", `{}`); w.Code != http.StatusBadRequest || next.runs != 0 {
+		t.Fatalf("key-less POST: %d runs=%d", w.Code, next.runs)
+	}
+	if w := send(handler, http.MethodPost, "   ", "p1", `{}`); w.Code != http.StatusBadRequest || next.runs != 0 {
+		t.Fatalf("blank-key POST: %d runs=%d", w.Code, next.runs)
+	}
+	if w := send(handler, http.MethodPost, "k", "p1", `{}`); w.Code != http.StatusCreated || next.runs != 1 {
+		t.Fatalf("keyed POST: %d runs=%d", w.Code, next.runs)
+	}
+	if w := send(handler, http.MethodGet, "", "p1", ""); w.Code != http.StatusCreated || next.runs != 2 {
+		t.Fatalf("GET without key: %d runs=%d", w.Code, next.runs)
 	}
 }

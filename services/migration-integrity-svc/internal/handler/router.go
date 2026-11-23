@@ -2,12 +2,14 @@ package handler
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	chiMiddleware "github.com/go-chi/chi/v5/middleware"
 	svcenvelope "zoiko.io/migration-integrity-svc/internal/envelope"
 	"zoiko.io/migration-integrity-svc/internal/health"
 	"zoiko.io/migration-integrity-svc/internal/middleware"
+	"zoiko.io/migration-integrity-svc/internal/problem"
 )
 
 // NewRouter builds the route tree. Request path through the service:
@@ -17,6 +19,7 @@ import (
 //	                         correlation ids, source channel; Idempotency-Key and
 //	                         X-Legal-Entity-Id on writes)
 //	→ TenantMiddleware      (X-Tenant-Id onto the context; 401 when absent)
+//	→ requireIdempotencyKey (400 on a write without Idempotency-Key, any mode)
 //	→ handler               (this package)
 //	→ store.Store           (PgStore in production)
 //
@@ -47,7 +50,12 @@ func NewRouterWithReadiness(h *Handler, readyz http.HandlerFunc) http.Handler {
 	// Everything below requires a gateway-verified tenant. Applied via With()
 	// on the subtree rather than as a path exemption inside the middleware:
 	// comparing r.URL.Path to skip an auth gate is a classic bypass source.
-	r.With(middleware.TenantMiddleware).Route("/v1/migrations", func(r chi.Router) {
+	//
+	// requireIdempotencyKey holds the Idempotency-Key requirement in every
+	// envelope mode: the envelope refuses a key-less write only when
+	// enforcing (ZS_ENVELOPE_ENFORCEMENT=observe admits it), and the store
+	// treats an empty key as "record nothing".
+	r.With(middleware.TenantMiddleware, requireIdempotencyKey).Route("/v1/migrations", func(r chi.Router) {
 		r.Post("/validate", h.ValidateMigration)
 		r.Get("/", h.ListJobs)
 		r.Get("/{id}", h.GetJobByID)
@@ -56,4 +64,20 @@ func NewRouterWithReadiness(h *Handler, readyz http.HandlerFunc) http.Handler {
 	})
 
 	return r
+}
+
+// requireIdempotencyKey refuses every write (POST/PUT/PATCH/DELETE) that
+// carries no Idempotency-Key with 400 idempotency-key-required.
+func requireIdempotencyKey(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+			if strings.TrimSpace(r.Header.Get(headerIdempotencyKey)) == "" {
+				problem.Write(w, r, http.StatusBadRequest, "idempotency-key-required", "Idempotency-Key required",
+					"Idempotency-Key header is required for this write")
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }

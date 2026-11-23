@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 
@@ -67,7 +68,10 @@ func (h *Handler) TriggerRun(w http.ResponseWriter, r *http.Request) {
 
 // GetRun handles GET /v1/reports/runs/{runId}.
 //
-// Statuses: 200; 400 bad id; 401; 404 unknown or another tenant's run.
+// Authz: REPORT_RUN_READ on the legal entity of the run's definition (a run
+// row carries no legal entity of its own).
+// Statuses: 200; 400 bad id; 401; 403 authz denied; 404 unknown or another
+// tenant's run; 503 authz unavailable.
 func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	caller, ok := h.requireCaller(w, r)
 	if !ok {
@@ -83,13 +87,24 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		h.writeDomainError(w, r, err)
 		return
 	}
+	definition, err := h.definitions.GetDefinition(r.Context(), caller.TenantID, run.DefinitionID)
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+	if !h.authorizeRead(w, r, caller, definition.LegalEntityID, actionRunRead) {
+		return
+	}
 	writeJSON(w, http.StatusOK, run)
 }
 
 // ListRuns handles GET /v1/reports/runs.
 //
 // Query: definition_id (UUID), status (filters); limit, offset.
-// Statuses: 200 {data, count, limit, offset}; 400 invalid query; 401.
+// Authz: REPORT_RUN_READ on the filtered definition's legal entity when
+// definition_id is given, else X-Legal-Entity-Id, else the tenant.
+// Statuses: 200 {data, count, limit, offset}; 400 invalid query; 401;
+// 403 authz denied; 503 authz unavailable.
 func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 	caller, ok := h.requireCaller(w, r)
 	if !ok {
@@ -109,6 +124,22 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		filter.DefinitionID = parsed.String()
+	}
+	scope := readScope(caller, "")
+	if filter.DefinitionID != "" {
+		// An unknown (or another tenant's) definition keeps the previous
+		// behaviour, an empty list, authorized against the caller's scope.
+		definition, err := h.definitions.GetDefinition(r.Context(), caller.TenantID, filter.DefinitionID)
+		switch {
+		case err == nil:
+			scope = definition.LegalEntityID
+		case !errors.Is(err, domain.ErrDefinitionNotFound):
+			h.writeDomainError(w, r, err)
+			return
+		}
+	}
+	if !h.authorizeRead(w, r, caller, scope, actionRunRead) {
+		return
 	}
 
 	runs, err := h.runs.ListRuns(r.Context(), caller.TenantID, filter, page)

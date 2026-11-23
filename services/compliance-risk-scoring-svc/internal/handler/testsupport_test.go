@@ -33,6 +33,8 @@ type policyAuthz struct {
 
 func allowAll() *policyAuthz {
 	return &policyAuthz{outcomes: map[string]error{
+		service.ActionRiskScoreRead:            nil,
+		service.ActionRiskThresholdRuleRead:    nil,
 		service.ActionRiskScoreCreate:          nil,
 		service.ActionRiskScoreReview:          nil,
 		service.ActionRiskAssessmentArchive:    nil,

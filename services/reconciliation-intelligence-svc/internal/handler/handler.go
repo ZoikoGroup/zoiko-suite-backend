@@ -87,6 +87,10 @@ func NewRouterWithDeps(h *Handler, readyz http.HandlerFunc, idem idempotency.Sto
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
+	// Idempotency-Key required on every material write, in every envelope
+	// mode (the envelope's own refusal is off in observe mode).
+	r.Use(idempotency.RequireKey)
+
 	// Idempotency-Key replay: a retried write with the same key returns the
 	// first answer instead of running again. Reads and probes pass through.
 	if idem != nil {
@@ -147,6 +151,13 @@ func (h *Handler) AnalyzeReconciliation(w http.ResponseWriter, r *http.Request) 
 	// The header is the tenant authority; a body tenant_id may only repeat it.
 	if req.TenantID != "" && req.TenantID != tenantID {
 		problem.Write(w, r, http.StatusForbidden, "tenant_mismatch", "body tenant_id does not match X-Tenant-Id")
+		return
+	}
+	// The caller's legal-entity scope, when declared, is authoritative too: a
+	// body legal_entity_id may only repeat it. Otherwise a caller scoped to
+	// one entity could analyze (and persist a job for) another entity.
+	if scoped := strings.TrimSpace(r.Header.Get(svcenvelope.HeaderLegalEntityID)); scoped != "" && scoped != req.LegalEntityID {
+		problem.Write(w, r, http.StatusForbidden, "legal_entity_mismatch", "body legal_entity_id does not match X-Legal-Entity-Id")
 		return
 	}
 

@@ -59,6 +59,30 @@ func (h *Handler) requireCaller(w http.ResponseWriter, r *http.Request) (request
 	}, true
 }
 
+// readScope is the legal entity a tenant-wide read (a list) is authorized
+// against: the explicit legal_entity_id filter, else X-Legal-Entity-Id, else
+// the tenant itself (as purchase-request-svc does for an unscoped list).
+func readScope(caller requestContext, filterLegalEntityID string) string {
+	if filterLegalEntityID != "" {
+		return filterLegalEntityID
+	}
+	if caller.LegalEntityID != "" {
+		return caller.LegalEntityID
+	}
+	return caller.TenantID
+}
+
+// authorizeRead asks authorization-svc whether the caller may read in
+// legalEntityID with a READ action: deny -> 403, unreachable -> 503 (fail
+// closed). The principal is already guaranteed by requireCaller (401).
+func (h *Handler) authorizeRead(w http.ResponseWriter, r *http.Request, caller requestContext, legalEntityID, action string) bool {
+	if err := h.authz.CheckAllowed(r.Context(), caller.TenantID, caller.PrincipalID, legalEntityID, action); err != nil {
+		h.writeAuthzError(w, r, err)
+		return false
+	}
+	return true
+}
+
 // requireUUIDParam reads a chi URL parameter that must be a UUID (400 if not).
 func requireUUIDParam(w http.ResponseWriter, r *http.Request, name string) (string, bool) {
 	value := chi.URLParam(r, name)

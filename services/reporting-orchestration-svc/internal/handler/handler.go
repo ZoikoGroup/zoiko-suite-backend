@@ -28,8 +28,12 @@ import (
 	"zoiko.io/reporting-orchestration-svc/internal/store"
 )
 
-// Authorization action types sent to authorization-svc.
+// Authorization action types sent to authorization-svc. Every write and
+// every tenant-data read is authorized (fail closed).
 const (
+	actionDefinitionRead         = "REPORT_DEFINITION_READ"
+	actionRunRead                = "REPORT_RUN_READ"
+	actionExportRead             = "AUDIT_EXPORT_READ"
 	actionDefinitionCreate       = "REPORT_DEFINITION_CREATE"
 	actionDefinitionStatusUpdate = "REPORT_DEFINITION_STATUS_UPDATE"
 	actionRunTrigger             = "REPORT_RUN_TRIGGER"
