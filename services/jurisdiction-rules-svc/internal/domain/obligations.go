@@ -143,10 +143,13 @@ type DueResult struct {
 	CalendarVersion   int        `json:"calendar_version,omitempty"`
 	CalendarVersionID string     `json:"calendar_version_id,omitempty"`
 	Adjusted          bool       `json:"adjusted"`
-	ExtensionGranted  int        `json:"extension_days_granted,omitempty"`
-	EscalationOwner   *string    `json:"escalation_owner,omitempty"`
-	EscalationSLAHrs  *int       `json:"escalation_sla_hours,omitempty"`
-	Explanation       []string   `json:"explanation"`
+	// BusinessDayAdjustment is the rule's convention (NONE, NEXT, PREVIOUS),
+	// part of the provenance a caller stores with the due date (R-INV-16).
+	BusinessDayAdjustment string   `json:"business_day_adjustment,omitempty"`
+	ExtensionGranted      int      `json:"extension_days_granted,omitempty"`
+	EscalationOwner       *string  `json:"escalation_owner,omitempty"`
+	EscalationSLAHrs      *int     `json:"escalation_sla_hours,omitempty"`
+	Explanation           []string `json:"explanation"`
 }
 
 // OverdueAt reports whether the due instant has passed at now.
@@ -409,7 +412,8 @@ func pickCalendar(cals []CalendarVersion, code string, on time.Time) *CalendarVe
 // has already chosen the rule; this function never guesses.
 func CalculateDueDate(r ObligationRule, cals []CalendarVersion, f DueFacts) DueResult {
 	res := DueResult{ObligationRuleID: r.ObligationRuleID, ObligationCode: r.ObligationCode, RuleVersion: r.RuleVersion,
-		ContentDigest: r.ContentDigest, EscalationOwner: r.EscalationOwner, EscalationSLAHrs: r.EscalationSLAHours, Explanation: []string{}}
+		ContentDigest: r.ContentDigest, EscalationOwner: r.EscalationOwner, EscalationSLAHrs: r.EscalationSLAHours, Explanation: []string{},
+		BusinessDayAdjustment: r.BusinessDayAdjustment}
 	step := func(format string, a ...any) { res.Explanation = append(res.Explanation, fmt.Sprintf(format, a...)) }
 	fail := func(outcome, msg string) DueResult {
 		res.Outcome, res.Message = outcome, msg
