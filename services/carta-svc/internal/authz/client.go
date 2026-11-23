@@ -76,7 +76,11 @@ func NewClientWithHTTPClient(baseURL string, httpClient *http.Client) *Client {
 // It is not used by any handler; CheckAllowed enforces the real fail-closed
 // authorization contract and should be used for all write actions.
 func (c *Client) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	key := principalID + "|" + legalEntityID + "|" + actionType
+	// The tenant is part of the decision: authorization-svc applies the
+	// tenant's own SoD rules from the forwarded X-Tenant-Id (see
+	// checkAllowedLive), so a decision for tenant A must never answer the same
+	// principal/entity/action asked under tenant B.
+	key := tenantFromContext(ctx) + "|" + principalID + "|" + legalEntityID + "|" + actionType
 
 	if decision, hit := c.lookupCache(key); hit {
 		return decision
@@ -89,6 +93,15 @@ func (c *Client) CheckAllowed(ctx context.Context, principalID, legalEntityID, a
 	}
 
 	return err
+}
+
+// tenantFromContext is the tenant that checkAllowedLive forwards as
+// X-Tenant-Id, so the cache key and the live question always agree.
+func tenantFromContext(ctx context.Context) string {
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		return env.TenantID
+	}
+	return ""
 }
 
 // lookupCache returns the cached decision for key and whether it is still

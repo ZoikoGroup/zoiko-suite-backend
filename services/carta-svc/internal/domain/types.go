@@ -45,6 +45,10 @@ type CartaAssessment struct {
 	Decision            Decision      `json:"decision"`
 	RiskFactors         []string      `json:"risk_factors"`
 	AssessmentTimestamp time.Time     `json:"assessment_timestamp"`
+	// EvaluatedBy is the verified principal (X-Principal-Id) that requested
+	// the evaluation. Empty when the caller presented none (gateway-auth-svc
+	// scoring a request during authentication); never taken from the body.
+	EvaluatedBy string `json:"evaluated_by,omitempty"`
 }
 
 type EvaluateRequest struct {

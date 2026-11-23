@@ -39,6 +39,9 @@ func (m *MemoryStore) SaveAssessment(ctx context.Context, tenantID string, asm *
 	defer m.mu.Unlock()
 	asm.ID = uuid.New().String()
 	asm.TenantID = tenantID
+	if asm.RiskFactors == nil {
+		asm.RiskFactors = []string{} // as PgStore returns it
+	}
 	m.assessments[asm.ID] = asm
 	return nil
 }

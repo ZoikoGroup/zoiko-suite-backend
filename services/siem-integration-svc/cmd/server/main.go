@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -15,8 +17,10 @@ import (
 
 	"zoiko.io/siem-integration-svc/internal/authz"
 	"zoiko.io/siem-integration-svc/internal/credential"
+	"zoiko.io/siem-integration-svc/internal/events"
 	"zoiko.io/siem-integration-svc/internal/handler"
 	"zoiko.io/siem-integration-svc/internal/idempotency"
+	"zoiko.io/siem-integration-svc/internal/outbox"
 	"zoiko.io/siem-integration-svc/internal/store"
 )
 
@@ -31,7 +35,11 @@ func main() {
 	// Exporters and the security event stream are authoritative state:
 	// Postgres, never the in-memory map (unit tests only). The pool connects
 	// lazily, so a database outage shows as /readyz 503, not a crash loop.
-	pool, err := newPool(databaseURL())
+	dsn, err := databaseURL()
+	if err != nil {
+		logger.Fatal("invalid configuration", zap.Error(err))
+	}
+	pool, err := newPool(dsn)
 	if err != nil {
 		logger.Fatal("invalid DATABASE_URL", zap.Error(err))
 	}
@@ -67,6 +75,21 @@ func main() {
 	h := handler.New(s, authzClient, logger).WithIdempotency(idempotency.NewPgStore(pool))
 	router := handler.NewRouter(h)
 
+	// Transactional outbox relay: exporter and event records are written
+	// with their lifecycle event in one transaction; the relay delivers them.
+	// KAFKA_BROKERS is optional: unset, events stay in outbox_events,
+	// unpublished but not lost, until it is configured.
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	if brokers := strings.TrimSpace(os.Getenv("KAFKA_BROKERS")); brokers != "" {
+		publisher, closeKafka := events.NewKafkaPublisher(brokers, kafkaTopic())
+		defer func() { _ = closeKafka() }()
+		go outbox.NewRelay(pool, publisher, 2*time.Second, 50, logger).Start(relayCtx)
+	} else {
+		logger.Warn("KAFKA_BROKERS is not set: the outbox relay is not running; events are kept in outbox_events and delivered once it is configured",
+			zap.String("topic", kafkaTopic()))
+	}
+
 	// Wrap router with apicontract middleware
 	r := chi.NewRouter()
 	r.Use(apicontract.RequestID)
@@ -88,14 +111,24 @@ func main() {
 	_ = srv.Shutdown(ctx)
 }
 
-// defaultDatabaseURL matches the sibling services' compose wiring.
-const defaultDatabaseURL = "postgres://postgres:postgres@postgres:5432/siem_integration?sslmode=disable"
+// databaseURL fails when DATABASE_URL is unset. It used to fall back to a
+// hard-coded superuser DSN (postgres:postgres@postgres/siem_integration),
+// which silently ran the service as a role that bypasses row-level security
+// whenever the deployment forgot the variable.
+func databaseURL() (string, error) {
+	v := strings.TrimSpace(os.Getenv("DATABASE_URL"))
+	if v == "" {
+		return "", errors.New("DATABASE_URL is required: exporters and the security event stream are persisted only in Postgres (database siem_integration)")
+	}
+	return v, nil
+}
 
-func databaseURL() string {
-	if v := os.Getenv("DATABASE_URL"); v != "" {
+// kafkaTopic defaults to zoiko.siem-integration.events.
+func kafkaTopic() string {
+	if v := strings.TrimSpace(os.Getenv("KAFKA_TOPIC")); v != "" {
 		return v
 	}
-	return defaultDatabaseURL
+	return "zoiko.siem-integration.events"
 }
 
 // newPool builds the pgx pool without dialling.

@@ -54,6 +54,9 @@ const (
 	SiemExporterRead   = "SIEM_EXPORTER_READ"
 	SiemExporterUpdate = "SIEM_EXPORTER_UPDATE"
 	SiemEventRead      = "SIEM_EVENT_READ"
+	// SiemEventStream is checked on POST /v1/siem/stream whenever the caller
+	// presents a principal (see StreamEvent).
+	SiemEventStream = "SIEM_EVENT_STREAM"
 )
 
 // AuthzChecker is the authorization-svc contract this handler depends on.
@@ -378,12 +381,31 @@ func (h *Handler) StreamEvent(w http.ResponseWriter, r *http.Request) {
 		h.errJSON(w, r, 400, err.Error())
 		return
 	}
-	// A paused or disabled exporter accepts no events.
+	// The route is envelope-exempt, so the middleware installed no envelope.
+	// Install the header one so the authorization call (and its tenant-keyed
+	// cache) and the outbox event carry this request's tenant, actor and
+	// correlation.
+	if _, present := svcenvelope.FromContext(r.Context()); !present {
+		r = r.WithContext(svcenvelope.WithEnvelope(r.Context(), svcenvelope.Parse(r)))
+	}
+	// A caller that presents a principal is a principal acting on this
+	// tenant: it is authorized SIEM_EVENT_STREAM on the exporter's own legal
+	// entity (403/503, fail closed). A caller with none is still admitted —
+	// the five internal/siem clients send X-Tenant-ID only and cannot send
+	// more until a service identity exists (see the note above
+	// requirePrincipal); refusing them would silently stop security-event
+	// recording platform-wide.
 	exp, err := h.store.GetExporterByID(r.Context(), tenantID, req.ExporterID)
 	if err != nil {
 		h.lookupFailed(w, r, err)
 		return
 	}
+	if principalID := strings.TrimSpace(r.Header.Get("X-Principal-Id")); principalID != "" {
+		if !h.authorize(w, r, principalID, exp.LegalEntityID, SiemEventStream) {
+			return
+		}
+	}
+	// A paused or disabled exporter accepts no events.
 	if exp.Status != domain.ExporterActive {
 		h.errJSON(w, r, http.StatusConflict, fmt.Sprintf("exporter is %s; it accepts no events", exp.Status))
 		return

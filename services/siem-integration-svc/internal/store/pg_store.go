@@ -12,7 +12,37 @@ import (
 
 	"zoiko.io/siem-integration-svc/internal/credential"
 	"zoiko.io/siem-integration-svc/internal/domain"
+	svcenvelope "zoiko.io/siem-integration-svc/internal/envelope"
+	"zoiko.io/siem-integration-svc/internal/outbox"
 )
+
+// SourceService names this service on every event envelope.
+const SourceService = "siem-integration-svc"
+
+// Lifecycle event types written to the transactional outbox in the same
+// transaction as the change they describe.
+const (
+	EventExporterCreated = "siem_exporter.created"
+	EventEventRecorded   = "siem_event.recorded"
+)
+
+// emit writes one outbox event inside tx. Actor and correlation come from the
+// request envelope (the verified principal, or none on the principal-less
+// service-to-service /stream path).
+func emit(ctx context.Context, tx pgx.Tx, aggregateType, aggregateID, eventType, tenantID, legalEntityID string, payload any) error {
+	env := svcenvelope.MustFromContext(ctx)
+	_, err := outbox.Insert(ctx, tx, SourceService, outbox.Event{
+		AggregateType: aggregateType,
+		AggregateID:   aggregateID,
+		EventType:     eventType,
+		TenantID:      tenantID,
+		LegalEntityID: legalEntityID,
+		ActorID:       env.Actor(),
+		CorrelationID: env.CorrelationID,
+		Payload:       payload,
+	})
+	return err
+}
 
 // PgStore is the production Store (deployments/migrations/000001).
 //
@@ -84,7 +114,13 @@ func (s *PgStore) CreateExporter(ctx context.Context, tenantID string, exp *doma
 		if err != nil {
 			return fmt.Errorf("insert exporter: %w", err)
 		}
-		return nil
+		// The payload is the exporter as returned to the caller: AuthToken
+		// is json:"-", so the credential never reaches the event stream.
+		created := *exp
+		created.ID, created.TenantID, created.Status = id, tenantID, domain.ExporterActive
+		created.CreatedAt, created.UpdatedAt = now, now
+		created.AuthToken = ""
+		return emit(ctx, tx, "siem_exporter", id, EventExporterCreated, tenantID, exp.LegalEntityID, created)
 	})
 	if err != nil {
 		return err
@@ -193,15 +229,17 @@ func (s *PgStore) StreamEvent(ctx context.Context, tenantID string, evt *domain.
 	id := uuid.New().String()
 	now := time.Now().UTC()
 	err := s.inTenantTx(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
+		var legalEntityID string
+		err := tx.QueryRow(ctx, `
 			UPDATE siem_exporters
 			   SET events_sent = events_sent + 1, last_streamed = $3, updated_at = $3
-			 WHERE tenant_id = $1 AND id = $2`, tenantID, evt.ExporterID, now)
+			 WHERE tenant_id = $1 AND id = $2
+			RETURNING legal_entity_id`, tenantID, evt.ExporterID, now).Scan(&legalEntityID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
 		if err != nil {
 			return fmt.Errorf("advance exporter counters: %w", err)
-		}
-		if tag.RowsAffected() == 0 {
-			return ErrNotFound
 		}
 		_, err = tx.Exec(ctx, `
 			INSERT INTO siem_events (id, tenant_id, exporter_id, source_service, event_type, severity,
@@ -212,7 +250,10 @@ func (s *PgStore) StreamEvent(ctx context.Context, tenantID string, evt *domain.
 		if err != nil {
 			return fmt.Errorf("append event: %w", err)
 		}
-		return nil
+		recorded := *evt
+		recorded.ID, recorded.TenantID, recorded.Status, recorded.Timestamp = id, tenantID, "DELIVERED", now
+		recorded.ExternalDelivery = domain.ExternalDeliveryNotPerformed
+		return emit(ctx, tx, "siem_event", id, EventEventRecorded, tenantID, legalEntityID, recorded)
 	})
 	if err != nil {
 		return err
@@ -221,6 +262,7 @@ func (s *PgStore) StreamEvent(ctx context.Context, tenantID string, evt *domain.
 	evt.TenantID = tenantID
 	evt.Status = "DELIVERED"
 	evt.Timestamp = now
+	evt.ExternalDelivery = domain.ExternalDeliveryNotPerformed
 	return nil
 }
 
@@ -249,6 +291,7 @@ func (s *PgStore) ListEvents(ctx context.Context, tenantID, exporterID string) (
 				return fmt.Errorf("scan event: %w", err)
 			}
 			e.Severity = domain.EventSeverity(severity)
+			e.ExternalDelivery = domain.ExternalDeliveryNotPerformed
 			out = append(out, e)
 		}
 		return rows.Err()

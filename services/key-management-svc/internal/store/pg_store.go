@@ -11,7 +11,38 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/key-management-svc/internal/domain"
+	svcenvelope "zoiko.io/key-management-svc/internal/envelope"
+	"zoiko.io/key-management-svc/internal/outbox"
 )
+
+// SourceService names this service on every event envelope.
+const SourceService = "key-management-svc"
+
+// Key lifecycle event types, written to the transactional outbox in the same
+// transaction as the change. key.rotated and key.disabled keep the names the
+// SIEM side-channel already uses.
+const (
+	EventKeyRegistered = "key.registered"
+	EventKeyRotated    = "key.rotated"
+	EventKeyDisabled   = "key.disabled"
+)
+
+// emitKeyEvent writes one key lifecycle event inside tx. The actor is the
+// request's verified principal (the envelope the middleware installed).
+func emitKeyEvent(ctx context.Context, tx pgx.Tx, eventType string, key *domain.CustomerKey) error {
+	env := svcenvelope.MustFromContext(ctx)
+	_, err := outbox.Insert(ctx, tx, SourceService, outbox.Event{
+		AggregateType: "customer_key",
+		AggregateID:   key.ID,
+		EventType:     eventType,
+		TenantID:      key.TenantID,
+		LegalEntityID: key.LegalEntityID,
+		ActorID:       env.Actor(),
+		CorrelationID: env.CorrelationID,
+		Payload:       key,
+	})
+	return err
+}
 
 // PgStore persists key metadata in customer_keys and its version history in
 // customer_key_versions (migration 000001). It stores no key material.
@@ -70,7 +101,16 @@ func (s *PgStore) CreateKey(ctx context.Context, tenantID string, key *domain.Cu
 			tenantID, id, string(domain.VersionCurrent), ts); err != nil {
 			return fmt.Errorf("insert key version: %w", err)
 		}
-		return nil
+		created := *key
+		created.ID = id
+		created.TenantID = tenantID
+		created.KeyVersion = 1
+		created.RotationCount = 0
+		created.LastRotatedAt = nil
+		created.State = domain.StateEnabled
+		created.CreatedAt = ts
+		created.UpdatedAt = ts
+		return emitKeyEvent(ctx, tx, EventKeyRegistered, &created)
 	})
 	if err != nil {
 		return err
@@ -190,8 +230,11 @@ func (s *PgStore) RotateKey(ctx context.Context, tenantID, id string) (*domain.C
 			RETURNING id, tenant_id, legal_entity_id, key_alias, key_model, key_provider,
 			          external_key_arn, key_version, state, rotation_count, last_rotated_at,
 			          created_at, updated_at`, tenantID, id, ts))
+		if err != nil {
+			return err
+		}
 		out = k
-		return err
+		return emitKeyEvent(ctx, tx, EventKeyRotated, k)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
@@ -219,11 +262,18 @@ func (s *PgStore) DisableKey(ctx context.Context, tenantID, id string) error {
 		if state == string(domain.StateDisabled) {
 			return nil
 		}
-		_, err := tx.Exec(ctx, `
+		k, err := scanKey(tx.QueryRow(ctx, `
 			UPDATE customer_keys SET state = $3, updated_at = $4
-			 WHERE tenant_id = $1 AND id = $2`,
-			tenantID, id, string(domain.StateDisabled), now())
-		return err
+			 WHERE tenant_id = $1 AND id = $2
+			RETURNING id, tenant_id, legal_entity_id, key_alias, key_model, key_provider,
+			          external_key_arn, key_version, state, rotation_count, last_rotated_at,
+			          created_at, updated_at`,
+			tenantID, id, string(domain.StateDisabled), now()))
+		if err != nil {
+			return err
+		}
+		// Only a real transition is an event; the no-op above emits nothing.
+		return emitKeyEvent(ctx, tx, EventKeyDisabled, k)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound

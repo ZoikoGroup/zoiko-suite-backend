@@ -82,7 +82,17 @@ type SIEMEvent struct {
 	Payload    string        `json:"payload,omitempty"`
 	Status     string        `json:"status"` // DELIVERED, FAILED
 	Timestamp  time.Time     `json:"timestamp"`
+	// ExternalDelivery states what Status does not: whether the event left
+	// this service. There is no egress to SIEM platforms yet, so it is always
+	// ExternalDeliveryNotPerformed. Status DELIVERED means "recorded here" and
+	// is kept unchanged for existing clients. Not stored: it describes this
+	// build, not the row.
+	ExternalDelivery string `json:"external_delivery"`
 }
+
+// ExternalDeliveryNotPerformed: the event was recorded by this service and
+// was NOT forwarded to the exporter's SIEM platform (no egress exists).
+const ExternalDeliveryNotPerformed = "NOT_PERFORMED"
 
 type CreateExporterRequest struct {
 	LegalEntityID string       `json:"legal_entity_id"`

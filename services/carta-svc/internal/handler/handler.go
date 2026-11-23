@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
@@ -61,6 +62,9 @@ func requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
 const (
 	CartaAssessmentRead       = "CARTA_ASSESSMENT_READ"
 	CartaAssessmentReevaluate = "CARTA_ASSESSMENT_REEVALUATE"
+	// CartaEvaluate is checked on POST /v1/carta/evaluate whenever the caller
+	// presents a principal (see EvaluateAccess).
+	CartaEvaluate = "CARTA_EVALUATE"
 )
 
 // AuthzChecker is the authorization-svc contract this handler depends on.
@@ -200,6 +204,20 @@ func NewRouter(h *Handler) http.Handler {
 	return r
 }
 
+// EvaluateAccess scores one access request and records the decision.
+//
+// Principal handling (2026-11-04 hardening). A caller that presents
+// X-Principal-Id is a principal acting on this tenant: it is authorized
+// CARTA_EVALUATE on the body's legal_entity_id (403 on deny, 503 when
+// authorization-svc is unreachable) and recorded as evaluated_by. A caller
+// that presents none is still admitted, because gateway-auth-svc — the
+// route's production caller, on every gated request — sends X-Tenant-ID
+// only, and refusing it would make every material write on the platform 503
+// (gateway AU-23 fails closed when carta-svc does not answer). Closing that
+// path needs a service identity for gateway-auth-svc (mTLS or a workload
+// principal) and is a platform decision, not something this service can
+// impose alone; such assessments are stored with evaluated_by NULL, not a
+// guessed actor.
 func (h *Handler) EvaluateAccess(w http.ResponseWriter, r *http.Request) {
 	tenantID, ok := requireTenant(w, r)
 	if !ok {
@@ -214,7 +232,18 @@ func (h *Handler) EvaluateAccess(w http.ResponseWriter, r *http.Request) {
 		h.errJSON(w, r, 400, err.Error())
 		return
 	}
+	// The route is envelope-exempt, so the middleware installed no envelope.
+	// Install the header one here so the authorization call (and its cache
+	// key) and the outbox event carry this request's tenant and correlation.
+	if _, present := svcenvelope.FromContext(r.Context()); !present {
+		r = r.WithContext(svcenvelope.WithEnvelope(r.Context(), svcenvelope.Parse(r)))
+	}
+	principalID := strings.TrimSpace(r.Header.Get("X-Principal-Id"))
+	if principalID != "" && !h.authorize(w, r, principalID, req.LegalEntityID, CartaEvaluate) {
+		return
+	}
 	asm := domain.EvaluateAccess(&req, tenantID)
+	asm.EvaluatedBy = principalID
 	if err := h.store.SaveAssessment(r.Context(), tenantID, asm); err != nil {
 		h.logger.Error("save assessment failed", zap.Error(err))
 		h.errJSON(w, r, 500, "failed to save assessment")

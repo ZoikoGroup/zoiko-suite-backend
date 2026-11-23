@@ -11,6 +11,12 @@ type Config struct {
 	Port            string
 	DatabaseURL     string
 	AuthzServiceURL string
+	// KafkaBrokers (comma-separated) is where the outbox relay delivers
+	// events. Optional: when unset the relay does not run and events stay in
+	// outbox_events, unpublished but not lost, until it is configured.
+	KafkaBrokers string
+	// KafkaTopic defaults to zoiko.carta.events.
+	KafkaTopic string
 }
 
 // Load fails rather than defaulting a dependency the service cannot run
@@ -22,6 +28,11 @@ func Load() (*Config, error) {
 		Port:            os.Getenv("PORT"),
 		DatabaseURL:     os.Getenv("DATABASE_URL"),
 		AuthzServiceURL: os.Getenv("AUTHZ_SERVICE_URL"),
+		KafkaBrokers:    os.Getenv("KAFKA_BROKERS"),
+		KafkaTopic:      os.Getenv("KAFKA_TOPIC"),
+	}
+	if cfg.KafkaTopic == "" {
+		cfg.KafkaTopic = "zoiko.carta.events"
 	}
 	if cfg.Port == "" {
 		cfg.Port = "8142"
