@@ -11,7 +11,6 @@ import (
 
 	"zoiko.io/contract-lifecycle-svc/internal/authz"
 	"zoiko.io/contract-lifecycle-svc/internal/domain"
-	"zoiko.io/contract-lifecycle-svc/internal/events"
 	"zoiko.io/contract-lifecycle-svc/internal/governancelog"
 	"zoiko.io/contract-lifecycle-svc/internal/middleware"
 	"zoiko.io/contract-lifecycle-svc/internal/store"
@@ -33,29 +32,30 @@ type AuthZClient interface {
 
 // Action types passed to authorization-svc for each write route.
 const (
-	actionContractCreate         = "CONTRACT_CREATE"
-	actionContractUpdate         = "CONTRACT_UPDATE"
-	actionContractSubmitReview   = "CONTRACT_SUBMIT_REVIEW"
-	actionContractApprove        = "CONTRACT_APPROVE"
-	actionContractSendForSig     = "CONTRACT_SEND_FOR_SIGNATURE"
-	actionContractRecordExec     = "CONTRACT_RECORD_EXECUTION"
-	actionContractAmend          = "CONTRACT_AMEND"
-	actionContractRenew          = "CONTRACT_RENEW"
-	actionContractTerminate      = "CONTRACT_TERMINATE"
+	actionContractCreate       = "CONTRACT_CREATE"
+	actionContractUpdate       = "CONTRACT_UPDATE"
+	actionContractSubmitReview = "CONTRACT_SUBMIT_REVIEW"
+	actionContractApprove      = "CONTRACT_APPROVE"
+	actionContractSendForSig   = "CONTRACT_SEND_FOR_SIGNATURE"
+	actionContractRecordExec   = "CONTRACT_RECORD_EXECUTION"
+	actionContractAmend        = "CONTRACT_AMEND"
+	actionContractRenew        = "CONTRACT_RENEW"
+	actionContractTerminate    = "CONTRACT_TERMINATE"
 )
 
 // Handler holds all dependencies for the HTTP layer.
 type Handler struct {
 	store         store.Store
-	publisher     events.Publisher
 	authz         AuthZClient
 	governanceLog GovernanceLogClient
 	logger        *zap.Logger
 }
 
-// New creates a new Handler.
-func New(st store.Store, pub events.Publisher, az AuthZClient, gl GovernanceLogClient, logger *zap.Logger) *Handler {
-	return &Handler{store: st, publisher: pub, authz: az, governanceLog: gl, logger: logger}
+// New creates a new Handler. Events are not published from here: each store
+// write emits its event into the transactional outbox in the same
+// transaction, and the outbox relay (cmd/server) delivers it.
+func New(st store.Store, az AuthZClient, gl GovernanceLogClient, logger *zap.Logger) *Handler {
+	return &Handler{store: st, authz: az, governanceLog: gl, logger: logger}
 }
 
 // RegisterRoutes mounts all contract lifecycle routes onto the given router.
@@ -95,6 +95,9 @@ func (h *Handler) CreateContract(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !requireActor(w, principalID, req.CreatedBy) {
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionContractCreate); err != nil {
 		h.writeAuthzErr(w, err)
 		return
@@ -115,16 +118,11 @@ func (h *Handler) CreateContract(w http.ResponseWriter, r *http.Request) {
 		CreatedBy:        principalID,
 	}
 
-	if err := h.store.CreateContract(r.Context(), c); err != nil {
+	if err := h.store.CreateContract(r.Context(), c, auditOf(r, principalID)); err != nil {
 		h.writeLifecycleErr(w, "failed to create contract", err)
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "contract.created", ContractID: c.ContractID, TenantID: tenantID,
-		LegalEntityID: c.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
-		Payload: c,
-	})
 	writeJSON(w, http.StatusCreated, c)
 }
 
@@ -159,7 +157,6 @@ func (h *Handler) ListContracts(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) UpdateContract(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	existing, err := h.store.GetContract(r.Context(), id)
 	if err != nil {
@@ -185,6 +182,9 @@ func (h *Handler) UpdateContract(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	if !requireActor(w, principalID, req.UpdatedBy) {
+		return
+	}
 
 	if req.Title != "" {
 		existing.Title = req.Title
@@ -205,22 +205,16 @@ func (h *Handler) UpdateContract(w http.ResponseWriter, r *http.Request) {
 		existing.TotalValue = req.TotalValue
 	}
 
-	if err := h.store.UpdateContract(r.Context(), existing, req.ChangeSummary); err != nil {
+	if err := h.store.UpdateContract(r.Context(), existing, req.ChangeSummary, auditOf(r, principalID)); err != nil {
 		h.writeLifecycleErr(w, "failed to update contract", err)
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "contract.updated", ContractID: id, TenantID: tenantID,
-		LegalEntityID: existing.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
-		Payload: existing,
-	})
 	writeJSON(w, http.StatusOK, existing)
 }
 
 func (h *Handler) SubmitReview(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	existing, err := h.store.GetContract(r.Context(), id)
 	if err != nil {
@@ -237,16 +231,11 @@ func (h *Handler) SubmitReview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c, err := h.store.SubmitReview(r.Context(), id, principalID)
+	c, err := h.store.SubmitReview(r.Context(), id, auditOf(r, principalID))
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to submit contract for review", err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "contract.submitted_for_review", ContractID: id, TenantID: tenantID,
-		LegalEntityID: c.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
-		Payload: c,
-	})
 	writeJSON(w, http.StatusOK, c)
 }
 
@@ -279,6 +268,9 @@ func (h *Handler) ApproveContract(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !requireActor(w, principalID, req.ApprovedBy) {
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionContractApprove); err != nil {
 		h.writeAuthzErr(w, err)
 		return
@@ -296,22 +288,16 @@ func (h *Handler) ApproveContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c, err := h.store.ApproveContract(r.Context(), id, principalID, req.GovernanceDecisionID)
+	c, err := h.store.ApproveContract(r.Context(), id, req.GovernanceDecisionID, auditOf(r, principalID))
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to approve contract", err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "contract.approved", ContractID: id, TenantID: tenantID,
-		LegalEntityID: c.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
-		Payload: c,
-	})
 	writeJSON(w, http.StatusOK, c)
 }
 
 func (h *Handler) SendForSignature(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	existing, err := h.store.GetContract(r.Context(), id)
 	if err != nil {
@@ -328,22 +314,16 @@ func (h *Handler) SendForSignature(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c, err := h.store.SendForSignature(r.Context(), id, principalID)
+	c, err := h.store.SendForSignature(r.Context(), id, auditOf(r, principalID))
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to send contract for signature", err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "contract.sent_for_signature", ContractID: id, TenantID: tenantID,
-		LegalEntityID: c.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
-		Payload: c,
-	})
 	writeJSON(w, http.StatusOK, c)
 }
 
 func (h *Handler) RecordExecution(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	var req domain.RecordExecutionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -370,22 +350,16 @@ func (h *Handler) RecordExecution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c, err := h.store.RecordExecution(r.Context(), id, &req)
+	c, err := h.store.RecordExecution(r.Context(), id, &req, auditOf(r, principalID))
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to record contract execution", err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "contract.executed", ContractID: id, TenantID: tenantID,
-		LegalEntityID: c.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
-		Payload: c,
-	})
 	writeJSON(w, http.StatusOK, c)
 }
 
 func (h *Handler) AmendContract(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	var req domain.AmendContractRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -403,27 +377,25 @@ func (h *Handler) AmendContract(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !requireActor(w, principalID, req.AmendedBy) {
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionContractAmend); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
 
-	c, err := h.store.AmendContract(r.Context(), id, &req)
+	req.AmendedBy = principalID
+	c, err := h.store.AmendContract(r.Context(), id, &req, auditOf(r, principalID))
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to amend contract", err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "contract.amended", ContractID: id, TenantID: tenantID,
-		LegalEntityID: c.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
-		Payload: c,
-	})
 	writeJSON(w, http.StatusOK, c)
 }
 
 func (h *Handler) RenewContract(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	var req domain.RenewContractRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -445,35 +417,29 @@ func (h *Handler) RenewContract(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !requireActor(w, principalID, req.RenewedBy) {
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionContractRenew); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
 
-	c, err := h.store.RenewContract(r.Context(), id, &req)
+	req.RenewedBy = principalID
+	c, err := h.store.RenewContract(r.Context(), id, &req, auditOf(r, principalID))
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to renew contract", err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "contract.renewed", ContractID: id, TenantID: tenantID,
-		LegalEntityID: c.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
-		Payload: c,
-	})
 	writeJSON(w, http.StatusOK, c)
 }
 
 func (h *Handler) TerminateContract(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	var req domain.TerminateContractRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if req.TerminatedBy == "" {
-		writeError(w, http.StatusBadRequest, "terminated_by is required")
 		return
 	}
 
@@ -487,22 +453,21 @@ func (h *Handler) TerminateContract(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !requireActor(w, principalID, req.TerminatedBy) {
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionContractTerminate); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
 
-	c, err := h.store.TerminateContract(r.Context(), id, &req)
+	req.TerminatedBy = principalID
+	c, err := h.store.TerminateContract(r.Context(), id, &req, auditOf(r, principalID))
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to terminate contract", err)
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "contract.terminated", ContractID: id, TenantID: tenantID,
-		LegalEntityID: c.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
-		Payload: c,
-	})
 	writeJSON(w, http.StatusOK, c)
 }
 
@@ -533,6 +498,25 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 		return "", false
 	}
 	return principalID, true
+}
+
+// requireActor applies the platform actor rule to a request-body actor field
+// (created_by, amended_by, terminated_by, …): the actor of a write is the
+// authenticated X-Principal-Id. An absent body value is filled from the
+// principal by the caller; a present value that names someone else is refused
+// 403 actor_mismatch rather than silently recorded or silently overridden.
+func requireActor(w http.ResponseWriter, principalID, bodyActor string) bool {
+	if bodyActor != "" && bodyActor != principalID {
+		writeCoded(w, http.StatusForbidden, "actor_mismatch", domain.ErrActorMismatch.Error())
+		return false
+	}
+	return true
+}
+
+// auditOf is the write attribution handed to the store: the principal, and
+// the request's correlation id for the outbox event.
+func auditOf(r *http.Request, principalID string) store.Audit {
+	return store.Audit{ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID")}
 }
 
 // writeAuthzErr writes the appropriate HTTP response for an authz.CheckAllowed
@@ -587,4 +571,9 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// writeCoded is writeError plus a stable machine-readable code.
+func writeCoded(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg, "code": code})
 }

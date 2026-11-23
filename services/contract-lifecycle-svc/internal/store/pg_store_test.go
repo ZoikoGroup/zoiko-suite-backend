@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 
@@ -38,19 +39,21 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS contract_versions, contracts CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS contract_versions, contracts, outbox_events, idempotency_keys CASCADE;`)
 
-	for _, name := range []string{
-		"000001_initial_schema.up.sql",
-		"000002_add_governance_decision_id.up.sql",
-		"000003_orthogonal_status_and_amend_renew.up.sql",
-	} {
-		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", name))
+	// Every forward migration, in order — the same set init-db.sh applies.
+	ups, err := filepath.Glob(filepath.Join(base, "../../deployments/migrations", "*.up.sql"))
+	if err != nil || len(ups) == 0 {
+		t.Fatalf("no migrations found: %v", err)
+	}
+	sort.Strings(ups)
+	for _, m := range ups {
+		sql, err := os.ReadFile(m)
 		if err != nil {
-			t.Fatalf("failed to read migration %s: %v", name, err)
+			t.Fatalf("failed to read migration %s: %v", m, err)
 		}
 		if _, err := pool.Exec(ctx, string(sql)); err != nil {
-			t.Fatalf("failed to apply migration %s: %v", name, err)
+			t.Fatalf("failed to apply migration %s: %v", filepath.Base(m), err)
 		}
 	}
 
@@ -97,14 +100,14 @@ func TestPgStore_FullLifecycle_ReachesEffective(t *testing.T) {
 	ctx := tenantCtx("tenant-a")
 
 	c := newContract("le-us", "drafter-1")
-	if err := s.CreateContract(ctx, c); err != nil {
+	if err := s.CreateContract(ctx, c, store.Audit{ActorID: "drafter-1"}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	if c.Status != domain.ContractStatusDraft || c.SignatureStatus != domain.SignatureStatusNotRequested {
 		t.Fatalf("new contract status = %s/%s, want DRAFT/NOT_REQUESTED", c.Status, c.SignatureStatus)
 	}
 
-	reviewed, err := s.SubmitReview(ctx, c.ContractID, "drafter-1")
+	reviewed, err := s.SubmitReview(ctx, c.ContractID, store.Audit{ActorID: "drafter-1"})
 	if err != nil {
 		t.Fatalf("submit review: %v", err)
 	}
@@ -112,7 +115,7 @@ func TestPgStore_FullLifecycle_ReachesEffective(t *testing.T) {
 		t.Fatalf("status after submit = %s, want REVIEW", reviewed.Status)
 	}
 
-	approved, err := s.ApproveContract(ctx, c.ContractID, "legal-lead-1", "dec-001")
+	approved, err := s.ApproveContract(ctx, c.ContractID, "dec-001", store.Audit{ActorID: "legal-lead-1"})
 	if err != nil {
 		t.Fatalf("approve: %v", err)
 	}
@@ -120,7 +123,7 @@ func TestPgStore_FullLifecycle_ReachesEffective(t *testing.T) {
 		t.Fatalf("status after approve = %s, want APPROVED", approved.Status)
 	}
 
-	sent, err := s.SendForSignature(ctx, c.ContractID, "legal-lead-1")
+	sent, err := s.SendForSignature(ctx, c.ContractID, store.Audit{ActorID: "legal-lead-1"})
 	if err != nil {
 		t.Fatalf("send for signature: %v", err)
 	}
@@ -131,7 +134,7 @@ func TestPgStore_FullLifecycle_ReachesEffective(t *testing.T) {
 		t.Fatalf("lifecycle status changed by SendForSignature: %s, want still APPROVED (orthogonal dimensions)", sent.Status)
 	}
 
-	executed, err := s.RecordExecution(ctx, c.ContractID, &domain.RecordExecutionRequest{SignedBy: "counterparty-signer"})
+	executed, err := s.RecordExecution(ctx, c.ContractID, &domain.RecordExecutionRequest{SignedBy: "counterparty-signer"}, store.Audit{ActorID: "legal-lead-1"})
 	if err != nil {
 		t.Fatalf("record execution: %v", err)
 	}
@@ -151,18 +154,18 @@ func TestPgStore_UpdateContract_RefusedOnceApproved(t *testing.T) {
 	ctx := tenantCtx("tenant-a")
 
 	c := newContract("le-us", "drafter-1")
-	if err := s.CreateContract(ctx, c); err != nil {
+	if err := s.CreateContract(ctx, c, store.Audit{ActorID: "drafter-1"}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := s.SubmitReview(ctx, c.ContractID, "drafter-1"); err != nil {
+	if _, err := s.SubmitReview(ctx, c.ContractID, store.Audit{ActorID: "drafter-1"}); err != nil {
 		t.Fatalf("submit review: %v", err)
 	}
-	if _, err := s.ApproveContract(ctx, c.ContractID, "legal-lead-1", "dec-001"); err != nil {
+	if _, err := s.ApproveContract(ctx, c.ContractID, "dec-001", store.Audit{ActorID: "legal-lead-1"}); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
 
 	c.Title = "Materially different terms"
-	if err := s.UpdateContract(ctx, c, "sneaking in a change"); !errors.Is(err, domain.ErrWrongLifecycleStatus) {
+	if err := s.UpdateContract(ctx, c, "sneaking in a change", store.Audit{ActorID: "drafter-1"}); !errors.Is(err, domain.ErrWrongLifecycleStatus) {
 		t.Fatalf("update after APPROVED returned %v, want ErrWrongLifecycleStatus", err)
 	}
 }
@@ -174,13 +177,13 @@ func TestPgStore_ApproveContract_SelfApprovalIsRefusedAtTheWrite(t *testing.T) {
 	ctx := tenantCtx("tenant-a")
 
 	c := newContract("le-us", "drafter-1")
-	if err := s.CreateContract(ctx, c); err != nil {
+	if err := s.CreateContract(ctx, c, store.Audit{ActorID: "drafter-1"}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := s.SubmitReview(ctx, c.ContractID, "drafter-1"); err != nil {
+	if _, err := s.SubmitReview(ctx, c.ContractID, store.Audit{ActorID: "drafter-1"}); err != nil {
 		t.Fatalf("submit review: %v", err)
 	}
-	if _, err := s.ApproveContract(ctx, c.ContractID, "drafter-1", "dec-001"); !errors.Is(err, domain.ErrSelfApprovalNotAllowed) {
+	if _, err := s.ApproveContract(ctx, c.ContractID, "dec-001", store.Audit{ActorID: "drafter-1"}); !errors.Is(err, domain.ErrSelfApprovalNotAllowed) {
 		t.Fatalf("self-approve returned %v, want ErrSelfApprovalNotAllowed", err)
 	}
 }
@@ -192,16 +195,16 @@ func TestPgStore_RecordExecution_RefusedWithoutSignatureSent(t *testing.T) {
 	ctx := tenantCtx("tenant-a")
 
 	c := newContract("le-us", "drafter-1")
-	if err := s.CreateContract(ctx, c); err != nil {
+	if err := s.CreateContract(ctx, c, store.Audit{ActorID: "drafter-1"}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := s.SubmitReview(ctx, c.ContractID, "drafter-1"); err != nil {
+	if _, err := s.SubmitReview(ctx, c.ContractID, store.Audit{ActorID: "drafter-1"}); err != nil {
 		t.Fatalf("submit review: %v", err)
 	}
-	if _, err := s.ApproveContract(ctx, c.ContractID, "legal-lead-1", "dec-001"); err != nil {
+	if _, err := s.ApproveContract(ctx, c.ContractID, "dec-001", store.Audit{ActorID: "legal-lead-1"}); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
-	if _, err := s.RecordExecution(ctx, c.ContractID, &domain.RecordExecutionRequest{SignedBy: "x"}); !errors.Is(err, domain.ErrSignatureNotSent) {
+	if _, err := s.RecordExecution(ctx, c.ContractID, &domain.RecordExecutionRequest{SignedBy: "x"}, store.Audit{ActorID: "legal-lead-1"}); !errors.Is(err, domain.ErrSignatureNotSent) {
 		t.Fatalf("record execution without signature sent returned %v, want ErrSignatureNotSent", err)
 	}
 }
@@ -214,23 +217,23 @@ func TestPgStore_AmendAndRenew_StayEffective(t *testing.T) {
 	ctx := tenantCtx("tenant-a")
 
 	c := newContract("le-us", "drafter-1")
-	if err := s.CreateContract(ctx, c); err != nil {
+	if err := s.CreateContract(ctx, c, store.Audit{ActorID: "drafter-1"}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := s.SubmitReview(ctx, c.ContractID, "drafter-1"); err != nil {
+	if _, err := s.SubmitReview(ctx, c.ContractID, store.Audit{ActorID: "drafter-1"}); err != nil {
 		t.Fatalf("submit review: %v", err)
 	}
-	if _, err := s.ApproveContract(ctx, c.ContractID, "legal-lead-1", "dec-001"); err != nil {
+	if _, err := s.ApproveContract(ctx, c.ContractID, "dec-001", store.Audit{ActorID: "legal-lead-1"}); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
-	if _, err := s.SendForSignature(ctx, c.ContractID, "legal-lead-1"); err != nil {
+	if _, err := s.SendForSignature(ctx, c.ContractID, store.Audit{ActorID: "legal-lead-1"}); err != nil {
 		t.Fatalf("send for signature: %v", err)
 	}
-	if _, err := s.RecordExecution(ctx, c.ContractID, &domain.RecordExecutionRequest{SignedBy: "counterparty-signer"}); err != nil {
+	if _, err := s.RecordExecution(ctx, c.ContractID, &domain.RecordExecutionRequest{SignedBy: "counterparty-signer"}, store.Audit{ActorID: "legal-lead-1"}); err != nil {
 		t.Fatalf("record execution: %v", err)
 	}
 
-	amended, err := s.AmendContract(ctx, c.ContractID, &domain.AmendContractRequest{AmendedBy: "legal-lead-1", TotalValue: 75000, ChangeSummary: "scope increase"})
+	amended, err := s.AmendContract(ctx, c.ContractID, &domain.AmendContractRequest{TotalValue: 75000, ChangeSummary: "scope increase"}, store.Audit{ActorID: "legal-lead-1"})
 	if err != nil {
 		t.Fatalf("amend: %v", err)
 	}
@@ -241,7 +244,7 @@ func TestPgStore_AmendAndRenew_StayEffective(t *testing.T) {
 		t.Fatalf("total_value after amend = %v, want 75000", amended.TotalValue)
 	}
 
-	renewed, err := s.RenewContract(ctx, c.ContractID, &domain.RenewContractRequest{RenewedBy: "legal-lead-1", NewEffectiveTo: "2027-01-01"})
+	renewed, err := s.RenewContract(ctx, c.ContractID, &domain.RenewContractRequest{NewEffectiveTo: "2027-01-01"}, store.Audit{ActorID: "legal-lead-1"})
 	if err != nil {
 		t.Fatalf("renew: %v", err)
 	}
@@ -269,10 +272,10 @@ func TestPgStore_TerminateContract_RefusedBeforeApproved(t *testing.T) {
 	ctx := tenantCtx("tenant-a")
 
 	c := newContract("le-us", "drafter-1")
-	if err := s.CreateContract(ctx, c); err != nil {
+	if err := s.CreateContract(ctx, c, store.Audit{ActorID: "drafter-1"}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := s.TerminateContract(ctx, c.ContractID, &domain.TerminateContractRequest{TerminatedBy: "x", TerminationNote: "n/a"}); !errors.Is(err, domain.ErrWrongLifecycleStatus) {
+	if _, err := s.TerminateContract(ctx, c.ContractID, &domain.TerminateContractRequest{TerminationNote: "n/a"}, store.Audit{ActorID: "x"}); !errors.Is(err, domain.ErrWrongLifecycleStatus) {
 		t.Fatalf("terminate a DRAFT contract returned %v, want ErrWrongLifecycleStatus", err)
 	}
 }
@@ -285,11 +288,11 @@ func TestPgStore_Transitions_AreTenantScoped(t *testing.T) {
 	s := store.NewPgStore(pool)
 
 	c := newContract("le-us", "drafter-1")
-	if err := s.CreateContract(tenantCtx("tenant-a"), c); err != nil {
+	if err := s.CreateContract(tenantCtx("tenant-a"), c, store.Audit{ActorID: "drafter-1"}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
-	if _, err := s.SubmitReview(tenantCtx("tenant-b"), c.ContractID, "drafter-1"); !errors.Is(err, domain.ErrContractNotFound) {
+	if _, err := s.SubmitReview(tenantCtx("tenant-b"), c.ContractID, store.Audit{ActorID: "drafter-1"}); !errors.Is(err, domain.ErrContractNotFound) {
 		t.Fatalf("cross-tenant submit returned %v, want ErrContractNotFound", err)
 	}
 	if _, err := s.GetContract(tenantCtx("tenant-b"), c.ContractID); !errors.Is(err, domain.ErrContractNotFound) {

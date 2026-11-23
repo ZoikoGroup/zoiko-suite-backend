@@ -26,8 +26,76 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/obligation-tracking-svc/internal/domain"
+	"zoiko.io/obligation-tracking-svc/internal/events"
 	"zoiko.io/obligation-tracking-svc/internal/middleware"
+	"zoiko.io/obligation-tracking-svc/internal/outbox"
 )
+
+// Audit identifies who caused a write and the request it belongs to. ActorID
+// is the authenticated principal (X-Principal-Id), never a request-body value.
+// The handler attaches it to the request context (WithAudit); every write
+// records it as the actor and stamps it on the outbox event it emits in its
+// own transaction, and a write without one is refused rather than emitting an
+// unattributed event.
+type Audit struct {
+	ActorID       string
+	CorrelationID string
+}
+
+type auditKey struct{}
+
+// WithAudit returns ctx carrying the write attribution.
+func WithAudit(ctx context.Context, a Audit) context.Context {
+	return context.WithValue(ctx, auditKey{}, a)
+}
+
+// AuditFrom returns the write attribution attached by WithAudit.
+func AuditFrom(ctx context.Context) (Audit, bool) {
+	a, ok := ctx.Value(auditKey{}).(Audit)
+	return a, ok && a.ActorID != ""
+}
+
+// ErrAuditMissing means a write reached the store without an attributed actor.
+var ErrAuditMissing = errors.New("write attribution (actor) missing from context")
+
+// emit writes one domain event into the transactional outbox using the
+// caller's transaction, so the change and its event commit or roll back
+// together. The payload is the full envelope the direct publish used to send.
+func (s *PgStore) emit(ctx context.Context, tx pgx.Tx, tenantID, eventType, entityID, legalEntityID string, payload any) error {
+	a, ok := AuditFrom(ctx)
+	if !ok {
+		return fmt.Errorf("emit %s: %w", eventType, ErrAuditMissing)
+	}
+	id := uuid.NewString()
+	_, err := outbox.Insert(ctx, tx, outbox.Event{
+		OutboxEventID: id,
+		AggregateType: "obligation",
+		AggregateID:   entityID,
+		EventType:     eventType,
+		TenantID:      tenantID,
+		LegalEntityID: legalEntityID,
+		ActorID:       a.ActorID,
+		CorrelationID: a.CorrelationID,
+		Payload: events.NewEvent(id, events.PublishParams{
+			EventType: eventType, ObligationID: entityID, TenantID: tenantID,
+			LegalEntityID: legalEntityID, ActorID: a.ActorID, CorrelationID: a.CorrelationID,
+			Payload: payload,
+		}),
+	})
+	if err != nil {
+		return fmt.Errorf("emit %s: %w", eventType, err)
+	}
+	return nil
+}
+
+// actorOf returns the attributed actor for a write, refusing an unattributed one.
+func actorOf(ctx context.Context) (string, error) {
+	a, ok := AuditFrom(ctx)
+	if !ok {
+		return "", ErrAuditMissing
+	}
+	return a.ActorID, nil
+}
 
 type Store interface {
 	CreateObligation(ctx context.Context, o *domain.Obligation) error
@@ -160,6 +228,9 @@ func (s *PgStore) CreateObligation(ctx context.Context, o *domain.Obligation) er
 		return fmt.Errorf("insert obligation: %w", err)
 	}
 
+	if err := s.emit(ctx, tx, tenantID, "obligation.created", o.ObligationID, o.LegalEntityID, o); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 
@@ -262,6 +333,9 @@ func (s *PgStore) UpdateObligation(ctx context.Context, o *domain.Obligation) er
 		return fmt.Errorf("update obligation: %w", err)
 	}
 
+	if err := s.emit(ctx, tx, tenantID, "obligation.updated", o.ObligationID, o.LegalEntityID, o); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 
@@ -289,6 +363,11 @@ func (s *PgStore) ValidateExtractedObligation(ctx context.Context, id, validated
 
 	now := time.Now().UTC()
 	o.Status = domain.ObligationStatusPlanned
+	// Segregation of duties: the validating principal may not be the one who
+	// created (extracted/proposed) the obligation (re-checked on the locked row).
+	if o.CreatedBy != "" && o.CreatedBy == validatedBy {
+		return nil, domain.ErrSegregationOfDuties
+	}
 	o.ValidatedBy = &validatedBy
 	o.ValidatedAt = &now
 	o.UpdatedAt = now
@@ -298,6 +377,9 @@ func (s *PgStore) ValidateExtractedObligation(ctx context.Context, id, validated
 		WHERE obligation_id=$5 AND tenant_id=$6`,
 		string(o.Status), o.ValidatedBy, o.ValidatedAt, o.UpdatedAt, id, tenantID,
 	); err != nil {
+		return nil, err
+	}
+	if err := s.emit(ctx, tx, tenantID, "obligation.validated", o.ObligationID, o.LegalEntityID, o); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -338,7 +420,11 @@ func (s *PgStore) Schedule(ctx context.Context, id string, req *domain.ScheduleO
 	o.SourceClauseID = req.SourceClauseID
 	o.TriggerDescription = req.TriggerDescription
 	o.CalculationMethod = req.CalculationMethod
-	o.ScheduledBy = &req.ScheduledBy
+	actor, err := actorOf(ctx)
+	if err != nil {
+		return nil, err
+	}
+	o.ScheduledBy = &actor
 	o.ScheduledAt = &now
 	o.UpdatedAt = now
 
@@ -350,6 +436,9 @@ func (s *PgStore) Schedule(ctx context.Context, id string, req *domain.ScheduleO
 		string(o.Status), o.SourceClauseID, o.TriggerDescription, o.CalculationMethod,
 		o.ScheduledBy, o.ScheduledAt, o.UpdatedAt, id, tenantID,
 	); err != nil {
+		return nil, err
+	}
+	if err := s.emit(ctx, tx, tenantID, "obligation.activated", o.ObligationID, o.LegalEntityID, o); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -394,6 +483,9 @@ func (s *PgStore) MarkDue(ctx context.Context, id, markedBy string) (*domain.Obl
 	); err != nil {
 		return nil, err
 	}
+	if err := s.emit(ctx, tx, tenantID, "obligation.due", o.ObligationID, o.LegalEntityID, o); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -432,6 +524,9 @@ func (s *PgStore) MarkInProgress(ctx context.Context, id, markedBy string) (*dom
 		WHERE obligation_id=$5 AND tenant_id=$6`,
 		string(o.Status), o.InProgressBy, o.InProgressAt, o.UpdatedAt, id, tenantID,
 	); err != nil {
+		return nil, err
+	}
+	if err := s.emit(ctx, tx, tenantID, "obligation.in_progress", o.ObligationID, o.LegalEntityID, o); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -486,6 +581,9 @@ func (s *PgStore) Complete(ctx context.Context, id, satisfiedBy string) (*domain
 	); err != nil {
 		return nil, err
 	}
+	if err := s.emit(ctx, tx, tenantID, "obligation.satisfied", o.ObligationID, o.LegalEntityID, o); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -516,7 +614,16 @@ func (s *PgStore) Waive(ctx context.Context, id string, req *domain.WaiveObligat
 
 	now := time.Now().UTC()
 	o.Status = domain.ObligationStatusWaived
-	o.WaivedBy = &req.WaivedBy
+	actor, err := actorOf(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Segregation of duties: the principal deciding this step may not be the
+	// one who created the obligation (re-checked on the locked row).
+	if o.CreatedBy != "" && o.CreatedBy == actor {
+		return nil, domain.ErrSegregationOfDuties
+	}
+	o.WaivedBy = &actor
 	o.WaivedAt = &now
 	o.WaiverAuthorityReference = &req.WaiverAuthorityReference
 	o.UpdatedAt = now
@@ -526,6 +633,9 @@ func (s *PgStore) Waive(ctx context.Context, id string, req *domain.WaiveObligat
 		WHERE obligation_id=$6 AND tenant_id=$7`,
 		string(o.Status), o.WaivedBy, o.WaivedAt, o.WaiverAuthorityReference, o.UpdatedAt, id, tenantID,
 	); err != nil {
+		return nil, err
+	}
+	if err := s.emit(ctx, tx, tenantID, "obligation.waived", o.ObligationID, o.LegalEntityID, o); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -554,7 +664,11 @@ func (s *PgStore) RecordBreach(ctx context.Context, id string, req *domain.Recor
 
 	now := time.Now().UTC()
 	o.Status = domain.ObligationStatusBreached
-	o.BreachedBy = &req.BreachedBy
+	actor, err := actorOf(ctx)
+	if err != nil {
+		return nil, err
+	}
+	o.BreachedBy = &actor
 	o.BreachedAt = &now
 	if req.BreachNote != "" {
 		o.BreachNote = &req.BreachNote
@@ -566,6 +680,9 @@ func (s *PgStore) RecordBreach(ctx context.Context, id string, req *domain.Recor
 		WHERE obligation_id=$6 AND tenant_id=$7`,
 		string(o.Status), o.BreachedBy, o.BreachedAt, o.BreachNote, o.UpdatedAt, id, tenantID,
 	); err != nil {
+		return nil, err
+	}
+	if err := s.emit(ctx, tx, tenantID, "obligation.breached", o.ObligationID, o.LegalEntityID, o); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -592,7 +709,11 @@ func (s *PgStore) Dispute(ctx context.Context, id string, req *domain.DisputeObl
 
 	now := time.Now().UTC()
 	o.Status = domain.ObligationStatusDisputed
-	o.DisputedBy = &req.DisputedBy
+	actor, err := actorOf(ctx)
+	if err != nil {
+		return nil, err
+	}
+	o.DisputedBy = &actor
 	o.DisputedAt = &now
 	o.DisputeReason = &req.DisputeReason
 	o.UpdatedAt = now
@@ -602,6 +723,9 @@ func (s *PgStore) Dispute(ctx context.Context, id string, req *domain.DisputeObl
 		WHERE obligation_id=$6 AND tenant_id=$7`,
 		string(o.Status), o.DisputedBy, o.DisputedAt, o.DisputeReason, o.UpdatedAt, id, tenantID,
 	); err != nil {
+		return nil, err
+	}
+	if err := s.emit(ctx, tx, tenantID, "obligation.disputed", o.ObligationID, o.LegalEntityID, o); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -642,6 +766,9 @@ func (s *PgStore) Supersede(ctx context.Context, id, supersededBy string) (*doma
 		WHERE obligation_id=$4 AND tenant_id=$5`,
 		string(o.Status), o.SupersededBy, o.UpdatedAt, id, tenantID,
 	); err != nil {
+		return nil, err
+	}
+	if err := s.emit(ctx, tx, tenantID, "obligation.superseded", o.ObligationID, o.LegalEntityID, o); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {

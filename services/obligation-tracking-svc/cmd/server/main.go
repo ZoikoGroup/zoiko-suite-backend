@@ -24,6 +24,7 @@ import (
 	"zoiko.io/obligation-tracking-svc/internal/idempotency"
 	"zoiko.io/obligation-tracking-svc/internal/middleware"
 	"zoiko.io/obligation-tracking-svc/internal/mtls"
+	"zoiko.io/obligation-tracking-svc/internal/outbox"
 	"zoiko.io/obligation-tracking-svc/internal/store"
 	"zoiko.io/obligation-tracking-svc/internal/telemetry"
 )
@@ -79,7 +80,15 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
 
-	h := handler.New(pgStore, publisher, authzClient, logger)
+	h := handler.New(pgStore, authzClient, logger)
+
+	// Transactional outbox relay: delivers the events each store write
+	// committed into outbox_events, retrying until Kafka accepts them.
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	if pool != nil {
+		go outbox.NewRelay(pool, publisher, 1500*time.Millisecond, 50, logger).Start(relayCtx)
+	}
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -124,6 +133,7 @@ func main() {
 	<-stop
 
 	logger.Info("shutting down obligation-tracking-svc gracefully...")
+	stopRelay()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 

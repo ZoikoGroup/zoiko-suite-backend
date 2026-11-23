@@ -13,8 +13,8 @@ import (
 
 	"zoiko.io/contract-lifecycle-svc/internal/authz"
 	"zoiko.io/contract-lifecycle-svc/internal/domain"
-	"zoiko.io/contract-lifecycle-svc/internal/events"
 	"zoiko.io/contract-lifecycle-svc/internal/governancelog"
+	"zoiko.io/contract-lifecycle-svc/internal/store"
 )
 
 // --- In-memory stub store ---
@@ -22,6 +22,8 @@ import (
 type stubStore struct {
 	contracts map[string]*domain.Contract
 	versions  map[string][]domain.ContractVersion
+	// lastAudit is the attribution the handler handed to the last write.
+	lastAudit store.Audit
 }
 
 func newStubStore() *stubStore {
@@ -31,7 +33,8 @@ func newStubStore() *stubStore {
 	}
 }
 
-func (s *stubStore) CreateContract(_ context.Context, c *domain.Contract) error {
+func (s *stubStore) CreateContract(_ context.Context, c *domain.Contract, a store.Audit) error {
+	s.lastAudit = a
 	if c.ContractID == "" {
 		c.ContractID = "ctr-test-001"
 	}
@@ -57,7 +60,8 @@ func (s *stubStore) ListContracts(_ context.Context, _ string) ([]domain.Contrac
 	return out, nil
 }
 
-func (s *stubStore) UpdateContract(_ context.Context, c *domain.Contract, _ string) error {
+func (s *stubStore) UpdateContract(_ context.Context, c *domain.Contract, _ string, a store.Audit) error {
+	s.lastAudit = a
 	existing, ok := s.contracts[c.ContractID]
 	if !ok {
 		return domain.ErrContractNotFound
@@ -69,7 +73,9 @@ func (s *stubStore) UpdateContract(_ context.Context, c *domain.Contract, _ stri
 	return nil
 }
 
-func (s *stubStore) SubmitReview(_ context.Context, id, submittedBy string) (*domain.Contract, error) {
+func (s *stubStore) SubmitReview(_ context.Context, id string, a store.Audit) (*domain.Contract, error) {
+	s.lastAudit = a
+	submittedBy := a.ActorID
 	c, ok := s.contracts[id]
 	if !ok {
 		return nil, domain.ErrContractNotFound
@@ -82,7 +88,9 @@ func (s *stubStore) SubmitReview(_ context.Context, id, submittedBy string) (*do
 	return c, nil
 }
 
-func (s *stubStore) ApproveContract(_ context.Context, id, approvedBy, governanceDecisionID string) (*domain.Contract, error) {
+func (s *stubStore) ApproveContract(_ context.Context, id, governanceDecisionID string, a store.Audit) (*domain.Contract, error) {
+	s.lastAudit = a
+	approvedBy := a.ActorID
 	c, ok := s.contracts[id]
 	if !ok {
 		return nil, domain.ErrContractNotFound
@@ -99,7 +107,8 @@ func (s *stubStore) ApproveContract(_ context.Context, id, approvedBy, governanc
 	return c, nil
 }
 
-func (s *stubStore) SendForSignature(_ context.Context, id, sentBy string) (*domain.Contract, error) {
+func (s *stubStore) SendForSignature(_ context.Context, id string, a store.Audit) (*domain.Contract, error) {
+	s.lastAudit = a
 	c, ok := s.contracts[id]
 	if !ok {
 		return nil, domain.ErrContractNotFound
@@ -111,7 +120,8 @@ func (s *stubStore) SendForSignature(_ context.Context, id, sentBy string) (*dom
 	return c, nil
 }
 
-func (s *stubStore) RecordExecution(_ context.Context, id string, req *domain.RecordExecutionRequest) (*domain.Contract, error) {
+func (s *stubStore) RecordExecution(_ context.Context, id string, req *domain.RecordExecutionRequest, a store.Audit) (*domain.Contract, error) {
+	s.lastAudit = a
 	c, ok := s.contracts[id]
 	if !ok {
 		return nil, domain.ErrContractNotFound
@@ -128,7 +138,8 @@ func (s *stubStore) RecordExecution(_ context.Context, id string, req *domain.Re
 	return c, nil
 }
 
-func (s *stubStore) AmendContract(_ context.Context, id string, req *domain.AmendContractRequest) (*domain.Contract, error) {
+func (s *stubStore) AmendContract(_ context.Context, id string, req *domain.AmendContractRequest, a store.Audit) (*domain.Contract, error) {
+	s.lastAudit = a
 	c, ok := s.contracts[id]
 	if !ok {
 		return nil, domain.ErrContractNotFound
@@ -143,7 +154,8 @@ func (s *stubStore) AmendContract(_ context.Context, id string, req *domain.Amen
 	return c, nil
 }
 
-func (s *stubStore) RenewContract(_ context.Context, id string, req *domain.RenewContractRequest) (*domain.Contract, error) {
+func (s *stubStore) RenewContract(_ context.Context, id string, req *domain.RenewContractRequest, a store.Audit) (*domain.Contract, error) {
+	s.lastAudit = a
 	c, ok := s.contracts[id]
 	if !ok {
 		return nil, domain.ErrContractNotFound
@@ -156,7 +168,8 @@ func (s *stubStore) RenewContract(_ context.Context, id string, req *domain.Rene
 	return c, nil
 }
 
-func (s *stubStore) TerminateContract(_ context.Context, id string, req *domain.TerminateContractRequest) (*domain.Contract, error) {
+func (s *stubStore) TerminateContract(_ context.Context, id string, req *domain.TerminateContractRequest, a store.Audit) (*domain.Contract, error) {
+	s.lastAudit = a
 	c, ok := s.contracts[id]
 	if !ok {
 		return nil, domain.ErrContractNotFound
@@ -175,16 +188,6 @@ func (s *stubStore) TerminateContract(_ context.Context, id string, req *domain.
 func (s *stubStore) ListContractVersions(_ context.Context, contractID string) ([]domain.ContractVersion, error) {
 	return s.versions[contractID], nil
 }
-
-// --- Stub publisher ---
-
-type stubPublisher struct{}
-
-func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error {
-	return nil
-}
-
-var _ events.Publisher = (*stubPublisher)(nil)
 
 // --- Stub authz client ---
 
@@ -223,7 +226,7 @@ func (s *stubGovernanceLogClient) VerifyGranted(_ context.Context, _, _, _, _ st
 
 func newTestHandler() *Handler {
 	logger, _ := zap.NewDevelopment()
-	return New(newStubStore(), &stubPublisher{}, &stubAuthzClient{}, &stubGovernanceLogClient{}, logger)
+	return New(newStubStore(), &stubAuthzClient{}, &stubGovernanceLogClient{}, logger)
 }
 
 func buildRequest(method, path string, body interface{}) *http.Request {
@@ -251,7 +254,7 @@ func TestCreateContract(t *testing.T) {
 		EffectiveFrom:    "2026-01-01",
 		Currency:         "USD",
 		TotalValue:       50000,
-		CreatedBy:        "user-001",
+		CreatedBy:        "user-test-01", // repeats the principal: accepted
 	}
 	w := httptest.NewRecorder()
 	h.CreateContract(w, buildRequest(http.MethodPost, "/v1/contracts", body))
@@ -305,7 +308,6 @@ func TestTerminateContract_NotFound(t *testing.T) {
 	h := newTestHandler()
 	router := newTestRouter(h)
 	body := domain.TerminateContractRequest{
-		TerminatedBy:    "user-001",
 		TerminationNote: "Project cancelled",
 	}
 	req := buildRequest(http.MethodPost, "/v1/contracts/nonexistent/terminate", body)
@@ -332,7 +334,7 @@ func TestApproveContract_MissingGovernanceDecisionID(t *testing.T) {
 		Status: domain.ContractStatusReview,
 	}
 	logger, _ := zap.NewDevelopment()
-	h := New(store, &stubPublisher{}, &stubAuthzClient{}, &stubGovernanceLogClient{}, logger)
+	h := New(store, &stubAuthzClient{}, &stubGovernanceLogClient{}, logger)
 	router := newChiRouter(h)
 
 	body := domain.ApproveContractRequest{}
@@ -351,7 +353,7 @@ func TestApproveContract_GovernanceDecisionNotGranted(t *testing.T) {
 		Status: domain.ContractStatusReview,
 	}
 	logger, _ := zap.NewDevelopment()
-	h := New(store, &stubPublisher{}, &stubAuthzClient{}, &stubGovernanceLogClient{err: governancelog.ErrDecisionNotGranted}, logger)
+	h := New(store, &stubAuthzClient{}, &stubGovernanceLogClient{err: governancelog.ErrDecisionNotGranted}, logger)
 	router := newChiRouter(h)
 
 	body := domain.ApproveContractRequest{GovernanceDecisionID: "dec-001"}
@@ -370,7 +372,7 @@ func TestApproveContract_GovernanceLogUnavailable(t *testing.T) {
 		Status: domain.ContractStatusReview,
 	}
 	logger, _ := zap.NewDevelopment()
-	h := New(store, &stubPublisher{}, &stubAuthzClient{}, &stubGovernanceLogClient{err: governancelog.ErrServiceUnavailable}, logger)
+	h := New(store, &stubAuthzClient{}, &stubGovernanceLogClient{err: governancelog.ErrServiceUnavailable}, logger)
 	router := newChiRouter(h)
 
 	body := domain.ApproveContractRequest{GovernanceDecisionID: "dec-001"}
@@ -392,7 +394,7 @@ func TestApproveContract_BySameSubmitter_Returns403(t *testing.T) {
 		Status: domain.ContractStatusReview, SubmittedBy: &submitter,
 	}
 	logger, _ := zap.NewDevelopment()
-	h := New(store, &stubPublisher{}, &stubAuthzClient{}, &stubGovernanceLogClient{}, logger)
+	h := New(store, &stubAuthzClient{}, &stubGovernanceLogClient{}, logger)
 	router := newChiRouter(h)
 
 	body := domain.ApproveContractRequest{GovernanceDecisionID: "dec-001"}
@@ -412,7 +414,7 @@ func TestApproveContract_Success(t *testing.T) {
 		Status: domain.ContractStatusReview, SubmittedBy: &submitter,
 	}
 	logger, _ := zap.NewDevelopment()
-	h := New(store, &stubPublisher{}, &stubAuthzClient{}, &stubGovernanceLogClient{}, logger)
+	h := New(store, &stubAuthzClient{}, &stubGovernanceLogClient{}, logger)
 	router := newChiRouter(h)
 
 	body := domain.ApproveContractRequest{GovernanceDecisionID: "dec-001"}
@@ -442,7 +444,7 @@ func TestRecordExecution_WithoutSendForSignature_Returns409(t *testing.T) {
 		ContractID: "ctr-001", TenantID: "tenant-test-01", LegalEntityID: "le-001",
 		Status: domain.ContractStatusApproved, SignatureStatus: domain.SignatureStatusNotRequested,
 	}
-	h := New(store, &stubPublisher{}, &stubAuthzClient{}, &stubGovernanceLogClient{}, zap.NewNop())
+	h := New(store, &stubAuthzClient{}, &stubGovernanceLogClient{}, zap.NewNop())
 	router := newChiRouter(h)
 
 	body := domain.RecordExecutionRequest{SignedBy: "user-001"}
@@ -460,7 +462,7 @@ func TestSendForSignatureThenRecordExecution_MovesToEffective(t *testing.T) {
 		ContractID: "ctr-001", TenantID: "tenant-test-01", LegalEntityID: "le-001",
 		Status: domain.ContractStatusApproved, SignatureStatus: domain.SignatureStatusNotRequested,
 	}
-	h := New(store, &stubPublisher{}, &stubAuthzClient{}, &stubGovernanceLogClient{}, zap.NewNop())
+	h := New(store, &stubAuthzClient{}, &stubGovernanceLogClient{}, zap.NewNop())
 	router := newChiRouter(h)
 
 	wSend := httptest.NewRecorder()
@@ -491,12 +493,12 @@ func TestAmendContract_RequiresEffective(t *testing.T) {
 		ContractID: "ctr-001", TenantID: "tenant-test-01", LegalEntityID: "le-001",
 		Status: domain.ContractStatusDraft,
 	}
-	h := New(store, &stubPublisher{}, &stubAuthzClient{}, &stubGovernanceLogClient{}, zap.NewNop())
+	h := New(store, &stubAuthzClient{}, &stubGovernanceLogClient{}, zap.NewNop())
 	router := newChiRouter(h)
 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/contracts/ctr-001/amend",
-		domain.AmendContractRequest{AmendedBy: "user-001", Title: "New Title"}))
+		domain.AmendContractRequest{Title: "New Title"}))
 	if w.Code != http.StatusConflict {
 		t.Fatalf("expected 409 amending a DRAFT contract, got %d — %s", w.Code, w.Body.String())
 	}
@@ -508,12 +510,12 @@ func TestTerminateContract_DraftIsRefused(t *testing.T) {
 		ContractID: "ctr-001", TenantID: "tenant-test-01", LegalEntityID: "le-001",
 		Status: domain.ContractStatusDraft,
 	}
-	h := New(store, &stubPublisher{}, &stubAuthzClient{}, &stubGovernanceLogClient{}, zap.NewNop())
+	h := New(store, &stubAuthzClient{}, &stubGovernanceLogClient{}, zap.NewNop())
 	router := newChiRouter(h)
 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/contracts/ctr-001/terminate",
-		domain.TerminateContractRequest{TerminatedBy: "user-001", TerminationNote: "n/a"}))
+		domain.TerminateContractRequest{TerminationNote: "n/a"}))
 	if w.Code != http.StatusConflict {
 		t.Fatalf("expected 409 terminating a DRAFT contract (nothing to terminate), got %d — %s", w.Code, w.Body.String())
 	}
@@ -525,7 +527,7 @@ func TestContract_ReadEndpoints_RequirePrincipal(t *testing.T) {
 		ContractID: "ctr-001", TenantID: "tenant-test-01", LegalEntityID: "le-001",
 		Status: domain.ContractStatusDraft,
 	}
-	h := New(store, &stubPublisher{}, &stubAuthzClient{}, &stubGovernanceLogClient{}, zap.NewNop())
+	h := New(store, &stubAuthzClient{}, &stubGovernanceLogClient{}, zap.NewNop())
 	router := newChiRouter(h)
 
 	// GET /v1/contracts without principal
@@ -556,7 +558,6 @@ func TestContract_ReadEndpoints_RequirePrincipal(t *testing.T) {
 	}
 }
 
-
 func newTestRouter(h *Handler) http.Handler {
 	// Import chi inline for tests
 	mux := http.NewServeMux()
@@ -572,4 +573,140 @@ func newTestRouter(h *Handler) http.Handler {
 		}
 	})
 	return mux
+}
+
+// --- Actor identity (the actor of a write is X-Principal-Id) ---
+
+func effectiveContractHandler(t *testing.T) (*stubStore, http.Handler) {
+	t.Helper()
+	st := newStubStore()
+	st.contracts["ctr-001"] = &domain.Contract{
+		ContractID: "ctr-001", TenantID: "tenant-test-01", LegalEntityID: "le-001",
+		Status: domain.ContractStatusEffective,
+	}
+	return st, newChiRouter(New(st, &stubAuthzClient{}, &stubGovernanceLogClient{}, zap.NewNop()))
+}
+
+func assertCoded(t *testing.T, w *httptest.ResponseRecorder, status int, code string) {
+	t.Helper()
+	if w.Code != status {
+		t.Fatalf("expected %d, got %d — %s", status, w.Code, w.Body.String())
+	}
+	var body map[string]string
+	_ = json.NewDecoder(w.Body).Decode(&body)
+	if body["code"] != code {
+		t.Fatalf("expected code %q, got %q", code, body["code"])
+	}
+}
+
+func TestWrites_BodyActorDisagreeingWithPrincipal_Returns403ActorMismatch(t *testing.T) {
+	cases := []struct {
+		name, path string
+		body       interface{}
+	}{
+		{"amend", "/v1/contracts/ctr-001/amend", domain.AmendContractRequest{AmendedBy: "someone-else", Title: "x"}},
+		{"renew", "/v1/contracts/ctr-001/renew", domain.RenewContractRequest{RenewedBy: "someone-else", NewEffectiveTo: "2030-01-01"}},
+		{"terminate", "/v1/contracts/ctr-001/terminate", domain.TerminateContractRequest{TerminatedBy: "someone-else"}},
+		{"create", "/v1/contracts", domain.CreateContractRequest{Title: "t", CounterpartyID: "cp", EffectiveFrom: "2026-01-01", LegalEntityID: "le-001", CreatedBy: "someone-else"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st, router := effectiveContractHandler(t)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, buildRequest(http.MethodPost, tc.path, tc.body))
+			assertCoded(t, w, http.StatusForbidden, "actor_mismatch")
+			if st.lastAudit.ActorID != "" {
+				t.Fatalf("a refused write must not reach the store, got audit %+v", st.lastAudit)
+			}
+		})
+	}
+}
+
+func TestWrites_AbsentBodyActor_IsFilledFromPrincipal(t *testing.T) {
+	cases := []struct {
+		name, path string
+		body       interface{}
+		got        func(c *domain.Contract) *string
+	}{
+		{"amend", "/v1/contracts/ctr-001/amend", map[string]string{"title": "x"}, func(c *domain.Contract) *string { return c.AmendedBy }},
+		{"renew", "/v1/contracts/ctr-001/renew", map[string]string{"new_effective_to": "2030-01-01"}, func(c *domain.Contract) *string { return c.RenewedBy }},
+		// terminated_by used to be required (400); absent now means "the principal".
+		{"terminate", "/v1/contracts/ctr-001/terminate", map[string]string{"termination_note": "n/a"}, func(c *domain.Contract) *string { return c.TerminatedBy }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st, router := effectiveContractHandler(t)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, buildRequest(http.MethodPost, tc.path, tc.body))
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d — %s", w.Code, w.Body.String())
+			}
+			if st.lastAudit.ActorID != "user-test-01" {
+				t.Fatalf("store must be handed the principal as actor, got %q", st.lastAudit.ActorID)
+			}
+			if got := tc.got(st.contracts["ctr-001"]); got == nil || *got != "user-test-01" {
+				t.Fatalf("expected the principal recorded as actor, got %v", got)
+			}
+		})
+	}
+}
+
+func TestWrites_MatchingBodyActor_IsAccepted(t *testing.T) {
+	_, router := effectiveContractHandler(t)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/contracts/ctr-001/amend",
+		domain.AmendContractRequest{AmendedBy: "user-test-01", Title: "x"}))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 when the body repeats the principal, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestWrites_WithoutPrincipal_Return401(t *testing.T) {
+	_, router := effectiveContractHandler(t)
+	for _, path := range []string{"/v1/contracts/ctr-001/amend", "/v1/contracts/ctr-001/renew", "/v1/contracts/ctr-001/terminate"} {
+		r := buildRequest(http.MethodPost, path, map[string]string{"new_effective_to": "2030-01-01"})
+		r.Header.Del("X-Principal-Id")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, r)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("%s: expected 401 without X-Principal-Id, got %d", path, w.Code)
+		}
+	}
+}
+
+func TestWrites_AuthzDeny_Returns403(t *testing.T) {
+	st := newStubStore()
+	st.contracts["ctr-001"] = &domain.Contract{
+		ContractID: "ctr-001", TenantID: "tenant-test-01", LegalEntityID: "le-001",
+		Status: domain.ContractStatusEffective,
+	}
+	router := newChiRouter(New(st, &stubAuthzClient{deny: true}, &stubGovernanceLogClient{}, zap.NewNop()))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/contracts/ctr-001/terminate", map[string]string{}))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 on authz deny, got %d", w.Code)
+	}
+	if st.lastAudit.ActorID != "" {
+		t.Fatal("a denied write must not reach the store")
+	}
+}
+
+// RecordExecution: signed_by is signing evidence and may differ from the
+// caller; the caller is recorded as the actor (execution_recorded_by).
+func TestRecordExecution_SignedByIsEvidence_RecorderIsPrincipal(t *testing.T) {
+	st := newStubStore()
+	st.contracts["ctr-001"] = &domain.Contract{
+		ContractID: "ctr-001", TenantID: "tenant-test-01", LegalEntityID: "le-001",
+		Status: domain.ContractStatusApproved, SignatureStatus: domain.SignatureStatusSent,
+	}
+	router := newChiRouter(New(st, &stubAuthzClient{}, &stubGovernanceLogClient{}, zap.NewNop()))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/contracts/ctr-001/record-execution",
+		domain.RecordExecutionRequest{SignedBy: "Jane Counterparty"}))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — %s", w.Code, w.Body.String())
+	}
+	if st.lastAudit.ActorID != "user-test-01" {
+		t.Fatalf("expected the principal as the recording actor, got %q", st.lastAudit.ActorID)
+	}
 }
