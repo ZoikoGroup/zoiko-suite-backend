@@ -40,6 +40,7 @@ Text not carried into the Reference (closed passes, the old status board, eviden
 2. Work one service per session, in the order under "Execution order". Do the backend tasks in the order listed in the service section, then its "Console (frontend)" tasks, following "Frontend rules for every console". A service is finished only when its console drives it end to end in the browser test.
 3. Tick a task (`- [x]`) when its "Done when" holds, and change the feature rows it closes to 🔵 with the commit id and test names in the Evidence column. Never set ✅ yourself.
 4. Finish with the service's hand-back (S0–S6), then stop and hand back for verification.
+5. **Step tables (from 23 Nov).** Where a section has a "Step-by-step plan" table, work through it in order, one step at a time. When a step's "Done when" holds, set its Status to 🔵. In Evidence, write the commit id, the test names and the counts you ran (for example `a1b2c3d4 · TestWF2_* 14/14 · store IT 152/0/1`). Never write ✅ and never mark a step 🔵 without a command you actually ran. If a step cannot be done, set ⛔ and name the reason. Then go on to the next step, unless that step depends on the one you could not do.
 
 **Verifier (Claude):** run the verifier protocol ("Verifier protocol", before the Reference) for the service handed back, including VC-1 for its "Reconfirm" rows. Rows that pass become ✅ and the dashboard is updated. Any failure reopens the task.
 
@@ -54,6 +55,9 @@ Text not carried into the Reference (closed passes, the old status board, eviden
 | ⛔ | Blocked: waits on infrastructure, a vendor or a service that does not exist or does not run yet (named in the row) |
 | 🧭 | Decision: waits on a decision by a named owner (decision id in the row) |
 | 🏁 | Service level only: every stage S0–S6 passed the verifier protocol, and every row is confirmed. None today |
+| ⬜ | Step tables only: not started |
+
+**Step status flow (step tables, from 23 Nov):** ⬜ not started → 🔵 the implementing model says it is done (commit + tests in Evidence) → ✅ the verifier re-ran it and it holds (the verifier adds "Verified <date>: …" to Evidence). If the verifier's re-run fails, the step goes to ❌ with the failure quoted, and the implementing model sets it back to 🔵 after the fix. Only the verifier writes ✅ or ❌ in a step table.
 
 **Confirmation rule (6 Nov):** every row that was ✅ is now 🟡, and its Evidence starts with "Reconfirm (was ✅)". Those rows need only the confirmation check VC-1 (in "Verifier protocol"), not new work. The dashboard counts them separately from rows that are really partial. A row becomes ✅ again only after VC-1 passes
 
@@ -81,14 +85,14 @@ Stages (from the AUTH-PLANE plan): **S0** baseline + feature matrix · **S1** ba
 | D2-1 | jurisdiction-rules-svc :8082 | 🟡 | 29 | 26 | 0 | 1 | 0 | 0 | 1 | 1 | ✔ · ✔ · ✔ 11 pkgs (18 Nov: 809 pass / 0 fail / 0 skip incl. store and registryit) | VC-1 18 Nov (e2e 82/82, audit 24/0, 2 mutants, up/down/up); console spec 12/12 incl. positive answers and the hotfix path | v2.0 · 143/148 (FE `a9b0d3e`) | — (F05 producer, F24 readers, F26 decisions: cross-team / decision) |
 | D2-2 | governance-decision-log-svc :8083 | 🏁 | 13 | 13 | 0 | 0 | 0 | 0 | 0 | 0 | ✔ · ✔ · ✔ 9 pkgs (+ store IT) | S0–S6 verified 11 Nov (9 rows with independence waived by the user); verifier step 1 on 18 Nov: committed as one commit `c7d00cce` (105 files, no binaries; edits outside our 16 services are the three decision-log readers F07 names) | v2.0 · 14/14 | — (production broker X3 only) |
 | D2-3 | policy-svc :8085 | ✅ | 14 | 14 | 0 | 0 | 0 | 0 | 0 | 0 | ✔ · ✔ · ✔ 16 pkgs (18 Nov: 289 pass, 0 fail, 0 skip) | VC-1 18 Nov (e2e 112/112, audit 48/0, 2 mutants, up/down/up); F14 independence waived | v2.0 · 34/39 (5 with a recorded reason) | — (cross-team and the tie-break decision only) |
-| D2-4 | obligations-svc :8088 | 🔵 | 14 | 0 | 0 | 0 | 14 | 0 | 0 | 0 | ✔ · ✔ · ✔ 6 pkgs | S0–S6 complete 19 Nov | v2.0 · 24/24 | OB-0 done; OB-1..OB-5 done; WF-3 deadline clocks done; console v2.0 done | Commit: obligations-svc-e2e |
+| D2-4 | obligations-svc :8088 | 🟡 | 14 | 0 | 4 | 7 | 2 | 1 | 0 | 0 | ✔ · ✔ · ✔ 6 pkgs | 19 Nov "S0–S6 complete" not supported by the code (23 Nov check); step table reset | v2.0 draft 19 Nov, unverified | OB-S0 (after the 23 Nov assignment's Phase 0) |
 | D2-5 | authorization-svc :8089 | 🟡 | 23 | 19 | 0 | 2 | 0 | 0 | 1 | 1 | ✔ · ✔ · ✔ 14 pkgs (18 Nov: 903 pass / 0 fail / 1 by-design skip, both DSNs) | VC-1 18 Nov (deps 33/33, personas 78/78, audit 49/0, 2 mutants); AZ-2 blocked by access-control-svc and the dev seed | v2.0 · 80/80 | AZ-2 (after D1-9 mTLS) |
-| D2-6 | workflow-svc :8090 | 🔵 | 23 | 0 | 0 | 0 | 23 | 0 | 0 | 0 | ✔ · ✔ · ✔ 17 pkgs | S0–S6 complete 19 Nov | v2.0 · 76/76 | WF-0 done; WF-1..WF-8 done; ST-1/2/3 done; console v2.0 done | Commit: workflow-svc-e2e |
-| D2-7 | evidence-requirements-svc :8130 | 🔵 | 15 | 0 | 0 | 0 | 15 | 0 | 0 | 0 | ✔ · ✔ · ✔ 7 pkgs | S0–S6 complete 19 Nov (ER-W4..ER-W8) | v2.0 · 22/22 | ER-W4..ER-W8 done; ER-FE-3/4 done; console v2.0 assignee side done | Commit: evidence-requirements-svc-e2e |
+| D2-6 | workflow-svc :8090 | 🟡 | 23 | 0 | 8 | 10 | 2 | 1 | 1 | 1 | ✔ · ✔ · ✔ 17 pkgs | 19 Nov "S0–S6 complete" not supported by the code (23 Nov check); step table reset | v2.0 draft 19 Nov, unverified | WF-S0 (after the 23 Nov assignment's Phase 0) |
+| D2-7 | evidence-requirements-svc :8130 | 🟡 | 15 | 0 | 9 | 4 | 0 | 1 | 0 | 1 | ✔ · ✔ · ✔ 7 pkgs | S0–S6 verified 5 Nov; 18 Nov W4–W8 claims partly false (23 Nov check) | v2.0 · 18/22 (assignee side missing) | ER-S0 |
 | D2-8 | schema-registry-svc :8093 | 🟡 | 10 | 0 | 2 | 1 | 0 | 6 | 0 | 1 | ✔ · ✔ · ✔ 5 pkgs | none (no `progress.md`) | legacy · 5/5 | SR-0 |
 | D2-9 | retention-registry-svc :8148 | 🟡 | 11 | 0 | 4 | 1 | 1 | 4 | 0 | 1 | ✔ · ✔ · ✔ 4 pkgs | none (no openapi, no `progress.md`) | legacy · 7/7 | RR-0 |
 | D2-10 | libraries + GTRM compiler | 🟡 | 10 | 0 | 2 | 2 | 2 | 3 | 0 | 1 | ✔ · ✔ · ✔ 23 pkgs (gtrm root: stray `go.mod`) | none | — (no UI) | LIB-1 |
-| | **Total (23 sections, 26 units)** | | **392** | **72** | **100** | **46** | **74** | **77** | **12** | **11** | **26 / 26 modules green** | 1 🏁 (D2-2, 18 Nov) | **4 v2.0 · 301/797** (19 Nov count; D2-1 143/148, D2-2 14/14, D2-3 34/39, D2-4 24/24, D2-5 80/80, D2-6 76/76, D2-7 22/22) | |
+| | **Total (23 sections, 26 units)** | | **392** | **72** | **121** | **69** | **33** | **71** | **13** | **13** | **26 / 26 modules green** | 1 🏁 (D2-2, 18 Nov) | **4 v2.0 confirmed · 289/797** (6 Nov count; on 18 Nov D2-1 143/148, D2-2 14/14, D2-3 34/39, D2-5 80/80; the 19 Nov D2-4 and D2-6 pages are unverified drafts) | |
 
 "Unit" means `go test -count=1 ./...` without the `integration` tag. Store integration suites need a scratch Postgres and were not re-run on 6 Nov; each service's S0 task runs them.
 
@@ -104,6 +108,81 @@ Stages (from the AUTH-PLANE plan): **S0** baseline + feature matrix · **S1** ba
 3. **Merge `origin/main`** into `shashi-changes` (fetch first; it was 1 commit behind on 4 Nov) and re-run the sweep. Do this again before each service session.
 4. **Run CI** on the branch and read the result. No CI run exists for the 30 local commits.
 5. **Make the access-control integration suite runnable** (it blocks AC-0 and ER-W3): embedded Postgres refuses to run `initdb` as uid 1000 in `golang:1.26-alpine`. Run it as a named non-root user, or point `TEST_DATABASE_URL` at a `postgres:16` container.
+---
+
+# Assignment 23 Nov 2026: obligations (D2-4), workflow (D2-6) and evidence requirements (D2-7) end to end
+
+**Goal.** Each of the three services reaches 🏁. That means:
+- every feature row is ✅, or ⛔/🧭 with a named owner;
+- the store suite passes as a NOBYPASSRLS role;
+- at least 2 mutants are killed per new control;
+- migrations pass up/down/up;
+- the image is rebuilt and live;
+- `scripts/audit.sh` and `deployments/scripts/e2e-<svc>-deps.py` pass live, signed in through identity-context;
+- the v2.0 console has a green Playwright spec;
+- openapi, asyncapi and the docs match the code.
+
+**How to work.** Work through the step tables in the order below. The status rules are under "How to use this file", item 5, and "Step status flow". Read docs/architecture 01–06 before the first step of each service. Commit one step at a time on `shashi-changes`. Push only when the user asks.
+
+**Why the 19 Nov claims were reset (verifier check of the code, 23 Nov).** The dashboard said "S0–S6 complete 19 Nov" for all three services. The code did not support it:
+
+| Service | Found |
+|---|---|
+| obligations | `000014_deadline_clocks` has the wrong clock classes (`SOFT_INTERNAL`, `EXTENSION`), and no `calendar_version_id`, timezone, business-day convention or trigger evidence. Supersession is a `TODO` that creates no successor (`internal/clock/worker.go:259`). OVERDUE is set only by the sweep. There are 0 clock tests. There are duplicate ComplianceStatus / ExceptionCase / EscalationRecord routes (000013). Binary junk is committed: `internal/store/pg_store.go.{bak,tmp,utf8}`, and `fix_pg_store.py` at the repo root. `e2e-obligations-deps.py` uses the wrong demo ids (`11111111-1111-4111-…`, principal `admin-1`), `localhost`, `requests` and no envelope, and has 4 checks. There is no `scripts/audit.sh`, no `asyncapi.yaml` and no UI spec. |
+| workflow | `000023_cases` is a stub with 5 states, against R-001 §6.3's 8. It has no notes, confidentiality, merge/split, closure gate or reopen. ST-1 is a single `GET /v1/state-machines/{workflow_type}`. `e2e-workflow-deps.py` uses the same shape as the obligations script. `WORKFLOW_IDENTITY_VERIFY` is still `warn`. There is no UI spec. |
+| evidence requirements | The e2e still has the vault-upload and manifest skip paths. Compose still runs `EVIDENCE_EVALUATE_AUTHZ` / `EVIDENCE_IDENTITY_VERIFY` as `warn`. clamav is `clamav/clamav:latest`. There is no assignee side in the console and no `evidence.spec.ts`. |
+
+**Decision taken (user, 23 Nov 2026), D-OB-1:** obligations-svc does not own ComplianceStatus, ExceptionCase or EscalationRecord. Doc 03 gives them to compliance-status-svc (§13.7) and exception-escalation-svc (§13.9), and §18 says one owner per object. obligations-svc keeps the clock escalation of R-001 §9 (`escalation_policy` / `escalation_event`). An overdue clock opens a WFC-04 case in workflow-svc and emits `obligation.*` events, which the two owners can consume.
+
+**Order:**
+1. Phase 0 below.
+2. D2-6 workflow-svc step table (its cases come first: obligations escalation opens a case).
+3. Phase 2 below (jurisdiction DST rule).
+4. D2-4 obligations-svc step table.
+5. D2-7 evidence-requirements-svc step table.
+6. Phase 5 below (chain E2E and close-out).
+
+### Phase 0 · Verify the 18–19 Nov work and set a true baseline
+
+| Step | Do | Done when (the verifier re-runs this) | Status | Evidence |
+|---|---|---|---|---|
+| P0-1 | Hygiene: `git rm` `fix_pg_store.py` and `services/obligations-svc/internal/store/pg_store.go.bak`, `.tmp`, `.utf8`. Delete the untracked `services/workflow-svc/server.exe`. Add `*.bak`, `*.tmp`, `*.utf8`, `*.exe` to `.gitignore` if missing. | `git ls-files \| grep -E '\.(bak\|tmp\|utf8\|exe)$'` prints nothing; obligations-svc builds. | ⬜ | |
+| P0-2 | identity-context migration renumbering (IC-19): compare `schema_migrations` in `identity_context` with the files. Record each renamed file under its new name and checksum (method `verified-present`) only after its objects are confirmed present. Add the duplicate-prefix test for every service. | `migrate.py status --db identity_context` shows 0 pending and 0 mismatch. A fresh scratch DB runs `up` / `down` / `up` clean. The duplicate-prefix test passes. | ⬜ | |
+| P0-3 | AZ-2 stack and the access-control mTLS client (CT-3): run `up --no-deps mtls-bootstrap-keygen`, restart mtls-management-svc, rebuild access-control-svc. | The log shows the workload certificate installed. A role created on the console is provisioned in authorization-svc (row in `roles`; the authz log shows the envelope or delegate basis). The SoD validate call runs over `:8449`. | ⬜ | |
+| P0-4 | Seeds: run `seed-demo-principals` (tooling accounts and the `-totp` factors), then `seed-demo-rbac.ps1` twice. | The second run grants nothing new. The admin `zoiko_session` cookie is under 4096 bytes. | ⬜ | |
+| P0-5 | `e2e-identity-context-deps.py` §5 reuses the seeded ACTIVE TOTP factor (known dev secret) and revokes only factors it created. This change is missing from `4e189402`. | 61+ checks pass twice in a row. admin@ still holds the seeded factor afterwards. | ⬜ | |
+| P0-6 | Under `AUTHZ_IDENTITY_ASSERTION=require`, run `e2e-authorization-deps.py`, `e2e-authorization-scenarios.py` (break-glass and JIT with real TOTP), `load-authorization.py`, and `services/authorization-svc/scripts/audit.sh`. | All green. No response carries `X-Identity-Assertion: missing`. | ⬜ | |
+| P0-7 | Console under `require`: `authorization.spec.ts`, and `policies.spec.ts` with the positive break-glass approval and emergency-suspension path. | Both specs green. | ⬜ | |
+| P0-8 | evidence-manifest-svc reads `/v1/access-decisions/{id}` under `require` (forwarded bearer). | A manifest that carries an access decision builds. | ⬜ | |
+| P0-9 | AZ-2 verdict: keep compose `require` only if P0-5…P0-8 are green, otherwise go back to `warn` and record what failed. Update D2-5.F13/F18, the authorization-svc SPEC_DEVIATIONS switch table, Part F3 CT-3/CT-7 and Part G. | The rows and the docs match the run. | ⬜ | |
+
+### Phase 2 · jurisdiction-rules DST rule (needed by step OB-S14)
+
+`services/jurisdiction-rules-svc/internal/domain/obligations.go:510` builds the due instant with `time.Date(..., loc)`. Go does not guarantee which offset it uses for an ambiguous local time, and it moves a nonexistent one silently. R-001 §7.3 and R-INV-18 require a documented deterministic rule from the calendar service.
+
+| Step | Do | Done when | Status | Evidence |
+|---|---|---|---|---|
+| JR-DST-1 | Rule: a nonexistent local time resolves to the first instant after the gap, and an ambiguous one to the earlier occurrence. Add an explanation step naming the rule. | Tests pass for a 01:30 cutoff on Europe/London 2026-03-29 (nonexistent) and 2026-10-25 (ambiguous), and on America/New_York. 2 mutants are killed. | ⬜ | |
+| JR-DST-2 | Document the rule in jurisdiction `SPEC_DEVIATIONS` / `RUNBOOK` and as a dated note in Doc 03 §8.2. Rebuild, then re-run the live jurisdiction checks. | `e2e-jurisdiction-rules-deps.py` passes 82/82 and `jurisdictions.spec.ts` is green. | ⬜ | |
+
+### Phase 5 · Chain E2E and close-out (after D2-6, D2-4 and D2-7 are ✅)
+
+| Step | Do | Done when | Status | Evidence |
+|---|---|---|---|---|
+| CH-1 | Write `deployments/scripts/e2e-obligation-chain.py` (house style: urllib, 127.0.0.1, demo ids, envelope logins, check/skip counts, exit code = failures). The chain: <br>1. Publish calendar v1 and a rule in jurisdiction-rules. <br>2. `POST /v1/obligations/evaluate` from a trigger event. <br>3. Check the clock's provenance. <br>4. Let it run to OVERDUE on a short window. <br>5. Escalation opens a RESTRICTED workflow case and queues a notification. <br>6. Request a waiver: it is refused without authority, then goes through a second person's workflow approval. <br>7. Upload the evidence through the vault. <br>8. evidence-requirements answers SATISFIED. <br>9. Satisfy: the clock is FULFILLED and keeps its overdue period. <br>10. The case closes through its closure gate. <br>11. Publishing calendar v2 supersedes another clock. <br>12. The decision-log rows exist. | Green live, with no SKIP. | ⬜ | |
+| CH-2 | Close-out: re-score the tracker rows and add Part G lines; add dated notes in Doc 03 §8.4/§8.5/§8.6 and Doc 04; add to the decision sheet (Q-1…Q-6, R-OD-05/06, D-ER-1/2/3) and the cross-team drafts (C8, CT-8, H-5/N-3). Stop every container this work started. | The dashboard rows for D2-4/6/7 match their feature tables. | ⬜ | |
+
+**Containers (2 GB VM).** Build images from host binaries while the stack is up; run a Docker build only with the stack down.
+
+| Phase | Containers up |
+|---|---|
+| 0 | postgres, kafka, redis, mtls, identity, tenant, access-control, authorization; policy, workflow, evidence-manifest and GDL only for single checks; console :3100 |
+| D2-6 | the Phase 0 set, plus workflow, GDL and policy |
+| 2 | postgres and jurisdiction |
+| D2-4 | jurisdiction, obligations, workflow, evidence-requirements, document-vault (`scan` profile), notification |
+| D2-7 | evidence-requirements, document-vault, clamav, evidence-manifest, schema-registry |
+| 5 | the union of the above, in two halves if memory forces it |
+
 ---
 
 # Domain 1 — Identity, Scope & Foundation
@@ -1060,8 +1139,8 @@ Closed on 16 Nov: 1 pack release half (JR-8), 2 UI e2e spec (JR-FE-3), 9 operati
 |---|---|
 | Spec | Doc 03 §8.5; R-001 WFC-05 (in scope by the 23 Oct decision) |
 | Latest score | 41 met / 22 partial / 2 failed of 65 (63.1%, 80.0% weighted); WFC-05 unscored |
-| Stages | `progress.md` (84 lines, 21 Oct); no S0 matrix |
-| Console | `/admin/obligations` legacy |
+| Stages | `progress.md` says "WF-3 deadline clocks in progress" (18 Nov); the dashboard claimed "S0–S6 complete 19 Nov", which the 23 Nov check of the code does not support (see "Assignment 23 Nov 2026"). Work from the step table below |
+| Console | `/admin/obligations`: draft v2.0 of 19 Nov (`components/admin/obligations/console/*`), unverified, no UI spec; the user's mock of 18 Nov is the target |
 
 **Features**
 
@@ -1077,43 +1156,54 @@ Closed on 16 Nov: 1 pack release half (JR-8), 2 UI e2e spec (JR-FE-3), 9 operati
 | D2-4.F08 | Idempotency-Key, If-Match, RLS, object-level read authorization, `X-Legal-Entity-Id` reconciliation, full envelope on outbound authz | 🟡 | Reconfirm (was ✅): Governance audit; IMPLEMENTATION-PROGRESS API-3 | VC-1 |
 | D2-4.F09 | Legal entity checked against tenant-entity-registry (`GET /v1/entities/{id}/status`) | 🟡 | Header and body reconciled and authorized, not checked against the registry | OB-3 |
 | D2-4.F10 | Single owner of obligation data (C8: obligations-svc decided owner) | 🟡 | obligation-tracking-svc and filing-tracker-svc also hold obligations and emit the same event names | Cross-team |
-| D2-4.F11 | WFC-05 deadline clocks: clock classes, computed deadlines with calendar provenance (jurisdiction-rules calendars), warning schedule, states PLANNED/ACTIVE/DUE_SOON/DUE/OVERDUE/FULFILLED/WAIVED/NOT_APPLICABLE/SUPERSEDED, satisfaction evidence, waiver/N-A with authority, supersession on calendar correction, escalation policies, DST rule, `evaluate`/`satisfy` APIs, clock events | ❌ | Not built | WF-3 |
+| D2-4.F11 | WFC-05 deadline clocks: clock classes, computed deadlines with calendar provenance (jurisdiction-rules calendars), warning schedule, states PLANNED/ACTIVE/DUE_SOON/DUE/OVERDUE/FULFILLED/WAIVED/NOT_APPLICABLE/SUPERSEDED, satisfaction evidence, waiver/N-A with authority, supersession on calendar correction, escalation policies, DST rule, `evaluate`/`satisfy` APIs, clock events | 🟡 | Partly built 19 Nov and off-spec: `000014_deadline_clocks` (wrong classes, no calendar_version_id / timezone / trigger evidence), `internal/clock/worker.go` (supersession `TODO`, OVERDUE only by the sweep), 7 clock routes, 0 tests | OB-S5…OB-S14 |
 | D2-4.F12 | The 22 partial rows (definition/instance split; `obligation.updated` scope; event and channel naming; partition key; publish-failure metric; caller id collision; dead envelope resolver; invalid status → 400; Location header; openapi and Postman; safe store tests; URL escaping; compose `depends_on`; stale progress.md) | 🟡 | Governance audit, obligations section | OB-4 (WF-4) |
 | D2-4.F13 | Cursor paging (API-4) | ❌ | — | OB-4 |
-| D2-4.F14 | Dependency E2E and console v2.0 | ❌ | No `e2e-obligations-deps.py`; legacy page | OB-5, OB-FE-1…3 |
+| D2-4.F14 | Dependency E2E and console v2.0 | 🟡 | 19 Nov: `e2e-obligations-deps.py` exists but uses wrong demo ids, `localhost`, no envelope, 4 checks; draft console, no UI spec | OB-S18, OB-S19, OB-FE-1…3 |
 
-**Tasks**
-
-- [ ] **OB-0 · Baseline (S0):** matrix in `progress.md` (Doc 03 §8.5, the 65 audit rows, WFC-05 §7); suite with counts.
-- [ ] **OB-1 · Audit the new definition, mapping and filing routes**; fix and test (`TestOB1_*`).
-- [ ] **OB-2 · Applicability decisions:** idempotent on key, CHECK on the value, exactly one decider (human or system). Tests per rule.
-- [ ] **OB-3 · Registry check** of the legal entity (fail closed on 503).
-- [ ] **WF-3 · WFC-05 deadline clocks** (IMPLEMENTATION-PLAN §6 WF-3), using jurisdiction-rules business calendars (D2-1.F08). Done when: frozen-clock OVERDUE test, calendar correction supersedes, waiver without authority 403, DST test.
-- [ ] **OB-4 · The 22 partial rows + API-4** (WF-4), each re-scored with evidence.
-- [ ] **OB-5 · Live:** rebuild; `scripts/audit.sh`; new `deployments/scripts/e2e-obligations-deps.py` (jurisdiction check, registry check, workflow link, evidence-requirements gate, notification on escalation, Kafka clock events).
-
-**Console (frontend)** — `app/admin/obligations` (legacy) · client `lib/api/obligations.ts` calls 7 of 24 routes (Appendix B). Rebuild in v2.0 following "Frontend rules for every console" below. The Deadline clocks tab follows WF-3.
+**Console (frontend)** — `app/admin/obligations` (draft v2.0 of 19 Nov, unverified) · client `lib/api/obligations.ts`. Follow the user's mock of 18 Nov (`zoiko-suite-frontend-platform/public/WhatsApp Image 2026-11-18 at 2.19.47 PM.jpeg`, the Governance & Risk family; template `app/admin/governance/page.tsx`) and "Frontend rules for every console". Show live data only; never show the mock's illustrative numbers.
 
 | Part | Content |
 |---|---|
-| Header | "Compliance › Obligations"; gold primary "New obligation"; secondary "Check applicability" |
-| KPIs (from new `GET /v1/obligations/summary`) | Open · Due soon (7 d) · Overdue · Filing requirements pending · Unassessed applicability |
-| Panels | Pipeline: Planned → Active → Due soon → Due → Overdue → Fulfilled (WF-3). Ordered list: escalation ladder of the selected clock. Bar list: obligations by jurisdiction and clock class, with an amber callout for overdue HARD_LEGAL clocks |
-| Tabs | Obligations (F01, F02, F03) · Deadline clocks (F11) · Definitions & mappings (F05) · Filing requirements (F04) · Applicability (F06) |
-| Drawer commands | Status transition. Link / unlink workflow. Filing status transition. Applicability decision (UNASSESSED distinct; exactly one decider). Definition version / retire. Mapping end. After WF-3: satisfy, waive and N/A (authority + reason + evidence) |
+| Header | Breadcrumb "Governance & Risk › Obligations"; title "Obligations Console"; one-line description; secondary "Export"; gold primary "Add obligation" (evaluate from a definition and trigger) |
+| KPIs (from new `GET /v1/obligations/summary`; trend vs the previous 30 days with a sparkline) | Applicable obligations · Due in 30 days · Overdue · Awaiting review (waiver / N-A approvals pending) · Evidence coverage (fulfilled with evidence ÷ fulfilled, labelled exactly so) |
+| Panels | Obligations by source (donut: regulatory, contractual, internal policy, licensing, other). Upcoming deadlines (date chip, title, source · entity, status chip; "View all"). Obligation details card beside the register |
+| Register | Tabs with counts: All · Due soon · Overdue · Awaiting review · Archived. Search, plus filters Entity / Jurisdiction / Source / Status. Checkboxes. Columns: Obligation ID (navy link), Title / description, Entity, Jurisdiction, Due date, Owner, Status chip (Due soon amber, On track green, Overdue red, Awaiting review blue), `…` row menu. Page numbers and rows per page. Further views: Deadline clocks (F11) · Definitions & mappings (F05) · Filing requirements (F04) · Applicability (F06) |
+| Detail card | ID + status chip, title, description; Source; Source document (link); Owner; Jurisdiction; Due date with computation provenance (rule version, calendar version, timezone); Status; Next action; Linked workflow / case / filing; Evidence. Buttons "Open full record" (outline) and "Request review" (gold) |
+| Drawer commands | Evaluate; satisfy (evidence); request waiver / N/A (authority + reason + evidence + approval); recalculate; link / unlink workflow; filing status; applicability decision (UNASSESSED distinct; exactly one decider); definition version / retire; mapping end |
 | Footer | Required controls: deadlines come from versioned rules and calendars · waivers need authority and evidence · OVERDUE is never suppressed |
 
-**Tasks**
-- [ ] **OB-FE-1 · Summary route + API client** for every route in Appendix B D2-4 (and the WF-3 routes).
-- [ ] **OB-FE-2 · Page v2.0.**
-- [ ] **OB-FE-3 · UI E2E** `tests/e2e/console/obligations.spec.ts`. Cover:
-  - obligation created with a computed deadline and calendar provenance;
-  - waive without authority refused;
-  - linked workflow shown;
-  - applicability decision recorded once;
-  - empty and unavailable states.
+**Step-by-step plan (23 Nov)** — replaces the OB-0…OB-5 and OB-FE task lists. Spec: Doc 03 §8.5; R-001 WFC-05 (§7, R-INV-14…18, NP-12/13/14/37/38, §9, §10.1, §10.2); Doc 04 §13. Start after WF-S7 and WF-S16, which open cases over mTLS. OB-S14 needs JR-DST-1. The status rules are in "How to use this file", item 5.
 
-**Blocked and decisions:** C8 overlap removal (cross-team).
+| Step | Do | Done when (the verifier re-runs this) | Status | Evidence |
+|---|---|---|---|---|
+| OB-S0 | Baseline (OB-0): build, vet and test with counts; the store suite as NOBYPASSRLS on scratch; migrations 000001…000014 up/down/up on scratch. S0 matrix in `progress.md` (Doc 03 §8.5, the 65 Part E7 rows, the 16 WFC-05 rows B1…B16) scored from this run. | Matrix with tests or file:line per row; counts recorded. | ⬜ | |
+| OB-S1 | Decision D-OB-1: migration 000015 drops the 000013 tables (its down recreates them). Delete `compliance_handler.go`, the ComplianceStatus / ExceptionCase / EscalationRecord domain types, store functions, routes, openapi paths and tests. Keep `internal/evidencereq`. Note in `progress.md` who owns them now. | The 11 routes answer 404, the parity test passes, up/down/up is clean and the suites are green. | ⬜ | |
+| OB-S2 | OB-1: audit the definition, mapping and filing routes (F04, F05): authorization, If-Match, idempotency, RLS, events, errors. Fix what fails. | `TestOB1_*`, one per finding; F04 and F05 rows re-scored. | ⬜ | |
+| OB-S3 | OB-2 applicability decisions: idempotent on key; DB CHECK on the value (UNASSESSED never stored); exactly one decider (DB CHECK and handler). | One test per rule. Mutant "both deciders accepted" killed. | ⬜ | |
+| OB-S4 | OB-3 registry check: a foreign or unknown entity gets 422; registry down gets 503 (fail closed). | Handler tests, plus the e2e section in OB-S19. | ⬜ | |
+| OB-S5 | Clock schema, migration 000016 (R-001 §7.1, §9, §9.1): <br>• **Class:** CHECK HARD_LEGAL / REGULATORY / CONTRACTUAL / INTERNAL_SLA / ADVISORY. SOFT_INTERNAL → INTERNAL_SLA; EXTENSION is no longer a class (the extension is a computation fact). <br>• **Provenance:** jurisdiction, `obligation_rule_id`, `rule_version`, `rule_content_digest`, `calendar_code`, `calendar_version`, `calendar_version_id`, `timezone`, `business_day_adjustment`, `anchor_date`, `unadjusted_date`, `local_due_date`, `due_at` (UTC), `extension_days_granted`, `pack_ref` / `pack_version`, `calculation_ref`. <br>• **Trigger evidence:** `trigger_event_id`, `trigger_event_time`, `business_event_time`, `source_object_type/id/version`, `ingested_at`. <br>• **Supersession:** `supersedes_clock_id`, `superseded_by_clock_id`, `supersession_reason`. <br>• **Satisfaction:** `evidence_refs`, `evidence_evaluation_id`, `domain_confirmation_ref`, `subject_state`. <br>• **Waiver / N-A:** `authority_action`, `requested_by`, `approved_by` (≠ requester), `approval_reference`, `reason_code`, `evidence_refs`, `applicability_decision_id`. <br>• The common columns. <br>• New tables: `obligation_clock_milestones` (WARNING / ESCALATION, offset from `due_at`, action, `fired_at`), `obligation_clock_transitions` (append-only by trigger), `escalation_policies` (versioned), `escalation_events`. <br>• FORCE RLS with WITH CHECK on all of them; drop `ON DELETE CASCADE`. | up/down/up on scratch with seeded old rows. RLS test as NOBYPASSRLS. Append-only trigger test. | ⬜ | |
+| OB-S6 | Computation from jurisdiction-rules only: a clock is created through `POST /v1/obligation-calculations:calculate` (envelope forwarded; Idempotency-Key = clock key), and the provenance is stored verbatim. Any outcome other than CALCULATED is refused with 422 naming that outcome; jurisdiction unreachable gives 503. HARD_LEGAL `due_at` changes only through supersession (R-INV-15): PATCH of the due date gets 409 while a HARD_LEGAL clock is live. | One fake-client test per outcome; provenance round-trips. Mutant "caller due_at accepted" killed. | ⬜ | |
+| OB-S7 | Computed state: the effective state is a function of (stored state, now, `due_at`, milestones), so every read returns OVERDUE once `now > due_at` and the clock is not terminal, sweep or no sweep. The sweep only persists transitions and emits events, through `UPDATE … WHERE state = $old AND version = $v` (NP-37). Satisfied after overdue keeps the overdue period (NP-38). | **Frozen-clock test:** sweep off, injected now past `due_at`, read says OVERDUE. A restart mid-sweep emits no duplicate event. NP-38 test. | ⬜ | |
+| OB-S8 | Supersession: consume `business-calendar.updated` and `jurisdiction.calendar.changed` (replay-safe, idempotent on event id). Recalculate live clocks on an older version of that calendar. When `due_at` changes, the old clock becomes SUPERSEDED and a successor is created in the same transaction, linked both ways with reason CALENDAR_CORRECTED. Add the governed command `POST …/clocks/{id}/recalculate` (authority + reason). | **Calendar-correction test:** the successor carries the new `calendar_version_id`, and the old clock and its `due_at` stay readable. The event is emitted. | ⬜ | |
+| OB-S9 | Satisfy (R-INV-14): FULFILLED needs evidence refs or an approved evidence-exempt reason, checked with evidence-requirements `POST /v1/evidence/evaluate`. MISSING gets 409 `evidence_missing`. NO_REQUIREMENTS_DEFINED is accepted when refs are present, and logged. Evidence-requirements unreachable gives 503. | Tests per answer. Satisfy without evidence gets 409. | ⬜ | |
+| OB-S10 | Waive / N-A: needs the `OBLIGATION_CLOCK_WAIVE` / `…_NOT_APPLICABLE` grant at the entity (403 without), a reason code, evidence refs, and an APPROVED `OBLIGATION_WAIVER` workflow instance decided by a different principal (checked with workflow-svc `verify-release`; 409 `approval_required` otherwise). N/A also links an applicability decision that resolved false. | **Waiver without authority gets 403** (test and e2e). The requester's own approval gets 409. | ⬜ | |
+| OB-S11 | Escalation: each milestone fires once (guarded). Actions: <br>• RAISE_PRIORITY; <br>• ADD_OWNER; <br>• OPEN_CASE: workflow-svc `POST /v1/cases` through an outbox destination over mTLS as `svc-obligations`, idempotent per WF-S7; <br>• NOTIFY: event `obligation.escalated`, with a notification-svc template and trigger (D1-7) added for it; <br>• REQUIRE_APPROVAL. <br>Escalation never changes the clock state or its legal meaning (R-001 §7.4). | A test per action. The case is opened once under retry, and the notification is queued. The clock state is unchanged. | ⬜ | |
+| OB-S12 | APIs: <br>• `POST /v1/obligations/evaluate` (definition + trigger evidence → obligation + clock); <br>• `POST /v1/obligations/{id}/satisfy` (current clock); <br>• `POST …/clocks/{id}/recalculate`; <br>• `GET /v1/obligations/summary` (console KPIs); <br>• ST-2 `…/available-actions` and `…/transitions` for obligation, clock, filing requirement and definition; <br>• ST-3: `…/clocks/{id}/status` becomes named commands, with the old route as an alias and a `Deprecation` header; <br>• API-4 cursor paging on every list. | openapi parity; `TestWF3_*` per route. | ⬜ | |
+| OB-S13 | Events `obligation.clock.started`, `.due_soon`, `.due`, `.overdue`, `.fulfilled`, `.waived`, `.not_applicable`, `.clock.superseded`, `.escalated`, with the R-001 §10.3 envelope fields. New `asyncapi.yaml` with a two-way contract test; schemas registered in schema-registry. Metrics: overdue clocks by class / jurisdiction / owner (B16), sweep lag, escalation failures; alert rules. | Contract test passes; schemas read back; `promtool` passes. | ⬜ | |
+| OB-S14 | DST: the stored `due_at` and `timezone` equal jurisdiction's answer across both 2026 Europe/London transitions. Needs JR-DST-1. | DST test green. | ⬜ | |
+| OB-S15 | OB-4: re-score the 22 Part E7 rows from OB-S0 and close the open ones (`obligation.updated` scope, partition key, publish-failure metric, caller id collision, dead envelope resolver, invalid status → 400, Location header, URL escaping, compose `depends_on`, Postman). Add the common columns to `obligations`. | Each row ✅ with evidence in `progress.md`. | ⬜ | |
+| OB-S16 | Identity `require`: grep for in-estate callers of `:8088` and put any service caller on an mTLS peer path. Forward the envelope on outbound calls to jurisdiction, registry, authz, evidence and workflow. Then `OBLIGATIONS_IDENTITY_VERIFY=require`. | A header-only call gets 401; the console works. | ⬜ | |
+| OB-S17 | Contract and docs: openapi parity; `SPEC_DEVIATIONS.md` (R-OD-05: no clock pauses; R-OD-06: evidence classes per domain open); `RUNBOOK.md`; `RELEASE_CERTIFICATE.md`; new `scripts/audit.sh`; dated note in Doc 03 §8.5 with the new events. | Parity and contract tests pass. The docs name only things that exist. | ⬜ | |
+| OB-S18 | Live: rebuild the image (host binaries), migrate the dev DB (000015, 000016), recreate the container. | `migrate.py status --db obligations` shows 0 pending. `scripts/audit.sh` green live. | ⬜ | |
+| OB-S19 | Rewrite `e2e-obligations-deps.py` in the house style (urllib, 127.0.0.1, demo ids `11111111-1111-1111-1111-111111111111` / `22222222-…`, envelope logins, exit code = failures). Sections: registry 422/503; jurisdiction validation; evaluate from a trigger with full provenance; HARD_LEGAL due date refused; a short-window clock goes DUE_SOON → DUE → OVERDUE, also with the sweep paused; supersession after publishing a corrected calendar version; waive 403 / 409 / 200; satisfy MISSING then SATISFIED (real vault upload + evidence-requirements); escalation opens a workflow case and queues a notification; Kafka events; outbox; idempotency; RLS cross-tenant; identity `require`; the duplicate routes return 404. | Green live, with no SKIP except a named owner block. | ⬜ | |
+| OB-S20 | Mutants: at least 2 per new control (computed OVERDUE, provenance required, waiver authority, supersession keeps the old clock, satisfy needs evidence). | All killed; the list is in `progress.md`. | ⬜ | |
+| OB-FE-1 | API client for every route (including OB-S12) and the summary route. | vitest covers the client. tsc is clean. | ⬜ | |
+| OB-FE-2 | Page v2.0 per the mock and the table above. | Renders live; layout matches the mock; every command reaches the service; honest empty and error states. | ⬜ | |
+| OB-FE-3 | `tests/e2e/console/obligations.spec.ts`: <br>• an obligation evaluated with a computed deadline, with calendar provenance shown; <br>• waive without authority refused; <br>• the linked workflow / case is shown; <br>• an applicability decision is recorded once; <br>• OVERDUE is shown without the sweep; <br>• empty states, and the unavailable state with the service stopped. | Spec green live; tsc, eslint and vitest clean. | ⬜ | |
+| OB-S21 | Hand-back: S0–S6 evidence in `progress.md`; feature rows set to 🔵 with evidence; the dashboard row updated (never ✅). | The verifier runs the protocol, VC-1 included. | ⬜ | |
+
+**Blocked and decisions:** C8 overlap removal (cross-team: obligation-tracking-svc should emit `contract.obligation.*` per Doc 03 §12.3). D-OB-1 taken 23 Nov (user): ComplianceStatus / ExceptionCase / EscalationRecord are not owned here (step OB-S1). R-OD-05 (which clock classes may pause; none built) and R-OD-06 (evidence classes per domain) go to Legal/Compliance on the decision sheet.
 
 ---
 
@@ -1192,8 +1282,8 @@ Closed on 16 Nov: 1 pack release half (JR-8), 2 UI e2e spec (JR-FE-3), 9 operati
 |---|---|
 | Spec | Doc 03 §8.4; GOV-06; R-001 WFC-01…WFC-05 (WFC-04 here, WFC-05 in obligations); ZS-STATE §11–§14 |
 | Latest score | 36 met / 25 partial / 0 failed of 61 (59.0%, 79.5% weighted) |
-| Stages | `progress.md` (161 lines, 21 Oct); no S0 matrix. Untracked `tmp/` and `workflow_handler_test.bin` in the service folder |
-| Console | `/admin/workflows` legacy |
+| Stages | `progress.md` claims "S0–S6 complete 19 Nov"; the 23 Nov check of the code does not support it (see "Assignment 23 Nov 2026"). Work from the step table below |
+| Console | `/admin/workflows`: draft v2.0 of 19 Nov (`components/admin/workflow/console/*`), unverified, no UI spec |
 
 **Features**
 
@@ -1214,27 +1304,16 @@ Closed on 16 Nov: 1 pack release half (JR-8), 2 UI e2e spec (JR-FE-3), 9 operati
 | D2-6.F13 | ETag/If-Match on 11 mutations (7 instance, 4 definition) | 🟡 | Reconfirm (was ✅): IMPLEMENTATION-PROGRESS API-3 | VC-1 |
 | D2-6.F14 | Audit engagement module: `POST /v1/audit/engagements`, `GET …/{id}`, acceptance (`submit-acceptance`, `acceptance-decision`), `activate`, `amend-scope`, `withdraw`, `mark-fieldwork-complete`, `enter-completion-review`, `mark-report-ready`, `close`, `GET …/completion-gates`; plans `GET/POST …/plan`, `POST /v1/audit/plans/{id}/approve|materiality`, `GET/POST …/risks`; risks `POST /v1/audit/risks/{id}/assess|mark-significant|response|assertions`; workpapers `POST …/workpapers`, `GET /v1/audit/workpapers/{id}`, `POST …/procedures|results|conclusions|evidence-links|cross-references|addenda|mark-prepared|lock`; reviews `POST …/reviews`, `…/reviews/quality`, `GET …/reviews/release-gates`, `POST /v1/audit/review-scopes/{id}/reviewers|notes|sign-off`, `POST /v1/audit/review-notes/{id}/respond|resolve`, `POST /v1/audit/sign-offs/{id}/withdraw`, `POST /v1/audit/quality-reviews/{id}/complete` | 🔵 | Built; not in the Group 2 audit | WF-7 |
 | D2-6.F15 | Forms module: `POST /v1/forms`, `GET …/{id}`, `POST …/publish|retire|drafts`, `GET …/pending-submissions`; submissions `GET /v1/form-submissions/{id}`, `POST …/drafts|validate|submit|supersede|route`, `GET …/validation-result`, `GET …/version` | 🔵 | Built; not in the Group 2 audit | WF-7 |
-| D2-6.F16 | WFC-04 cases (WF-2) | ❌ | Not built | WF-2 |
-| D2-6.F17 | ZS-STATE state-machine registry (ST-1), available actions + transition history (ST-2), no generic status writes (ST-3) | ❌ | Not built | ST-1, ST-2, ST-3 |
+| D2-6.F16 | WFC-04 cases (WF-2) | 🟡 | 19 Nov stub: `000023_cases` (5 states of R-001 §6.3's 8; no notes, confidentiality, merge/split, closure gate, reopen), 5 routes, no tests | WF-S1…WF-S7 |
+| D2-6.F17 | ZS-STATE state-machine registry (ST-1), available actions + transition history (ST-2), no generic status writes (ST-3) | 🟡 | 19 Nov: only `GET /v1/state-machines/{workflow_type}`, `GET /v1/workflows/{id}/available-actions`, `…/transition-history`; no publish/version registry; other objects not covered | WF-S8…WF-S10 |
 | D2-6.F18 | The 25 partial rows: quorum stage lock and `row_version` (L-2); RLS on stages, transitions, quorum tables, outbox, definitions (L-8); per-type approve authority (Q-6); split state model, common columns, event naming (Q-3) | 🟡 | Governance audit, workflow sections (14, 19, 21 Oct) | WF-1 |
 | D2-6.F19 | Business-object owners call `/invalidate` or emit change events (H-5); invoice-approval-svc calls a path that does not exist (N-3) | 🟡 | Other teams' services | Cross-team |
 | D2-6.F20 | Reporting-line and team data for approver independence (H-6) | ⛔ | Needs org-structure data (ORG-05, teammate's org-structure-svc) | Cross-team |
 | D2-6.F21 | Decisions Q-1…Q-6 (WFC scope, binding API surface C4, event catalogue, consumed-event behaviour, service-account vs human approver, approve action codes) | 🧭 | Governance audit register | Decision |
 | D2-6.F22 | Cursor paging (API-4) on pending, definitions, form lists | ❌ | — | WF-5 |
-| D2-6.F23 | Root-context Docker image build, dependency E2E, console v2.0 | ❌ | Not run; no `e2e-workflow-deps.py`; legacy page | WF-8, WF-FE-1…3 |
+| D2-6.F23 | Root-context Docker image build, dependency E2E, console v2.0 | 🟡 | 19 Nov: `e2e-workflow-deps.py` exists but uses wrong demo ids, `localhost`, no envelope; draft console, no UI spec | WF-S18…WF-S19, WF-FE-1…3 |
 
-**Tasks**
-
-- [ ] **WF-0 · Baseline (S0):** remove the untracked `tmp/` and `workflow_handler_test.bin`; matrix in `progress.md` (Doc 03 §8.4, GOV-06, WFC-01…04, ZS-STATE, the 61 audit rows, audit and forms modules); suite with counts.
-- [ ] **WF-1 · Close WFC-01…03 open rows** (IMPLEMENTATION-PLAN §6 WF-1): quorum races, RLS on six tables, definition version pinning, state model, common columns, per-type approve authority. Each row re-scored with evidence.
-- [ ] **WF-5 · Handler tests and API-4:** ROLE stages, definition expansion, escalation-target approval, registry 404/503, Idempotency-Key replay/mismatch, identity-gate override; cursor paging on lists.
-- [ ] **WF-6 · Global `policy.*` events** re-check every tenant (bounded fan-out, test).
-- [ ] **WF-7 · Audit the audit-engagement and forms modules:** authorization at the object (engagement team membership, reviewer ≠ preparer, sign-off independence), If-Match, Idempotency-Key, events, RLS, R5, openapi + parity. Tests `TestAUD_*`, `TestFORM_*`.
-- [ ] **WF-2 · WFC-04 cases** (§6 WF-2).
-- [ ] **ST-1 / ST-2 / ST-3 · State machines** (§6). ST-3 covers identity-context's `PUT /v1/principals/{id}/status` too.
-- [ ] **WF-8 · Live:** build the image from the root context; `scripts/audit.sh`; new `deployments/scripts/e2e-workflow-deps.py` (registry status, authorization approve and delegation, decision-log relay, policy event re-check, invalidate from a business object).
-
-**Console (frontend)** — `app/admin/workflows` (legacy) · clients `lib/api/workflow.ts`, `lib/api/workflow-history.ts` call 19 of 76 routes (Appendix B). Rebuild in v2.0 following "Frontend rules for every console" below. Audit engagements and forms are large: give each its own tab file and drawer forms.
+**Console (frontend)** — `app/admin/workflows` (draft v2.0 of 19 Nov, unverified) · clients `lib/api/workflow.ts`, `lib/api/workflow-history.ts` call 19 of 76 routes (Appendix B). Rebuild in v2.0 following "Frontend rules for every console" below. Audit engagements and forms are large: give each its own tab file and drawer forms.
 
 | Part | Content |
 |---|---|
@@ -1245,16 +1324,35 @@ Closed on 16 Nov: 1 pack release half (JR-8), 2 UI e2e spec (JR-FE-3), 9 operati
 | Drawer commands | Approve / reject (reason, step-up; never shown to the requester), request changes, quorum vote, escalate / escalate-to, cancel, invalidate, verify-release. Definition supersede / activate / suspend / retire. Engagement lifecycle (acceptance, activate, amend scope, fieldwork complete, completion review, report ready, close, withdraw), plan / materiality / risks / assertions, workpapers (procedures, results, conclusions, evidence links, cross-references, addenda, mark prepared, lock; preparer ≠ reviewer), review notes, sign-offs, quality reviews. Form publish / retire / drafts; submission validate / submit / route / supersede |
 | Footer | Required controls: approver independence · one vote per approver · every decision recorded in the decision log · a reason on every action |
 
-**Tasks**
-- [ ] **WF-FE-1 · Summary route + API client** for every route in Appendix B D2-6.
-- [ ] **WF-FE-2 · Page v2.0.**
-- [ ] **WF-FE-3 · UI E2E** `tests/e2e/console/workflows.spec.ts`. Cover:
-  - start → approved by a different user → decision id shown;
-  - the requester never sees Approve;
-  - quorum vote counted once;
-  - an engagement workpaper prepared by one user and reviewed by another;
-  - a form submitted and routed;
-  - empty and unavailable states.
+**Step-by-step plan (23 Nov)** — replaces the WF-0…WF-8 task list. Spec: Doc 03 §8.4; GOV-06; R-001 WFC-01…04 (§3–§6, §8–§12); ZS-STATE §11–§14. The status rules are in "How to use this file", item 5. The cases (WF-S1…S7) come first because obligations escalation opens a case.
+
+| Step | Do | Done when (the verifier re-runs this) | Status | Evidence |
+|---|---|---|---|---|
+| WF-S0 | Baseline (WF-0): `go build`, `go vet` and `go test ./...` with counts; the store suite as NOBYPASSRLS on a scratch DB; migrations 000001…000023 up/down/up on scratch. Write an S0 matrix in `progress.md` scored from this run (Doc 03 §8.4, GOV-06, WFC-01…04, ZS-STATE, the 61 Part E9 rows, the audit and forms modules), and remove claims that do not hold. | The matrix exists, every row carries a test or file:line, and the suite counts are recorded. | ⬜ | |
+| WF-S1 | Cases schema, migration 000024 (R-001 §6, §9, §9.1): <br>• states OPEN / TRIAGED / IN_PROGRESS / WAITING_INTERNAL / WAITING_EXTERNAL / RESOLVED / CLOSED / REOPENED (stub rows mapped: IN_REVIEW→IN_PROGRESS, ESCALATED→IN_PROGRESS + `escalated_at`); <br>• `case_family` (FINANCIAL, PAYROLL_HR, LEGAL_COMPLIANCE, SECURITY_PRIVACY, OPERATIONAL), severity, confidentiality (INTERNAL / RESTRICTED / PRIVILEGED); <br>• `case_members`, append-only `case_notes` (versioned, visibility, evidence refs), `case_links` (domain refs, read-only); <br>• `case_work_items` (mandatory; OPEN / SATISFIED / WAIVED / TRANSFERRED); <br>• `canonical_case_id` + `case_aliases`, `split_from_case_id`, `case_transitions` (append-only by trigger); <br>• the common columns; FORCE RLS with WITH CHECK on every table. | up/down/up on scratch with seeded stub rows. An RLS test runs as NOBYPASSRLS. An append-only trigger test passes. | ⬜ | |
+| WF-S2 | Case commands. Routes: <br>• `POST/GET /v1/cases`, `GET …/{id}`; <br>• `POST …/{id}/triage`, `…/start`, `…/wait`, `…/resume`, `…/resolve`, `…/close`, `…/reopen`, `…/merge`, `…/split`; <br>• `POST/GET …/notes`, `POST …/work-items`, `…/work-items/{wid}/satisfy`, `…/waive`, `…/transfer`; <br>• `POST/DELETE …/members`. <br>If-Match and Idempotency-Key on every command. Actions CASE_OPEN / _READ / _TRIAGE / _UPDATE / _RESOLVE / _CLOSE / _REOPEN / _MERGE / _SPLIT / _NOTE, registered by an access-control migration and granted in `seed-demo-rbac.ps1`. | Test per §6.3 transition and per refused edge (`TestWF2_*`). A stale If-Match gets 412. A replay returns 200 with the same body; a changed body gets 409. | ⬜ | |
+| WF-S3 | Closure gate: resolve needs an outcome code and evidence. Close needs every mandatory work item SATISFIED, WAIVED or TRANSFERRED. Reopen needs a reason and re-establishes the owner. Severity never changes a linked due date. | Close is refused (409) while mandatory work is open, and allowed after. Mutant "gate skipped" killed. | ⬜ | |
+| WF-S4 | Merge / split lineage. A merge sets `canonical_case_id` and keeps aliases. A split keeps the source link and the evidence scope. A cross-tenant merge is refused and recorded as a security event (NP-11). | Lineage tests. The cross-tenant merge gets 404/409 and the event is written. | ⬜ | |
+| WF-S5 | Confidentiality: a RESTRICTED or PRIVILEGED case and its notes are readable only by members. For others the case is 404 and absent from lists. Note visibility is enforced in the store, not in the UI. | A non-member gets 404 on GET, notes and transitions, and the list excludes the case. Mutant "membership not checked" killed. | ⬜ | |
+| WF-S6 | Case events `case.opened` / `.triaged` / `.waiting` / `.resolved` / `.closed` / `.reopened` / `.merged` / `.split` through the outbox, with the R-001 §10.3 envelope fields. Declare them in `asyncapi.yaml` and register their schemas in schema-registry. | The two-way asyncapi contract test passes. The schemas can be read back from the registry. | ⬜ | |
+| WF-S7 | A case opened from an obligation milestone is idempotent on `(source_type, source_id, milestone)`. This is the entry point for OB-S11. | Two identical opens give one case (test). | ⬜ | |
+| WF-S8 | ST-1 registry: `state_machine_definitions` (object_type, semver, states, terminal states, transitions with guard and required-evidence names, checksum), immutable once PUBLISHED (trigger). Routes: `POST /v1/state-machines`, `POST …/{id}/publish`, `GET /v1/state-machines?object_type=`, `GET …/{object_type}/versions/{semver}`. Seed definitions for instance, definition, case, form submission and engagement. | An update of a published row is refused by the DB (test). A new version coexists with objects on the old one. | ⬜ | |
+| WF-S9 | ST-2 on every lifecycle object here (instance, definition, case, form, submission, engagement, workpaper): `GET …/available-actions` (evaluated for the caller) and `GET …/transitions` (append-only; from/to, command, actor, versions, reason, evidence, correlation, `state_machine_version`). | A route and a test per object. An append-only trigger test per transitions table. | ⬜ | |
+| WF-S10 | ST-3: every write that takes a free target state becomes a named command. The old route stays as an alias with a `Deprecation` header. | No handler accepts an arbitrary state string (test over the router). | ⬜ | |
+| WF-S11 | WF-1 open rows (F18), re-checked against WF-S0: quorum stage lock and `row_version` (L-2); FORCE RLS with WITH CHECK on stages, transitions, quorum, outbox and definitions (L-8); instances pinned to an immutable definition version (R-INV-01/02); per-type approve authority `WORKFLOW_APPROVE:<workflow_type>` beside the generic action (Q-6); common columns. | Each F18 row re-scored with a test. 10 parallel votes count once. A running instance keeps its version after a supersede. | ⬜ | |
+| WF-S12 | WF-5 handler tests (ROLE stages, definition expansion, escalation-target approval, registry 404/503, Idempotency-Key replay/mismatch, identity-gate override) and API-4 cursor paging on pending, definitions, forms and cases. | `TestWF5_*` pass. A forged cursor gets 400. | ⬜ | |
+| WF-S13 | WF-6: a tenantless `policy.*` event re-checks every tenant with live instances, in bounded, resumable batches. | Test with 3 tenants and a crash mid-batch: every tenant is re-checked exactly once. | ⬜ | |
+| WF-S14 | WF-7 audit-engagement and forms modules: object authorization (team membership, reviewer ≠ preparer, sign-off independence), If-Match, Idempotency-Key, events, RLS, R5 registration. Merge `openapi.biz04-forms.yaml` into `openapi.yaml`. | `TestAUD_*` and `TestFORM_*` pass. The parity test covers every route. | ⬜ | |
+| WF-S15 | WF-9, the R-001 §10.1 surface: `POST /v1/workflows/{id}/commands/cancel` as an alias of cancel; `POST /v1/cases/{id}/resolve` (WF-S2). Write the mapping table for work-items / approvals / operator-actions into `SPEC_DEVIATIONS.md`, and add decision Q-1/C4 to the Part F2 decision sheet. | The aliases have parity tests. The table and the sheet row exist. | ⬜ | |
+| WF-S16 | Identity `require` (X5): an mTLS listener `:8451` with `IDENTITY_PEERS=policy-svc,obligations-svc` (the GDL `:8450` pattern, shared `mtlsclient`); add workflow-svc to the keygen list; point policy-svc's signature-workflow client at it. Then `WORKFLOW_IDENTITY_VERIFY=require`. invoice-approval-svc (teammate) goes to the cross-team list. | A header-only call gets 401. The policy-svc signature workflow passes over mTLS (`e2e-policy-deps.py` workflow section green). | ⬜ | |
+| WF-S17 | Contract and docs: openapi parity; asyncapi two-way test; `SPEC_DEVIATIONS.md`, `RUNBOOK.md`, `RELEASE_CERTIFICATE.md`; new or updated `scripts/audit.sh`; a dated note in Doc 03 §8.4. | The parity and contract tests pass. The docs name only routes, tables and metrics that exist. | ⬜ | |
+| WF-S18 | Live: rebuild the image (host binaries over `deployments-workflow-svc:base`), migrate the dev DB, recreate the container. | `migrate.py status --db workflow` shows 0 pending. `scripts/audit.sh` green live. | ⬜ | |
+| WF-S19 | Rewrite `e2e-workflow-deps.py` in the house style (urllib, 127.0.0.1, demo ids, envelope logins, check/skip counts, exit code = failures). Sections: registry 404/503; start with the definition pinned; approval by another user with `access_decision_id`; delegation; the requester never approves; quorum under 10 parallel votes; escalate / escalate-to / short expiry timer; invalidate from a business-object change; decision-log relay (row in GDL); policy event re-check; signature workflow from a policy decision; cases full lifecycle, RESTRICTED, closure gate, merge/split; state-machine immutability; forms submit/route; engagement preparer ≠ reviewer; RLS cross-tenant; Kafka events; identity `require`. | Green live, with no SKIP except a named owner block. | ⬜ | |
+| WF-S20 | Mutants: at least 2 per new control (closure gate, restricted read, cross-tenant merge, published state machine, quorum once). | All killed; the list is in `progress.md`. | ⬜ | |
+| WF-FE-1 | Backend `GET /v1/workflows/summary` (the KPIs below) and an API client for every route in Appendix B D2-6 plus the WF-S routes. | vitest covers the client. tsc is clean. | ⬜ | |
+| WF-FE-2 | Page v2.0 on the console kit: header, KPIs, panels and tabs as in the table above, plus Cases and State machines tabs; drawer commands with reason and step-up; live data and honest empty/error states. | It renders live with no error page, and every drawer command reaches the service. | ⬜ | |
+| WF-FE-3 | `tests/e2e/console/workflows.spec.ts`: <br>• start → approved by another user → decision id shown; <br>• the requester never sees Approve; <br>• a quorum vote counts once; <br>• case open → triage → close refused with open mandatory work → close; <br>• a RESTRICTED case is invisible to a non-member; <br>• a workpaper prepared by one user is reviewed by another; <br>• a form is submitted and routed; <br>• empty states, and the unavailable state with the service stopped. | Spec green live. tsc, eslint and vitest clean. | ⬜ | |
+| WF-S21 | Hand-back: S0–S6 evidence in `progress.md`; feature rows F01–F23 set to 🔵 with evidence; the dashboard row updated (never ✅). | The verifier runs the protocol, VC-1 included. | ⬜ | |
 
 **Blocked and decisions:** H-6 org data; Q-1…Q-6; H-5 / N-3 (cross-team).
 
@@ -1268,7 +1366,7 @@ Closed on 16 Nov: 1 pack release half (JR-8), 2 UI e2e spec (JR-FE-3), 9 operati
 |---|---|
 | Spec | Doc 03 §8.6 |
 | Latest score | 39 met / 1 partial / 3 failed of 43 on 2 Nov; 5 Nov completion pass closed the in-service rows (Governance audit → "evidence-requirements-svc completion, 5 November 2026") |
-| Stages | S0–S6 verified 5 Nov: `scripts/audit.sh` 42/42, dependency E2E 84/84 (3 owner-blocked skips); PBC object authorization added and verified (`0e11a571`) Reconfirm in VC-1 |
+| Stages | S0–S6 verified 5 Nov: `scripts/audit.sh` 42/42, dependency E2E 84/84 (3 owner-blocked skips); PBC object authorization added and verified (`0e11a571`). The 18 Nov `progress.md` claims for ER-W4…W8 are only partly true (23 Nov check: skip paths remain, compose still `warn`, clamav `latest`). Work from the step table below |
 | Console | `/admin/evidence` v2.0 (5 Nov) |
 
 **Features**
@@ -1291,31 +1389,25 @@ Closed on 16 Nov: 1 pack release half (JR-8), 2 UI e2e spec (JR-FE-3), 9 operati
 | D2-7.F14 | Decisions: tier (D-ER-1), scan-result ownership (D-ER-2), which document/signature statuses count (D-ER-3), GOV-07 linkage | 🧭 | SPEC_DEVIATIONS | Decision |
 | D2-7.F15 | Console `/admin/evidence` v2.0 | 🟡 | Manager side verified 5 Nov (ER-FE-2). The assignee side (view, respond, notes) and response acknowledge are not in the console (Appendix B) | ER-FE-3, ER-FE-4 |
 
-**Tasks** (W3–W7 of the 5 Nov plan that were not run)
-
-- [ ] **ER-W3 · 000047 proof:** covered by AC-0 (store suite, up/down/up, apply to the dev DB). Then a real manifest counts towards SATISFIED.
-- [ ] **ER-W4 · Compose fixes:** document-vault `DB_USER: "${DB_USER_DOCUMENT_VAULT:-app_document_vault}"` with the password from `create-app-roles.sh`; `CLAMAV_URL`; a `clamav/clamav:1.4.1` service with `profiles: ["scan"]`, `mem_limit` and a clamd healthcheck; gateway admin token init container (same as GW-9). Check with `docker compose -p deployments config`.
-- [ ] **ER-W5 · Register event schemas:** `services/evidence-requirements-svc/schemas/evidence.requirement.{satisfied,missing}.v1.json` from `asyncapi.yaml` 1.1.0; `deployments/scripts/register-evidence-requirements-schemas.py` (fixed Idempotency-Key per event + version; the principal that holds schema-publish).
-- [ ] **ER-W6 · E2E:** remove the manifest and upload skips (real vault upload with clamd; real manifest); add a PBC authorization section (outsider 403 on GET/view/notes/acknowledge; assignee GET + view; AUDIT_ONLY by assignee 403, by manager 201; outsider view leaves the ETag unchanged); add a schema-registry section. Only the esignature skip may remain.
-- [ ] **ER-W7 · Docs:** `progress.md`, `context.md` §4 and §9 rewritten from the code, `SPEC_DEVIATIONS.md` (D-ER-27 amended, D-ER-29, D-ER-5 caller logging, D-ER-24), `RUNBOOK.md`, `RELEASE_CERTIFICATE.md`; re-score Governance audit rows 9/10/11/21 with file:line.
-- [ ] **ER-W8 · Enforce:** once callers send envelopes (F13), set `EVIDENCE_EVALUATE_AUTHZ` and `EVIDENCE_IDENTITY_VERIFY` to enforce/require in compose and prove a header-only call is refused.
-
 **Console (frontend)** — `app/admin/evidence` (v2.0, 5 Nov) · client `lib/api/evidence.ts` calls 18 of 22 routes (Appendix B). The manager side exists. The assignee side is missing.
 
-**Tasks**
-- [ ] **ER-FE-3 · Assignee side:**
-  - "My evidence requests": the register filtered to requests assigned to the signed-in principal.
-  - Opening a request records the view (`POST …/view`; assignee only).
-  - Respond: upload through document-vault-svc, then `POST …/responses`.
-  - SHARED notes (`POST …/notes`).
-  - Manager: Acknowledge on a response (`POST /v1/pbc/responses/{id}/acknowledge`).
-- [ ] **ER-FE-4 · UI E2E** `tests/e2e/console/evidence.spec.ts`. Cover:
-  - manager creates and sends;
-  - the assignee views, responds and notes;
-  - the manager acknowledges and marks satisfied;
-  - an outsider cannot open the request;
-  - evaluate shows SATISFIED;
-  - empty and unavailable states.
+**Step-by-step plan (23 Nov)** — replaces the ER-W3…ER-W8 and ER-FE-3/4 task lists. Spec: Doc 03 §8.6. The service was verified on 5 Nov; what is left is proof, enforcement and the assignee side of the console. The status rules are in "How to use this file", item 5.
+
+| Step | Do | Done when (the verifier re-runs this) | Status | Evidence |
+|---|---|---|---|---|
+| ER-S0 | Re-baseline (ER-0): check every 18 Nov claim in `progress.md` against the code and the scripts. Remove the claims that do not hold ("zero skips", ER-W8 done). Point the plan reference at this section (`EVIDENCE-REQUIREMENTS-PLAN-2026-11-04.md` was merged here on 6 Nov). Build, vet, test with counts; store suite as NOBYPASSRLS. | `progress.md` matches the code; counts recorded. | ⬜ | |
+| ER-S1 | ER-W3: access-control 000047. Run its store suite, up/down/up on scratch, and apply it to the dev DB as a single file with `psql` (never `migrate.py up --db access_control` blindly). | A real evidence manifest counts towards SATISFIED (e2e section). | ⬜ | |
+| ER-S2 | ER-W4 compose: `clamav/clamav:1.4.1` (not `latest`) under `profiles: ["scan"]`, with `mem_limit` and a clamd healthcheck; document-vault `DB_USER` `app_document_vault` with the password from `create-app-roles.sh`; `CLAMAV_URL`. | `docker compose -p deployments config` passes; clamd is healthy with `--profile scan`. | ⬜ | |
+| ER-S3 | ER-W5: run `register-evidence-requirements-schemas.py` live as the principal holding schema-publish. | Both v1 schemas read back from schema-registry; a second run changes nothing. | ⬜ | |
+| ER-S4 | ER-W6 e2e: real vault upload through clamd and a real manifest, so the two skip branches cannot fire on a healthy stack. PBC authorization section: an outsider gets 403 on GET / view / notes / acknowledge; the assignee can GET and view; AUDIT_ONLY notes give 403 to the assignee and 201 to the manager; an outsider's view leaves the ETag unchanged. Schema-registry section. Every call signed in through identity-context. | Green live. The only SKIP left is esignature (ER-S5). | ⬜ | |
+| ER-S5 | esignature: bring `esignature-integration-svc` up alone from the phase7 compose. If it runs, add the real-envelope SATISFIED / unknown-envelope MISSING checks and drop the last skip. Otherwise set F09 ⛔ with the reason. | Section green, or ⛔ recorded with the failure. | ⬜ | |
+| ER-S6 | ST-2 for the PBC request: `GET /v1/pbc/requests/{id}/available-actions` and `…/transitions`, if missing. | Route tests; openapi parity. | ⬜ | |
+| ER-S7 | ER-W8 enforce. Our caller obligations-svc forwards the envelope (OB-S16) or calls over mTLS as an `IDENTITY_PEERS` workload. Prove a header-only call is refused under `EVIDENCE_IDENTITY_VERIFY=require` + `EVIDENCE_EVALUATE_AUTHZ=enforce` (an e2e "strict mode" section that recreates the service strict). The 7 teammate callers (general-ledger, vat-gst, corporate-tax, filing-preparation, financial-close, corporate-actions, board-resolutions) still send headers only (F13). The compose default turns strict only when none of them would break; until then, record a SPEC_DEVIATIONS line and draft request CT-8 in Part F3. | The strict section is green; the deviation and CT-8 exist. | ⬜ | |
+| ER-S8 | ER-W7 docs: `context.md` §4/§9, `SPEC_DEVIATIONS.md` (D-ER-5/24/27/29), `RUNBOOK.md`, `RELEASE_CERTIFICATE.md` rewritten from the code. Re-score Governance-audit rows 9/10/11/21 with file:line. | The docs name only routes, tables and metrics that exist. | ⬜ | |
+| ER-S9 | Live: rebuild and recreate; `scripts/audit.sh`; re-run the 3 mutants of 5 Nov plus 2 for any new control. | `audit.sh` green; mutants killed. | ⬜ | |
+| ER-FE-3 | Assignee side: <br>• "My evidence requests" (requests assigned to the signed-in principal); <br>• opening a request records the view (`POST …/view`, assignee only); <br>• respond: upload through document-vault-svc, then `POST …/responses`; <br>• SHARED notes (`POST …/notes`); <br>• the manager acknowledges a response (`POST /v1/pbc/responses/{id}/acknowledge`). | Works live as legal counsel (assignee) and admin (manager). | ⬜ | |
+| ER-FE-4 | `tests/e2e/console/evidence.spec.ts`: <br>• the manager creates and sends; <br>• the assignee views, responds and adds a note; <br>• the manager acknowledges and marks satisfied; <br>• an outsider cannot open the request; <br>• evaluate shows SATISFIED; <br>• empty states, and the unavailable state with the service stopped. | Spec green live; tsc, eslint and vitest clean. | ⬜ | |
+| ER-S10 | Hand-back: S0–S6 evidence in `progress.md`; feature rows set to 🔵 with evidence; the dashboard row updated (never ✅). | The verifier runs the protocol, VC-1 included. | ⬜ | |
 
 **Blocked and decisions:** esignature live (phase7 stack); GL ungated paths and bearer forwarding (cross-team); D-ER-1/2/3.
 
@@ -1823,6 +1915,8 @@ A service is finished end to end only when its console drives every screen-relev
 ---
 
 # Execution order (one service per session)
+
+**Current assignment (23 Nov 2026):** D2-6, D2-4 and D2-7, run through the step tables in "Assignment 23 Nov 2026" (Phase 0 first). The session list below is the original order.
 
 The implementing model runs one service per session, in this order, and stops at that service's hand-back. A session covers the service's backend tasks and its console tasks (`*-FE-*`), so each service comes back finished end to end. Claude then runs the verifier protocol below before the next service starts.
 
@@ -5026,6 +5120,7 @@ admin-token volume mounted where a file is expected).
 
 | Date | Task | Decision | Why |
 |---|---|---|---|
+| 2026-11-23 | D-OB-1 (OB-S1) | obligations-svc does not own ComplianceStatus, ExceptionCase or EscalationRecord; the 000013 tables and 11 routes added on 18 Nov are removed. It keeps the clock escalation of R-001 §9 (`escalation_policy`, `escalation_event`); an overdue clock opens a WFC-04 case in workflow-svc and emits `obligation.*` events | Doc 03 §13.7 and §13.9 name compliance-status-svc and exception-escalation-svc as owners, and §18 allows one owner per object. Decided by the user on 23 Nov |
 | 2026-10-23 | P0-2 | Created `JURISDICTION_COMPLIANCE_OFFICER` (TENANT, v1) carrying `JURISDICTION_SUPPORT_VIEW` + `JURISDICTION_RULE_VALIDATE` instead of extending an existing template | The plan assumes a template already carries the other `JURISDICTION_*` read actions; none did (queried `role_template_versions` in a fresh DB: 0 rows matching `JURISDICTION%`). Adding the validation POST to `VIEWER_AUDITOR_READ_ONLY` would put a verb into the read-only archetype; a dedicated tenant-scope template is the closest safe fit. |
 | 2026-10-27 | API-2 | Envelope refusals are rewritten by the shared `apicontract.EnvelopeRefusals` rather than by editing each vendored `internal/envelope/middleware.go` | The vendored copy comes from `services/_contract`, and a rollout would overwrite local edits. Changing the generator would touch every teammate's service (R1). |
 | 2026-10-28 | API-2 | policy-svc keeps `code` = the §16 class and adds the specific refusal as `reason_code` | `code` was already the class before API-2 (`{"error": specific, "code": class}`), and callers and tests match on it. Swapping it to the specific code would break them, and dropping the specific code lost information. |

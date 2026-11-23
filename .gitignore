@@ -32,6 +32,12 @@ services/*/*.exe
 deployments/supabase/supabase-bootstrap
 deployments/supabase/supabase-bootstrap.exe
 
+# Stray compiled binaries and scratch files never committed (P0-1, 23 Nov):
+*.bak
+*.tmp
+*.utf8
+*.exe
+
 # tools/servicectl's binary cache. One compiled binary per service, ~15 MB
 # each, rebuilt whenever a service's sources are newer than the cached copy.
 # Roughly 1.3 GB with all 86 built, which is a build artifact and not something
