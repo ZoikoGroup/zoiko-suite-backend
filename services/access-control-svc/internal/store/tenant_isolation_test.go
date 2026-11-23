@@ -585,11 +585,14 @@ func TestStoreUpdateCannotCrossTenants(t *testing.T) {
 // does.
 func TestOutboxPolicyAdmitsTheRelayAndNobodyElse(t *testing.T) {
 	ctx := context.Background()
-	seedOutbox(t, tenantA, "role.updated")
-	seedOutbox(t, tenantB, "role.updated")
+	// Fresh tenants: tenantA / tenantB collect outbox rows from every other
+	// test, so on a reused database "exactly one row" counted them too.
+	tA, tB := uuid.NewString(), uuid.NewString()
+	seedOutbox(t, tA, "role.updated")
+	seedOutbox(t, tB, "role.updated")
 
 	// Scoped to tenant A: only tenant A's row is visible.
-	scoped := countOutbox(t, "SELECT set_config('app.tenant_id', '"+tenantA+"', true)")
+	scoped := countOutbox(t, "SELECT set_config('app.tenant_id', '"+tA+"', true)")
 	require.Equal(t, 1, scoped, "a tenant-scoped reader saw another tenant's outbox rows")
 
 	// Unscoped: nothing at all. Fail-closed by SQL semantics.

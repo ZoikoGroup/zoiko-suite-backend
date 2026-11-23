@@ -23,20 +23,48 @@ INSERT INTO role_templates (template_code, template_name, default_intent, role_s
 ON CONFLICT (template_code) DO NOTHING;
 
 -- New versions, never edits: roles on an earlier version move only by an
--- explicit upgrade.
+-- explicit upgrade. Each new version is the template's latest version plus
+-- the clock actions (000046/000047 already published OBLIGATION_MANAGER v2/v3
+-- and COMPLIANCE_CATALOGUE_ADMINISTRATOR v2), so the next number and the
+-- inherited actions are read, not assumed.
+INSERT INTO role_template_versions (template_code, template_version, permitted_actions, change_note, published_by)
+SELECT v.template_code, v.template_version + 1,
+       ARRAY(SELECT DISTINCT a FROM unnest(v.permitted_actions || x.extra) AS a ORDER BY a),
+       x.note, 'migration:000062'
+  FROM (VALUES
+        ('OBLIGATION_MANAGER', ARRAY['OBLIGATION_CLOCK_CREATE','OBLIGATION_CLOCK_SATISFY','OBLIGATION_CLOCK_RECALCULATE'],
+         'Adds the WFC-05 deadline-clock actions (start, fulfil, recalculate)'),
+        ('COMPLIANCE_CATALOGUE_ADMINISTRATOR', ARRAY['OBLIGATION_ESCALATION_POLICY_MANAGE'],
+         'Adds clock escalation policies')
+       ) AS x(code, extra, note)
+  JOIN role_template_versions v ON v.template_code = x.code
+ WHERE v.template_version = (SELECT max(template_version) FROM role_template_versions m WHERE m.template_code = x.code)
+   AND NOT EXISTS (SELECT 1 FROM role_template_versions d WHERE d.template_code = x.code AND d.published_by = 'migration:000062');
+
 INSERT INTO role_template_versions (template_code, template_version, permitted_actions, change_note, published_by) VALUES
-    ('OBLIGATION_MANAGER', 2, ARRAY['OBLIGATION_READ','OBLIGATION_CREATE','OBLIGATION_UPDATE','OBLIGATION_STATUS_UPDATE',
-                                    'FILING_REQUIREMENT_READ','FILING_REQUIREMENT_CREATE','FILING_REQUIREMENT_STATUS_UPDATE',
-                                    'OBLIGATION_DEFINITION_READ','EVIDENCE_EVALUATE','EVIDENCE_REQUIREMENT_READ','EVIDENCE_EVALUATION_READ',
-                                    'OBLIGATION_CLOCK_CREATE','OBLIGATION_CLOCK_SATISFY','OBLIGATION_CLOCK_RECALCULATE'],
-     'Adds the WFC-05 deadline-clock actions (start, fulfil, recalculate)', 'migration:000062'),
     ('OBLIGATION_AUTHORITY', 1, ARRAY['OBLIGATION_READ','OBLIGATION_CLOCK_WAIVE','OBLIGATION_CLOCK_NOT_APPLICABLE','APPLICABILITY_DECISION_READ'],
-     'Initial template (WFC-05 waiver and not-applicable authority)', 'migration:000062'),
-    ('COMPLIANCE_CATALOGUE_ADMINISTRATOR', 2, ARRAY['OBLIGATION_DEFINITION_READ','OBLIGATION_DEFINITION_MANAGE','OBLIGATION_ENTITY_MAPPING_MANAGE',
-                                    'EVIDENCE_REQUIREMENT_READ','EVIDENCE_REQUIREMENT_CREATE','EVIDENCE_REQUIREMENT_RETIRE',
-                                    'OBLIGATION_ESCALATION_POLICY_MANAGE'],
-     'Adds clock escalation policies', 'migration:000062')
+     'Initial template (WFC-05 waiver and not-applicable authority)', 'migration:000062')
 ON CONFLICT (template_code, template_version) DO NOTHING;
+
+-- The three templates now carry the actions in their latest version; a
+-- silent skip (ON CONFLICT on a taken number) fails the migration instead.
+DO $$
+DECLARE missing TEXT;
+BEGIN
+    SELECT string_agg(x.code || ':' || x.action, ', ') INTO missing
+      FROM (VALUES ('OBLIGATION_MANAGER', 'OBLIGATION_CLOCK_CREATE'), ('OBLIGATION_MANAGER', 'OBLIGATION_CLOCK_SATISFY'),
+                   ('OBLIGATION_MANAGER', 'OBLIGATION_CLOCK_RECALCULATE'),
+                   ('COMPLIANCE_CATALOGUE_ADMINISTRATOR', 'OBLIGATION_ESCALATION_POLICY_MANAGE'),
+                   ('OBLIGATION_AUTHORITY', 'OBLIGATION_CLOCK_WAIVE'), ('OBLIGATION_AUTHORITY', 'OBLIGATION_CLOCK_NOT_APPLICABLE')) AS x(code, action)
+     WHERE NOT EXISTS (SELECT 1 FROM role_template_versions v
+                        WHERE v.template_code = x.code
+                          AND v.template_version = (SELECT max(template_version) FROM role_template_versions m WHERE m.template_code = x.code)
+                          AND x.action = ANY (v.permitted_actions));
+    IF missing IS NOT NULL THEN
+        RAISE EXCEPTION '000062: the latest template versions do not carry %', missing;
+    END IF;
+END
+$$;
 
 DO $$
 DECLARE missing TEXT;
