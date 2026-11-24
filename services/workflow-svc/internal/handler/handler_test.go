@@ -198,6 +198,16 @@ type stubStore struct {
 	// WFC-02: Work Items (WF-S23)
 	workItem    *domain.WorkItem
 	workItemErr error
+
+	// WF-S24: Operator Repair
+	operatorAction    *domain.OperatorAction
+	operatorActionErr error
+
+	// WF-S25: Emergency Approval
+	emergencyApproval      *domain.EmergencyApproval
+	emergencyApprovalErr   error
+	breakGlassSessionValid bool
+	breakGlassSessionErr   error
 }
 
 func (s *stubStore) CreateForm(_ context.Context, _ domain.CreateFormParams) (*domain.FormDefinition, bool, error) {
@@ -516,6 +526,33 @@ func (s *stubStore) InvalidateWorkflow(_ context.Context, _ domain.InvalidateWor
 }
 func (s *stubStore) VerifyRelease(_ context.Context, _ domain.VerifyReleaseParams) (*domain.ReleaseVerificationResult, error) {
 	return s.verifyReleaseResult, s.verifyReleaseErr
+}
+func (s *stubStore) CreateOperatorAction(_ context.Context, _ domain.CreateOperatorActionParams) (*domain.OperatorAction, error) {
+	return s.operatorAction, s.operatorActionErr
+}
+func (s *stubStore) GetOperatorAction(_ context.Context, _ string) (*domain.OperatorAction, error) {
+	return s.operatorAction, s.operatorActionErr
+}
+func (s *stubStore) ListOperatorActions(_ context.Context, _ string, _ domain.ListOperatorActionsFilter) ([]*domain.OperatorAction, *domain.PaginationCursor, error) {
+	return []*domain.OperatorAction{s.operatorAction}, nil, s.operatorActionErr
+}
+func (s *stubStore) ApproveOperatorAction(_ context.Context, _ domain.ApproveOperatorActionParams) (*domain.OperatorAction, error) {
+	return s.operatorAction, s.operatorActionErr
+}
+func (s *stubStore) ExecuteOperatorAction(_ context.Context, _ domain.ExecuteOperatorActionParams) (*domain.OperatorAction, error) {
+	return s.operatorAction, s.operatorActionErr
+}
+func (s *stubStore) CreateEmergencyApproval(_ context.Context, _ domain.CreateEmergencyApprovalParams) (*domain.EmergencyApproval, error) {
+	return s.emergencyApproval, s.emergencyApprovalErr
+}
+func (s *stubStore) GetEmergencyApproval(_ context.Context, _ string) (*domain.EmergencyApproval, error) {
+	return s.emergencyApproval, s.emergencyApprovalErr
+}
+func (s *stubStore) ListEmergencyApprovals(_ context.Context, _ string, _ domain.ListEmergencyApprovalsFilter) ([]*domain.EmergencyApproval, *domain.PaginationCursor, error) {
+	return []*domain.EmergencyApproval{s.emergencyApproval}, nil, s.emergencyApprovalErr
+}
+func (s *stubStore) CheckBreakGlassSession(_ context.Context, _ string) (bool, error) {
+	return s.breakGlassSessionValid, s.breakGlassSessionErr
 }
 func (s *stubStore) CreateAuditEngagement(_ context.Context, _ domain.CreateAuditEngagementParams) (*domain.AuditEngagement, bool, error) {
 	return s.auditEngagement, s.auditCreateCreated, s.auditCreateErr

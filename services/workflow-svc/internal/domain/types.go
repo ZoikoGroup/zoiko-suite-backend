@@ -1168,3 +1168,152 @@ type TransitionHistoryEntry struct {
 
 // ErrNoStateMachine is returned when no state machine is registered for a workflow type.
 var ErrNoStateMachine = errorString("no state machine registered for workflow type")
+
+// =============================================================================
+// WF-S24: Operator Repair (F30)
+// =============================================================================
+
+// OperatorActionKind represents the type of operator repair action.
+type OperatorActionKind string
+
+const (
+	OperatorActionRetryTimer          OperatorActionKind = "RETRY_TIMER"
+	OperatorActionRecomputeNextAction OperatorActionKind = "RECOMPUTE_NEXT_ACTION"
+	OperatorActionForceEscalate       OperatorActionKind = "FORCE_ESCALATE"
+	OperatorActionForceExpire         OperatorActionKind = "FORCE_EXPIRE"
+	OperatorActionRequeueParkedEvent  OperatorActionKind = "REQUEUE_PARKED_EVENT"
+	OperatorActionReleaseClaim        OperatorActionKind = "RELEASE_CLAIM"
+)
+
+// OperatorActionStatus represents the status of an operator action.
+type OperatorActionStatus string
+
+const (
+	OperatorActionStatusPending  OperatorActionStatus = "PENDING"
+	OperatorActionStatusApproved OperatorActionStatus = "APPROVED"
+	OperatorActionStatusRejected OperatorActionStatus = "REJECTED"
+	OperatorActionStatusExecuted OperatorActionStatus = "EXECUTED"
+	OperatorActionStatusExpired  OperatorActionStatus = "EXPIRED"
+)
+
+// OperatorAction represents an operator repair action.
+type OperatorAction struct {
+	OperatorActionID   string               `json:"operator_action_id"`
+	TenantID           string               `json:"tenant_id"`
+	WorkflowInstanceID string               `json:"workflow_instance_id"`
+	Kind               OperatorActionKind   `json:"kind"`
+	Status             OperatorActionStatus `json:"status"`
+	Reason             string               `json:"reason"`
+	Scope              *string              `json:"scope,omitempty"`
+	EvidenceRefs       []string             `json:"evidence_refs"`
+	RequestedBy        string               `json:"requested_by"`
+	RequestedAt        time.Time            `json:"requested_at"`
+	ApprovedBy         *string              `json:"approved_by,omitempty"`
+	ApprovedAt         *time.Time           `json:"approved_at,omitempty"`
+	ExecutedAt         *time.Time           `json:"executed_at,omitempty"`
+	ExecutionResult    *string              `json:"execution_result,omitempty"`
+	CreatedAt          time.Time            `json:"created_at"`
+	UpdatedAt          time.Time            `json:"updated_at"`
+	RowVersion         int                  `json:"row_version"`
+}
+
+type CreateOperatorActionParams struct {
+	WorkflowInstanceID string
+	Kind               OperatorActionKind
+	Reason             string
+	Scope              *string
+	EvidenceRefs       []string
+	ActorPrincipalID   string
+	CorrelationID      string
+	Meta               CommandMeta
+}
+
+type ApproveOperatorActionParams struct {
+	OperatorActionID string
+	ActorPrincipalID string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+type ExecuteOperatorActionParams struct {
+	OperatorActionID string
+	ActorPrincipalID string
+	CorrelationID    string
+	ExecutionResult  string
+	Meta             CommandMeta
+}
+
+type ListOperatorActionsFilter struct {
+	TenantID           string
+	WorkflowInstanceID *string
+	Status             OperatorActionStatus
+	Kind               OperatorActionKind
+	Limit              int
+	Cursor             *PaginationCursor
+}
+
+var ErrOperatorActionNotFound = errorString("operator action not found")
+var ErrOperatorActionRequiresApproval = errorString("operator action requires second-person approval")
+var ErrOperatorActionRequesterCannotApprove = errorString("requester cannot approve their own operator action")
+
+// =============================================================================
+// WF-S25: Emergency Approval (F31)
+// =============================================================================
+
+// EmergencyCondition represents the condition an emergency approval bypasses.
+type EmergencyCondition string
+
+const (
+	EmergencyConditionQuorum EmergencyCondition = "QUORUM"
+	EmergencyConditionTiming EmergencyCondition = "TIMING"
+)
+
+// EmergencyApproval represents an emergency approval.
+type EmergencyApproval struct {
+	EmergencyApprovalID string               `json:"emergency_approval_id"`
+	TenantID            string               `json:"tenant_id"`
+	LegalEntityID       string               `json:"legal_entity_id"`
+	WorkflowInstanceID  string               `json:"workflow_instance_id"`
+	BreakGlassSessionID string               `json:"break_glass_session_id"`
+	WindowStart         time.Time            `json:"window_start"`
+	WindowEnd           time.Time            `json:"window_end"`
+	ReasonCode          string               `json:"reason_code"`
+	IncidentRef         *string              `json:"incident_ref,omitempty"`
+	Scope               *string              `json:"scope,omitempty"`
+	MaxImpact           *string              `json:"max_impact,omitempty"`
+	Conditions          []EmergencyCondition `json:"conditions"`
+	ApprovedBy          string               `json:"approved_by"`
+	ApprovedAt          time.Time            `json:"approved_at"`
+	ReviewWorkItemID    *string              `json:"review_work_item_id,omitempty"`
+	CreatedAt           time.Time            `json:"created_at"`
+	UpdatedAt           time.Time            `json:"updated_at"`
+	RowVersion          int                  `json:"row_version"`
+}
+
+type CreateEmergencyApprovalParams struct {
+	WorkflowInstanceID  string
+	BreakGlassSessionID string
+	WindowStart         time.Time
+	WindowEnd           time.Time
+	ReasonCode          string
+	IncidentRef         *string
+	Scope               *string
+	MaxImpact           *string
+	Conditions          []EmergencyCondition
+	ActorPrincipalID    string
+	CorrelationID       string
+	Meta                CommandMeta
+}
+
+type ListEmergencyApprovalsFilter struct {
+	TenantID            string
+	WorkflowInstanceID  *string
+	BreakGlassSessionID *string
+	Limit               int
+	Cursor              *PaginationCursor
+}
+
+var ErrEmergencyApprovalNotFound = errorString("emergency approval not found")
+var ErrBreakGlassSessionInvalid = errorString("break-glass session invalid or expired")
+var ErrProtectedTypeRefused = errorString("protected type refused emergency approval")
+var ErrActorCannotCompleteReview = errorString("actor cannot complete their own review work item")

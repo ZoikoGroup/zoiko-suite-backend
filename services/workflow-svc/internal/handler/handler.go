@@ -159,6 +159,19 @@ type WorkflowStore interface {
 	EscalateWorkItem(ctx context.Context, workItemID string, expectedVersion int, actorPrincipalID string, correlationID string) (*domain.WorkItem, bool, error)
 	ReassignWorkItem(ctx context.Context, workItemID string, expectedVersion int, newAssigneePrincipalID string, actorPrincipalID string, correlationID string) (*domain.WorkItem, bool, error)
 	BulkCompleteWorkItems(ctx context.Context, params domain.BulkCompleteWorkItemsParams) ([]*domain.WorkItem, []*domain.WorkItemResult, error)
+
+	// WF-S24: Operator Repair (F30)
+	CreateOperatorAction(ctx context.Context, params domain.CreateOperatorActionParams) (*domain.OperatorAction, error)
+	GetOperatorAction(ctx context.Context, operatorActionID string) (*domain.OperatorAction, error)
+	ListOperatorActions(ctx context.Context, tenantID string, filter domain.ListOperatorActionsFilter) ([]*domain.OperatorAction, *domain.PaginationCursor, error)
+	ApproveOperatorAction(ctx context.Context, params domain.ApproveOperatorActionParams) (*domain.OperatorAction, error)
+	ExecuteOperatorAction(ctx context.Context, params domain.ExecuteOperatorActionParams) (*domain.OperatorAction, error)
+
+	// WF-S25: Emergency Approval (F31)
+	CreateEmergencyApproval(ctx context.Context, params domain.CreateEmergencyApprovalParams) (*domain.EmergencyApproval, error)
+	GetEmergencyApproval(ctx context.Context, emergencyApprovalID string) (*domain.EmergencyApproval, error)
+	ListEmergencyApprovals(ctx context.Context, tenantID string, filter domain.ListEmergencyApprovalsFilter) ([]*domain.EmergencyApproval, *domain.PaginationCursor, error)
+	CheckBreakGlassSession(ctx context.Context, sessionID string) (bool, error)
 }
 
 // EventPublisher is the narrow interface the handler depends on. actorID on

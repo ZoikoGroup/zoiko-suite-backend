@@ -3139,3 +3139,623 @@ func (s *PgStore) transitionCaseInternal(ctx context.Context, params domain.Tran
 	}
 	return updated, updated != nil, nil
 }
+
+// =============================================================================
+// WF-S24: Operator Repair (F30)
+// =============================================================================
+
+const operatorActionColumns = `
+	operator_action_id, tenant_id, workflow_instance_id, kind, status,
+	reason, scope, evidence_refs, requested_by, requested_at,
+	approved_by, approved_at, executed_at, execution_result,
+	created_at, updated_at, row_version`
+
+func scanOperatorAction(row pgx.Row) (*domain.OperatorAction, error) {
+	oa := &domain.OperatorAction{}
+	var evidenceRefs []string
+	var scope *string
+	err := row.Scan(
+		&oa.OperatorActionID,
+		&oa.TenantID,
+		&oa.WorkflowInstanceID,
+		&oa.Kind,
+		&oa.Status,
+		&oa.Reason,
+		&scope,
+		&evidenceRefs,
+		&oa.RequestedBy,
+		&oa.RequestedAt,
+		&oa.ApprovedBy,
+		&oa.ApprovedAt,
+		&oa.ExecutedAt,
+		&oa.ExecutionResult,
+		&oa.CreatedAt,
+		&oa.UpdatedAt,
+		&oa.RowVersion,
+	)
+	if scope != nil {
+		oa.Scope = scope
+	}
+	oa.EvidenceRefs = evidenceRefs
+	return oa, err
+}
+
+func (s *PgStore) CreateOperatorAction(ctx context.Context, params domain.CreateOperatorActionParams) (*domain.OperatorAction, error) {
+	var oa *domain.OperatorAction
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		const insert = `
+			INSERT INTO operator_actions (
+				operator_action_id, tenant_id, workflow_instance_id, kind, status,
+				reason, scope, evidence_refs, requested_by, requested_at
+			) VALUES (gen_random_uuid(), $1, $2, $3, 'PENDING', $4, $5, $6, $7, NOW())
+			RETURNING ` + operatorActionColumns + `;`
+		var scanErr error
+		oa, scanErr = scanOperatorAction(tx.QueryRow(ctx, insert,
+			tenantID, params.WorkflowInstanceID, params.Kind, params.Reason,
+			params.Scope, params.EvidenceRefs, params.ActorPrincipalID))
+		if scanErr != nil {
+			if errors.Is(mapPgError(scanErr), domain.ErrInvalidIdentifier) {
+				return domain.ErrInvalidIdentifier
+			}
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+		}
+
+		payload := map[string]any{
+			"operator_action_id":   oa.OperatorActionID,
+			"workflow_instance_id": oa.WorkflowInstanceID,
+			"kind":                 oa.Kind,
+			"reason":               oa.Reason,
+			"requested_by":         oa.RequestedBy,
+		}
+		return s.outboxInsertTx(ctx, tx, "operator_action.created", "operator_action", oa.OperatorActionID, params.CorrelationID, payload, tenantID, "", params.ActorPrincipalID)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return oa, nil
+}
+
+func (s *PgStore) GetOperatorAction(ctx context.Context, operatorActionID string) (*domain.OperatorAction, error) {
+	tenantID := tenantOf(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrTenantMissing
+	}
+
+	const query = `SELECT ` + operatorActionColumns + ` FROM operator_actions WHERE operator_action_id = $1 AND tenant_id = $2;`
+
+	var oa *domain.OperatorAction
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, _ string) error {
+		var scanErr error
+		oa, scanErr = scanOperatorAction(tx.QueryRow(ctx, query, operatorActionID, tenantID))
+		return scanErr
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrOperatorActionNotFound
+		}
+		if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
+			return nil, domain.ErrInvalidIdentifier
+		}
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return oa, nil
+}
+
+func (s *PgStore) ListOperatorActions(ctx context.Context, tenantID string, filter domain.ListOperatorActionsFilter) ([]*domain.OperatorAction, *domain.PaginationCursor, error) {
+	if filter.TenantID != "" && filter.TenantID != tenantID {
+		return nil, nil, domain.ErrTenantMissing
+	}
+
+	query := `SELECT ` + operatorActionColumns + ` FROM operator_actions WHERE tenant_id = $1`
+	args := []any{tenantID}
+
+	addFilter := func(clause string, value any) {
+		args = append(args, value)
+		query += fmt.Sprintf(" AND %s $%d", clause, len(args))
+	}
+
+	if filter.WorkflowInstanceID != nil {
+		addFilter("workflow_instance_id =", *filter.WorkflowInstanceID)
+	}
+	if filter.Status != "" {
+		addFilter("status =", filter.Status)
+	}
+	if filter.Kind != "" {
+		addFilter("kind =", filter.Kind)
+	}
+
+	query += " ORDER BY requested_at DESC, operator_action_id DESC"
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if filter.Cursor != nil {
+		args = append(args, filter.Cursor.StartedAt)
+		query += fmt.Sprintf(" AND (requested_at, operator_action_id) < ($%d, $%d)", len(args), len(args)+1)
+		args = append(args, filter.Cursor.InstanceID)
+	}
+	args = append(args, limit+1)
+	query += fmt.Sprintf(" LIMIT $%d;", len(args))
+
+	var results []*domain.OperatorAction
+	var err error
+	err = s.withTenantTx(ctx, func(tx pgx.Tx, _ string) error {
+		rows, qErr := tx.Query(ctx, query, args...)
+		if qErr != nil {
+			if errors.Is(mapPgError(qErr), domain.ErrInvalidIdentifier) {
+				return domain.ErrInvalidIdentifier
+			}
+			s.log.Error("pg ListOperatorActions failed", zap.Error(qErr))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, qErr)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			oa, scanErr := scanOperatorAction(rows)
+			if scanErr != nil {
+				s.log.Error("pg ListOperatorActions scan failed", zap.Error(scanErr))
+				return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+			}
+			results = append(results, oa)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var nextCursor *domain.PaginationCursor
+	if len(results) > limit {
+		last := results[limit-1]
+		results = results[:limit]
+		nextCursor = &domain.PaginationCursor{
+			StartedAt:  last.RequestedAt.UTC().Format(time.RFC3339),
+			InstanceID: last.OperatorActionID,
+		}
+	}
+
+	return results, nextCursor, nil
+}
+
+func (s *PgStore) ApproveOperatorAction(ctx context.Context, params domain.ApproveOperatorActionParams) (*domain.OperatorAction, error) {
+	var oa *domain.OperatorAction
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		// Check if the action requires approval (high-risk kinds)
+		const checkQuery = `SELECT kind, requested_by FROM operator_actions WHERE operator_action_id = $1 AND tenant_id = $2 FOR UPDATE;`
+		var kind domain.OperatorActionKind
+		var requestedBy string
+		err := tx.QueryRow(ctx, checkQuery, params.OperatorActionID, tenantID).Scan(&kind, &requestedBy)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrOperatorActionNotFound
+			}
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+
+		// High-risk kinds: FORCE_ESCALATE, FORCE_EXPIRE, RELEASE_CLAIM
+		highRisk := kind == domain.OperatorActionForceEscalate || kind == domain.OperatorActionForceExpire || kind == domain.OperatorActionReleaseClaim
+		if highRisk {
+			if requestedBy == params.ActorPrincipalID {
+				return domain.ErrOperatorActionRequesterCannotApprove
+			}
+		}
+
+		const update = `
+			UPDATE operator_actions
+			SET status = 'APPROVED', approved_by = $1, approved_at = NOW(), updated_at = NOW(), row_version = row_version + 1
+			WHERE operator_action_id = $2 AND tenant_id = $3
+			RETURNING ` + operatorActionColumns + `;`
+		var scanErr error
+		oa, scanErr = scanOperatorAction(tx.QueryRow(ctx, update, params.ActorPrincipalID, params.OperatorActionID, tenantID))
+		if scanErr != nil {
+			if errors.Is(scanErr, pgx.ErrNoRows) {
+				return domain.ErrOperatorActionNotFound
+			}
+			if errors.Is(mapPgError(scanErr), domain.ErrInvalidIdentifier) {
+				return domain.ErrInvalidIdentifier
+			}
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+		}
+
+		payload := map[string]any{
+			"operator_action_id":   oa.OperatorActionID,
+			"workflow_instance_id": oa.WorkflowInstanceID,
+			"kind":                 oa.Kind,
+			"approved_by":          oa.ApprovedBy,
+		}
+		return s.outboxInsertTx(ctx, tx, "operator_action.approved", "operator_action", oa.OperatorActionID, params.CorrelationID, payload, tenantID, "", params.ActorPrincipalID)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return oa, nil
+}
+
+func (s *PgStore) ExecuteOperatorAction(ctx context.Context, params domain.ExecuteOperatorActionParams) (*domain.OperatorAction, error) {
+	var oa *domain.OperatorAction
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		const checkQuery = `SELECT status FROM operator_actions WHERE operator_action_id = $1 AND tenant_id = $2 FOR UPDATE;`
+		var status domain.OperatorActionStatus
+		err := tx.QueryRow(ctx, checkQuery, params.OperatorActionID, tenantID).Scan(&status)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrOperatorActionNotFound
+			}
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+
+		if status != domain.OperatorActionStatusApproved {
+			return fmt.Errorf("%w: operator action not approved", domain.ErrInvalidTransition)
+		}
+
+		const update = `
+			UPDATE operator_actions
+			SET status = 'EXECUTED', executed_at = NOW(), execution_result = $1, updated_at = NOW(), row_version = row_version + 1
+			WHERE operator_action_id = $2 AND tenant_id = $3
+			RETURNING ` + operatorActionColumns + `;`
+		var scanErr error
+		oa, scanErr = scanOperatorAction(tx.QueryRow(ctx, update, params.ExecutionResult, params.OperatorActionID, tenantID))
+		if scanErr != nil {
+			if errors.Is(scanErr, pgx.ErrNoRows) {
+				return domain.ErrOperatorActionNotFound
+			}
+			if errors.Is(mapPgError(scanErr), domain.ErrInvalidIdentifier) {
+				return domain.ErrInvalidIdentifier
+			}
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+		}
+
+		// Execute the actual repair action based on kind
+		if err := s.executeOperatorActionInternal(ctx, tx, oa, params.CorrelationID); err != nil {
+			return err
+		}
+
+		payload := map[string]any{
+			"operator_action_id":   oa.OperatorActionID,
+			"workflow_instance_id": oa.WorkflowInstanceID,
+			"kind":                 oa.Kind,
+			"executed_by":          params.ActorPrincipalID,
+			"execution_result":     params.ExecutionResult,
+		}
+		return s.outboxInsertTx(ctx, tx, "operator_action.executed", "operator_action", oa.OperatorActionID, params.CorrelationID, payload, tenantID, "", params.ActorPrincipalID)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return oa, nil
+}
+
+func (s *PgStore) executeOperatorActionInternal(ctx context.Context, tx pgx.Tx, oa *domain.OperatorAction, correlationID string) error {
+	switch oa.Kind {
+	case domain.OperatorActionRetryTimer:
+		// Recompute next_action_at and update workflow instance
+		const retryQuery = `
+			UPDATE workflow_instances
+			SET next_action_at = NOW() + interval '1 hour', updated_at = NOW(), row_version = row_version + 1
+			WHERE workflow_instance_id = $1 AND tenant_id = $2;`
+		_, err := tx.Exec(ctx, retryQuery, oa.WorkflowInstanceID, oa.TenantID)
+		return err
+	case domain.OperatorActionRecomputeNextAction:
+		// Recompute next_action_at based on current stage
+		const recomputeQuery = `
+			UPDATE workflow_instances wi
+			SET next_action_at = (
+				SELECT due_at FROM workflow_stages ws
+				WHERE ws.workflow_instance_id = wi.workflow_instance_id
+				AND ws.stage_order = wi.current_stage
+				AND ws.tenant_id = wi.tenant_id
+			), updated_at = NOW(), row_version = row_version + 1
+			WHERE wi.workflow_instance_id = $1 AND wi.tenant_id = $2;`
+		_, err := tx.Exec(ctx, recomputeQuery, oa.WorkflowInstanceID, oa.TenantID)
+		return err
+	case domain.OperatorActionForceEscalate:
+		// Force escalate the workflow
+		const escalateQuery = `
+			UPDATE workflow_instances
+			SET workflow_status = 'ESCALATED', updated_at = NOW(), row_version = row_version + 1, escalated_at = NOW()
+			WHERE workflow_instance_id = $1 AND tenant_id = $2;`
+		_, err := tx.Exec(ctx, escalateQuery, oa.WorkflowInstanceID, oa.TenantID)
+		return err
+	case domain.OperatorActionForceExpire:
+		// Force expire the workflow
+		const expireQuery = `
+			UPDATE workflow_instances
+			SET workflow_status = 'EXPIRED', updated_at = NOW(), row_version = row_version + 1
+			WHERE workflow_instance_id = $1 AND tenant_id = $2;`
+		_, err := tx.Exec(ctx, expireQuery, oa.WorkflowInstanceID, oa.TenantID)
+		return err
+	case domain.OperatorActionRequeueParkedEvent:
+		// Requeue parked outbox events
+		const requeueQuery = `
+			UPDATE outbox_events
+			SET created_at = NOW(), headers = jsonb_set(headers, '{requeued}', 'true')
+			WHERE aggregate_id = $1 AND aggregate_type = 'workflow_instance' AND headers->>'parked' = 'true';`
+		_, err := tx.Exec(ctx, requeueQuery, oa.WorkflowInstanceID)
+		return err
+	case domain.OperatorActionReleaseClaim:
+		// Release a claimed work item
+		const releaseQuery = `
+			UPDATE work_items
+			SET state = 'UNASSIGNED', assignee_principal_id = NULL, updated_at = NOW(), row_version = row_version + 1
+			WHERE workflow_instance_id = $1 AND tenant_id = $2 AND state = 'CLAIMED';`
+		_, err := tx.Exec(ctx, releaseQuery, oa.WorkflowInstanceID, oa.TenantID)
+		return err
+	default:
+		return fmt.Errorf("unknown operator action kind: %s", oa.Kind)
+	}
+}
+
+// =============================================================================
+// WF-S25: Emergency Approval (F31)
+// =============================================================================
+
+const emergencyApprovalColumns = `
+	emergency_approval_id, tenant_id, legal_entity_id, workflow_instance_id, break_glass_session_id,
+	window_start, window_end, reason_code, incident_ref, scope, max_impact,
+	conditions, approved_by, approved_at, review_work_item_id,
+	created_at, updated_at, row_version`
+
+func scanEmergencyApproval(row pgx.Row) (*domain.EmergencyApproval, error) {
+	ea := &domain.EmergencyApproval{}
+	var conditions []string
+	err := row.Scan(
+		&ea.EmergencyApprovalID,
+		&ea.TenantID,
+		&ea.LegalEntityID,
+		&ea.WorkflowInstanceID,
+		&ea.BreakGlassSessionID,
+		&ea.WindowStart,
+		&ea.WindowEnd,
+		&ea.ReasonCode,
+		&ea.IncidentRef,
+		&ea.Scope,
+		&ea.MaxImpact,
+		&conditions,
+		&ea.ApprovedBy,
+		&ea.ApprovedAt,
+		&ea.ReviewWorkItemID,
+		&ea.CreatedAt,
+		&ea.UpdatedAt,
+		&ea.RowVersion,
+	)
+	ea.Conditions = make([]domain.EmergencyCondition, len(conditions))
+	for i, c := range conditions {
+		ea.Conditions[i] = domain.EmergencyCondition(c)
+	}
+	return ea, err
+}
+
+func (s *PgStore) CreateEmergencyApproval(ctx context.Context, params domain.CreateEmergencyApprovalParams) (*domain.EmergencyApproval, error) {
+	var ea *domain.EmergencyApproval
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		// Check if workflow instance exists and is in a valid state
+		const checkQuery = `SELECT workflow_status, workflow_definition_id, legal_entity_id FROM workflow_instances WHERE workflow_instance_id = $1 AND tenant_id = $2;`
+		var status, defID, legalEntityID string
+		err := tx.QueryRow(ctx, checkQuery, params.WorkflowInstanceID, tenantID).Scan(&status, &defID, &legalEntityID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrWorkflowNotFound
+			}
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+
+		if status != domain.WorkflowStatusPending && status != domain.WorkflowStatusEscalated {
+			return fmt.Errorf("%w: workflow not in approvable state", domain.ErrInvalidTransition)
+		}
+
+		// Check if definition allows emergency approval
+		const defQuery = `SELECT emergency_allowed, emergency_conditions FROM workflow_definitions WHERE workflow_definition_id = $1 AND tenant_id = $2;`
+		var emergencyAllowed bool
+		var emergencyConditions []string
+		err = tx.QueryRow(ctx, defQuery, defID, tenantID).Scan(&emergencyAllowed, &emergencyConditions)
+		if err != nil {
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+
+		if !emergencyAllowed {
+			return domain.ErrProtectedTypeRefused
+		}
+
+		// Check if requested conditions are allowed by the definition
+		for _, c := range params.Conditions {
+			allowed := false
+			for _, ec := range emergencyConditions {
+				if ec == string(c) {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				return domain.ErrProtectedTypeRefused
+			}
+		}
+
+		// Check break-glass session (placeholder - would call policy-svc in real implementation)
+		if params.BreakGlassSessionID == "" {
+			return domain.ErrBreakGlassSessionInvalid
+		}
+
+		const insert = `
+			INSERT INTO emergency_approvals (
+				emergency_approval_id, tenant_id, legal_entity_id, workflow_instance_id, break_glass_session_id,
+				window_start, window_end, reason_code, incident_ref, scope, max_impact,
+				conditions, approved_by, approved_at
+			) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
+			RETURNING ` + emergencyApprovalColumns + `;`
+		var scanErr error
+		ea, scanErr = scanEmergencyApproval(tx.QueryRow(ctx, insert,
+			tenantID, ea.LegalEntityID, params.WorkflowInstanceID, params.BreakGlassSessionID,
+			params.WindowStart, params.WindowEnd, params.ReasonCode,
+			params.IncidentRef, params.Scope, params.MaxImpact,
+			params.Conditions, params.ActorPrincipalID))
+		if scanErr != nil {
+			if errors.Is(mapPgError(scanErr), domain.ErrInvalidIdentifier) {
+				return domain.ErrInvalidIdentifier
+			}
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+		}
+		ea.LegalEntityID = legalEntityID
+
+		// Create mandatory review work item
+		reviewItem, err := s.CreateWorkItem(ctx, domain.CreateWorkItemParams{
+			TenantID:           tenantID,
+			LegalEntityID:      ea.LegalEntityID,
+			WorkflowInstanceID: &ea.WorkflowInstanceID,
+			ItemType:           "EMERGENCY_REVIEW",
+			Mandatory:          true,
+			CompletionSchema:   map[string]interface{}{"type": "object", "properties": map[string]interface{}{"approved": map[string]interface{}{"type": "boolean"}}},
+			ActorPrincipalID:   params.ActorPrincipalID,
+			CorrelationID:      params.CorrelationID,
+			Meta:               params.Meta,
+		})
+		if err != nil {
+			return err
+		}
+
+		// Update emergency approval with review work item ID
+		const updateReview = `UPDATE emergency_approvals SET review_work_item_id = $1 WHERE emergency_approval_id = $2;`
+		_, err = tx.Exec(ctx, updateReview, reviewItem.WorkItemID, ea.EmergencyApprovalID)
+		if err != nil {
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		ea.ReviewWorkItemID = &reviewItem.WorkItemID
+
+		payload := map[string]any{
+			"emergency_approval_id":  ea.EmergencyApprovalID,
+			"workflow_instance_id":   ea.WorkflowInstanceID,
+			"break_glass_session_id": ea.BreakGlassSessionID,
+			"reason_code":            ea.ReasonCode,
+			"conditions":             ea.Conditions,
+			"approved_by":            ea.ApprovedBy,
+			"review_work_item_id":    ea.ReviewWorkItemID,
+		}
+		return s.outboxInsertTx(ctx, tx, "workflow.emergency_approved", "workflow_instance", ea.WorkflowInstanceID, params.CorrelationID, payload, tenantID, "", params.ActorPrincipalID)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return ea, nil
+}
+
+func (s *PgStore) GetEmergencyApproval(ctx context.Context, emergencyApprovalID string) (*domain.EmergencyApproval, error) {
+	tenantID := tenantOf(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrTenantMissing
+	}
+
+	const query = `SELECT ` + emergencyApprovalColumns + ` FROM emergency_approvals WHERE emergency_approval_id = $1 AND tenant_id = $2;`
+
+	var ea *domain.EmergencyApproval
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, _ string) error {
+		var scanErr error
+		ea, scanErr = scanEmergencyApproval(tx.QueryRow(ctx, query, emergencyApprovalID, tenantID))
+		return scanErr
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrEmergencyApprovalNotFound
+		}
+		if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
+			return nil, domain.ErrInvalidIdentifier
+		}
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return ea, nil
+}
+
+func (s *PgStore) ListEmergencyApprovals(ctx context.Context, tenantID string, filter domain.ListEmergencyApprovalsFilter) ([]*domain.EmergencyApproval, *domain.PaginationCursor, error) {
+	if filter.TenantID != "" && filter.TenantID != tenantID {
+		return nil, nil, domain.ErrTenantMissing
+	}
+
+	query := `SELECT ` + emergencyApprovalColumns + ` FROM emergency_approvals WHERE tenant_id = $1`
+	args := []any{tenantID}
+
+	addFilter := func(clause string, value any) {
+		args = append(args, value)
+		query += fmt.Sprintf(" AND %s $%d", clause, len(args))
+	}
+
+	if filter.WorkflowInstanceID != nil {
+		addFilter("workflow_instance_id =", *filter.WorkflowInstanceID)
+	}
+	if filter.BreakGlassSessionID != nil {
+		addFilter("break_glass_session_id =", *filter.BreakGlassSessionID)
+	}
+
+	query += " ORDER BY approved_at DESC, emergency_approval_id DESC"
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if filter.Cursor != nil {
+		args = append(args, filter.Cursor.StartedAt)
+		query += fmt.Sprintf(" AND (approved_at, emergency_approval_id) < ($%d, $%d)", len(args), len(args)+1)
+		args = append(args, filter.Cursor.InstanceID)
+	}
+	args = append(args, limit+1)
+	query += fmt.Sprintf(" LIMIT $%d;", len(args))
+
+	var results []*domain.EmergencyApproval
+	var err error
+	err = s.withTenantTx(ctx, func(tx pgx.Tx, _ string) error {
+		rows, qErr := tx.Query(ctx, query, args...)
+		if qErr != nil {
+			if errors.Is(mapPgError(qErr), domain.ErrInvalidIdentifier) {
+				return domain.ErrInvalidIdentifier
+			}
+			s.log.Error("pg ListEmergencyApprovals failed", zap.Error(qErr))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, qErr)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			ea, scanErr := scanEmergencyApproval(rows)
+			if scanErr != nil {
+				s.log.Error("pg ListEmergencyApprovals scan failed", zap.Error(scanErr))
+				return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+			}
+			results = append(results, ea)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var nextCursor *domain.PaginationCursor
+	if len(results) > limit {
+		last := results[limit-1]
+		results = results[:limit]
+		nextCursor = &domain.PaginationCursor{
+			StartedAt:  last.ApprovedAt.UTC().Format(time.RFC3339),
+			InstanceID: last.EmergencyApprovalID,
+		}
+	}
+
+	return results, nextCursor, nil
+}
+
+func (s *PgStore) CheckBreakGlassSession(ctx context.Context, sessionID string) (bool, error) {
+	// In a real implementation, this would call policy-svc to verify the break-glass session
+	// For now, we just check if the session exists in our emergency_approvals table
+	tenantID := tenantOf(ctx)
+	if tenantID == "" {
+		return false, domain.ErrTenantMissing
+	}
+
+	const query = `SELECT 1 FROM emergency_approvals WHERE break_glass_session_id = $1 AND tenant_id = $2;`
+	var exists bool
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, _ string) error {
+		return tx.QueryRow(ctx, query, sessionID, tenantID).Scan(&exists)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return true, nil
+}
