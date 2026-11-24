@@ -74,6 +74,15 @@ type Config struct {
 	TenantRegistryURL string
 	AccessControlURL  string
 
+	// TenantRegistryMTLSURL, when set, sends every tenant-registry call to this
+	// URL (the registry's mTLS listener) with this service's own workload
+	// certificate, provisioned from MTLS_MANAGEMENT_SERVICE_URL with
+	// MTLS_BOOTSTRAP_TOKEN_PATH. The registry's identity gate in require mode
+	// admits a caller with no envelope only as a registered mTLS peer, and a
+	// context resolve has no envelope yet: it is what mints one. Empty means
+	// plain HTTP to TenantRegistryURL.
+	TenantRegistryMTLSURL string
+
 	// CommercialAccountURL is COM-03 Entitlement (commercial-account-svc), the
 	// "commercial entitlement read model" §4 names for the entitlement context
 	// reference. Empty leaves it UPSTREAM_NOT_CONFIGURED. ServicePrincipalID is
@@ -597,6 +606,10 @@ func Load() (*Config, error) {
 	}
 	if cfg.MTLSEnabled && cfg.MTLSManagementURL == "" {
 		return nil, fmt.Errorf("MTLS_ENABLED=true needs MTLS_MANAGEMENT_SERVICE_URL: the listener's certificate comes from mtls-management-svc")
+	}
+	cfg.TenantRegistryMTLSURL = strings.TrimSpace(env("TENANT_REGISTRY_MTLS_URL", ""))
+	if cfg.TenantRegistryMTLSURL != "" && (cfg.MTLSManagementURL == "" || cfg.MTLSBootstrapTokenPath == "") {
+		return nil, fmt.Errorf("TENANT_REGISTRY_MTLS_URL needs MTLS_MANAGEMENT_SERVICE_URL and MTLS_BOOTSTRAP_TOKEN_PATH: the client certificate comes from mtls-management-svc")
 	}
 
 	if err := loadAuthPlane(cfg); err != nil {

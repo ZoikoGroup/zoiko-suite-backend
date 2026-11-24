@@ -125,3 +125,53 @@ func TestNameIsStableForTheChecksMap(t *testing.T) {
 	// The dashboard, the alert rules and the runbook all key off this string.
 	assert.Equal(t, "tenant_registry", clientFor("http://x").Name())
 }
+
+// tenant-entity-registry-svc's identity gate (require mode) admits a caller
+// with no envelope only when it arrives over mTLS as a registered peer. A
+// context resolve is what mints the envelope, so it has none to send: with
+// WithMTLS every registry call must leave on the mTLS URL with the client that
+// presents this service's certificate, and none may fall back to the plain URL
+// (which the gate answers 401, failing every sign-in).
+func TestWithMTLSSendsEveryRegistryCallToTheMTLSURL(t *testing.T) {
+	plainHits := 0
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		plainHits++
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer plain.Close()
+
+	var paths []string
+	secure := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		assert.NotNil(t, r.TLS, "the registry call must arrive over TLS")
+		if r.URL.Path == "/v1/tenants/11111111-1111-1111-1111-111111111111" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"lifecycle_state":"ACTIVE"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer secure.Close()
+
+	c := clientFor(plain.URL).WithMTLS(secure.URL, secure.Client())
+
+	active, err := c.IsTenantActive(context.Background(), "11111111-1111-1111-1111-111111111111")
+	require.NoError(t, err)
+	assert.True(t, active)
+	require.NoError(t, c.Ping(context.Background()))
+
+	assert.Equal(t, []string{"/v1/tenants/11111111-1111-1111-1111-111111111111", "/healthz"}, paths)
+	assert.Zero(t, plainHits, "no registry call may go to the plain URL once mTLS is configured")
+}
+
+func TestWithoutMTLSTheRegistryIsCalledOnThePlainURL(t *testing.T) {
+	hits := 0
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer plain.Close()
+
+	require.NoError(t, clientFor(plain.URL).Ping(context.Background()))
+	assert.Equal(t, 1, hits)
+}

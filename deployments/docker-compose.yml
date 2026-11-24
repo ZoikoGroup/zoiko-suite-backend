@@ -603,6 +603,14 @@ services:
       AUTH_MAX_FAILED_ATTEMPTS: "5"
       AUTH_LOCK_DURATION_SECONDS: "900"
       TENANT_REGISTRY_URL: "http://tenant-svc:8081"
+      # tenant-svc's identity gate is strict (require): a caller with no
+      # envelope is admitted only as a registered mTLS peer. A context resolve
+      # has no envelope yet (it mints one), so on the plain URL every sign-in
+      # failed with 401 from the registry. This sends every registry call to
+      # its mTLS listener with this service's own certificate (same bootstrap
+      # token as the listener below); tenant-svc lists identity-context-svc in
+      # MTLS_ALLOWED_CLIENTS. Empty = plain HTTP to TENANT_REGISTRY_URL.
+      TENANT_REGISTRY_MTLS_URL: "${IDENTITY_TENANT_REGISTRY_MTLS_URL:-https://tenant-entity-registry-svc:8449}"
       DELEGATED_AUTHORITY_URL: "http://identity-svc:8080"
       # access-control-svc, NOT this service. internal/upstream calls
       # GET {ACCESS_CONTROL_URL}/v1/role-definitions/{id}/permission-bundles,
@@ -951,11 +959,13 @@ services:
       # Provisioning retries in the background: mtls-management-svc being down
       # never stops the plaintext listener. Only the listed client CNs are
       # admitted, and X-Workload-Id is set to the verified one.
+      # identity-context-svc reads tenants and entities here while it resolves
+      # a sign-in, before any envelope exists, so it must be a peer.
       MTLS_ENABLED: "true"
       MTLS_PORT: "8449"
       MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
       MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
-      MTLS_ALLOWED_CLIENTS: "gateway-auth-svc,authorization-svc"
+      MTLS_ALLOWED_CLIENTS: "gateway-auth-svc,authorization-svc,identity-context-svc"
     volumes:
       # Only this service's own bootstrap token (register M-01): the
       # sub-directory tenant-entity-registry-svc/ of the keygen volume, so /bootstrap/token

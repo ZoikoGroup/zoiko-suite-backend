@@ -53,6 +53,7 @@ import (
 	"zoiko.io/identity-context-svc/internal/upstream"
 	idenv "zoiko.io/identity-envelope"
 	"zoiko.io/identity-envelope/apicontract"
+	"zoiko.io/identity-envelope/mtlsclient"
 )
 
 // kafkaWriterAdapter bridges the relay's broker-agnostic MessageWriter to
@@ -261,6 +262,19 @@ func main() {
 		WithRevocationHorizon(time.Duration(cfg.EnvelopeJWTTTLSeconds)*time.Second + time.Minute)
 	go consumer.Run(consumerCtx, kafkaReader)
 	upstreamRegistry := upstream.NewRegistryClient(cfg, log)
+	if cfg.TenantRegistryMTLSURL != "" {
+		// The registry's identity gate admits a caller with no envelope only as
+		// a registered mTLS peer, and a resolve has none yet. Calls fail their
+		// handshake until the first certificate is installed, so a resolve in
+		// the first seconds after start fails closed (503) rather than open.
+		registryIdentity := mtlsclient.Start(context.Background(), mtlsclient.Options{
+			ServiceName:        "identity-context-svc",
+			ManagementURL:      cfg.MTLSManagementURL,
+			BootstrapTokenPath: cfg.MTLSBootstrapTokenPath,
+		}, log)
+		upstreamRegistry.WithMTLS(cfg.TenantRegistryMTLSURL, registryIdentity.HTTPClient(3*time.Second))
+		log.Info("tenant registry over mTLS", zap.String("url", cfg.TenantRegistryMTLSURL))
+	}
 
 	// ── Transactional outbox ──────────────────────────────────────────────
 	//
