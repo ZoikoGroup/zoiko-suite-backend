@@ -123,6 +123,8 @@ paths:
         returned every tenant's configuration to any caller. It is now scoped to
         the verified header; naming a different tenant is refused.
       parameters:
+        - $ref: '#/components/parameters/ListLimit'
+        - $ref: '#/components/parameters/ListCursor'
         - $ref: '#/components/parameters/TenantId'
         - $ref: '#/components/parameters/RequestId'
         - $ref: '#/components/parameters/CorrelationId'
@@ -231,6 +233,8 @@ paths:
       operationId: listFeatureFlags
       summary: List the flags that apply to the caller
       parameters:
+        - $ref: '#/components/parameters/ListLimit'
+        - $ref: '#/components/parameters/ListCursor'
         - $ref: '#/components/parameters/TenantId'
         - $ref: '#/components/parameters/RequestId'
         - $ref: '#/components/parameters/CorrelationId'
@@ -617,12 +621,15 @@ paths:
         - $ref: '#/components/parameters/CorrelationId'
         - $ref: '#/components/parameters/SourceChannel'
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
       requestBody:
         required: false
         content:
           application/json:
             schema: { $ref: '#/components/schemas/ApproveChangeRequest' }
       responses:
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '428': { $ref: '#/components/responses/PreconditionRequired' }
         '200':
           description: The change with its updated status (APPROVED, or PROPOSED when rejected).
           content:
@@ -667,7 +674,10 @@ paths:
         - $ref: '#/components/parameters/CorrelationId'
         - $ref: '#/components/parameters/SourceChannel'
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
       responses:
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '428': { $ref: '#/components/responses/PreconditionRequired' }
         '200':
           description: The verified change.
           content:
@@ -710,7 +720,10 @@ paths:
         - $ref: '#/components/parameters/CorrelationId'
         - $ref: '#/components/parameters/SourceChannel'
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
       responses:
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '428': { $ref: '#/components/responses/PreconditionRequired' }
         '201':
           description: The proposed rollback change.
           content:
@@ -775,7 +788,10 @@ paths:
         - $ref: '#/components/parameters/CorrelationId'
         - $ref: '#/components/parameters/SourceChannel'
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
       responses:
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '428': { $ref: '#/components/responses/PreconditionRequired' }
         '200':
           description: The active emergency change.
           content:
@@ -992,6 +1008,7 @@ paths:
         - $ref: '#/components/parameters/CorrelationId'
         - $ref: '#/components/parameters/SourceChannel'
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
       requestBody:
         required: true
         content:
@@ -1003,6 +1020,8 @@ paths:
                 environment: { type: string }
                 consumer_scan_evidence: { type: object }
       responses:
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '428': { $ref: '#/components/responses/PreconditionRequired' }
         '200':
           description: The retirement record, now reusable.
           content:
@@ -1035,12 +1054,16 @@ paths:
         - $ref: '#/components/parameters/CorrelationId'
         - $ref: '#/components/parameters/SourceChannel'
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IfNoneMatchStar'
       requestBody:
         required: true
         content:
           application/json:
             schema: { $ref: '#/components/schemas/CreateReleasePlanRequest' }
       responses:
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '428': { $ref: '#/components/responses/PreconditionRequired' }
         '201':
           description: The published plan.
           content:
@@ -1190,6 +1213,45 @@ components:
       in: header
       required: true
       description: ZS-ARCH-SVC-001 §4. Mandatory on material state changes.
+      schema: { type: string }
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: |
+        API-3. The ETag from the latest read of the aggregate (`"v<n>"`, or `*`).
+        Required on this route: without it the answer is `428
+        precondition_required`; a malformed value is `400 invalid_if_match`.
+        The store compares it with the row it has locked, so of two writers
+        holding the same ETag only the first succeeds; the second gets `412
+        stale_version` with the current ETag. On a release plan the ETag is
+        the latest plan version in that scope.
+      schema: { type: string, example: '"v3"' }
+    IfNoneMatchStar:
+      name: If-None-Match
+      in: header
+      required: false
+      description: |
+        `*` publishes the first release plan in a scope (none exists yet).
+        Send it instead of If-Match, never with it (`400 invalid_if_match`).
+        Once a plan exists it is `412 stale_version`.
+      schema: { type: string, enum: ['*'] }
+    ListLimit:
+      name: limit
+      in: query
+      required: false
+      description: API-4. Rows per page, 1–500 (default 100). Out of range is `400 invalid_limit`.
+      schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+    ListCursor:
+      name: cursor
+      in: query
+      required: false
+      description: |
+        API-4. The `X-Next-Cursor` of the previous page (also sent as `Link:
+        <…>; rel="next"`). Rows are ordered by (key, environment, tenant), the
+        global default first; the next page starts strictly after the cursor.
+        A cursor this service did not issue is `400 invalid_cursor`. The last
+        page sends no `X-Next-Cursor`.
       schema: { type: string }
 
   schemas:
@@ -1818,6 +1880,22 @@ components:
         current_version: { type: integer, format: int64 }
 
   responses:
+    PreconditionRequired:
+      description: '`precondition_required` — the route needs If-Match (API-3).'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    PreconditionFailed:
+      description: |
+        `stale_version` — the aggregate changed since the supplied ETag. The
+        body's `current_version` and the `ETag` header name the current
+        version (no ETag when nothing exists yet).
+      headers:
+        ETag:
+          schema: { type: string }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
     BadRequest:
       description: |
         `missing_field` — a required field was absent.

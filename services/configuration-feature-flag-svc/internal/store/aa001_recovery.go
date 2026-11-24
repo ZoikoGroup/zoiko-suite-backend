@@ -57,6 +57,10 @@ func (s *PgStore) RollbackChange(ctx context.Context, targetID, callerTenantID, 
 		if t.TenantID != nil && *t.TenantID != callerTenantID {
 			return domain.ErrScopeNotAllowed
 		}
+		// API-3: the caller rolls back the change it read, not a later state.
+		if err := domain.CheckPrecondition(ctx, t.RecordVersion); err != nil {
+			return err
+		}
 		var content []byte
 		if err := tx.QueryRow(ctx, `
 			SELECT content FROM config_snapshots WHERE snapshot_id = $1`, *t.BeforeSnapshotID).Scan(&content); err != nil {

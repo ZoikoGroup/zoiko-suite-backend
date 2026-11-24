@@ -413,13 +413,26 @@ func (s *PgStore) ListCurrentConfigEntries(ctx context.Context, filter ListFilte
 			results = append(results, configFromManifest(e))
 		}
 	}
+	// (key, environment, tenant), the global default first: the API-4 cursor
+	// is this sort key, so it must be total.
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].Key != results[j].Key {
 			return results[i].Key < results[j].Key
 		}
-		return results[i].Environment < results[j].Environment
+		if results[i].Environment != results[j].Environment {
+			return results[i].Environment < results[j].Environment
+		}
+		return tenantSortKey(results[i].TenantID) < tenantSortKey(results[j].TenantID)
 	})
 	return results, nil
+}
+
+// tenantSortKey orders the global default ("") before a tenant's row.
+func tenantSortKey(t *string) string {
+	if t == nil {
+		return ""
+	}
+	return *t
 }
 
 // ── feature_flags ────────────────────────────────────────────────────────────
@@ -619,11 +632,16 @@ func (s *PgStore) ListCurrentFeatureFlags(ctx context.Context, filter ListFilter
 			results = append(results, flagFromManifest(e))
 		}
 	}
+	// (key, environment, tenant), the global default first: the API-4 cursor
+	// is this sort key, so it must be total.
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].Key != results[j].Key {
 			return results[i].Key < results[j].Key
 		}
-		return results[i].Environment < results[j].Environment
+		if results[i].Environment != results[j].Environment {
+			return results[i].Environment < results[j].Environment
+		}
+		return tenantSortKey(results[i].TenantID) < tenantSortKey(results[j].TenantID)
 	})
 	return results, nil
 }

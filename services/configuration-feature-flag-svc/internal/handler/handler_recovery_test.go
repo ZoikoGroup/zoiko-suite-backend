@@ -161,6 +161,7 @@ func TestKillSwitch_Refusals(t *testing.T) {
 func TestRollback_ProposesAndForwardsTarget(t *testing.T) {
 	s := &stubStore{rollback: &domain.ConfigChange{ChangeID: "c-2", Status: domain.ChangeStatusProposed}}
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/config/changes/c-1/rollback", strings.NewReader(`{}`)))
+	req.Header.Set("If-Match", `"v3"`)
 	w := httptest.NewRecorder()
 	newRecoveryRouter(s, &stubAuthz{}).ServeHTTP(w, req)
 	if w.Code != http.StatusCreated || s.rollbackOf != "c-1" {
@@ -171,6 +172,7 @@ func TestRollback_ProposesAndForwardsTarget(t *testing.T) {
 func TestRollback_InvalidTarget409(t *testing.T) {
 	s := &stubStore{rollbackErr: domain.ErrRollbackTargetInvalid}
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/config/changes/c-1/rollback", strings.NewReader(`{}`)))
+	req.Header.Set("If-Match", `"v3"`)
 	w := httptest.NewRecorder()
 	newRecoveryRouter(s, &stubAuthz{}).ServeHTTP(w, req)
 	if w.Code != http.StatusConflict {

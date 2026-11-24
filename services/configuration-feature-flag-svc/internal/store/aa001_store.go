@@ -1060,10 +1060,10 @@ func (s *PgStore) CreateKillSwitch(ctx context.Context, params domain.CreateKill
 			INSERT INTO kill_switches (flag_key, environment, tenant_id, reason, incident_id,
 			                           safe_behavior, expires_at, created_by_principal_id)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-			RETURNING kill_switch_id, created_at`,
+			RETURNING kill_switch_id, created_at, record_version`,
 			k.FlagKey, k.Environment, k.TenantID, k.Reason, k.IncidentID,
 			k.SafeBehavior, k.ExpiresAt, k.CreatedByPrincipalID,
-		).Scan(&k.KillSwitchID, &k.CreatedAt); err != nil {
+		).Scan(&k.KillSwitchID, &k.CreatedAt, &k.RecordVersion); err != nil {
 			return mapWriteInsertError(err, "kill_switches")
 		}
 
@@ -1469,6 +1469,14 @@ func (s *PgStore) CreateReleasePlan(ctx context.Context, params domain.CreateRel
 			params.FlagKey, params.Environment, params.TenantID).Scan(&latest); err != nil {
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
+		// API-3: the plan series in this scope is the aggregate and its
+		// latest version is the ETag (If-None-Match: * for the first plan).
+		// Two publishers holding the same ETag both pass here, but only one
+		// inserts version latest+1: uq_release_plans_one_version_per_scope
+		// refuses the other.
+		if err := domain.CheckPrecondition(ctx, int64(latest)); err != nil {
+			return err
+		}
 
 		canonical, err := json.Marshal(params.TargetingRules)
 		if err != nil {
@@ -1483,11 +1491,11 @@ func (s *PgStore) CreateReleasePlan(ctx context.Context, params domain.CreateRel
 				(flag_key, environment, tenant_id, strategy, salt, bucket_count,
 				 targeting_hash, targeting_rules, version, published_by_principal_id)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-			RETURNING release_plan_id, published_at`,
+			RETURNING release_plan_id, published_at, record_version`,
 			plan.FlagKey, plan.Environment, plan.TenantID, plan.Strategy, plan.Salt,
 			plan.BucketCount, plan.TargetingHash, plan.TargetingRules, plan.Version,
 			plan.PublishedByPrincipalID,
-		).Scan(&plan.ReleasePlanID, &plan.PublishedAt); err != nil {
+		).Scan(&plan.ReleasePlanID, &plan.PublishedAt, &plan.RecordVersion); err != nil {
 			return mapWriteInsertError(err, "release_plans")
 		}
 		out = plan
@@ -1562,10 +1570,10 @@ func (s *PgStore) RetireFlag(ctx context.Context, params domain.RetireFlagParams
 				(key, environment, tenant_id, final_enabled, final_rollout,
 				 reusable, consumer_scan_evidence, retired_by_principal_id)
 			VALUES ($1, $2, $3, $4, $5, false, $6, $7)
-			RETURNING retirement_id, retired_at`,
+			RETURNING retirement_id, retired_at, record_version`,
 			params.Key, params.Environment, params.TenantID, params.FinalEnabled,
 			params.FinalRollout, clampJSON(params.ConsumerScanEvidence), params.ActorPrincipalID,
-		).Scan(&retired.RetirementID, &retired.RetiredAt); err != nil {
+		).Scan(&retired.RetirementID, &retired.RetiredAt, &retired.RecordVersion); err != nil {
 			return mapWriteInsertError(err, "flag_retirements")
 		}
 
@@ -2028,11 +2036,11 @@ func (s *PgStore) doCreateChange(ctx context.Context, callerTenantID string, cha
 				(change_class, environment, tenant_id, status, before_snapshot_id, parts,
 				 approval_required, planned_effective_at, rollback_change_id, created_by_principal_id)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-			RETURNING change_id, created_at, updated_at`,
+			RETURNING change_id, created_at, updated_at, record_version`,
 			change.ChangeClass, change.Environment, change.TenantID, domain.ChangeStatusProposed,
 			snap.SnapshotID, partsJSON, change.ApprovalRequired,
 			change.PlannedEffectiveAt, change.RollbackChangeID, change.CreatedByPrincipalID,
-		).Scan(&change.ChangeID, &change.CreatedAt, &change.UpdatedAt); err != nil {
+		).Scan(&change.ChangeID, &change.CreatedAt, &change.UpdatedAt, &change.RecordVersion); err != nil {
 			return mapWriteInsertError(err, "config_changes")
 		}
 		change.Status = domain.ChangeStatusProposed
@@ -2088,6 +2096,10 @@ func (s *PgStore) ApproveChange(ctx context.Context, changeID string, approval d
 		if change.TenantID != nil && *change.TenantID != callerTenantID {
 			return domain.ErrChangeNotFound
 		}
+		// API-3: the caller's If-Match, compared under the row lock.
+		if err := domain.CheckPrecondition(ctx, change.RecordVersion); err != nil {
+			return err
+		}
 		// S3-2 / R-5: only a change awaiting a decision can take one. With no
 		// guard here a rejection sent a VERIFIED change back to PROPOSED and a
 		// re-approval to APPROVED, which made it activatable again.
@@ -2119,15 +2131,19 @@ func (s *PgStore) ApproveChange(ctx context.Context, changeID string, approval d
 		if approval.Approved {
 			status = domain.ChangeStatusApproved
 		}
-		tag, err := tx.Exec(ctx, `
+		// RETURNING the bumped record_version: the response is the ETag the
+		// caller sends on activate (it used to echo the pre-update version).
+		err = tx.QueryRow(ctx, `
 			UPDATE config_changes
 			SET status = $2, approval = $3, updated_at = NOW()
-			WHERE change_id = $1 AND status IN ('PROPOSED', 'VALIDATED')`, changeID, status, approvalJSON)
+			WHERE change_id = $1 AND status IN ('PROPOSED', 'VALIDATED')
+			RETURNING record_version, updated_at`, changeID, status, approvalJSON).
+			Scan(&change.RecordVersion, &change.UpdatedAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrChangeNotApprovable
+		}
 		if err != nil {
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-		}
-		if tag.RowsAffected() != 1 {
-			return domain.ErrChangeNotApprovable
 		}
 
 		change.Status = status
@@ -2159,6 +2175,12 @@ func (s *PgStore) ActivateChange(ctx context.Context, changeID, callerTenantID, 
 				return domain.ErrChangeNotFound
 			}
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		// API-3: the handler compared If-Match before the call; this compares
+		// it again under the row lock, so two activations holding the same
+		// ETag cannot both pass.
+		if err := domain.CheckPrecondition(ctx, change.RecordVersion); err != nil {
+			return err
 		}
 		if change.Status != domain.ChangeStatusApproved {
 			return domain.ErrChangeApprovalRequired
@@ -2290,6 +2312,12 @@ func (s *PgStore) ActivateChange(ctx context.Context, changeID, callerTenantID, 
 		if err := enqueueSnapshotPublished(ctx, tx, callerTenantID, actor, "", *snap); err != nil {
 			return err
 		}
+		// Activation may update the row twice (APPLYING, then VERIFIED); the
+		// response carries the version the caller's next ETag must name.
+		if err := tx.QueryRow(ctx, `SELECT record_version FROM config_changes WHERE change_id = $1`, changeID).
+			Scan(&change.RecordVersion); err != nil {
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
 		out = change
 		return nil
 	})
@@ -2360,10 +2388,10 @@ func (s *PgStore) CreateEmergencyChange(ctx context.Context, params domain.Creat
 			INSERT INTO emergency_changes
 				(key, environment, tenant_id, new_value, reason, incident_id, actor_principal_id, expires_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-			RETURNING emergency_change_id, created_at`,
+			RETURNING emergency_change_id, created_at, record_version`,
 			e.Key, e.Environment, e.TenantID, e.NewValue, e.Reason, e.IncidentID,
 			e.ActorPrincipalID, e.ExpiresAt,
-		).Scan(&e.EmergencyChangeID, &e.CreatedAt); err != nil {
+		).Scan(&e.EmergencyChangeID, &e.CreatedAt, &e.RecordVersion); err != nil {
 			return mapWriteInsertError(err, "emergency_changes")
 		}
 
@@ -2399,6 +2427,11 @@ func (s *PgStore) ActivateEmergencyChange(ctx context.Context, emergencyChangeID
 		}
 		if callerTenantID != "" && e.TenantID != nil && *e.TenantID != callerTenantID {
 			return domain.ErrScopeNotAllowed
+		}
+		// API-3: compared again under the row lock (the handler checked
+		// If-Match before the call), so one ETag activates once.
+		if err := domain.CheckPrecondition(ctx, e.RecordVersion); err != nil {
+			return err
 		}
 		// Break-glass activates once, from OPEN, inside its window. Without
 		// this an EXPIRED or already-ACTIVE change could be re-applied at will,
@@ -2466,9 +2499,9 @@ func (s *PgStore) ActivateEmergencyChange(ctx context.Context, emergencyChangeID
 			    had_prior = $5, prior_value = $6,
 			    activated_config_entry_id = $7, prior_config_entry_id = $8
 			WHERE emergency_change_id = $1
-			RETURNING status, activated_at`, emergencyChangeID, domain.EmergencyStatusActive,
+			RETURNING status, activated_at, record_version`, emergencyChangeID, domain.EmergencyStatusActive,
 			e.Kind, activatedRowID, e.HadPrior, prior, e.ActivatedConfigEntryID, e.PriorConfigEntryID,
-		).Scan(&e.Status, &e.ActivatedAt); err != nil {
+		).Scan(&e.Status, &e.ActivatedAt, &e.RecordVersion); err != nil {
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
 

@@ -110,7 +110,7 @@ func (h *Handler) RetireFlag(w http.ResponseWriter, r *http.Request) {
 	}
 	h.metrics.GovernedWrites.WithLabelValues(action, telemetry.WriteCreated).Inc()
 	h.log.Info("flag retired", zap.String("flag_key", key), zap.String("correlation_id", correlationID))
-	writeJSON(w, http.StatusCreated, retired)
+	writeJSONWithETag(w, http.StatusCreated, retired, retired.RecordVersion)
 }
 
 // ── POST /v1/flags/{key}/removal ─────────────────────────────────────────────
@@ -161,6 +161,12 @@ func (h *Handler) MarkFlagRemoved(w http.ResponseWriter, r *http.Request) {
 		h.metrics.GovernedWrites.WithLabelValues(action, outcome).Inc()
 		return
 	}
+	// If-Match (API-3): the retirement's record_version, from the retire
+	// response's ETag; the store compares it under the row lock.
+	r, ok = requirePrecondition(w, r, false)
+	if !ok {
+		return
+	}
 	removed, err := h.store.MarkFlagRemoved(r.Context(), store.MarkFlagRemovedParams{
 		Key: key, Environment: req.Environment, ConsumerScanEvidence: req.ConsumerScanEvidence,
 		CallerTenantID: tenantScope, ActorPrincipalID: principalID,
@@ -170,5 +176,5 @@ func (h *Handler) MarkFlagRemoved(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.metrics.GovernedWrites.WithLabelValues(action, telemetry.WriteCreated).Inc()
-	writeJSON(w, http.StatusOK, removed)
+	writeJSONWithETag(w, http.StatusOK, removed, removed.RecordVersion)
 }

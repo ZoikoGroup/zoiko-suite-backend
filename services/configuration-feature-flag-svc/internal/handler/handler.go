@@ -399,6 +399,10 @@ func (h *Handler) ListConfigEntries(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusForbidden, "tenant_scope_mismatch", "request tenant_id does not match the caller's verified tenant scope")
 		return
 	}
+	limit, after, ok := parseListPage(w, r)
+	if !ok {
+		return
+	}
 	filter := store.ListFilter{
 		Environment:   q.Get("environment"),
 		TenantID:      &tenantScope,
@@ -415,11 +419,15 @@ func (h *Handler) ListConfigEntries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	page, next := pageRows(results, func(e *domain.ConfigEntry) listKey {
+		return listKey{Key: e.Key, Environment: e.Environment, Tenant: tenantOrEmpty(e.TenantID)}
+	}, limit, after)
 	// Always return an array — never null.
-	if results == nil {
-		results = []*domain.ConfigEntry{}
+	if page == nil {
+		page = []*domain.ConfigEntry{}
 	}
-	writeJSON(w, http.StatusOK, results)
+	writeNextPage(w, r, next)
+	writeJSON(w, http.StatusOK, page)
 }
 
 // ── POST /v1/flags ───────────────────────────────────────────────────────────
@@ -648,6 +656,10 @@ func (h *Handler) ListFeatureFlags(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusForbidden, "tenant_scope_mismatch", "request tenant_id does not match the caller's verified tenant scope")
 		return
 	}
+	limit, after, ok := parseListPage(w, r)
+	if !ok {
+		return
+	}
 	filter := store.ListFilter{
 		Environment:   q.Get("environment"),
 		TenantID:      &tenantScope,
@@ -665,10 +677,14 @@ func (h *Handler) ListFeatureFlags(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Always return an array — never null.
-	if results == nil {
-		results = []*domain.FeatureFlag{}
+	page, next := pageRows(results, func(f *domain.FeatureFlag) listKey {
+		return listKey{Key: f.Key, Environment: f.Environment, Tenant: tenantOrEmpty(f.TenantID)}
+	}, limit, after)
+	if page == nil {
+		page = []*domain.FeatureFlag{}
 	}
-	writeJSON(w, http.StatusOK, results)
+	writeNextPage(w, r, next)
+	writeJSON(w, http.StatusOK, page)
 }
 
 // writeJSON serialises v as JSON and writes it to w with the given status code.
@@ -793,10 +809,60 @@ func writeJSONWithETag(w http.ResponseWriter, status int, v any, version int64) 
 }
 
 // requireIfMatch checks the If-Match header against the current version.
-// Returns true if the request should proceed, false if it was rejected
-// (428 Precondition Required or 412 Precondition Failed already written).
-func requireIfMatch(w http.ResponseWriter, r *http.Request, currentVersion int64) bool {
-	return apicontract.CheckIfMatch(w, r, currentVersion)
+// Returns the request carrying the precondition (the store compares it again
+// under the row lock) and true if the request should proceed, false if it was
+// rejected (428 Precondition Required or 412 Precondition Failed already
+// written).
+func requireIfMatch(w http.ResponseWriter, r *http.Request, currentVersion int64) (*http.Request, bool) {
+	if !apicontract.CheckIfMatch(w, r, currentVersion) {
+		return r, false
+	}
+	version, any, _, _ := apicontract.IfMatchVersion(r)
+	return r.WithContext(domain.WithPrecondition(r.Context(), domain.Precondition{Version: version, Any: any})), true
+}
+
+// requirePrecondition reads the caller's If-Match (API-3) and puts it on the
+// request context; the store compares it inside the write transaction, after
+// the row is locked. Where allowNone is set, If-None-Match: * instead asserts
+// that nothing exists yet (the first release plan in a scope).
+//
+//	428 precondition_required -> neither header
+//	400 invalid_if_match      -> a malformed ETag, or both headers
+func requirePrecondition(w http.ResponseWriter, r *http.Request, allowNone bool) (*http.Request, bool) {
+	ifMatch := strings.TrimSpace(r.Header.Get("If-Match"))
+	if allowNone && strings.TrimSpace(r.Header.Get("If-None-Match")) == "*" {
+		if ifMatch != "" {
+			writeError(w, r, http.StatusBadRequest, "invalid_if_match", "send If-Match or If-None-Match: *, not both")
+			return r, false
+		}
+		return r.WithContext(domain.WithPrecondition(r.Context(), domain.Precondition{NoneMatch: true})), true
+	}
+	version, any, present, err := apicontract.IfMatchVersion(r)
+	if !present {
+		detail := "If-Match is required: send the ETag from the latest read"
+		if allowNone {
+			detail = "If-Match is required (the latest ETag), or If-None-Match: * when none exists yet"
+		}
+		writeError(w, r, http.StatusPreconditionRequired, "precondition_required", detail)
+		return r, false
+	}
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid_if_match", "If-Match must be a single ETag from the latest representation")
+		return r, false
+	}
+	return r.WithContext(domain.WithPrecondition(r.Context(), domain.Precondition{Version: version, Any: any})), true
+}
+
+// writeStale answers 412 stale_version with the current version, in the body
+// and as the ETag (none when nothing exists yet).
+func writeStale(w http.ResponseWriter, r *http.Request, current int64) {
+	p := apicontract.ProblemFor(http.StatusPreconditionFailed, "stale_version",
+		"The aggregate has changed since the supplied ETag")
+	p.CurrentVersion = &current
+	if current > 0 {
+		apicontract.WriteETag(w, current)
+	}
+	apicontract.WriteProblem(w, r, p)
 }
 
 // decodeJSON reads a size-capped JSON body, answering 413 rather than 400 when
@@ -973,6 +1039,18 @@ func (h *Handler) authorizeGoverned(w http.ResponseWriter, r *http.Request, prin
 // outage and answers 503. action names the GovernedWrites series ("" on the
 // pure-read routes, which do not count).
 func (h *Handler) governedRefusal(w http.ResponseWriter, r *http.Request, action, logOp, correlationID string, err error) {
+	var stale *domain.StaleVersionError
+	if errors.As(err, &stale) {
+		if action != "" {
+			h.metrics.GovernedWrites.WithLabelValues(action, telemetry.WriteConflict).Inc()
+		}
+		h.log.Info(logOp+" refused: stale If-Match",
+			zap.String("correlation_id", correlationID),
+			zap.Int64("current_version", stale.Current),
+		)
+		writeStale(w, r, stale.Current)
+		return
+	}
 	status := http.StatusServiceUnavailable
 	code := "store_unavailable"
 	if c := domain.ErrorCode(err); c != "" {
@@ -1729,7 +1807,7 @@ func (h *Handler) CreateChange(w http.ResponseWriter, r *http.Request) {
 		zap.String("change_class", created.ChangeClass),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, http.StatusCreated, created)
+	writeJSONWithETag(w, http.StatusCreated, created, created.RecordVersion)
 }
 
 // ── POST /v1/config/changes/{change_id}/approve ──────────────────────────────
@@ -1780,6 +1858,12 @@ func (h *Handler) ApproveChange(w http.ResponseWriter, r *http.Request) {
 	approvedAt := time.Now().UTC()
 
 	action, ok := h.authorizeTarget(w, r, principalID, tenantScope, "change", changeID)
+	if !ok {
+		return
+	}
+	// If-Match (API-3), read after authorization; the store compares it with
+	// the change's record_version under the row lock.
+	r, ok = requirePrecondition(w, r, false)
 	if !ok {
 		return
 	}
@@ -1858,7 +1942,8 @@ func (h *Handler) ActivateChange(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if !requireIfMatch(w, r, change.RecordVersion) {
+	r, ok = requireIfMatch(w, r, change.RecordVersion)
+	if !ok {
 		return
 	}
 
@@ -1984,7 +2069,7 @@ func (h *Handler) CreateEmergencyChange(w http.ResponseWriter, r *http.Request) 
 		zap.String("key", req.Key),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, http.StatusCreated, created)
+	writeJSONWithETag(w, http.StatusCreated, created, created.RecordVersion)
 }
 
 // ── POST /v1/emergency-changes/{emergency_change_id}/activate ────────────────
@@ -2032,7 +2117,8 @@ func (h *Handler) ActivateEmergencyChange(w http.ResponseWriter, r *http.Request
 		}
 		return
 	}
-	if !requireIfMatch(w, r, ec.RecordVersion) {
+	r, ok = requireIfMatch(w, r, ec.RecordVersion)
+	if !ok {
 		return
 	}
 
@@ -2232,6 +2318,12 @@ func (h *Handler) CreateReleasePlan(w http.ResponseWriter, r *http.Request) {
 		h.metrics.GovernedWrites.WithLabelValues(action, outcome).Inc()
 		return
 	}
+	// API-3: the plan series in this scope is versioned; If-Match names the
+	// latest version the caller read, If-None-Match: * publishes the first.
+	r, ok = requirePrecondition(w, r, true)
+	if !ok {
+		return
+	}
 
 	plan, err := h.store.CreateReleasePlan(r.Context(), domain.CreateReleasePlanParams{
 		FlagKey:          key,
@@ -2257,7 +2349,7 @@ func (h *Handler) CreateReleasePlan(w http.ResponseWriter, r *http.Request) {
 		zap.String("strategy", plan.Strategy),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, http.StatusCreated, plan)
+	writeJSONWithETag(w, http.StatusCreated, plan, int64(plan.Version))
 }
 
 // ── POST /v1/flags/{key}/evaluate ────────────────────────────────────────────

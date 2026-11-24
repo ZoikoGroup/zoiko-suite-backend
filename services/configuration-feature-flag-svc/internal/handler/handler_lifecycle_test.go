@@ -116,6 +116,7 @@ func TestRetireAndRemoval(t *testing.T) {
 
 	ok := authed(httptest.NewRequest(http.MethodPost, "/v1/flags/legacy/removal",
 		strings.NewReader(`{"environment":"production","consumer_scan_evidence":{"references":0}}`)))
+	ok.Header.Set("If-Match", `"v1"`)
 	w = httptest.NewRecorder()
 	newRecoveryRouter(s, &stubAuthz{}).ServeHTTP(w, ok)
 	if w.Code != http.StatusOK || s.gotRemoval.Key != "legacy" {
@@ -126,6 +127,7 @@ func TestRetireAndRemoval(t *testing.T) {
 	w = httptest.NewRecorder()
 	again := authed(httptest.NewRequest(http.MethodPost, "/v1/flags/legacy/removal",
 		strings.NewReader(`{"environment":"production","consumer_scan_evidence":{"references":0}}`)))
+	again.Header.Set("If-Match", `"v1"`)
 	newRecoveryRouter(s, &stubAuthz{}).ServeHTTP(w, again)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("removing a key not retired: expected 409, got %d", w.Code)

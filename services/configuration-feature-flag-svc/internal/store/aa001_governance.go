@@ -213,23 +213,39 @@ func (s *PgStore) MarkFlagRemoved(ctx context.Context, params MarkFlagRemovedPar
 	}
 	out := &domain.FlagRetirement{Key: params.Key, Environment: params.Environment}
 	err := s.withOps(ctx, func(tx pgx.Tx) error {
+		// Lock the retirement first: the tenant and the caller's If-Match
+		// (API-3) are checked against the row as it is now, before it changes.
+		var owner *string
+		var version int64
 		err := tx.QueryRow(ctx, `
-			UPDATE flag_retirements
-			SET reusable = true, removed_at = NOW(), consumer_scan_evidence = $3
+			SELECT tenant_id, record_version FROM flag_retirements
 			WHERE key = $1 AND environment = $2 AND reusable = false
-			RETURNING retirement_id, tenant_id, final_enabled, final_rollout, reusable,
-			          retired_by_principal_id, retired_at, removed_at`,
-			params.Key, params.Environment, clampJSON(params.ConsumerScanEvidence),
-		).Scan(&out.RetirementID, &out.TenantID, &out.FinalEnabled, &out.FinalRollout, &out.Reusable,
-			&out.RetiredByPrincipalID, &out.RetiredAt, &out.RemovedAt)
+			FOR UPDATE`,
+			params.Key, params.Environment,
+		).Scan(&owner, &version)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrFlagNotRetired
 		}
 		if err != nil {
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
-		if out.TenantID != nil && *out.TenantID != params.CallerTenantID {
+		if owner != nil && *owner != params.CallerTenantID {
 			return domain.ErrScopeNotAllowed
+		}
+		if err := domain.CheckPrecondition(ctx, version); err != nil {
+			return err
+		}
+		err = tx.QueryRow(ctx, `
+			UPDATE flag_retirements
+			SET reusable = true, removed_at = NOW(), consumer_scan_evidence = $3
+			WHERE key = $1 AND environment = $2 AND reusable = false
+			RETURNING retirement_id, tenant_id, final_enabled, final_rollout, reusable,
+			          retired_by_principal_id, retired_at, removed_at, record_version`,
+			params.Key, params.Environment, clampJSON(params.ConsumerScanEvidence),
+		).Scan(&out.RetirementID, &out.TenantID, &out.FinalEnabled, &out.FinalRollout, &out.Reusable,
+			&out.RetiredByPrincipalID, &out.RetiredAt, &out.RemovedAt, &out.RecordVersion)
+		if err != nil {
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
 		out.ConsumerScanEvidence = params.ConsumerScanEvidence
 		return nil
