@@ -18,6 +18,7 @@ WORKDIR /app
 
 COPY --from=builder /server /app/server
 COPY --from=builder /healthcheck /app/healthcheck
+COPY --from=builder /healthcheck /healthcheck
 
 EXPOSE 8118
 
