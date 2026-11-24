@@ -327,6 +327,10 @@ func (s *PgStore) ListDelegations(ctx context.Context, f domain.ListDelegationsF
 		// two grants written in the same transaction share it -- so without
 		// the tiebreaker a paged read can return one row twice and skip
 		// another entirely.
+		if f.AfterCreatedAt != nil {
+			args = append(args, *f.AfterCreatedAt, f.AfterID)
+			query += fmt.Sprintf(" AND (created_at, delegation_id) < ($%d, $%d::uuid)", len(args)-1, len(args))
+		}
 		query += " ORDER BY created_at DESC, delegation_id DESC"
 		if f.Limit > 0 {
 			args = append(args, f.Limit)

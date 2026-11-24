@@ -2,10 +2,12 @@ package handler
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -170,18 +172,25 @@ func (h *Handler) checkAllowed(ctx context.Context, principalID, legalEntityID, 
 	return err
 }
 
+// DelegationRoutePrefixes are the two mounts of the delegation surface:
+// /v1/delegations and the ZS-IAM-001 name /v1/iam/delegations (IAM-11 /
+// AU-26). Both are served by the same handlers.
+var DelegationRoutePrefixes = []string{"/v1/delegations", "/v1/iam/delegations"}
+
 func RegisterRoutes(r chi.Router, h *Handler) {
-	r.Route("/v1/delegations", func(r chi.Router) {
-		r.Post("/", h.CreateDelegation)
-		r.Get("/", h.ListDelegations)
-		r.Get("/{delegation_id}", h.GetDelegation)
-		r.Post("/{delegation_id}/revoke", h.RevokeDelegation)
-		r.Post("/{delegation_id}/extend", h.ExtendDelegation)
-		r.Post("/{delegation_id}/activate", h.ActivateDelegation)
-		r.Post("/{delegation_id}/suspend", h.SuspendDelegation)
-		r.Post("/{delegation_id}/resume", h.ResumeDelegation)
-		r.Get("/explain", h.ExplainDelegationChain)
-	})
+	for _, prefix := range DelegationRoutePrefixes {
+		r.Route(prefix, func(r chi.Router) {
+			r.Post("/", h.CreateDelegation)
+			r.Get("/", h.ListDelegations)
+			r.Get("/{delegation_id}", h.GetDelegation)
+			r.Post("/{delegation_id}/revoke", h.RevokeDelegation)
+			r.Post("/{delegation_id}/extend", h.ExtendDelegation)
+			r.Post("/{delegation_id}/activate", h.ActivateDelegation)
+			r.Post("/{delegation_id}/suspend", h.SuspendDelegation)
+			r.Post("/{delegation_id}/resume", h.ResumeDelegation)
+			r.Get("/explain", h.ExplainDelegationChain)
+		})
+	}
 }
 
 // ── GET /v1/delegations ────────────────────────────────────────────────────────
@@ -231,6 +240,15 @@ func (h *Handler) ListDelegations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f.Limit, f.Offset = limit, offset
+	if c := r.URL.Query().Get("cursor"); c != "" {
+		at, id, ok := decodeCursor(c)
+		if !ok || offset != 0 || r.URL.Query().Get("as_of") != "" {
+			writeError(w, r, http.StatusBadRequest, "invalid_cursor",
+				"cursor must be a next cursor this endpoint returned, and cannot be combined with offset or as_of")
+			return
+		}
+		f.AfterCreatedAt, f.AfterID = &at, id
+	}
 
 	if f.LegalEntityID != "" {
 		if err := h.checkAllowed(r.Context(), principalID, f.LegalEntityID, actionDelegationView); err != nil {
@@ -291,6 +309,15 @@ func (h *Handler) ListDelegations(w http.ResponseWriter, r *http.Request) {
 	}
 	if list == nil {
 		list = []domain.DelegationGrant{}
+	}
+	if len(list) == f.Limit && f.Limit > 0 {
+		last := list[len(list)-1]
+		next := encodeCursor(last.CreatedAt, last.DelegationID)
+		q := r.URL.Query()
+		q.Set("cursor", next)
+		q.Del("offset")
+		w.Header().Set("X-Next-Cursor", next)
+		w.Header().Set("Link", "<"+r.URL.Path+"?"+q.Encode()+`>; rel="next"`)
 	}
 	// For list endpoint, use a weak ETag based on first item's version and count
 	var etag int64
@@ -573,4 +600,30 @@ func writeJSONWithETag(w http.ResponseWriter, status int, body any, version int6
 // requireIfMatch checks the If-Match header and returns false if the request should be rejected.
 func (h *Handler) requireIfMatch(w http.ResponseWriter, r *http.Request, currentVersion int64) bool {
 	return apicontract.CheckIfMatch(w, r, currentVersion)
+}
+
+// encodeCursor / decodeCursor carry a keyset position (API-4) as
+// base64url("<created_at RFC3339Nano>|<delegation_id>"). A cursor that does
+// not decode to a time and a UUID is refused (400), never ignored.
+func encodeCursor(at time.Time, id string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(at.UTC().Format(time.RFC3339Nano) + "|" + id))
+}
+
+func decodeCursor(c string) (time.Time, string, bool) {
+	raw, err := base64.RawURLEncoding.DecodeString(c)
+	if err != nil {
+		return time.Time{}, "", false
+	}
+	ts, id, ok := strings.Cut(string(raw), "|")
+	if !ok {
+		return time.Time{}, "", false
+	}
+	at, err := time.Parse(time.RFC3339Nano, ts)
+	if err != nil {
+		return time.Time{}, "", false
+	}
+	if _, err := uuid.Parse(id); err != nil {
+		return time.Time{}, "", false
+	}
+	return at, id, true
 }

@@ -242,6 +242,13 @@ paths:
             An unrecognised value is **400 `unknown_status`**, never an empty
             list. On a governance register "nobody holds any delegated
             authority" and "you misspelled the filter" must not look identical.
+        - name: cursor
+          in: query
+          schema: { type: string }
+          description: |
+            API-4 keyset continuation: the `X-Next-Cursor` of the previous page
+            (a full page carries it, with a `Link: rel="next"`). A cursor that
+            does not decode is 400; it cannot be combined with `offset` or `as_of`.
         - name: limit
           in: query
           schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
@@ -622,6 +629,606 @@ paths:
         `target_principal_id`, in order, along the shortest path. Requires
         `DELEGATION_VIEW` on the entity.
       operationId: explainDelegationChain
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - { name: legal_entity_id, in: query, required: true, schema: { type: string } }
+        - { name: start_principal_id, in: query, required: true, schema: { type: string } }
+        - { name: target_principal_id, in: query, required: true, schema: { type: string } }
+        - { name: action_type, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: The chain; `found` is false when no path exists.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  found: { type: boolean }
+                  chain:
+                    type: array
+                    items: { $ref: '#/components/schemas/DelegationChainStep' }
+        '400':
+          description: '`missing_fields`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: '`forbidden` — `DELEGATION_VIEW` required.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  # ZS-IAM-001 name of the same surface (IAM-11 / AU-26): every route above is
+  # also served at /v1/iam/delegations by the same handler.
+  /v1/iam/delegations/:
+    post:
+      tags: [delegations]
+      summary: Grant a delegation
+      description: |
+        Creates one delegated-authority chain.
+
+        Idempotent on `(tenant_id, correlation_id, created_by_principal_id, action_type, legal_entity_id, effective_from, effective_to)`:
+        a retried submission resolves to the original grant and answers **200** rather than creating
+        a second one. A first creation answers **201**. Generate the correlation
+        id once per submission, never per attempt.
+
+        The scope now includes the caller, the action being delegated, the legal
+        entity, and the time window — so the same correlation_id used by a different
+        caller, for a different action, on a different entity, or with a different
+        validity window will correctly create a new grant rather than being treated
+        as a replay.
+
+        Before anything is written, authorization-svc is asked whether the
+        **delegator** holds the `action_type` being delegated on this entity.
+        That is a live call, never trusted from the request body, and this
+        service fails closed if authorization-svc cannot be reached.
+      operationId: createDelegationIam
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/SourceChannel'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDelegationRequest'
+      responses:
+        '201':
+          description: Delegation created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DelegationGrant' }
+        '200':
+          description: |
+            Replay. The same grant (same maker, action, entity, window,
+            delegator, delegate and ceiling) under this `correlation_id`
+            already exists and is returned unchanged. The same
+            `correlation_id` naming a different grant is a 409
+            `correlation_reused`, never a replay.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DelegationGrant' }
+        '400':
+          description: |
+            `missing_fields` (including a missing `reason`), `invalid_json`,
+            `delegate_is_delegator`, `invalid_time_window` or `invalid_limit`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                delegate_is_delegator:
+                  value:
+                    type: https://api.zoikosuite.com/problems/delegate-is-delegator
+                    title: Bad Request
+                    status: 400
+                    code: delegate_is_delegator
+                    detail: delegate_principal_id must differ from delegator_principal_id
+                invalid_time_window:
+                  value:
+                    type: https://api.zoikosuite.com/problems/invalid-time-window
+                    title: Bad Request
+                    status: 400
+                    code: invalid_time_window
+                    detail: effective_to must be after effective_from
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: |
+            Three distinct refusals, and they need different remedies:
+
+            - `delegator_mismatch` — the caller named somebody else as delegator
+              without holding `DELEGATION_ADMINISTER` on this entity.
+            - `self_dealing` — an administrator routed another principal's
+              authority to themselves.
+            - `delegator_lacks_authority` — the delegator does not hold what is
+              being delegated. This is the §9.3 invariant.
+            - `delegator_authority_delegated` — the delegator holds it only by
+              delegation. authorization-svc confers through a delegation only
+              what the delegator holds in their own right, so it cannot be
+              passed on.
+            - `delegator_exceeds_limit` — the ceiling is above the delegator's
+              own authority limit (ORG-06 negative case 11).
+            - `sod_conflict` — the delegate would hold conflicting duties.
+            - `forbidden` — the caller lacks `DELEGATION_CREATE`.
+
+            Every one of these is recorded in `refused_escalations`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                delegator_mismatch:
+                  value:
+                    type: https://api.zoikosuite.com/problems/delegator-mismatch
+                    title: Forbidden
+                    status: 403
+                    code: delegator_mismatch
+                    detail: caller may only delegate their own authority
+                self_dealing:
+                  value:
+                    type: https://api.zoikosuite.com/problems/self-dealing
+                    title: Forbidden
+                    status: 403
+                    code: self_dealing
+                    detail: a delegation administered for another principal may not name the caller as delegate
+                delegator_lacks_authority:
+                  value:
+                    type: https://api.zoikosuite.com/problems/delegator-lacks-authority
+                    title: Forbidden
+                    status: 403
+                    code: delegator_lacks_authority
+                    detail: delegator does not hold the authority being delegated
+        '409':
+          description: |
+            `overlap_conflict` — the delegate already holds this action on this
+            entity for an overlapping window (half-open `[from, to)`; adjacent
+            windows do not overlap).
+            `correlation_reused` — this `correlation_id` was already used for a
+            different grant.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+    get:
+      tags: [delegations]
+      summary: Read the delegation register
+      description: |
+        Two scopes, and which one you get is decided by `legal_entity_id`:
+
+        - **with it** — every delegation on that entity. Requires
+          `DELEGATION_VIEW` on the entity.
+        - **without it** — only the delegations the caller is delegator or
+          delegate of. No authorization call; this is the caller's own
+          involvement and needs no grant.
+
+        There is no third mode. An unscoped read used to skip authorization
+        entirely and return the tenant's complete map of who may act for whom.
+      operationId: listDelegationsIam
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - name: legal_entity_id
+          in: query
+          schema: { type: string }
+          description: Switches the read to entity scope. Requires `DELEGATION_VIEW`.
+        - name: delegator_principal_id
+          in: query
+          schema: { type: string }
+        - name: delegate_principal_id
+          in: query
+          schema: { type: string }
+        - name: as_of
+          in: query
+          schema: { type: string, format: date-time }
+          description: |
+            GetEffectiveDelegations as of an instant: the grants effective then,
+            with the status and window they had then, from the append-only
+            history. Cannot be combined with `status`.
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/DelegationStatus' }
+          description: |
+            An unrecognised value is **400 `unknown_status`**, never an empty
+            list. On a governance register "nobody holds any delegated
+            authority" and "you misspelled the filter" must not look identical.
+        - name: cursor
+          in: query
+          schema: { type: string }
+          description: |
+            API-4 keyset continuation: the `X-Next-Cursor` of the previous page
+            (a full page carries it, with a `Link: rel="next"`). A cursor that
+            does not decode is 400; it cannot be combined with `offset` or `as_of`.
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: The register, in the scope described above.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/DelegationGrant' }
+        '400':
+          description: '`unknown_status` or `invalid_paging`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: |
+            `forbidden` — either the caller lacks `DELEGATION_VIEW` on the named
+            entity, or the read named another principal with no entity scope.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/iam/delegations/{delegation_id}:
+    get:
+      tags: [delegations]
+      summary: Read one delegation
+      operationId: getDelegationIam
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/DelegationId'
+      responses:
+        '200':
+          description: The grant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DelegationGrant' }
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          description: |
+            `not_found`. A read the caller may not make is answered exactly
+            the same way, so an id cannot be probed for existence. A party to
+            the grant (delegator, delegate or maker) may always read it; anyone
+            else needs `DELEGATION_VIEW` on its entity.
+            A **malformed** id answers 404 too, not 503: the value
+            reaches Postgres as `22P02 invalid_text_representation`, and a
+            string that cannot name a row is exactly what 404 means. Reporting
+            it as an outage sent whoever was on call to look at a healthy
+            database.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/iam/delegations/{delegation_id}/revoke:
+    post:
+      tags: [delegations]
+      summary: Revoke a PROPOSED, ACTIVE or SUSPENDED delegation
+      description: |
+        Terminal. A revoked grant cannot be reinstated; issue a new one.
+        `expected_version` is required (409 `version_mismatch` if the grant has
+        changed since it was read; 428 without it) and so is a `reason`, which
+        is recorded as `revocation_reason`.
+
+        Requires `DELEGATION_REVOKE`. `authority.revoked` is written in the same
+        transaction as the status change and delivered by the outbox relay —
+        identity-context-svc ends the delegate's session on that event, so it is
+        the one event here that may not be best-effort.
+      operationId: revokeDelegationIam
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/DelegationId'
+        - $ref: '#/components/parameters/ExpectedVersion'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransitionRequest' }
+      responses:
+        '200':
+          description: Revoked. `revoked_by_principal_id`, `revoked_at` and `revocation_reason` are set.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DelegationGrant' }
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: '`forbidden` — the caller lacks `DELEGATION_REVOKE`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: '`not_found`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '428':
+          description: '`version_required`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: |
+            `version_mismatch`, or `invalid_transition` — already `REVOKED` or `EXPIRED`. Not a fault
+            and not a refusal: a correct answer that the caller is late. A
+            rising rate of it means two operators are chasing the same
+            delegation.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/iam/delegations/{delegation_id}/extend:
+    post:
+      tags: [delegations]
+      summary: Extend an ACTIVE delegation's effective_to
+      description: |
+        Extends an ACTIVE delegation to a later end date. Only the delegator
+        or an administrator with `DELEGATION_ADMINISTER` may extend.
+
+        The new `effective_to` must be strictly after the current one, and a
+        grant whose window has already ended is not revived (409 `lapsed`). The
+        extension re-checks the delegator's authority, limit and SoD, and fails
+        with `overlap_conflict` only if ANOTHER active delegation would overlap
+        — the grant itself is excluded by id. `expected_version` and a `reason`
+        are required.
+
+        `authority.extended` is written in the same transaction as the change.
+      operationId: extendDelegationIam
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/DelegationId'
+        - $ref: '#/components/parameters/ExpectedVersion'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExtendDelegationRequest'
+      responses:
+        '200':
+          description: Extended. `effective_to` and `updated_at` are updated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DelegationGrant' }
+        '400':
+          description: '`missing_fields`, `invalid_json`, or `invalid_time_window` (new_effective_to not after current).'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: |
+            `forbidden` — not the delegator and lacks `DELEGATION_ADMINISTER`.
+            `self_dealing` — the delegate extending their own grant.
+            `approval_not_segregated` — the grant's maker extending it alone.
+            `delegator_lacks_authority`, `delegator_authority_delegated`,
+            `delegator_exceeds_limit` or `sod_conflict` — the extended grant
+            would exceed the delegator.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: '`not_found`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: |
+            `overlap_conflict` — another ACTIVE delegation for the same delegate
+            and action would overlap the new window.
+            `cannot_extend` — delegation is not ACTIVE.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/iam/delegations/{delegation_id}/activate:
+    post:
+      tags: [delegations]
+      summary: Approve a PROPOSED delegation
+      description: |
+        Proposed → Active (ORG-06). The approver is the delegator
+        (`DELEGATOR_APPROVAL`) or a holder of `DELEGATION_ADMINISTER` who is neither
+        the maker nor the delegate (`ADMINISTRATOR_APPROVAL`); the database enforces the
+        same rule. Re-checks the delegator's authority, the delegated ceiling against
+        the delegator's own limit, SoD and overlap. Publishes `authority.delegated`
+        (DelegationActivated).
+      operationId: activateDelegationIam
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/DelegationId'
+        - $ref: '#/components/parameters/ExpectedVersion'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransitionRequest' }
+      responses:
+        '200':
+          description: Applied; the grant at its new version.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DelegationGrant' }
+        '400':
+          description: '`reason_required`, `invalid_expected_version` or `invalid_json`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: '`approval_not_segregated`, `delegator_lacks_authority`, `delegator_exceeds_limit`, `sod_conflict` or `forbidden`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: '`not_found`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: '`invalid_transition`, `version_mismatch`, `lapsed` (window already ended) or `overlap_conflict`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '428':
+          description: '`version_required` — no expected_version.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/iam/delegations/{delegation_id}/suspend:
+    post:
+      tags: [delegations]
+      summary: Suspend an ACTIVE delegation
+      description: |
+        Active → Suspended. Confers nothing until resumed. The delegator or a
+        holder of `DELEGATION_REVOKE` may suspend; a reason is required. Publishes
+        `authority.suspended`, on which identity-context-svc ends the delegate's
+        sessions and authorization-svc stops honouring the grant.
+      operationId: suspendDelegationIam
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/DelegationId'
+        - $ref: '#/components/parameters/ExpectedVersion'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransitionRequest' }
+      responses:
+        '200':
+          description: Applied; the grant at its new version.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DelegationGrant' }
+        '400':
+          description: '`reason_required`, `invalid_expected_version` or `invalid_json`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: '`forbidden` — not the delegator and lacks `DELEGATION_REVOKE`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: '`not_found`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: '`invalid_transition`, `version_mismatch`, `lapsed` (window already ended) or `overlap_conflict`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '428':
+          description: '`version_required` — no expected_version.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/iam/delegations/{delegation_id}/resume:
+    post:
+      tags: [delegations]
+      summary: Resume a SUSPENDED delegation
+      description: |
+        Suspended → Active, after the same re-checks as activation. The
+        delegator, or a holder of `DELEGATION_ADMINISTER` who is not the delegate.
+        Publishes `authority.resumed`.
+      operationId: resumeDelegationIam
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/DelegationId'
+        - $ref: '#/components/parameters/ExpectedVersion'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransitionRequest' }
+      responses:
+        '200':
+          description: Applied; the grant at its new version.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DelegationGrant' }
+        '400':
+          description: '`reason_required`, `invalid_expected_version` or `invalid_json`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: '`self_dealing`, `approval_not_segregated` (the grant''s maker resuming it alone), `delegator_lacks_authority`, `delegator_authority_delegated`, `delegator_exceeds_limit`, `sod_conflict` or `forbidden`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: '`not_found`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: '`invalid_transition`, `version_mismatch`, `lapsed` (window already ended) or `overlap_conflict`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '428':
+          description: '`version_required` — no expected_version.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/iam/delegations/explain:
+    get:
+      tags: [delegations]
+      summary: Explain the delegation chain between two principals
+      description: |
+        ExplainDelegationChain (ORG-06): every currently effective link by which
+        authority for `action_type` flows from `start_principal_id` to
+        `target_principal_id`, in order, along the shortest path. Requires
+        `DELEGATION_VIEW` on the entity.
+      operationId: explainDelegationChainIam
       parameters:
         - $ref: '#/components/parameters/TenantId'
         - $ref: '#/components/parameters/PrincipalId'

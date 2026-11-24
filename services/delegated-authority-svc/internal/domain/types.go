@@ -191,6 +191,12 @@ type ListDelegationsFilter struct {
 
 	Limit  int
 	Offset int
+
+	// AfterCreatedAt / AfterID continue a keyset page (API-4): rows strictly
+	// after the last row of the previous page in (created_at, delegation_id)
+	// DESC order.
+	AfterCreatedAt *time.Time
+	AfterID        string
 }
 
 type CreateDelegationRequest struct {

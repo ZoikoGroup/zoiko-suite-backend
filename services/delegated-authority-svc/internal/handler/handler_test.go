@@ -118,6 +118,15 @@ func (s *stubStore) ListDelegations(_ context.Context, f domain.ListDelegationsF
 	}
 	// Deterministic order so paging assertions mean something.
 	sort.Slice(out, func(i, j int) bool { return out[i].DelegationID > out[j].DelegationID })
+	if f.AfterCreatedAt != nil { // keyset: the stub orders by id alone
+		kept := out[:0]
+		for _, d := range out {
+			if d.DelegationID < f.AfterID {
+				kept = append(kept, d)
+			}
+		}
+		out = kept
+	}
 	if f.Offset > 0 {
 		if f.Offset >= len(out) {
 			return nil, nil
