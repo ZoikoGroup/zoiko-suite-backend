@@ -405,14 +405,14 @@ func TestPgStore_TenantIsolation_ListHierarchiesByEntity(t *testing.T) {
 
 	// Tenant B queries using tenant A's entity ID.
 	ctxB := domain.WithTenant(ctx, b.tenantID)
-	results, err := s.ListHierarchiesByEntity(ctxB, a.entityID)
+	results, _, err := s.ListHierarchiesByEntity(ctxB, a.entityID, 50, "")
 	require.NoError(t, err)
 	for _, h := range results {
 		assert.NotEqual(t, a.tenantID, h.TenantID, "ISOLATION FAILURE: ListHierarchiesByEntity returned tenant A's hierarchy in tenant B's context")
 	}
 
 	// Sanity: tenant B can still read its own hierarchies.
-	ownResults, err := s.ListHierarchiesByEntity(ctxB, b.entityID)
+	ownResults, _, err := s.ListHierarchiesByEntity(ctxB, b.entityID, 50, "")
 	require.NoError(t, err)
 	assert.NotEmpty(t, ownResults, "tenant B should see its own hierarchy")
 }
@@ -435,9 +435,9 @@ func TestPgStore_TenantIsolation_EndDateHierarchy(t *testing.T) {
 	require.ErrorIs(t, err, registry.ErrNotFound)
 
 	// Verify: tenant A's hierarchy's effective_to should still be NULL.
-	rows, err := s.ListHierarchiesByEntity(
+	rows, _, err := s.ListHierarchiesByEntity(
 		domain.WithTenant(context.Background(), a.tenantID),
-		a.entityID,
+		a.entityID, 50, "",
 	)
 	require.NoError(t, err)
 	for _, h := range rows {
@@ -456,7 +456,7 @@ func TestPgStore_TenantIsolation_ListJurisdictionAssignments(t *testing.T) {
 
 	// Tenant B queries using tenant A's entity ID.
 	ctxB := domain.WithTenant(ctx, b.tenantID)
-	results, err := s.ListJurisdictionAssignments(ctxB, a.entityID)
+	results, _, err := s.ListJurisdictionAssignments(ctxB, a.entityID, 50, "")
 	require.NoError(t, err)
 	for _, a := range results {
 		assert.NotEqual(t, a.TenantID, b.tenantID, "sanity check failed")
@@ -465,7 +465,7 @@ func TestPgStore_TenantIsolation_ListJurisdictionAssignments(t *testing.T) {
 	assert.Empty(t, results, "ISOLATION FAILURE: ListJurisdictionAssignments returned tenant A's assignments in tenant B's context")
 
 	// Sanity: tenant B can still list its own assignments.
-	ownResults, err := s.ListJurisdictionAssignments(ctxB, b.entityID)
+	ownResults, _, err := s.ListJurisdictionAssignments(ctxB, b.entityID, 50, "")
 	require.NoError(t, err)
 	assert.NotEmpty(t, ownResults, "tenant B should see its own jurisdiction assignments")
 }
@@ -484,7 +484,7 @@ func TestPgStore_TenantIsolation_EndDateJurisdictionAssignment(t *testing.T) {
 
 	// Verify: tenant A's assignment is still active (effective_to = NULL).
 	ctxA := domain.WithTenant(context.Background(), a.tenantID)
-	rows, err := s.ListJurisdictionAssignments(ctxA, a.entityID)
+	rows, _, err := s.ListJurisdictionAssignments(ctxA, a.entityID, 50, "")
 	require.NoError(t, err)
 	for _, r := range rows {
 		if r.AssignmentID == a.assignmentID {
@@ -582,12 +582,12 @@ func TestPgStore_TenantIsolation_ListTaxIdentityBundlesByEntity(t *testing.T) {
 
 	// Tenant B probes using tenant A's entity ID.
 	ctxB := domain.WithTenant(ctx, b.tenantID)
-	results, err := s.ListTaxIdentityBundlesByEntity(ctxB, a.entityID)
+	results, _, err := s.ListTaxIdentityBundlesByEntity(ctxB, a.entityID, 50, "")
 	require.NoError(t, err)
 	assert.Empty(t, results, "ISOLATION FAILURE: ListTaxIdentityBundlesByEntity returned RESTRICTED data across tenant boundary")
 
 	// Sanity: tenant B can list its own bundles.
-	ownResults, err := s.ListTaxIdentityBundlesByEntity(ctxB, b.entityID)
+	ownResults, _, err := s.ListTaxIdentityBundlesByEntity(ctxB, b.entityID, 50, "")
 	require.NoError(t, err)
 	assert.NotEmpty(t, ownResults, "tenant B should see its own tax bundles")
 }
