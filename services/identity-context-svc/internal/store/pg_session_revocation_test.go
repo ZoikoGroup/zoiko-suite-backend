@@ -25,9 +25,12 @@ func TestIC16_RevocationEventCommitsWithTheInvalidationOnce(t *testing.T) {
 	rec, err := events.Render(events.EventSessionRevoked, "t-1", "", "admin-1", "corr-1", "sc-1",
 		map[string]any{"session_context_id": "sc-1", "tenant_id": "t-1", "actor": "admin-1"})
 	require.NoError(t, err)
+	// The eventing outbox gives each envelope its own event id, so count the
+	// revocations of this session.
 	count := func() int {
 		var n int
-		require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM event_outbox WHERE event_id = $1`, rec.EventID).Scan(&n))
+		require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM eventing_outbox
+			WHERE aggregate_id = 'sc-1' AND event_type LIKE '%identity.session.revoked'`).Scan(&n))
 		return n
 	}
 	require.NoError(t, s.MarkSessionInvalidated(ctx, "sc-1", "t-1", domain.InvalidationReasonAdminRevoke, time.Now().UTC(), rec))
@@ -35,7 +38,5 @@ func TestIC16_RevocationEventCommitsWithTheInvalidationOnce(t *testing.T) {
 
 	rec2, _ := events.Render(events.EventSessionRevoked, "t-1", "", "admin-1", "corr-2", "sc-1", map[string]any{"session_context_id": "sc-1"})
 	require.NoError(t, s.MarkSessionInvalidated(ctx, "sc-1", "t-1", domain.InvalidationReasonAdminRevoke, time.Now().UTC(), rec2))
-	var n2 int
-	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM event_outbox WHERE event_id = $1`, rec2.EventID).Scan(&n2))
-	require.Zero(t, n2, "an already-invalidated session emits nothing")
+	require.Equal(t, 1, count(), "an already-invalidated session emits nothing")
 }
