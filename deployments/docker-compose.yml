@@ -1072,6 +1072,8 @@ services:
       # Unset URL: records wait in the outbox (evidence fails safe).
       GOVERNANCE_DECISION_LOG_MTLS_URL: "${JURISDICTION_DECISION_LOG_MTLS_URL:-https://governance-decision-log-svc:8450}"
       LEDGER_PRINCIPAL_ID: "${JURISDICTION_LEDGER_PRINCIPAL_ID:-svc-jurisdiction-rules}"
+      # Deliveries per second; a burst waits in the outbox instead of competing with decisions.
+      LEDGER_RELAY_MAX_PER_SECOND: "${JURISDICTION_LEDGER_RELAY_MAX_PER_SECOND:-20}"
       MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
       MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
     volumes:
@@ -1572,6 +1574,8 @@ services:
       # Unset URL: records wait in the outbox (evidence fails safe).
       GOVERNANCE_DECISION_LOG_MTLS_URL: "${OBLIGATIONS_DECISION_LOG_MTLS_URL:-https://governance-decision-log-svc:8450}"
       LEDGER_PRINCIPAL_ID: "${OBLIGATIONS_LEDGER_PRINCIPAL_ID:-svc-obligations}"
+      # Deliveries per second; a burst waits in the outbox instead of competing with decisions.
+      LEDGER_RELAY_MAX_PER_SECOND: "${OBLIGATIONS_LEDGER_RELAY_MAX_PER_SECOND:-20}"
       MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
       MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
     volumes:
@@ -1784,6 +1788,8 @@ services:
       # Unset URL: records wait in the outbox (evidence fails safe).
       GOVERNANCE_DECISION_LOG_MTLS_URL: "${AUTHZ_DECISION_LOG_MTLS_URL:-https://governance-decision-log-svc:8450}"
       LEDGER_PRINCIPAL_ID: "${AUTHZ_LEDGER_PRINCIPAL_ID:-svc-authorization}"
+      # Deliveries per second; a burst waits in the outbox instead of competing with decisions.
+      LEDGER_RELAY_MAX_PER_SECOND: "${AUTHZ_LEDGER_RELAY_MAX_PER_SECOND:-20}"
     volumes:
       # Only this service's own bootstrap token (register M-01): the
       # sub-directory authorization-svc/ of the keygen volume, so /bootstrap/token
@@ -3340,6 +3346,8 @@ services:
       # Unset URL: records wait in the outbox (evidence fails safe).
       GOVERNANCE_DECISION_LOG_MTLS_URL: "${EVIDENCE_DECISION_LOG_MTLS_URL:-https://governance-decision-log-svc:8450}"
       LEDGER_PRINCIPAL_ID: "${EVIDENCE_LEDGER_PRINCIPAL_ID:-svc-evidence-requirements}"
+      # Deliveries per second; a burst waits in the outbox instead of competing with decisions.
+      LEDGER_RELAY_MAX_PER_SECOND: "${EVIDENCE_LEDGER_RELAY_MAX_PER_SECOND:-20}"
       MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
       MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
     volumes:

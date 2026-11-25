@@ -200,10 +200,6 @@ func (h *Handler) admin(w http.ResponseWriter, r *http.Request, resource, action
 }
 
 func (h *Handler) emitRegistry(r *http.Request, eventType, aggregateID, actor string, payload map[string]any) {
-	if h.registryPub == nil {
-		return
-	}
-	corr := r.Header.Get("X-Correlation-ID")
 	if v := h.eventAggregateVersion(r.Context()); v > 0 {
 		withVersion := make(map[string]any, len(payload)+1)
 		for k, x := range payload {
@@ -212,6 +208,13 @@ func (h *Handler) emitRegistry(r *http.Request, eventType, aggregateID, actor st
 		withVersion[events.AggregateVersionKey] = v
 		payload = withVersion
 	}
+	// DL-4: a governed decision is queued for the governance ledger in the
+	// same unit of work, whether or not an event broker is configured.
+	_ = h.recordDecision(r, nil, eventType, aggregateID, actor, payload)
+	if h.registryPub == nil {
+		return
+	}
+	corr := r.Header.Get("X-Correlation-ID")
 	h.publish(eventType, corr, func() error {
 		err := h.registryPub.PublishRegistryEvent(r.Context(), eventType, aggregateID, actor, corr, payload)
 		if err != nil {

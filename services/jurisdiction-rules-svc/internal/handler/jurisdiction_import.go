@@ -253,6 +253,13 @@ func (h *Handler) ApproveJurisdictionImport(w http.ResponseWriter, r *http.Reque
 			return err
 		}
 		batch = b
+		// DL-4: the approval is a governed decision; its ledger record shares
+		// the transaction that applies the batch.
+		if err := h.recordDecision(r, q, EventImportApproved, b.BatchID, principalID, map[string]any{
+			"reason": req.Reason, "added": intPtrValue(b.Added), "updated": intPtrValue(b.Updated), "retired": intPtrValue(b.Retired),
+		}); err != nil {
+			return err
+		}
 		src := importSource(b)
 		for _, c := range changes {
 			if err := h.announceImportChange(ctx, c, src, correlationID); err != nil {

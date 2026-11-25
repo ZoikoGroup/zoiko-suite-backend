@@ -359,3 +359,23 @@ by its incident commander under the ring-order exception; the retrospective is r
 
 F24 stays 🟡: reads and runtime resolutions accept a headers-only identity (`warn`) until the tax and
 payroll readers outside D1/D2 forward the envelope.
+
+## Decision capture (DL-4, 25 Nov 2026)
+
+Doc 01 §7: the Jurisdiction engine's governed decisions reach governance-decision-log-svc as
+`svc-jurisdiction-rules` (migration 000046 in authorization-svc): pack certify (`CERTIFIED`), release/publish
+(`RELEASED`), block (`BLOCKED`), unblock (`UNBLOCKED`), withdraw (`WITHDRAWN`), rollback (`ROLLED_BACK`), supersede
+(`SUPERSEDED`); interpretation approval and jurisdiction import approval (`APPROVED`); calendar publication
+(`PUBLISHED`); payment-term approval (`ACTIVATED`). `rule_basis` is `<pack_ref>@<version>` (calendar
+`calendar:<code>@<version>`, term `payment_term:<code>@<version>`, `interpretation:<id>`, `import:<batch>`); the
+person who decided is `evaluation_context.on_behalf_of`; packs are platform reference data, so the record's
+legal entity is the ledger's `PLATFORM` scope and its tenant is the requester's.
+
+- One hook: `handler.emitRegistry` queues the record in the request's unit of work beside the registry event
+  (`internal/handler/decision_ledger.go`); import approval queues it in its own transaction. A record that cannot
+  be queued aborts the unit, exactly like its event (J-11).
+- Migration 000038 `decision_log_outbox`; metrics `jurisdiction_decision_log_*` (`internal/ledgermetrics`).
+- Tests: `TestLedgerRecord_GovernedDecisionsOnly`, `TestLedgerRecord_DecisionIDIsStablePerChange`; the dependency
+  e2e gains a ledger section (certify by an independent certifier, publish, interpretation approval).
+
+The record is written to `decision_log_outbox` in the transaction of the decision it records and delivered by `identity-envelope/decisionledger`'s relay (lease-based claim, backoff to 10 minutes, a 409 parks the row for an operator, delivered rows purged after `LEDGER_RETENTION_HOURS`, default 168) to `GOVERNANCE_DECISION_LOG_MTLS_URL` with this service's own workload certificate (`mtlsclient`, bootstrap token `MTLS_BOOTSTRAP_TOKEN_PATH`). Deliveries are capped at `LEDGER_RELAY_MAX_PER_SECOND` (default 20): a ledger outage or a burst delays the evidence, it never fails or slows the decision. Status: 🔵 built, not verified (tracker "Assignment 25 Nov 2026").
