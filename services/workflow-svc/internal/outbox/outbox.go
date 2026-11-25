@@ -215,6 +215,14 @@ func (r *Relay) RelayOnce(ctx context.Context) {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// The relay acts for no tenant. outbox_events has FORCE RLS, and its
+	// policy (000028) admits a transaction that names itself the relay;
+	// without this the runtime role's poll sees no rows at all.
+	if _, err := tx.Exec(ctx, `SELECT set_config('app.outbox_relay', 'true', true)`); err != nil {
+		r.log.Error("outbox relay: set relay marker failed", zap.Error(err))
+		return
+	}
+
 	const pollSQL = `
 		SELECT outbox_event_id, aggregate_type, aggregate_id, event_type,
 		       tenant_id, legal_entity_id, actor_id, correlation_id, headers,

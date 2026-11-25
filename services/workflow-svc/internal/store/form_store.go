@@ -609,7 +609,7 @@ func (s *PgStore) ListPendingSubmissions(ctx context.Context, tenantID, formID s
 		last := out[limit-1] // The last item of the actual page
 		out = out[:limit]
 		nextCursor = &domain.PaginationCursor{
-			StartedAt:  last.CreatedAt.UTC().Format(time.RFC3339),
+			StartedAt:  last.CreatedAt.UTC().Format(time.RFC3339Nano),
 			InstanceID: last.SubmissionID,
 		}
 	}

@@ -279,8 +279,11 @@ def ledger():
 
     s, _, f = gdl("POST", "/v1/decisions", principal=WRITER, body=decision_body(outcome="APPROVED", causation_id=d["decision_id"],
                                                               title="Resolve: Approve vendor contract renewal"))
+    # Later in the chain, not necessarily next: since DL-3 (D-DL-1) authorization-svc
+    # relays every DENY, including the refused writes above, so its records can
+    # land between the two. The chain section re-verifies every link.
     check("follow-up recorded with causation_id", s == 201 and f.get("causation_id") == d["decision_id"]
-          and f.get("chain_seq") == d["chain_seq"] + 1 and f.get("prev_hash") == d["curr_hash"], f"HTTP {s} {brief(f)}")
+          and f.get("chain_seq", 0) > d["chain_seq"] and len(f.get("prev_hash", "")) == 64, f"HTTP {s} {brief(f)}")
     state["follow_up"] = f
     s, _, p = gdl("GET", f"/v1/decisions/{d['decision_id']}")
     check("parent shows follow_up_count=1", s == 200 and p.get("follow_up_count") == 1, f"HTTP {s} {p.get('follow_up_count')}")
@@ -685,7 +688,15 @@ def workflow():
     if not check("health workflow-svc /healthz", s == 200, f"HTTP {s}"):
         return
     subject = f"PR-{RUN}"
-    h = envelope(ADMIN, write=True)
+    # workflow-svc forwards the caller's envelope to tenant-entity-registry-svc
+    # to check the legal entity, and the registry's identity gate is strict
+    # (20 Nov 2026): bare identity headers there are 401, which workflow-svc
+    # answers 503 registry_unavailable. Every call carries the signed envelope.
+    def wfh(principal, write=False):
+        h = envelope(principal, write=write)
+        h["Authorization"] = "Bearer " + person_jwt(principal)
+        return h
+    h = wfh(ADMIN, write=True)
     s, _, wf = call("POST", f"{WORKFLOW}/v1/workflows", h, {
         "tenant_id": TENANT, "legal_entity_id": ENTITY, "workflow_type": "PURCHASE_APPROVAL",
         "subject_type": "PURCHASE_REQUEST", "subject_id": subject,
@@ -695,8 +706,8 @@ def workflow():
         return
     wid = wf["workflow_instance_id"]
     # Optimistic concurrency (API-3): the instance's current ETag in If-Match.
-    _, wh, _ = call("GET", f"{WORKFLOW}/v1/workflows/{wid}", envelope(APPROVER))
-    ah = envelope(APPROVER, write=True)
+    _, wh, _ = call("GET", f"{WORKFLOW}/v1/workflows/{wid}", wfh(APPROVER))
+    ah = wfh(APPROVER, write=True)
     if wh and wh.get("ETag"):
         ah["If-Match"] = wh.get("ETag")
     s, _, act = call("POST", f"{WORKFLOW}/v1/workflows/{wid}/actions", ah,

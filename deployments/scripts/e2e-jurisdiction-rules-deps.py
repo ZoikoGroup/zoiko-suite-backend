@@ -499,7 +499,7 @@ def decision_ledger():
             rows = page.get("records") if isinstance(page, dict) else None
             return rows if st == 200 and rows else None
         rows = until(found, 30)
-        if check(f"ledger: {action} {basis} is in the decision log within 30 s", rows, "not found"):
+        if check(f"ledger: {action} {basis} is in the decision log within 30 s", rows, "found" if rows else "not found"):
             d = rows[0]
             check(f"ledger: {action} recorded by svc-jurisdiction-rules on behalf of the person who decided",
                   d.get("actor_id") == "svc-jurisdiction-rules" and (d.get("evaluation_context") or {}).get("on_behalf_of") == person,

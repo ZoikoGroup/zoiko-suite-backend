@@ -238,11 +238,14 @@ def workflow():
     s, wf = call("POST", f"{WORKFLOW}/v1/workflows", as_person("admin", write=True, extra={"X-Causation-Id": decision_id}),
                  {"tenant_id": TENANT, "legal_entity_id": ENTITY, "workflow_type": "PAYMENT_APPROVAL",
                   "stages": [{"approver_principal_id": approver}]})
-    inst = (wf.get("workflow_instance") or {}) if isinstance(wf, dict) else {}
+    # The instance fields are at the top level of the response (the stages
+    # sit beside them), not under a "workflow_instance" key.
+    inst = wf if isinstance(wf, dict) else {}
     if not check("workflow: started for the escalated decision, which it stores", s == 201 and inst.get("causation_decision_id") == decision_id,
                  f"HTTP {s} {brief(wf)}"):
         return
-    s, act = call("POST", f"{WORKFLOW}/v1/workflows/{inst['workflow_instance_id']}/actions", as_person("legal", write=True),
+    s, act = call("POST", f"{WORKFLOW}/v1/workflows/{inst['workflow_instance_id']}/actions",
+                  as_person("legal", write=True, extra={"If-Match": f'"v{inst.get("row_version", 1)}"'}),
                   {"action": "APPROVE", "rationale": "e2e decision capture"})
     check("workflow: the approver approves", s == 200, f"HTTP {s} {brief(act)}")
     end, found = time.time() + 60, None
