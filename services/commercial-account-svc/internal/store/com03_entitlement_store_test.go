@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -170,5 +171,137 @@ func TestEntitlement_PolicyPublicationIsAppendOnly(t *testing.T) {
 	v2 := f.policy("READ_ONLY", 7, publisher)
 	if v2.PolicyVersion != v1.PolicyVersion+1 {
 		t.Fatalf("policy versions must be sequential: %d after %d", v2.PolicyVersion, v1.PolicyVersion)
+	}
+}
+
+// A6: a replayed PublishEntitlementPolicy under the same idempotency key
+// must return the exact original command's own version — not whichever
+// version happens to be effective "now" at replay time, which genuinely
+// differs here: the original call published a future-dated DENY policy that
+// is not yet effective, so "what's effective now" is still the earlier
+// READ_ONLY baseline. A pre-fix replay would have returned that baseline,
+// not the DENY version the original call actually created.
+func TestEntitlement_PublishEntitlementPolicyReplayReturnsOriginalVersion(t *testing.T) {
+	f := newSub(t)
+	baseline := f.policy("READ_ONLY", 30, publisher)
+
+	future := day(1000)
+	p := &domain.EntitlementPolicyVersion{EndedOutcome: "DENY", EffectiveFrom: future, Reason: "future hard cutover",
+		CreatedAt: day(5), CreatedByPrincipalID: publisher}
+	claim := f.claim(publisher, "PublishEntitlementPolicy", "grace-policy")
+	original, err := f.s.PublishEntitlementPolicy(f.ctx, p, claim)
+	if err != nil {
+		t.Fatalf("publish future policy: %v", err)
+	}
+	if original.PolicyVersion != baseline.PolicyVersion+1 || original.EndedOutcome != "DENY" {
+		t.Fatalf("original publish: %+v", original)
+	}
+
+	// What's effective "now" (day(5), before the future policy's effective
+	// date) is still the baseline — confirming a recompute-fresh replay
+	// really would answer differently from the original command's result.
+	effectiveNow, err := f.s.GetEntitlementPolicy(f.ctx, day(5))
+	if err != nil || effectiveNow == nil || effectiveNow.PolicyVersion != baseline.PolicyVersion {
+		t.Fatalf("effective-now baseline: %+v (err=%v)", effectiveNow, err)
+	}
+
+	// Retry under the identical claim (same key, same body hash): a second,
+	// unrelated policy must NOT have been inserted (it is still would-be
+	// version baseline+2 if a fresh one got created), and the replay error's
+	// resource id must resolve back to the ORIGINAL future DENY version.
+	p2 := &domain.EntitlementPolicyVersion{EndedOutcome: "DENY", EffectiveFrom: future, Reason: "future hard cutover",
+		CreatedAt: day(5), CreatedByPrincipalID: publisher}
+	_, err = f.s.PublishEntitlementPolicy(f.ctx, p2, claim)
+	var replay *domain.IdempotentReplayError
+	if !errors.As(err, &replay) {
+		t.Fatalf("retry under the same key did not replay: %v", err)
+	}
+	version, perr := strconv.Atoi(replay.ResourceID)
+	if perr != nil {
+		t.Fatalf("replay resource id %q is not the policy_version: %v", replay.ResourceID, perr)
+	}
+	got, err := f.s.GetEntitlementPolicyByVersion(f.ctx, version)
+	if err != nil || got == nil {
+		t.Fatalf("get replayed version: %+v (err=%v)", got, err)
+	}
+	if got.PolicyVersion != original.PolicyVersion || got.EndedOutcome != "DENY" || !got.EffectiveFrom.Equal(future) {
+		t.Fatalf("replayed policy = %+v, want the original future DENY version %+v", got, original)
+	}
+	var count int
+	if err := f.admin.QueryRow(f.ctx, `SELECT count(*) FROM entitlement_policy_versions`).Scan(&count); err != nil {
+		t.Fatalf("count policy versions: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("replay must not insert a second row: %d policy versions exist, want 2", count)
+	}
+}
+
+// A6: a replayed CreateSnapshot under the same idempotency key must return
+// the exact decisions the original call captured, even though the
+// organization's genuinely effective entitlements have since changed (here,
+// a restriction applied after the original snapshot). A recompute-fresh
+// replay (the pre-fix behavior) would answer RESTRICTED, not the original
+// ALLOW — exactly the divergence this proves matters.
+func TestEntitlement_CreateSnapshotReplayReturnsOriginalResult(t *testing.T) {
+	f := newSub(t)
+	f.publishPlan("business", planOpts{autoRenew: true, caps: []domain.PlanCapability{{CapabilityKey: "api_access"}}})
+	activateNow(f, f.sv(f.start(f.startParams(f.account, "business", day(11)))), day(11))
+
+	batchID1 := domain.NewCommercialID(domain.PrefixEntitlementSnapshotBatch)
+	claim := f.claim(operator, "CreateSnapshot", batchID1)
+	original, err := f.s.CreateSnapshot(f.ctx, f.org, operator, day(12), claim, batchID1)
+	if err != nil || len(original) == 0 {
+		t.Fatalf("create snapshot: %+v (err=%v)", original, err)
+	}
+	var originalOutcome domain.Outcome
+	for _, d := range original {
+		if d.CapabilityKey == "api_access" {
+			originalOutcome = d.Outcome
+		}
+	}
+	if originalOutcome != domain.OutcomeAllow {
+		t.Fatalf("original outcome = %s, want ALLOW", originalOutcome)
+	}
+
+	// State genuinely changes between the original call and the replay.
+	f.restrict(domain.RestrictionRestricted, operator, day(13))
+	fresh, err := f.s.GetEffectiveEntitlements(f.ctxOrg, day(14))
+	if err != nil {
+		t.Fatalf("get effective (fresh): %v", err)
+	}
+	var freshOutcome domain.Outcome
+	for _, d := range fresh {
+		if d.CapabilityKey == "api_access" {
+			freshOutcome = d.Outcome
+		}
+	}
+	if freshOutcome != domain.OutcomeRestricted {
+		t.Fatalf("a recompute-fresh read after the restriction = %s, want RESTRICTED (so the two must genuinely differ)", freshOutcome)
+	}
+
+	// Retry under the identical claim: a different, unrelated local batch id
+	// (simulating a second process retrying with no memory of the first)
+	// must not matter — the replay must resolve back to the ORIGINAL batch.
+	batchID2 := domain.NewCommercialID(domain.PrefixEntitlementSnapshotBatch)
+	_, err = f.s.CreateSnapshot(f.ctx, f.org, operator, day(14), claim, batchID2)
+	var replay *domain.IdempotentReplayError
+	if !errors.As(err, &replay) {
+		t.Fatalf("retry under the same key did not replay: %v", err)
+	}
+	if replay.ResourceID != batchID1 {
+		t.Fatalf("replay resource id = %s, want the original batch id %s", replay.ResourceID, batchID1)
+	}
+	replayed, err := f.s.GetEntitlementSnapshotBatch(f.ctxOrg, f.org, replay.ResourceID)
+	if err != nil || len(replayed) == 0 {
+		t.Fatalf("get replayed batch: %+v (err=%v)", replayed, err)
+	}
+	var replayedOutcome domain.Outcome
+	for _, d := range replayed {
+		if d.CapabilityKey == "api_access" {
+			replayedOutcome = d.Outcome
+		}
+	}
+	if replayedOutcome != domain.OutcomeAllow {
+		t.Fatalf("replayed outcome = %s, want the ORIGINAL ALLOW, not the current RESTRICTED state", replayedOutcome)
 	}
 }

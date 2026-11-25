@@ -75,7 +75,7 @@ func (a *cpAuthz) CheckAllowed(_ context.Context, _, legalEntityID, action strin
 }
 
 func cpRouter(s *mockStore, az handler.AuthZClient) chi.Router {
-	h := handler.New(s, az, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, az, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
 	handler.RegisterRoutes(r, h)

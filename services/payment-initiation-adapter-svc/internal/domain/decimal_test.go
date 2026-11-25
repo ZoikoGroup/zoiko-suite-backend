@@ -54,31 +54,71 @@ func TestDecimal_MarshalIsABareNumber(t *testing.T) {
 	}
 }
 
-// The NUMERIC(18,2) column stores exactly what passes, and ColumnText is what
-// amount::text reads back.
+// The NUMERIC(18,4) column (migration 000009 widened it from NUMERIC(18,2))
+// stores exactly what passes, and ColumnText is what amount::text reads
+// back. This is a column-capacity check only — "10.005" and "0.001" (3
+// decimal places) now fit the column; whether a SPECIFIC currency actually
+// allows 3 decimal places is TestValidateCurrencyPrecision's concern, not
+// this one's.
 func TestValidatePositiveAmount(t *testing.T) {
 	for d, want := range map[domain.Decimal]error{
-		"0":                   domain.ErrInvalidAmount,
-		"-1":                  domain.ErrInvalidAmount,
-		"":                    domain.ErrInvalidAmount,
-		"10.005":              domain.ErrAmountPrecision,
-		"0.001":               domain.ErrAmountPrecision,
-		"10000000000000000":   domain.ErrAmountPrecision,
-		"10000000000000000.5": domain.ErrAmountPrecision,
+		"0":                 domain.ErrInvalidAmount,
+		"-1":                domain.ErrInvalidAmount,
+		"":                  domain.ErrInvalidAmount,
+		"10.00001":          domain.ErrAmountPrecision, // 5th decimal place: beyond the column's own scale
+		"100000000000000":   domain.ErrAmountPrecision, // 15 integer digits: beyond the column's own 14-digit capacity
+		"100000000000000.5": domain.ErrAmountPrecision,
 	} {
 		if _, err := domain.ValidatePositiveAmount(d); !errors.Is(err, want) {
 			t.Errorf("%q: %v, want %v", d, err, want)
 		}
 	}
 	for d, text := range map[domain.Decimal]string{
-		"10.5":                "10.50",
-		"500":                 "500.00",
-		"0.01":                "0.01",
-		"9999999999999999.99": "9999999999999999.99",
+		"10.005":              "10.0050",
+		"0.001":               "0.0010",
+		"10.5":                "10.5000",
+		"500":                 "500.0000",
+		"0.01":                "0.0100",
+		"99999999999999.9999": "99999999999999.9999",
 	} {
 		r, err := domain.ValidatePositiveAmount(d)
-		if err != nil || domain.ColumnText(r) != text {
-			t.Errorf("%q: %v, column text %q, want %q", d, err, domain.ColumnText(r), text)
+		if err != nil {
+			t.Errorf("%q: %v, want no error", d, err)
+			continue
+		}
+		if domain.ColumnText(r) != text {
+			t.Errorf("%q: column text %q, want %q", d, domain.ColumnText(r), text)
+		}
+	}
+}
+
+// A real currency's decimal places come from its own ISO 4217 minor-unit
+// count — a value that fits the column (NUMERIC(18,4)) is not necessarily
+// valid for every currency.
+func TestValidateCurrencyPrecision(t *testing.T) {
+	cases := []struct {
+		amount    domain.Decimal
+		minorUnit int
+		wantErr   bool
+	}{
+		{"100", 0, false},     // JPY: an integer amount is fine
+		{"100.5", 0, true},    // JPY: any fractional part is refused
+		{"10.01", 2, false},   // USD/GBP: 2 decimal places is the common case
+		{"10.005", 2, true},   // USD/GBP: a 3rd decimal place is refused
+		{"100.123", 3, false}, // BHD: 3 decimal places is its real precision
+		{"100.1234", 3, true}, // BHD: a 4th decimal place is still refused
+	}
+	for _, c := range cases {
+		r, err := domain.ValidatePositiveAmount(c.amount)
+		if err != nil {
+			t.Fatalf("%q: ValidatePositiveAmount failed: %v", c.amount, err)
+		}
+		err = domain.ValidateCurrencyPrecision(r, c.minorUnit)
+		if c.wantErr && !errors.Is(err, domain.ErrAmountExceedsCurrencyPrecision) {
+			t.Errorf("%q at minor_unit=%d: %v, want ErrAmountExceedsCurrencyPrecision", c.amount, c.minorUnit, err)
+		}
+		if !c.wantErr && err != nil {
+			t.Errorf("%q at minor_unit=%d: %v, want nil", c.amount, c.minorUnit, err)
 		}
 	}
 }

@@ -90,7 +90,7 @@ func TestDispatch_PrepareBindsTheProviderAndTheExactAmount(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "simbank", d.ProviderKey)
 	assert.Equal(t, "SEPA_CT@1", d.Rail)
-	assert.Equal(t, "10.50", d.AmountText, "the amount is read exactly, never through a float")
+	assert.Equal(t, "10.5000", d.AmountText, "the amount is read exactly, never through a float")
 	assert.Equal(t, domain.StatusPrepared, d.Status)
 	assert.Equal(t, 0, d.SendCount)
 

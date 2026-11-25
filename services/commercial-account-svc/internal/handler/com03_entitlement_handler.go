@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -88,6 +89,18 @@ func RegisterEntitlementRoutes(r chi.Router, h *EntitlementHandler) {
 
 func (h *EntitlementHandler) fail(w http.ResponseWriter, r *http.Request, err error) {
 	writeFailure(w, r, h.logger, err)
+}
+
+// Replay readers are optional concrete-store capabilities (B5/B6's shape):
+// CreateSnapshot's claim resource id is the snapshot batch it wrote, and
+// PublishEntitlementPolicy's claim resource id is the policy_version it
+// reserved — neither is on the EntitlementStore interface itself, so a test
+// stub that doesn't implement it keeps compiling.
+type entitlementSnapshotBatchReader interface {
+	GetEntitlementSnapshotBatch(ctx context.Context, organizationID, snapshotBatchID string) ([]domain.CapabilityDecision, error)
+}
+type entitlementPolicyVersionReader interface {
+	GetEntitlementPolicyByVersion(ctx context.Context, policyVersion int) (*domain.EntitlementPolicyVersion, error)
 }
 
 func (h *EntitlementHandler) principal(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -260,16 +273,33 @@ func (h *EntitlementHandler) CreateSnapshot(w http.ResponseWriter, r *http.Reque
 		writeProblem(w, r, Problem{Status: http.StatusBadRequest, Code: CodeInvalidCommercialContext, Field: "organization_id", Detail: "is required"})
 		return
 	}
-	cmd, ok := commandFor(w, r, domain.SellerScope, principal, "CreateSnapshot", req.OrganizationID, raw, false)
+	// The batch id is generated here, before the claim, so it is stable
+	// across a retry under the same Idempotency-Key: the first call's claim
+	// stores it as the claim's resource id, and a replay gets that exact
+	// original id back via IdempotentReplayError.ResourceID, regardless of
+	// the (unused) new id this retry generates below.
+	snapshotBatchID := domain.NewCommercialID(domain.PrefixEntitlementSnapshotBatch)
+	cmd, ok := commandFor(w, r, domain.SellerScope, principal, "CreateSnapshot", snapshotBatchID, raw, false)
 	if !ok {
 		return
 	}
-	ds, err := h.store.CreateSnapshot(r.Context(), req.OrganizationID, principal, h.now(), cmd.claim)
+	ds, err := h.store.CreateSnapshot(r.Context(), req.OrganizationID, principal, h.now(), cmd.claim, snapshotBatchID)
 	if err != nil {
 		var replay *domain.IdempotentReplayError
 		if errors.As(err, &replay) {
+			// A6: return the exact original command's own result, looked up
+			// by the batch id the original call stored as its claim's
+			// resource id — never a fresh GetEffectiveEntitlements, which
+			// would silently differ from the original evidence if the
+			// organization's state changed between the original call and
+			// this replay.
+			reader, hasReader := h.store.(entitlementSnapshotBatchReader)
+			if !hasReader {
+				h.fail(w, r, err)
+				return
+			}
 			ctx := svcmiddleware.WithTenant(r.Context(), req.OrganizationID)
-			if existing, gerr := h.store.GetEffectiveEntitlements(ctx, h.now()); gerr == nil {
+			if existing, gerr := reader.GetEntitlementSnapshotBatch(ctx, req.OrganizationID, replay.ResourceID); gerr == nil && len(existing) > 0 {
 				w.Header().Set("Idempotent-Replayed", "true")
 				writeJSON(w, http.StatusCreated, map[string]any{"decisions": existing})
 				return
@@ -468,6 +498,11 @@ func (h *EntitlementHandler) PublishPolicy(w http.ResponseWriter, r *http.Reques
 	}
 	p := &domain.EntitlementPolicyVersion{EndedOutcome: req.EndedOutcome, EndedReadOnlyDays: req.EndedReadOnlyDays,
 		EffectiveFrom: effFrom, Reason: strings.TrimSpace(req.Reason), CreatedAt: now, CreatedByPrincipalID: principal}
+	// The resource id passed here is a placeholder: PublishEntitlementPolicy
+	// overwrites claim.ResourceID with the policy_version it actually
+	// reserves before claiming, so the stored resource_id — and what a
+	// replay reads back — is always the exact version the original call
+	// created, never this constant.
 	cmd, ok := commandFor(w, r, domain.SellerScope, principal, "PublishEntitlementPolicy", "grace-policy", raw, false)
 	if !ok {
 		return
@@ -476,7 +511,23 @@ func (h *EntitlementHandler) PublishPolicy(w http.ResponseWriter, r *http.Reques
 	if err != nil {
 		var replay *domain.IdempotentReplayError
 		if errors.As(err, &replay) {
-			if existing, gerr := h.store.GetEntitlementPolicy(r.Context(), h.now()); gerr == nil && existing != nil {
+			// A6: the original call's own policy version, looked up by the
+			// policy_version it reserved — never GetEntitlementPolicy(now),
+			// which answers "what's effective now" and would silently
+			// return a different, later-published version, or the
+			// currently-effective one instead of a not-yet-effective
+			// original, on replay.
+			reader, hasReader := h.store.(entitlementPolicyVersionReader)
+			if !hasReader {
+				h.fail(w, r, err)
+				return
+			}
+			version, perr := strconv.Atoi(replay.ResourceID)
+			if perr != nil {
+				h.fail(w, r, err)
+				return
+			}
+			if existing, gerr := reader.GetEntitlementPolicyByVersion(r.Context(), version); gerr == nil && existing != nil {
 				w.Header().Set("Idempotent-Replayed", "true")
 				writeJSON(w, http.StatusCreated, existing)
 				return

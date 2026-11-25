@@ -34,6 +34,28 @@ import (
 // name — this service's mTLS identity is infrastructure, not tenant data.
 const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
+// entitlementInvalidationProcessor adapts PgStore.ProcessNextEntitlementInvalidation
+// to boundary.Processor (which the package hardwires to the method name
+// ProcessNextBoundary), so the entitlement invalidation queue can reuse the
+// same ticker/batch/SKIP-LOCKED worker machinery as the subscription
+// boundary queue without duplicating it.
+type entitlementInvalidationProcessor struct{ s *store.PgStore }
+
+func (e entitlementInvalidationProcessor) ProcessNextBoundary(ctx context.Context, now time.Time) (bool, error) {
+	return e.s.ProcessNextEntitlementInvalidation(ctx, now)
+}
+
+// pendingLateAdjustmentProcessor is entitlementInvalidationProcessor's
+// counterpart for pending_late_adjustments (COM-04 A8, SPEC_DEVIATIONS.md):
+// the durable late-event inbox registerLateEvent queues an item into when no
+// target statement exists yet. Same adapter, same reused ticker/batch/
+// SKIP-LOCKED worker machinery.
+type pendingLateAdjustmentProcessor struct{ s *store.PgStore }
+
+func (p pendingLateAdjustmentProcessor) ProcessNextBoundary(ctx context.Context, now time.Time) (bool, error) {
+	return p.s.ProcessNextPendingLateAdjustment(ctx, now)
+}
+
 func main() {
 	logger, err := telemetry.NewLogger("commercial-account-svc")
 	if err != nil {
@@ -141,6 +163,21 @@ func main() {
 	// and publishes events for versions as they take effect. Safe to run in
 	// every replica: items are claimed with FOR UPDATE SKIP LOCKED.
 	go boundary.NewWorker(pgStore, 30*time.Second, 200, logger).Start(relayCtx)
+
+	// Entitlement invalidation worker (A5, SPEC_DEVIATIONS.md): drains
+	// entitlement_invalidation_queue, the per-organization fan-out
+	// PublishEntitlementPolicy writes, and turns each row into the real
+	// per-tenant entitlement_snapshot.changed event. Reuses boundary.Worker's
+	// ticker/batch/SKIP-LOCKED shape through a one-method adapter, the same
+	// safe-in-every-replica posture as the boundary worker above.
+	go boundary.NewWorker(entitlementInvalidationProcessor{pgStore}, 30*time.Second, 200, logger).Start(relayCtx)
+
+	// Pending late-adjustment worker (A8, SPEC_DEVIATIONS.md): drains
+	// pending_late_adjustments, attaching each queued late event's adjustment
+	// the moment a valid target statement exists (a later term opening, or a
+	// frozen statement finally being certified). Never parks an item as
+	// failed -- see com04_pending_late_adjustments.go's package comment.
+	go boundary.NewWorker(pendingLateAdjustmentProcessor{pgStore}, 30*time.Second, 200, logger).Start(relayCtx)
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,

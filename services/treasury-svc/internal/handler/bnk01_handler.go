@@ -15,6 +15,7 @@ import (
 
 	"zoiko.io/treasury-svc/internal/domain"
 	svcmiddleware "zoiko.io/treasury-svc/internal/middleware"
+	"zoiko.io/treasury-svc/internal/tokenization"
 )
 
 const (
@@ -22,6 +23,15 @@ const (
 	actionAmendAccount      = "BANK_ACCOUNT_MANAGE"
 	actionCloseAccount      = "BANK_ACCOUNT_CLOSE"
 	actionViewAccountMasked = "BANK_ACCOUNT_VIEW_MASKED"
+
+	// actionTokenDetokenize gates the full, unmasked account number
+	// (GetBankAccountNumber below) — the same grant key-management-svc
+	// itself checks before detokenizing (SEC-T15's "additional scoped
+	// approval"), checked here too, exactly banking-connector-svc's and
+	// payee-banking-identity-svc's identical TOKEN_DETOKENIZE constant. One
+	// grant, one meaning across this whole platform: "may see raw bank
+	// details."
+	actionTokenDetokenize = "TOKEN_DETOKENIZE"
 )
 
 func (h *Handler) fetchAccountForAuth(w http.ResponseWriter, r *http.Request, accountID string) (*domain.BankAccount, bool) {
@@ -221,6 +231,77 @@ func (h *Handler) GetBankAccountMasked(w http.ResponseWriter, r *http.Request) {
 		BankAccountID: acct.BankAccountID, LegalEntityID: acct.LegalEntityID, AccountName: acct.AccountName,
 		MaskedAccountNumber: acct.MaskedAccountNumber, CurrencyCode: acct.CurrencyCode, AccountStatus: acct.AccountStatus,
 	})
+}
+
+// accountNumberResponse is the privileged account-number read's body.
+type accountNumberResponse struct {
+	BankAccountID string `json:"bank_account_id"`
+	AccountNumber string `json:"account_number"`
+	Tokenized     bool   `json:"tokenized"`
+}
+
+// GetBankAccountNumber handles GET /v1/treasury/accounts/{accountID}/account-number
+// — the explicit, narrowly-scoped privileged path to an account's FULL,
+// real account number, mirroring banking-connector-svc's
+// GetConnectionAccountNumber exactly:
+//
+//  1. A principal is required, and must hold TOKEN_DETOKENIZE at the
+//     account's own legal entity (from the row, never the caller).
+//  2. A tokenized account is detokenized through key-management-svc under
+//     that same principal, so the vault's own TOKEN_DETOKENIZE check,
+//     tenant binding (SEC-T29) and audit event (SEC-INV-15) all apply.
+//  3. A non-tokenized account (registered, or last rotated, before
+//     TOKENIZATION_ENFORCED) has no real value to return — unlike
+//     banking-connector-svc's legacy rows, RegisterBankAccountRequest's
+//     ORIGINAL contract only ever accepted an already-masked string, so
+//     there genuinely is nothing real stored server-side to reveal. This
+//     refuses with 409, not a stale masked string presented as the real
+//     number.
+//
+// Fails closed: a vault refusal is 403, an unreachable/unconfigured vault is
+// 503. The token itself is never returned in place of the number.
+func (h *Handler) GetBankAccountNumber(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	accountID := chi.URLParam(r, "accountID")
+	acct, ok := h.fetchAccountForAuth(w, r, accountID)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, acct.LegalEntityID, actionTokenDetokenize); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	if !acct.Tokenized() {
+		writeError(w, http.StatusConflict, "not_tokenized",
+			"this bank account was registered without tokenization enforced; no real account number is held by this service")
+		return
+	}
+	if h.tokenizer == nil {
+		h.log.Error("GetBankAccountNumber: tokenized account read with no tokenization service configured",
+			zap.String("bank_account_id", acct.BankAccountID))
+		writeError(w, http.StatusServiceUnavailable, "tokenization_not_configured", "tokenization service not configured")
+		return
+	}
+	number, err := h.tokenizer.Detokenize(r.Context(), tokenization.Scope{
+		TenantID:      acct.TenantID,
+		PrincipalID:   principalID,
+		LegalEntityID: acct.LegalEntityID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
+	}, acct.AccountNumberToken)
+	if err != nil {
+		if errors.Is(err, tokenization.ErrDetokenizationDenied) {
+			writeError(w, http.StatusForbidden, "detokenization_denied", "")
+			return
+		}
+		h.log.Error("GetBankAccountNumber: detokenize failed", zap.String("bank_account_id", acct.BankAccountID), zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "tokenization_service_unavailable", err.Error())
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, accountNumberResponse{BankAccountID: acct.BankAccountID, AccountNumber: number, Tokenized: true})
 }
 
 // availableActionsResponse names which of this account's own existing
@@ -522,6 +603,13 @@ func (h *Handler) CloseBankAccount(w http.ResponseWriter, r *http.Request) {
 type rotateTokenRequest struct {
 	NewMaskedAccountNumber string `json:"new_masked_account_number"`
 	NewBankIdentifier      string `json:"new_bank_identifier"`
+
+	// NewAccountNumber is the REAL new account number. Required, and used
+	// instead of NewMaskedAccountNumber above, only when
+	// TOKENIZATION_ENFORCED=true — same honest-contract reasoning as
+	// RegisterBankAccountRequest.AccountNumber (handler.go). Ignored while
+	// tokenization is not enforced.
+	NewAccountNumber string `json:"new_account_number,omitempty"`
 }
 
 func (h *Handler) RotateAccountIdentifierToken(w http.ResponseWriter, r *http.Request) {
@@ -530,7 +618,12 @@ func (h *Handler) RotateAccountIdentifierToken(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return
 	}
-	if req.NewMaskedAccountNumber == "" {
+	if h.tokenizationEnforced {
+		if req.NewAccountNumber == "" {
+			writeError(w, http.StatusBadRequest, "missing_field", "new_account_number is required when tokenization is enforced")
+			return
+		}
+	} else if req.NewMaskedAccountNumber == "" {
 		writeError(w, http.StatusBadRequest, "missing_field", "new_masked_account_number is required")
 		return
 	}
@@ -555,11 +648,43 @@ func (h *Handler) RotateAccountIdentifierToken(w http.ResponseWriter, r *http.Re
 	if newBankIdentifier == "" {
 		newBankIdentifier = acct.BankIdentifier
 	}
+
+	// Same real masking/tokenization treatment as RegisterBankAccount
+	// (handler.go): a no-op while TOKENIZATION_ENFORCED is false (the new
+	// masked value is exactly req.NewMaskedAccountNumber, as before); when
+	// enforced, the REAL new value is tokenized via key-management-svc and
+	// the stored masked form is derived from it server-side. acct's own
+	// LegalEntityID (already fetched above, never the caller's) scopes the
+	// vault call.
+	newMaskedAccountNumber := req.NewMaskedAccountNumber
+	var newAccountNumberToken string
+	if h.tokenizationEnforced {
+		if h.tokenizer == nil {
+			h.log.Error("RotateAccountIdentifierToken: tokenization enforced but no tokenizer configured")
+			writeError(w, http.StatusServiceUnavailable, "tokenization_not_configured", "tokenization service not configured")
+			return
+		}
+		token, err := h.tokenizer.Tokenize(r.Context(), tokenization.Scope{
+			TenantID:      acct.TenantID,
+			PrincipalID:   principalID,
+			LegalEntityID: acct.LegalEntityID,
+			CorrelationID: r.Header.Get("X-Correlation-ID"),
+		}, tokenization.ClassificationRestricted, req.NewAccountNumber)
+		if err != nil {
+			h.log.Error("RotateAccountIdentifierToken: tokenize account number failed", zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "tokenization_service_unavailable", "tokenization service unavailable")
+			return
+		}
+		newMaskedAccountNumber = domain.MaskAccountNumber(req.NewAccountNumber)
+		newAccountNumberToken = token
+	}
+
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	updated, err := h.store.RotateAccountIdentifierToken(r.Context(), domain.RotateAccountTokenParams{
-		BankAccountID: accountID, TenantID: tenantID, NewMaskedAccountNumber: req.NewMaskedAccountNumber,
+		BankAccountID: accountID, TenantID: tenantID, NewMaskedAccountNumber: newMaskedAccountNumber,
 		NewBankIdentifier: newBankIdentifier, ActorPrincipalID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"),
+		CorrelationID:         r.Header.Get("X-Correlation-ID"),
+		NewAccountNumberToken: newAccountNumberToken,
 	})
 	if err != nil {
 		h.writeBankAccountErr(w, err)

@@ -886,22 +886,31 @@ closes could both pass the state-machine check and the second overwrote
 closed_at; the register was unbounded; no body size cap or unknown-field
 rejection; Kafka BatchTimeout at the 1s default.
 
-## Open: obligations-svc does not verify the legal entity belongs to the caller's tenant
-Found by the live suite for the pass above, and deliberately NOT closed in it.
+## Resolved: obligations-svc does not verify the legal entity belongs to the caller's tenant
+Found by the live suite for the pass above, deliberately left open at the time,
+and since closed in `01e87756` ("complete Doc 03 §8.5").
 
-Authorization is scoped to the obligation's legal_entity_id, and tenancy is
-scoped by X-Tenant-Id, but nothing checks that the two agree. A principal
-holding OBLIGATION_CREATE on legal entity X can therefore write an obligation
-referencing X into ANY tenant, simply by changing the header -- the row lands in
-the caller's own tenant and is invisible to the entity's real tenant, so this
-is a write-side integrity gap rather than a read leak.
+Authorization was scoped to the obligation's legal_entity_id, and tenancy was
+scoped by X-Tenant-Id, but nothing checked that the two agreed. A principal
+holding OBLIGATION_CREATE on legal entity X could therefore write an obligation
+referencing X into ANY tenant, simply by changing the header -- the row landed in
+the caller's own tenant and was invisible to the entity's real tenant, so this
+was a write-side integrity gap rather than a read leak.
 
-The service already validates jurisdiction_id against jurisdiction-rules-svc and
-fails closed; the same treatment for legal_entity_id against
-tenant-entity-registry-svc is the fix, and it is a new outbound dependency
-rather than a one-line check. Worth checking whether the other entity-scoped
-services have the same hole -- the pattern of "authorize on the entity, scope
-rows by the tenant, never reconcile the two" is not specific to this service.
+Fixed exactly as prescribed: `internal/registry/client.go` validates
+legal_entity_id against tenant-entity-registry-svc's `GET
+/v1/entities/{id}/status`, mirroring the existing jurisdiction_id validator
+(fail-closed on any error; another tenant's entity reads as 404, identical to a
+missing one). Wired into both obligation-creation paths via `checkEntity`
+(`handler.go`, `completion_handler.go`), returns 422 `legal_entity_not_found`.
+`main.go` requires `TENANT_REGISTRY_URL` outside local/dev -- startup fails
+rather than silently falling back to the no-op checker. Covered by
+`completion_handler_test.go` ("unknown or other tenant's entity" -> 422) and
+`registry/client_test.go`.
+
+Still worth checking whether other entity-scoped services have the same
+hole -- the pattern of "authorize on the entity, scope rows by the tenant,
+never reconcile the two" is not specific to this service.
 
 ## Open: applicability_decisions has no tenant dimension
 Noticed while merging origin/main, which added the table and its store

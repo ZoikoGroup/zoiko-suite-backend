@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // BankAccount represents a registered bank account — BNK-01's own
 // identity/ownership/verification/operational-status model, extending
@@ -25,8 +28,48 @@ type BankAccount struct {
 	CloseReason             string `json:"close_reason,omitempty"`
 	CorrelationID           string `json:"-"`
 
+	// AccountNumberToken is this account's current row in
+	// bank_account_identifier_tokens (migration 000015) — the real
+	// key-management-svc vault token, never serialized. A non-empty value is
+	// the ONE signal that this account's identifier is tokenized (see
+	// Tokenized()); MaskedAccountNumber is always the safe display value
+	// regardless, so an ordinary read never needs this field at all.
+	AccountNumberToken string `json:"-"`
+
+	// AccountNumberRaw carries the REAL account number from the handler to
+	// the store for a TOKENIZATION_ENFORCED RegisterBankAccount call only.
+	// It is never persisted directly — the handler tokenizes it before the
+	// store ever sees this struct, and clears it immediately after — and
+	// never serialized (json:"-") as a second line of defense even if a bug
+	// left it set when a response is written.
+	AccountNumberRaw string `json:"-"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// Tokenized reports whether this account's identifier is held as a real
+// vault token (AccountNumberToken), rather than only ever a caller-supplied
+// masked display string. Decided by the token row's presence, never by what
+// MaskedAccountNumber looks like.
+func (a *BankAccount) Tokenized() bool {
+	return a != nil && a.AccountNumberToken != ""
+}
+
+// MaskAccountNumber is the masked display form of a bank identifier: the
+// last 4 characters visible, everything before them "*". A value of 4
+// characters or fewer is masked entirely rather than left in the clear.
+// Computed from the REAL value, server-side, once at write/rotation time
+// when tokenization is enforced — the same shape banking-connector-svc's and
+// payee-banking-identity-svc's identical helper already uses.
+func MaskAccountNumber(s string) string {
+	if s == "" {
+		return s
+	}
+	if len(s) <= 4 {
+		return strings.Repeat("*", len(s))
+	}
+	return strings.Repeat("*", len(s)-4) + s[len(s)-4:]
 }
 
 // BNK-01 operational-status lifecycle. account_status keeps its original
@@ -152,6 +195,16 @@ type RotateAccountTokenParams struct {
 	NewMaskedAccountNumber, NewBankIdentifier string
 	ActorPrincipalID                          string
 	CorrelationID                             string
+
+	// NewAccountNumberToken is the real vault token for the new identifier
+	// — set by the handler (via tokenizer.Tokenize) only when
+	// TOKENIZATION_ENFORCED is true, empty otherwise. When set, the store
+	// writes a new bank_account_identifier_tokens row and supersedes the
+	// account's previous one (if any) in the same transaction as the
+	// masked_account_number/token_version update. NewMaskedAccountNumber
+	// above is, in that case, the server-computed MaskAccountNumber(real
+	// value) — never a caller-supplied masked string.
+	NewAccountNumberToken string
 }
 
 // CashBalance represents a balance snapshot for a bank account.
@@ -187,6 +240,20 @@ type RegisterBankAccountRequest struct {
 	MaskedAccountNumber string `json:"masked_account_number"`
 	BankIdentifier      string `json:"bank_identifier"`
 	CurrencyCode        string `json:"currency_code"`
+
+	// AccountNumber is the REAL account number. Required, and used instead
+	// of MaskedAccountNumber above, only when TOKENIZATION_ENFORCED=true —
+	// the server tokenizes it via key-management-svc and derives the stored
+	// masked form (last 4 digits) from it directly, never from caller
+	// input. It is a deliberate, honest API contract change: before
+	// enforcement, MaskedAccountNumber was already-masked data the caller
+	// chose to send and this service merely stored as-is; once enforcement
+	// is on, a real value is what the contract actually needs, so it gets
+	// its own, honestly-named field rather than overloading a field called
+	// "masked" with a real number. Ignored while tokenization is not
+	// enforced — MaskedAccountNumber is the field callers use in that mode,
+	// completely unchanged from before.
+	AccountNumber string `json:"account_number,omitempty"`
 
 	BranchRef               string `json:"branch_ref,omitempty"`
 	Country                 string `json:"country,omitempty"`

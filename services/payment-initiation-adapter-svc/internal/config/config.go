@@ -22,6 +22,12 @@ type Config struct {
 
 	// PayrollRunServiceURL is payroll-run-svc, which verifies WFP-07 payroll payment instructions.
 	PayrollRunServiceURL string
+
+	// CurrencyRegistryURL is currency-registry-svc's (REF-02) base URL —
+	// the platform's one real currency-reference service. PrepareAttempt
+	// resolves each currency's real minor-unit count from it rather than
+	// applying a single hardcoded decimal-places rule to every currency.
+	CurrencyRegistryURL string
 	// AuthorizationServiceURL is the base URL of payment-authorization-svc
 	// (AP-10), used by PrepareAttempt to independently re-verify an
 	// AuthorizationSourcePaymentAuthorization fingerprint rather than
@@ -71,6 +77,7 @@ func Load() (*Config, error) {
 		AuthzServiceURL:         getEnvOrDefault("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 		TreasuryServiceURL:      getEnvOrDefault("TREASURY_SERVICE_URL", "http://treasury-svc:8103"),
 		PayrollRunServiceURL:    getEnvOrDefault("PAYROLL_RUN_SERVICE_URL", "http://payroll-run-svc:8110"),
+		CurrencyRegistryURL:     getEnvOrDefault("CURRENCY_REGISTRY_URL", "http://currency-registry-svc:8172"),
 		AuthorizationServiceURL: getEnvOrDefault("AUTHORIZATION_SERVICE_URL", "http://payment-authorization-svc:8160"),
 		EventResidencyRegion:    os.Getenv("EVENT_RESIDENCY_REGION"),
 		Providers:               loadProviders(),

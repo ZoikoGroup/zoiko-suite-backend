@@ -140,7 +140,8 @@ func TestGapFix_CreateSnapshotAndImmutability(t *testing.T) {
 	}})
 	activateNow(f, f.sv(f.start(f.startParams(f.account, "business", day(11)))), day(11))
 
-	ds, err := f.s.CreateSnapshot(f.ctx, f.org, publisher, day(12), f.claim(publisher, "CreateSnapshot", f.org))
+	batchID := domain.NewCommercialID(domain.PrefixEntitlementSnapshotBatch)
+	ds, err := f.s.CreateSnapshot(f.ctx, f.org, publisher, day(12), f.claim(publisher, "CreateSnapshot", batchID), batchID)
 	if err != nil || len(ds) == 0 {
 		t.Fatalf("create snapshot: %+v (err=%v)", ds, err)
 	}

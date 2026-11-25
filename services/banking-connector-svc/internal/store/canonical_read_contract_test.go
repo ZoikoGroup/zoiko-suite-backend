@@ -88,7 +88,7 @@ func TestCanonicalTransactionRead_CrossServiceContract(t *testing.T) {
 		r.Use(envelope.MiddlewareWithMode(envelope.ServicePolicy(), mode, nil))
 		h := handler.New(s, authz.NewClient(az.URL), zap.NewNop())
 		handler.RegisterRoutes(r, h)
-		handler.RegisterBNK0304Routes(r, h, s)
+		handler.RegisterBNK0304Routes(r, h, s, nil)
 		return r
 	}
 	get := func(r chi.Router, headers map[string]string) *httptest.ResponseRecorder {
