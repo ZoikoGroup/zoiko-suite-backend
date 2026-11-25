@@ -65,6 +65,10 @@ func NewRouter(h *Handler) http.Handler {
 
 		r.Post("/issues", h.RaiseIssue)
 		r.Post("/issues/{issueID}:assign", h.AssignIssue)
+
+		registerContractRoutes(r, h)
+		registerRevocationRoutes(r, h)
+		registerFacadeRoutes(r, h)
 	})
 
 	return r
@@ -169,7 +173,7 @@ func (h *Handler) RunDQ(w http.ResponseWriter, r *http.Request) {
 		h.respondFromError(w, err)
 		return
 	}
-	h.respondJSON(w, http.StatusCreated, got)
+	h.respondJSON(w, createdOrExisting(got.Deduplicated), got)
 }
 
 func (h *Handler) Reperform(w http.ResponseWriter, r *http.Request) {
@@ -207,8 +211,17 @@ func (h *Handler) CertifyDQ(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	runID := chi.URLParam(r, "runID")
-	claim := h.idempotencyClaim(principalID, "CertifyDQ", runID, "", r.Header.Get("Idempotency-Key"))
-	got, err := h.store.CertifyDQ(r.Context(), tenantID, runID, principalID, claim)
+	// The body is optional: it carries the lineage manifest reference the
+	// certification binds. It is part of the request hash so a retry that changes
+	// it is a conflict, not a replay.
+	var req domain.CertifyDQRequest
+	reqHash, err := h.readBody(r, &req)
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	claim := h.idempotencyClaim(principalID, "CertifyDQ", runID, reqHash, r.Header.Get("Idempotency-Key"))
+	got, err := h.store.CertifyDQ(r.Context(), tenantID, runID, principalID, req, claim)
 	if err != nil {
 		h.respondFromError(w, err)
 		return
@@ -237,7 +250,7 @@ func (h *Handler) RaiseIssue(w http.ResponseWriter, r *http.Request) {
 		h.respondFromError(w, err)
 		return
 	}
-	h.respondJSON(w, http.StatusCreated, got)
+	h.respondJSON(w, createdOrExisting(got.Deduplicated), got)
 }
 
 func (h *Handler) AssignIssue(w http.ResponseWriter, r *http.Request) {
@@ -378,6 +391,12 @@ func (h *Handler) respondFromError(w http.ResponseWriter, err error) {
 		h.respondJSON(w, http.StatusOK, map[string]string{"resource_id": replay.ResourceID})
 		return
 	}
+	if h.facadeError(w, err) {
+		return
+	}
+	if h.contractError(w, err) {
+		return
+	}
 	switch {
 	case errors.Is(err, domain.ErrRuleSetNotFound), errors.Is(err, domain.ErrRuleSetVersionNotFound),
 		errors.Is(err, domain.ErrRunNotFound), errors.Is(err, domain.ErrResultNotFound),
@@ -385,8 +404,12 @@ func (h *Handler) respondFromError(w http.ResponseWriter, err error) {
 		h.respondError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, domain.ErrRunHasOpenIssues), errors.Is(err, domain.ErrRunAlreadyCertified),
 		errors.Is(err, domain.ErrRunNotInExceptionsOpen), errors.Is(err, domain.ErrIssueAlreadyAssigned),
-		errors.Is(err, domain.ErrImmutableViolation), errors.Is(err, domain.ErrIdempotencyKeyReused):
+		errors.Is(err, domain.ErrImmutableViolation), errors.Is(err, domain.ErrIdempotencyKeyReused),
+		errors.Is(err, domain.ErrEvidenceIncomplete), errors.Is(err, domain.ErrEvidenceStale),
+		errors.Is(err, domain.ErrCertificationBasisExists):
 		h.respondError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, domain.ErrUnknownRule), errors.Is(err, domain.ErrDuplicateRuleOutcome):
+		h.respondError(w, http.StatusBadRequest, err.Error())
 	default:
 		h.logger.Error("data-quality-svc request failed", zap.Error(err))
 		h.respondError(w, http.StatusBadRequest, err.Error())

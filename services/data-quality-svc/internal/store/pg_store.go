@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sort"
 	"strings"
 	"time"
 
@@ -32,20 +33,56 @@ type Store interface {
 	RaiseIssue(ctx context.Context, tenantID string, req domain.RaiseIssueRequest, actor string, claim domain.IdempotencyClaim) (*domain.DQIssue, error)
 	AssignIssue(ctx context.Context, tenantID string, req domain.AssignIssueRequest, claim domain.IdempotencyClaim) (*domain.DQIssue, error)
 	Reperform(ctx context.Context, tenantID, oldRunID string, req domain.RunDQRequest, actor string, claim domain.IdempotencyClaim) (*domain.DQRun, error)
-	CertifyDQ(ctx context.Context, tenantID, runID, actor string, claim domain.IdempotencyClaim) (*domain.DQCertification, error)
+	CertifyDQ(ctx context.Context, tenantID, runID, actor string, req domain.CertifyDQRequest, claim domain.IdempotencyClaim) (*domain.DQCertification, error)
+
+	CreateContract(ctx context.Context, tenantID string, req domain.CreateContractRequest, actor string, claim domain.IdempotencyClaim) (*domain.ContractVersion, error)
+	SubmitContract(ctx context.Context, tenantID, assetID string, version int, actor string, claim domain.IdempotencyClaim) (*domain.ContractVersion, error)
+	PublishContract(ctx context.Context, tenantID, assetID string, version int, actor string, req domain.PublishContractRequest, claim domain.IdempotencyClaim) (*domain.ContractVersion, error)
+	DeprecateContract(ctx context.Context, tenantID, assetID string, version int, actor, note string, claim domain.IdempotencyClaim) (*domain.ContractVersion, error)
+	RetireContract(ctx context.Context, tenantID, assetID string, version int, actor, note string, claim domain.IdempotencyClaim) (*domain.ContractVersion, error)
+	GetContractVersion(ctx context.Context, tenantID, assetID string, version int) (*domain.ContractVersion, error)
+	ListContractVersions(ctx context.Context, tenantID, assetID string) ([]domain.ContractVersion, error)
+	CheckContractCompatibility(ctx context.Context, tenantID, assetID string, req domain.CompatibilityCheckRequest) (*domain.CompatibilityReport, error)
 
 	GetRun(ctx context.Context, tenantID, runID string) (*domain.DQRun, error)
 	GetResults(ctx context.Context, tenantID, runID string) ([]domain.DQResult, error)
 	GetIssues(ctx context.Context, tenantID, runID string) ([]domain.DQIssue, error)
 	GetCertification(ctx context.Context, tenantID, runID string) (*domain.DQCertification, error)
+	RecordObservation(ctx context.Context, tenantID string, req domain.RecordObservationRequest, actor string, claim domain.IdempotencyClaim) (*domain.DQObservation, error)
+	GetObservation(ctx context.Context, tenantID, observationRunID string) (*domain.DQObservation, error)
+	RevokeCertification(ctx context.Context, tenantID, runID, actor string, req domain.RevokeCertificationRequest, claim domain.IdempotencyClaim) (*domain.CertificationRevocation, error)
 }
 
+// DefaultEvidenceMaxAge is the freshness window applied when none is configured:
+// evidence older than this cannot be certified (ZS-SVC-Z-001 DQC-05, DQC-016).
+// Certification normally follows a run within minutes; a day is generous, and
+// a caller who needs longer must say so in configuration, not in a request.
+const DefaultEvidenceMaxAge = 24 * time.Hour
+
 type PgStore struct {
-	pool *pgxpool.Pool
+	pool   *pgxpool.Pool
+	maxAge time.Duration
+	now    func() time.Time
 }
 
 func NewPgStore(pool *pgxpool.Pool) *PgStore {
-	return &PgStore{pool: pool}
+	return &PgStore{pool: pool, maxAge: DefaultEvidenceMaxAge, now: func() time.Time { return time.Now().UTC() }}
+}
+
+// WithEvidenceMaxAge sets the freshness window. A non-positive value is
+// ignored: an unlimited window is not a setting this service offers, because
+// "never expires" is exactly the gap this exists to close.
+func (s *PgStore) WithEvidenceMaxAge(d time.Duration) *PgStore {
+	if d > 0 {
+		s.maxAge = d
+	}
+	return s
+}
+
+// WithClock replaces the time source, for tests.
+func (s *PgStore) WithClock(now func() time.Time) *PgStore {
+	s.now = now
+	return s
 }
 
 var _ Store = (*PgStore)(nil)
@@ -218,6 +255,11 @@ func loadRuleSetVersion(ctx context.Context, tx pgx.Tx, versionID string) (*doma
 //     failure once their SUM crosses the threshold — the doc's own named
 //     acceptance test.
 func evaluateOutcome(def *domain.RuleDefinition, ro domain.RuleOutcome) (domain.DQResultStatus, error) {
+	// A rule that evaluated no records has no denominator: "0 failures out of
+	// 0" is the absence of evidence, not a pass (ZS-SVC-Z-001 INV-04/INV-05).
+	if ro.PassCount == 0 && ro.FailCount == 0 {
+		return domain.ResultIndeterminate, nil
+	}
 	if ro.FailCount == 0 {
 		return domain.ResultPass, nil
 	}
@@ -264,30 +306,85 @@ func (s *PgStore) RunDQ(ctx context.Context, tenantID string, req domain.RunDQRe
 // rolls back, or vice versa) and risk exhausting the connection pool by
 // holding two connections for one logical operation.
 func runDQInTx(ctx context.Context, tx pgx.Tx, tenantID string, req domain.RunDQRequest, supersedesRunID *string, actor string, claim domain.IdempotencyClaim) (*domain.DQRun, error) {
-	version, err := loadRuleSetVersion(ctx, tx, req.RuleSetVersionID)
+	src, err := loadRuleSource(ctx, tx, req)
 	if err != nil {
 		return nil, err
-	}
-	defByKey := map[string]*domain.RuleDefinition{}
-	for i := range version.Rules {
-		defByKey[version.Rules[i].RuleKey] = &version.Rules[i]
 	}
 
 	type evaluated struct {
 		outcome domain.RuleOutcome
 		status  domain.DQResultStatus
+		spec    ruleSpec
 	}
-	results := make([]evaluated, 0, len(req.RuleOutcomes))
-	anyFail := false
+	results := make([]evaluated, 0, len(src.Specs))
+	anyFail, anyIndeterminate := false, false
+	seen := make(map[string]bool, len(req.RuleOutcomes))
 	for _, ro := range req.RuleOutcomes {
-		status, err := evaluateOutcome(defByKey[ro.RuleKey], ro)
+		// An outcome for a rule the pinned version does not contain is not
+		// evidence about this contract, and must not be guessed at (INV-15).
+		spec, known := src.spec(ro.RuleKey)
+		if !known {
+			return nil, fmt.Errorf("%w: %q", domain.ErrUnknownRule, ro.RuleKey)
+		}
+		if seen[ro.RuleKey] {
+			return nil, fmt.Errorf("%w: %q", domain.ErrDuplicateRuleOutcome, ro.RuleKey)
+		}
+		seen[ro.RuleKey] = true
+
+		status, err := spec.evaluate(ro)
 		if err != nil {
 			return nil, err
 		}
-		if status == domain.ResultFail {
-			anyFail = true
+		// Only a MANDATORY rule's failure opens exceptions and blocks certification. A rule the contract's
+		// certification profile does not require is recorded, with its severity, but does not (all rules of a
+		// rule-set run are mandatory, so for those nothing changes).
+		if spec.Mandatory {
+			switch status {
+			case domain.ResultFail:
+				anyFail = true
+			case domain.ResultIndeterminate:
+				anyIndeterminate = true
+			}
 		}
-		results = append(results, evaluated{outcome: ro, status: status})
+		results = append(results, evaluated{outcome: ro, status: status, spec: spec})
+	}
+	// Every rule in the pinned version must appear in the run. One the caller
+	// did not report on is recorded as Indeterminate rather than dropped, so
+	// the gap is itself evidence and the run cannot certify without it
+	// (INV-04: PASS requires complete mandatory evidence).
+	for _, sp := range src.Specs {
+		if seen[sp.Key] {
+			continue
+		}
+		if sp.Mandatory {
+			anyIndeterminate = true
+		}
+		results = append(results, evaluated{
+			outcome: domain.RuleOutcome{RuleKey: sp.Key, FailureMagnitudeSum: "0"},
+			status:  domain.ResultIndeterminate,
+			spec:    sp,
+		})
+	}
+
+	// The same evidence judged against the same contract is ONE run (ZS-SVC-Z-001 section 11: "same pinned
+	// asset/contract/evidence returns same logical result"). Checked before the idempotency key is claimed, so
+	// returning the existing run consumes nothing. A reperform of identical evidence is refused: it would
+	// supersede a run with itself.
+	var fingerprint *string
+	if src.isContract() {
+		fp := evidenceFingerprint(*src.ContractID, req)
+		fingerprint = &fp
+		existing, err := scanRun(tx.QueryRow(ctx, `SELECT `+runColumns+` FROM dq_runs WHERE tenant_id = $1 AND evidence_fingerprint = $2`, tenantID, fp))
+		switch {
+		case err == nil:
+			if supersedesRunID != nil {
+				return nil, domain.ErrEvidenceAlreadyRecorded
+			}
+			existing.Deduplicated = true
+			return existing, nil
+		case !errors.Is(err, pgx.ErrNoRows):
+			return nil, err
+		}
 	}
 
 	runID := newID(domain.PrefixRun)
@@ -297,21 +394,19 @@ func runDQInTx(ctx context.Context, tx pgx.Tx, tenantID string, req domain.RunDQ
 	}
 
 	finalStatus := domain.RunRunning
-	if anyFail {
+	if anyFail || anyIndeterminate {
 		finalStatus = domain.RunExceptionsOpen
 	}
 	now := time.Now().UTC()
 	var run domain.DQRun
 	if err := tx.QueryRow(ctx, `
-		INSERT INTO dq_runs (run_id, tenant_id, ruleset_version_id, population_ref, population_row_count,
-			population_content_hash, status, supersedes_run_id, started_at, created_by)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-		RETURNING run_id, tenant_id, ruleset_version_id, population_ref, population_row_count,
-			population_content_hash, status, supersedes_run_id, started_at, completed_at, created_by`,
-		runID, tenantID, req.RuleSetVersionID, req.PopulationRef, req.PopulationRowCount,
-		req.PopulationContentHash, finalStatus, supersedesRunID, now, actor,
-	).Scan(&run.RunID, &run.TenantID, &run.RuleSetVersionID, &run.PopulationRef, &run.PopulationRowCount,
-		&run.PopulationContentHash, &run.Status, &run.SupersedesRunID, &run.StartedAt, &run.CompletedAt, &run.CreatedBy); err != nil {
+		INSERT INTO dq_runs (run_id, tenant_id, ruleset_version_id, contract_id, population_ref, population_row_count,
+			population_content_hash, status, supersedes_run_id, started_at, created_by, evidence_as_of, evidence_fingerprint)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		RETURNING `+runColumns,
+		runID, tenantID, src.RuleSetVersionID, src.ContractID, req.PopulationRef, req.PopulationRowCount,
+		req.PopulationContentHash, finalStatus, supersedesRunID, now, actor, req.EvidenceAsOf, fingerprint,
+	).Scan(runDest(&run)...); err != nil {
 		return nil, fmt.Errorf("insert dq run: %w", err)
 	}
 
@@ -323,35 +418,90 @@ func runDQInTx(ctx context.Context, tx pgx.Tx, tenantID string, req domain.RunDQ
 		resultID := newID(domain.PrefixResult)
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO dq_results (result_id, tenant_id, run_id, rule_key, status, pass_count, fail_count,
-				failure_magnitude_sum, failing_record_refs)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8::numeric, $9::jsonb)`,
+				failure_magnitude_sum, failing_record_refs, severity, dimension, mandatory)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8::numeric, $9::jsonb, $10, $11, $12)`,
 			resultID, tenantID, runID, r.outcome.RuleKey, r.status, r.outcome.PassCount, r.outcome.FailCount,
-			r.outcome.FailureMagnitudeSum, failingJSON); err != nil {
+			r.outcome.FailureMagnitudeSum, failingJSON, severityOf(r.spec), dimensionOf(r.spec), mandatoryOf(r.spec)); err != nil {
 			return nil, fmt.Errorf("insert dq result: %w", err)
 		}
 	}
 
 	eventType := "DATA.DQRunCompleted"
-	if anyFail {
+	switch {
+	case anyFail:
 		eventType = "DATA.DQFailed"
+	case anyIndeterminate:
+		eventType = "DATA.DQIndeterminate"
 	}
 	if err := outbox.Insert(ctx, tx, outbox.Event{AggregateType: "dq_run", AggregateID: run.RunID,
 		EventType: eventType, TenantID: &tenantID, Payload: run}); err != nil {
 		return nil, err
 	}
+	// The spec's own event (ZS-SVC-Z-001 section 8), for runs judged against a contract: the per-rule
+	// outcome with its severity, so a consumer can see a BLOCKER failure without reading the results.
+	if src.isContract() {
+		type ruleOutcomeEvent struct {
+			RuleKey   string `json:"rule_key"`
+			Status    string `json:"status"`
+			Severity  string `json:"severity"`
+			Mandatory bool   `json:"mandatory"`
+		}
+		evs := make([]ruleOutcomeEvent, 0, len(results))
+		blockers := 0
+		for _, r := range results {
+			evs = append(evs, ruleOutcomeEvent{RuleKey: r.outcome.RuleKey, Status: string(r.status), Severity: string(r.spec.Rule.Severity), Mandatory: r.spec.Mandatory})
+			if r.spec.Rule.Severity == domain.SeverityBlocker && r.status != domain.ResultPass {
+				blockers++
+			}
+		}
+		if err := outbox.Insert(ctx, tx, outbox.Event{AggregateType: "dq_run", AggregateID: run.RunID,
+			EventType: "dqc.validation.completed", TenantID: &tenantID, Payload: map[string]any{
+				"run_id": run.RunID, "contract_id": *src.ContractID, "contract_sha256": src.ContractSHA256, "status": run.Status,
+				"population_ref": run.PopulationRef, "blocker_not_passed": blockers, "results": evs,
+			}}); err != nil {
+			return nil, err
+		}
+	}
 	return &run, nil
 }
 
-const runColumns = `run_id, tenant_id, ruleset_version_id, population_ref, population_row_count,
-	population_content_hash, status, supersedes_run_id, started_at, completed_at, created_by`
+const runColumns = `run_id, tenant_id, COALESCE(ruleset_version_id, ''), contract_id, population_ref, population_row_count,
+	population_content_hash, status, supersedes_run_id, started_at, completed_at, created_by, evidence_as_of`
+
+// runDest lists the scan targets for runColumns, in order.
+func runDest(run *domain.DQRun) []any {
+	return []any{&run.RunID, &run.TenantID, &run.RuleSetVersionID, &run.ContractID, &run.PopulationRef, &run.PopulationRowCount,
+		&run.PopulationContentHash, &run.Status, &run.SupersedesRunID, &run.StartedAt, &run.CompletedAt, &run.CreatedBy, &run.EvidenceAsOf}
+}
 
 func scanRun(row pgx.Row) (*domain.DQRun, error) {
 	var run domain.DQRun
-	if err := row.Scan(&run.RunID, &run.TenantID, &run.RuleSetVersionID, &run.PopulationRef, &run.PopulationRowCount,
-		&run.PopulationContentHash, &run.Status, &run.SupersedesRunID, &run.StartedAt, &run.CompletedAt, &run.CreatedBy); err != nil {
+	if err := row.Scan(runDest(&run)...); err != nil {
 		return nil, err
 	}
 	return &run, nil
+}
+
+func severityOf(sp ruleSpec) *string {
+	if sp.Rule == nil {
+		return nil
+	}
+	s := string(sp.Rule.Severity)
+	return &s
+}
+
+func dimensionOf(sp ruleSpec) *string {
+	if sp.Rule == nil {
+		return nil
+	}
+	return &sp.Rule.Dimension
+}
+
+func mandatoryOf(sp ruleSpec) *bool {
+	if sp.Rule == nil {
+		return nil
+	}
+	return &sp.Mandatory
 }
 
 func loadRun(ctx context.Context, tx pgx.Tx, runID string, forUpdate bool) (*domain.DQRun, error) {
@@ -376,13 +526,13 @@ func (s *PgStore) GetRun(ctx context.Context, tenantID, runID string) (*domain.D
 	return out, err
 }
 
-const resultColumns = `result_id, tenant_id, run_id, rule_key, status, pass_count, fail_count, failure_magnitude_sum, failing_record_refs, evaluated_at`
+const resultColumns = `result_id, tenant_id, run_id, rule_key, status, pass_count, fail_count, failure_magnitude_sum, failing_record_refs, evaluated_at, severity, dimension, mandatory`
 
 func scanResult(row pgx.Row) (*domain.DQResult, error) {
 	var res domain.DQResult
 	var failingJSON []byte
 	if err := row.Scan(&res.ResultID, &res.TenantID, &res.RunID, &res.RuleKey, &res.Status, &res.PassCount,
-		&res.FailCount, &res.FailureMagnitudeSum, &failingJSON, &res.EvaluatedAt); err != nil {
+		&res.FailCount, &res.FailureMagnitudeSum, &failingJSON, &res.EvaluatedAt, &res.Severity, &res.Dimension, &res.Mandatory); err != nil {
 		return nil, err
 	}
 	if len(failingJSON) > 0 {
@@ -458,8 +608,20 @@ func (s *PgStore) RaiseIssue(ctx context.Context, tenantID string, req domain.Ra
 		if result.RunID != req.RunID {
 			return domain.ErrResultNotFound
 		}
-		if result.Status != domain.ResultFail {
-			return fmt.Errorf("%w: result %s is not a Fail", domain.ErrResultNotFound, req.ResultID)
+		if result.Status != domain.ResultFail && result.Status != domain.ResultIndeterminate {
+			return fmt.Errorf("%w: result %s is neither a Fail nor Indeterminate", domain.ErrResultNotFound, req.ResultID)
+		}
+
+		// One exception per failing result: a second report of the same root evidence returns the first, not a
+		// second alert (ZS-SVC-Z-001 section 11: "dedup key prevents alert storms").
+		existing, err := scanIssue(tx.QueryRow(ctx, `SELECT `+issueColumns+` FROM dq_issues WHERE tenant_id = $1 AND result_id = $2`, tenantID, req.ResultID))
+		switch {
+		case err == nil:
+			existing.Deduplicated = true
+			out = existing
+			return nil
+		case !errors.Is(err, pgx.ErrNoRows):
+			return err
 		}
 
 		issueID := newID(domain.PrefixIssue)
@@ -477,8 +639,23 @@ func (s *PgStore) RaiseIssue(ctx context.Context, tenantID string, req domain.Ra
 			return fmt.Errorf("insert dq issue: %w", err)
 		}
 		out = got
+		if err := outbox.Insert(ctx, tx, outbox.Event{AggregateType: "dq_issue", AggregateID: got.IssueID,
+			EventType: "DATA.DQIssueRaised", TenantID: &tenantID, Payload: got}); err != nil {
+			return err
+		}
+		// The spec's own event (ZS-SVC-Z-001 section 12). severity is the rule's, frozen on the result, and is
+		// null for a rule-set run, which has none; the control is the contract (or rule set) and the rule.
+		control := contractIDOf(run)
+		if control == "" {
+			control = run.RuleSetVersionID
+		}
 		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "dq_issue", AggregateID: got.IssueID,
-			EventType: "DATA.DQIssueRaised", TenantID: &tenantID, Payload: got})
+			EventType: "dqc.exception.opened", TenantID: &tenantID, Payload: map[string]any{
+				"exception_id": got.IssueID, "run_id": run.RunID, "result_id": result.ResultID, "rule_key": result.RuleKey,
+				"severity": result.Severity, "control_id": control,
+				"evidence_refs": []string{run.RunID, result.ResultID, run.PopulationRef + "@" + run.PopulationContentHash},
+				"wfc_case_ref":  nil, "raised_by": actor,
+			}})
 	})
 	return out, err
 }
@@ -563,8 +740,13 @@ func (s *PgStore) Reperform(ctx context.Context, tenantID, oldRunID string, req 
 		if oldRun.Status != domain.RunExceptionsOpen && oldRun.Status != domain.RunRunning {
 			return fmt.Errorf("%w: run %s is %s and cannot be reperformed", domain.ErrImmutableViolation, oldRunID, oldRun.Status)
 		}
-		if req.RuleSetVersionID != oldRun.RuleSetVersionID {
-			return fmt.Errorf("reperform must use the same ruleset_version_id as the run it supersedes")
+		// A reperform is evidence about the SAME rules: the same rule-set version, or the same contract version.
+		newSrc, err := loadRuleSource(ctx, tx, req)
+		if err != nil {
+			return err
+		}
+		if !sameSource(newSrc, oldRun) {
+			return fmt.Errorf("reperform must use the same ruleset_version_id or contract version as the run it supersedes")
 		}
 
 		newRun, err := runDQInTx(ctx, tx, tenantID, req, &oldRunID, actor, claim)
@@ -586,7 +768,10 @@ func (s *PgStore) Reperform(ctx context.Context, tenantID, oldRunID string, req 
 // CertifyDQ seals a DQCertification for a run with no open issues.
 // Immutable once sealed — same doctrine as every other sealed-evidence
 // table in this repo.
-func (s *PgStore) CertifyDQ(ctx context.Context, tenantID, runID, actor string, claim domain.IdempotencyClaim) (*domain.DQCertification, error) {
+func (s *PgStore) CertifyDQ(ctx context.Context, tenantID, runID, actor string, req domain.CertifyDQRequest, claim domain.IdempotencyClaim) (*domain.DQCertification, error) {
+	if err := req.Validate(); err != nil {
+		return nil, err
+	}
 	var out *domain.DQCertification
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		run, err := loadRun(ctx, tx, runID, true)
@@ -608,6 +793,47 @@ func (s *PgStore) CertifyDQ(ctx context.Context, tenantID, runID, actor string, 
 		if err != nil {
 			return err
 		}
+		// Do not rely on the run's status alone. A run recorded before
+		// completeness was enforced can be Running with only some of the
+		// version's rules reported; certification re-derives completeness from
+		// the pinned version and the stored results (INV-04, INV-21).
+		src, err := loadRuleSourceForRun(ctx, tx, run)
+		if err != nil {
+			return err
+		}
+		if err := requireCompleteEvidence(src, results); err != nil {
+			return err
+		}
+
+		// Freshness (DQC-05, NP-43, DQC-016). Evidence is as old as the moment it
+		// was observed — the caller-asserted evidence_as_of, or failing that when
+		// this service first recorded it. Stale evidence is never certified; the
+		// remedy is a Reperform with current evidence, which is a recorded fact,
+		// not a flag flipped.
+		now := s.now().UTC()
+		asOf := run.StartedAt
+		if run.EvidenceAsOf != nil {
+			asOf = *run.EvidenceAsOf
+		}
+		age := now.Sub(asOf)
+		if age > s.maxAge {
+			return fmt.Errorf("%w: evidence is %s old, window is %s", domain.ErrEvidenceStale,
+				age.Round(time.Second), s.maxAge)
+		}
+
+		// The basis: WHAT is certified, independent of which run, who or when.
+		basisSHA256, err := certificationBasisHash(tenantID, run, src, asOf, s.maxAge, results, req)
+		if err != nil {
+			return err
+		}
+		var existingID string
+		switch err := tx.QueryRow(ctx, `SELECT certification_id FROM dq_certifications WHERE basis_sha256 = $1`,
+			basisSHA256).Scan(&existingID); {
+		case err == nil:
+			return &domain.BasisExistsError{ExistingID: existingID}
+		case !errors.Is(err, pgx.ErrNoRows):
+			return err
+		}
 
 		certID := newID(domain.PrefixCertification)
 		claim.ResourceID = certID
@@ -615,9 +841,13 @@ func (s *PgStore) CertifyDQ(ctx context.Context, tenantID, runID, actor string, 
 			return err
 		}
 
+		asOfUTC := asOf.UTC()
 		summary := domain.DQCertificationSummary{
-			RunID: run.RunID, RuleSetVersionID: run.RuleSetVersionID, PopulationRef: run.PopulationRef,
+			RunID: run.RunID, RuleSetVersionID: run.RuleSetVersionID, ContractID: contractIDOf(run), ContractSHA256: src.ContractSHA256, PopulationRef: run.PopulationRef,
 			PopulationRowCount: run.PopulationRowCount, PopulationContentHash: run.PopulationContentHash, Results: results,
+			BasisSHA256: basisSHA256, EvidenceAsOf: &asOfUTC, EvidenceMaxAgeSeconds: int64(s.maxAge / time.Second),
+			CertifiedAgainstAge: int64(age / time.Second),
+			LineageManifestID:   req.LineageManifestID, LineageManifestSHA256: req.LineageManifestSHA256,
 		}
 		summaryJSON, err := json.Marshal(summary)
 		if err != nil {
@@ -625,28 +855,129 @@ func (s *PgStore) CertifyDQ(ctx context.Context, tenantID, runID, actor string, 
 		}
 		sum := sha256.Sum256(summaryJSON)
 		summarySHA256 := hex.EncodeToString(sum[:])
-		now := time.Now().UTC()
 
 		var cert domain.DQCertification
 		if err := tx.QueryRow(ctx, `
-			INSERT INTO dq_certifications (certification_id, tenant_id, run_id, summary, summary_sha256, certified_at, certified_by)
-			VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)
+			INSERT INTO dq_certifications (certification_id, tenant_id, run_id, summary, summary_sha256, certified_at, certified_by,
+				basis_sha256, lineage_manifest_id, lineage_manifest_sha256, evidence_as_of, evidence_max_age_seconds)
+			VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12)
 			RETURNING certification_id, tenant_id, run_id, summary_sha256, certified_at, certified_by`,
 			certID, tenantID, runID, summaryJSON, summarySHA256, now, actor,
+			basisSHA256, req.LineageManifestID, req.LineageManifestSHA256, asOfUTC, int64(s.maxAge/time.Second),
 		).Scan(&cert.CertificationID, &cert.TenantID, &cert.RunID, &cert.SummarySHA256, &cert.CertifiedAt, &cert.CertifiedBy); err != nil {
+			// The pre-check above covers the common case; this covers two
+			// certifications of one basis racing each other.
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "uq_dq_certifications_basis" {
+				return domain.ErrCertificationBasisExists
+			}
 			return fmt.Errorf("insert dq certification: %w", err)
 		}
 		cert.Summary = summary
+		cert.BasisSHA256, cert.LineageManifestID, cert.LineageManifestSHA256 = basisSHA256, req.LineageManifestID, req.LineageManifestSHA256
 
 		if _, err := tx.Exec(ctx, `UPDATE dq_runs SET status = 'Certified', completed_at = $2 WHERE run_id = $1`, runID, now); err != nil {
 			return fmt.Errorf("mark run certified: %w", err)
 		}
 
+		cert.Status = domain.CertificationActive
 		out = &cert
+		if err := outbox.Insert(ctx, tx, outbox.Event{AggregateType: "dq_certification", AggregateID: cert.CertificationID,
+			EventType: "DATA.DQCertified", TenantID: &tenantID, Payload: cert}); err != nil {
+			return err
+		}
+		// The spec's own event (ZS-SVC-Z-001 section 8).
 		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "dq_certification", AggregateID: cert.CertificationID,
-			EventType: "DATA.DQCertified", TenantID: &tenantID, Payload: cert})
+			EventType: "dqc.certification.issued", TenantID: &tenantID, Payload: map[string]any{
+				"certification_id": cert.CertificationID, "run_id": run.RunID, "contract_id": contractIDOf(run),
+				"summary_sha256": cert.SummarySHA256, "basis_sha256": cert.BasisSHA256, "certified_by": actor, "certified_at": cert.CertifiedAt,
+			}})
 	})
 	return out, err
+}
+
+// certificationBasis is the canonical content hashed into basis_sha256. It names
+// what was certified — and deliberately omits the run id, the certifier and the
+// seal time, so the same evidence yields the same basis wherever and whenever it
+// is certified. Field order is fixed by the struct; results are sorted by rule.
+type certificationBasis struct {
+	TenantID              string       `json:"tenant_id"`
+	RuleSetVersionID      string       `json:"ruleset_version_id,omitempty"`
+	ContractID            string       `json:"contract_id,omitempty"`
+	ContractSHA256        string       `json:"contract_sha256,omitempty"`
+	PopulationRef         string       `json:"population_ref"`
+	PopulationRowCount    int64        `json:"population_row_count"`
+	PopulationContentHash string       `json:"population_content_hash"`
+	EvidenceAsOf          string       `json:"evidence_as_of"`
+	EvidenceMaxAgeSeconds int64        `json:"evidence_max_age_seconds"`
+	LineageManifestID     string       `json:"lineage_manifest_id"`
+	LineageManifestSHA256 string       `json:"lineage_manifest_sha256"`
+	Results               []basisEntry `json:"results"`
+}
+
+type basisEntry struct {
+	RuleKey             string `json:"rule_key"`
+	Status              string `json:"status"`
+	PassCount           int64  `json:"pass_count"`
+	FailCount           int64  `json:"fail_count"`
+	FailureMagnitudeSum string `json:"failure_magnitude_sum"`
+}
+
+func certificationBasisHash(tenantID string, run *domain.DQRun, src *ruleSource, asOf time.Time, maxAge time.Duration,
+	results []domain.DQResult, req domain.CertifyDQRequest) (string, error) {
+	b := certificationBasis{
+		TenantID: tenantID, RuleSetVersionID: run.RuleSetVersionID, PopulationRef: run.PopulationRef,
+		PopulationRowCount: run.PopulationRowCount, PopulationContentHash: run.PopulationContentHash,
+		EvidenceAsOf:          asOf.UTC().Format(time.RFC3339Nano),
+		EvidenceMaxAgeSeconds: int64(maxAge / time.Second),
+	}
+	if src.isContract() {
+		b.ContractID, b.ContractSHA256 = *src.ContractID, src.ContractSHA256
+	}
+	if req.LineageManifestID != nil {
+		b.LineageManifestID, b.LineageManifestSHA256 = *req.LineageManifestID, *req.LineageManifestSHA256
+	}
+	for _, r := range results {
+		b.Results = append(b.Results, basisEntry{RuleKey: r.RuleKey, Status: string(r.Status), PassCount: r.PassCount,
+			FailCount: r.FailCount, FailureMagnitudeSum: r.FailureMagnitudeSum})
+	}
+	sort.Slice(b.Results, func(i, j int) bool { return b.Results[i].RuleKey < b.Results[j].RuleKey })
+	raw, err := json.Marshal(b)
+	if err != nil {
+		return "", fmt.Errorf("encode certification basis: %w", err)
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// requireCompleteEvidence returns ErrEvidenceIncomplete unless every rule in
+// the pinned version has exactly one stored result and that result is a Pass.
+func requireCompleteEvidence(src *ruleSource, results []domain.DQResult) error {
+	byRule := make(map[string]domain.DQResultStatus, len(results))
+	for _, r := range results {
+		byRule[r.RuleKey] = r.Status
+	}
+	for _, sp := range src.Specs {
+		if !sp.Mandatory {
+			continue // recorded evidence, but the certification profile does not require it
+		}
+		status, ok := byRule[sp.Key]
+		if !ok {
+			return fmt.Errorf("%w: no result for rule %q", domain.ErrEvidenceIncomplete, sp.Key)
+		}
+		if status != domain.ResultPass {
+			return fmt.Errorf("%w: rule %q is %s", domain.ErrEvidenceIncomplete, sp.Key, status)
+		}
+	}
+	return nil
+}
+
+// sameSource reports whether a request's rule source is the one a stored run was judged against.
+func sameSource(src *ruleSource, run *domain.DQRun) bool {
+	if src.isContract() {
+		return run.ContractID != nil && *run.ContractID == *src.ContractID
+	}
+	return run.ContractID == nil && src.RuleSetVersionID != nil && *src.RuleSetVersionID == run.RuleSetVersionID
 }
 
 func loadResultsForRun(ctx context.Context, tx pgx.Tx, runID string) ([]domain.DQResult, error) {
@@ -671,9 +1002,12 @@ func (s *PgStore) GetCertification(ctx context.Context, tenantID, runID string) 
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		var cert domain.DQCertification
 		var summaryJSON []byte
-		err := tx.QueryRow(ctx, `SELECT certification_id, tenant_id, run_id, summary, summary_sha256, certified_at, certified_by
+		var basis *string
+		err := tx.QueryRow(ctx, `SELECT certification_id, tenant_id, run_id, summary, summary_sha256, certified_at, certified_by,
+				basis_sha256, lineage_manifest_id, lineage_manifest_sha256
 			FROM dq_certifications WHERE run_id = $1`, runID,
-		).Scan(&cert.CertificationID, &cert.TenantID, &cert.RunID, &summaryJSON, &cert.SummarySHA256, &cert.CertifiedAt, &cert.CertifiedBy)
+		).Scan(&cert.CertificationID, &cert.TenantID, &cert.RunID, &summaryJSON, &cert.SummarySHA256, &cert.CertifiedAt, &cert.CertifiedBy,
+			&basis, &cert.LineageManifestID, &cert.LineageManifestSHA256)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrCertificationNotFound
 		}
@@ -683,8 +1017,85 @@ func (s *PgStore) GetCertification(ctx context.Context, tenantID, runID string) 
 		if err := json.Unmarshal(summaryJSON, &cert.Summary); err != nil {
 			return err
 		}
+		if basis != nil {
+			cert.BasisSHA256 = *basis
+		}
+		cert.Status = domain.CertificationActive
+		var rev domain.CertificationRevocation
+		switch err := tx.QueryRow(ctx, `SELECT `+revocationCols+` FROM dq_certification_revocations WHERE certification_id = $1`, cert.CertificationID).Scan(revocationDest(&rev)...); {
+		case err == nil:
+			cert.Status, cert.Revocation = domain.CertificationRevoked, &rev
+		case !errors.Is(err, pgx.ErrNoRows):
+			return err
+		}
 		out = &cert
 		return nil
+	})
+	return out, err
+}
+
+const revocationCols = `revocation_id, certification_id, reason_code, reason, evidence_refs, certified_by, certified_at, revoked_by, revoked_at`
+
+func revocationDest(r *domain.CertificationRevocation) []any {
+	return []any{&r.RevocationID, &r.CertificationID, &r.ReasonCode, &r.Reason, &r.EvidenceRefs, &r.CertifiedBy, &r.CertifiedAt, &r.RevokedBy, &r.RevokedAt}
+}
+
+// RevokeCertification withdraws reliance on a certification, prospectively (ZS-SVC-Z-001 RB-05, DQC-017).
+// The sealed certification and its evidence are not touched: the revocation is its own append-only record,
+// once per certification. The certification's basis stays claimed, so the same evidence cannot be certified
+// again; the remedy for a false pass is new evidence.
+func (s *PgStore) RevokeCertification(ctx context.Context, tenantID, runID, actor string, req domain.RevokeCertificationRequest, claim domain.IdempotencyClaim) (*domain.CertificationRevocation, error) {
+	if err := req.Validate(); err != nil {
+		return nil, err
+	}
+	var out *domain.CertificationRevocation
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		var certID, summarySHA, certifiedBy string
+		var certifiedAt time.Time
+		var basis *string
+		err := tx.QueryRow(ctx, `SELECT certification_id, summary_sha256, basis_sha256, certified_by, certified_at
+			FROM dq_certifications WHERE run_id = $1 FOR UPDATE`, runID).
+			Scan(&certID, &summarySHA, &basis, &certifiedBy, &certifiedAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrCertificationNotFound
+		}
+		if err != nil {
+			return err
+		}
+		// Checked before the idempotency key is claimed, so a refused revocation does not consume it.
+		if actor == certifiedBy {
+			return domain.ErrRevokerIsCertifier
+		}
+		revID := newID(domain.PrefixRevocation)
+		claim.ResourceID = revID
+		if err := claimIdempotency(ctx, tx, claim); err != nil {
+			return err
+		}
+		var rev domain.CertificationRevocation
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO dq_certification_revocations (revocation_id, tenant_id, certification_id, reason_code, reason, evidence_refs,
+				certified_by, certified_at, revoked_by)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			RETURNING `+revocationCols,
+			revID, tenantID, certID, req.ReasonCode, strings.TrimSpace(req.Reason), req.EvidenceRefs, certifiedBy, certifiedAt, actor,
+		).Scan(revocationDest(&rev)...); err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				return domain.ErrCertificationAlreadyRevoked
+			}
+			return fmt.Errorf("insert revocation: %w", err)
+		}
+		out = &rev
+		basisStr := ""
+		if basis != nil {
+			basisStr = *basis
+		}
+		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "dq_certification", AggregateID: certID,
+			EventType: "dqc.certification.revoked", TenantID: &tenantID, Payload: map[string]any{
+				"revocation_id": rev.RevocationID, "certification_id": certID, "run_id": runID, "reason_code": rev.ReasonCode,
+				"reason": rev.Reason, "evidence_refs": rev.EvidenceRefs, "revoked_by": actor, "effective_from": rev.RevokedAt, "revoked_at": rev.RevokedAt,
+				"summary_sha256": summarySHA, "basis_sha256": basisStr,
+			}})
 	})
 	return out, err
 }
