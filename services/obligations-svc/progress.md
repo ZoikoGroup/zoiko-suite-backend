@@ -78,3 +78,18 @@ case and emits `obligation.*` events their owners can consume.
 - NOTIFY needs a notification-svc template and trigger for `obligation.escalated` (D1-7).
 - OB-FE-1…3 console; C8 single owner (cross-team); R-OD-05 (clock pauses: none built),
   R-OD-06 (evidence classes per domain) on the decision sheet.
+
+## Decision capture (DL-5, 25 Nov 2026)
+
+Doc 01 §7: an obligation raised by `POST /v1/obligations/evaluate` (`OBLIGATION_EVALUATE` → `RAISED`, basis the
+jurisdiction, obligation rule version, pack and calendar version of its due date) and a clock waiver
+(`OBLIGATION_CLOCK_WAIVE` → `WAIVED`, basis the reason code and the approval reference, which also goes in
+`workflow_instance_id`) reach governance-decision-log-svc as `svc-obligations` (authorization-svc 000046, beside
+the 000044 clock-worker role). Queued in the clock's own transaction (`internal/store/decision_ledger.go`,
+`PgStore.SetDecisionLedger`), migration 000017 `decision_log_outbox`; metrics `obligations_decision_log_*`.
+Tests: `TestEvaluateRecord_RaisedWithItsBasis`, `TestWaiveRecord_WaivedWithReasonAndApproval`.
+
+Built before the 23 Nov D2-4 step table is ✅ (the assignment's order asked for after); the user asked on
+25 Nov 2026 for the whole assignment.
+
+The record is written to `decision_log_outbox` in the transaction of the decision it records and delivered by `identity-envelope/decisionledger`'s relay (lease-based claim, backoff to 10 minutes, a 409 parks the row for an operator, delivered rows purged after `LEDGER_RETENTION_HOURS`, default 168) to `GOVERNANCE_DECISION_LOG_MTLS_URL` with this service's own workload certificate (`mtlsclient`, bootstrap token `MTLS_BOOTSTRAP_TOKEN_PATH`). Deliveries are capped at `LEDGER_RELAY_MAX_PER_SECOND` (default 20): a ledger outage or a burst delays the evidence, it never fails or slows the decision. Status: 🔵 built, not verified (tracker "Assignment 25 Nov 2026").

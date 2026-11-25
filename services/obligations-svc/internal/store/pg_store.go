@@ -245,6 +245,9 @@ type Store interface {
 type PgStore struct {
 	pool *pgxpool.Pool
 	log  *zap.Logger
+	// ledgerOn queues governance-ledger records with evaluate and waive
+	// decisions (DL-5, SetDecisionLedger).
+	ledgerOn bool
 }
 
 // New returns an open PgStore. Caller must call pool.Close() when done.

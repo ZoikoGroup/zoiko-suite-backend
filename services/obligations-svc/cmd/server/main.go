@@ -24,12 +24,15 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 	idenv "zoiko.io/identity-envelope"
 	apicontract "zoiko.io/identity-envelope/apicontract"
+	"zoiko.io/identity-envelope/decisionledger"
+	"zoiko.io/identity-envelope/mtlsclient"
 
 	"zoiko.io/obligations-svc/internal/authz"
 	"zoiko.io/obligations-svc/internal/clock"
@@ -40,6 +43,7 @@ import (
 	"zoiko.io/obligations-svc/internal/handler"
 	"zoiko.io/obligations-svc/internal/health"
 	"zoiko.io/obligations-svc/internal/jurisdiction"
+	"zoiko.io/obligations-svc/internal/ledgermetrics"
 	svcmiddleware "zoiko.io/obligations-svc/internal/middleware"
 	"zoiko.io/obligations-svc/internal/outbox"
 	"zoiko.io/obligations-svc/internal/registry"
@@ -186,6 +190,36 @@ func main() {
 	}
 	clockCtx, clockCancel := context.WithCancel(context.Background())
 	defer clockCancel()
+
+	// Decision capture (DL-5, 25 Nov 2026; Doc 01 s7): an obligation raised by
+	// evaluate and a clock waiver are queued in decision_log_outbox (000017)
+	// in their own transaction and relayed to governance-decision-log-svc as
+	// LEDGER_PRINCIPAL_ID with this service's workload certificate.
+	ledgerQueue := decisionledger.NewPgQueue(pool)
+	ledgerGauges := ledgermetrics.New(prometheus.DefaultRegisterer)
+	go decisionledger.RunSampler(clockCtx, ledgerQueue, ledgerGauges, 15*time.Second,
+		time.Duration(cfg.LedgerRetentionHours)*time.Hour, log)
+	pgStore.SetDecisionLedger(cfg.LedgerPrincipalID != "")
+	if cfg.DecisionLogMTLSURL != "" && cfg.LedgerPrincipalID != "" {
+		ledgerIdentity := mtlsclient.Start(clockCtx, mtlsclient.Options{
+			ServiceName:        "obligations-svc",
+			ManagementURL:      cfg.MTLSManagementServiceURL,
+			BootstrapTokenPath: cfg.MTLSBootstrapTokenPath,
+		}, log)
+		ledgerRelay := decisionledger.NewRelay(ledgerQueue, &decisionledger.HTTPSender{
+			BaseURL: cfg.DecisionLogMTLSURL, Principal: cfg.LedgerPrincipalID,
+			KeyPrefix: "obligations-ledger", Purpose: "obligation_decision_evidence",
+			Client: ledgerIdentity.HTTPClient(5 * time.Second),
+		}, time.Duration(cfg.LedgerRelayIntervalMS)*time.Millisecond, log)
+		ledgerRelay.Observe(ledgerGauges)
+		ledgerRelay.SetMaxPerSecond(cfg.LedgerRelayMaxPerSecond)
+		ledgerRelay.Start()
+		defer ledgerRelay.Stop()
+		log.Info("decision-log relay: governance ledger over mTLS", zap.String("url", cfg.DecisionLogMTLSURL),
+			zap.String("principal", cfg.LedgerPrincipalID))
+	} else if cfg.LedgerPrincipalID != "" {
+		log.Warn("GOVERNANCE_DECISION_LOG_MTLS_URL unset — obligation decisions wait in decision_log_outbox until a relay runs")
+	}
 	clockWorker := clock.NewWorker(pgStore, workflow, metrics, log, time.Duration(cfg.ClockSweepIntervalSeconds)*time.Second)
 	clockWorker.Start(clockCtx)
 	defer clockWorker.Stop()

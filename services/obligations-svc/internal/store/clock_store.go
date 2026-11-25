@@ -516,6 +516,12 @@ func (s *PgStore) startClockTx(ctx context.Context, tx pgx.Tx, tenantID string, 
 	if err := insertClockEventTx(ctx, tx, c, "obligation.clock.started", p.Actor, p.CorrelationID, p.CausationID, payload); err != nil {
 		return nil, err
 	}
+	// DL-5: an obligation raised by evaluate is a governance decision.
+	if strings.HasPrefix(p.ClockKey, EvaluateClockKeyPrefix) {
+		if err := s.recordDecisionTx(ctx, tx, evaluateRecord(c, p)); err != nil {
+			return nil, err
+		}
+	}
 	return &startResult{clock: c, created: true}, nil
 }
 
@@ -679,6 +685,12 @@ func (s *PgStore) ApplyClockCommand(ctx context.Context, p domain.ClockCommandPa
 		}
 		if err := insertClockEventTx(ctx, tx, next, stateEvent(to), p.Actor, p.CorrelationID, "", payload); err != nil {
 			return err
+		}
+		// DL-5: a waiver is a governance decision.
+		if p.Command == domain.ClockCommandWaive {
+			if err := s.recordDecisionTx(ctx, tx, waiveRecord(next, p)); err != nil {
+				return err
+			}
 		}
 		out = next
 		return nil
