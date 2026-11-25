@@ -54,6 +54,9 @@ services:
       - ../services/payment-status-svc/deployments/migrations:/migrations/payment-status:ro
       - ../services/metric-registry-svc/deployments/migrations:/migrations/metric-registry:ro
       - ../services/source-authority-svc/deployments/migrations:/migrations/source-authority:ro
+      - ../services/data-quality-svc/deployments/migrations:/migrations/data-quality:ro
+      - ../services/data-lineage-svc/deployments/migrations:/migrations/data-lineage:ro
+      - ../services/classification-svc/deployments/migrations:/migrations/classification:ro
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
       - ../services/governance-decision-log-svc/deployments/migrations:/migrations/governance-decision-log:ro
       - ../services/policy-svc/deployments/migrations:/migrations/policy:ro
@@ -5905,6 +5908,100 @@ services:
       DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/source_authority?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.source-authority.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    restart: on-failure
+
+  # ── Domain 3 data-control services (ZS-SVC-N-001 DATA-02 / lineage / DATA-classification) ──
+  # Same shape as source-authority-svc: the pre-provisioned NOSUPERUSER/NOBYPASSRLS
+  # zoiko_app role, so the FORCE RLS policies in each 000001 migration actually bind
+  # the connection instead of being skipped by the superuser default.
+  data-quality-svc:
+    build:
+      context: ../services/data-quality-svc
+      dockerfile: Dockerfile
+    container_name: data-quality-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8178:8178"
+    environment:
+      PORT: "8178"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/data_quality?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_TOPIC: "zoiko.data.quality.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    restart: on-failure
+
+  data-lineage-svc:
+    build:
+      context: ../services/data-lineage-svc
+      dockerfile: Dockerfile
+    container_name: data-lineage-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8179:8179"
+    environment:
+      PORT: "8179"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/data_lineage?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_TOPIC: "zoiko.data.lineage.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    restart: on-failure
+
+  classification-svc:
+    build:
+      context: ../services/classification-svc
+      dockerfile: Dockerfile
+    container_name: classification-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8180:8180"
+    environment:
+      PORT: "8180"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/classification?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_TOPIC: "zoiko.data.classification.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
     depends_on:
       postgres:
