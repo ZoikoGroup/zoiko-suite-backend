@@ -106,7 +106,7 @@ the same set. There is no `DRAFT` state and no command that creates one.
 Adding `DRAFT` without a draft command would create an unreachable state, so
 this is recorded rather than papered over.
 
-### A3. Active legacy routes remain an alternate commercial path
+### A3. Active legacy routes remain an alternate commercial path — mostly closed 2026-11-20
 
 The non-bypassable invariants say:
 
@@ -119,30 +119,123 @@ The non-bypassable invariants say:
 > “COM-03 is the sole runtime entitlement decision service for commercial plan
 > access/limits. Clients may display entitlements but cannot self-assert them.”
 
-The following legacy routes are still mounted and tested, alongside the
-canonical COM-02/03/04 surfaces:
+**Retired.** The following are no longer mounted — `RegisterSubscriptionRoutes`
+registers only the `/v1/price-catalogs` and `/v1/plans` GET/retired-write
+routes now, and `RegisterRoutes` registers only `/v1/commercial-accounts`:
 
-- `/v1/subscriptions` — `CreateSubscription`, `ResolveEntitlement`,
-  `RecordUsageEvent`, `SetSubscriptionStatus`, `CreateEvaluationProgram`.
-  `ResolveEntitlement` reads legacy plan/overlay limits directly, so it is a
-  second runtime decision path. `RecordUsageEvent` writes
-  `commercial_usage_meter_events` without COM-04 meter registration,
-  statement freeze or adjustment lineage. `SetSubscriptionStatus` uses the
-  legacy status enum (including `PAST_DUE` and `RESTRICTED`), which mixes
-  lifecycle, billing health and entitlement state that §6 keeps orthogonal.
-- `/v1/subscription-change-requests` — legacy preview/confirm change path.
-- `/v1/contract-entitlement-overlays` — creates an overlay that the legacy
-  resolver reads; it is not a COM-03 restriction and does not go through the
+- `/v1/subscriptions` — `CreateSubscription`, `GetSubscription`,
+  `ResolveEntitlement`, `RecordUsageEvent`, `SetSubscriptionStatus`,
+  `ListStatusEvents`, `CreateEvaluationProgram`. `ResolveEntitlement` was a
+  second runtime entitlement decision path reading legacy plan/overlay limits
+  directly — exactly what the COM-03-is-sole-decision-service invariant
+  forbids. `RecordUsageEvent` wrote `commercial_usage_meter_events` without
+  COM-04 meter registration, statement freeze or adjustment lineage.
+  `SetSubscriptionStatus` used the legacy status enum (including `PAST_DUE`
+  and `RESTRICTED`), mixing lifecycle, billing health and entitlement state
+  that §6 keeps orthogonal.
+- `/v1/subscription-change-requests` — `PreviewSubscriptionChange`,
+  `ConfirmSubscriptionChange`.
+- `/v1/contract-entitlement-overlays` — `CreateOverlay`. Fed the legacy
+  resolver above; not a COM-03 restriction and never went through the
   canonical recompute.
-- `/v1/billing-source-transfers` — legacy transfer path.
-- `/v1/commercial-accounts` and `/v1/memberships` — legacy account/membership
-  lifecycle commands.
+- `/v1/billing-source-transfers` — `TransferBillingSource`.
+- `/v1/memberships` (and `GET /v1/organizations/{id}/memberships`) —
+  `CreateMembership`, `GetMembership`, `ListMemberships`,
+  `DeactivateMembership`. Unlike the rest of this list this one isn't an
+  entitlement-decision bypass; it was retired because it's the same
+  "legacy, chunk-based, superseded surface" class as the others and a repo-
+  and frontend-wide search found no caller.
 
-The `/v1/price-catalogs` and `/v1/plans` write routes are deliberately retired
-through `retiredCatalogWrite`; they are not active COM-01 bypasses. The
-remaining routes were not retired in this pass because existing tests and
-callers depend on them. Retiring them requires a consumer migration plan and
-is the main structural follow-up from this survey.
+Verification before deletion: grepped this repo and the frontend
+(`zoiko_suite_frontend/suite_frontend/zoiko-suite-frontend-platform`) for the
+literal paths above — no match outside this service's own handler/test code.
+identity-context-svc's `ResolveEntitlementContext`
+(`internal/upstream/entitlement_client.go`) was the one service-to-service
+candidate; it calls the canonical `GET /v1/commercial/entitlements/effective`,
+not the legacy `ResolveEntitlement` handler — confirmed by reading the file.
+gateway-auth-svc's `internal/commercial/client.go` calls
+`GET /v1/commercial-accounts/by-organization/{id}` and
+`GET /v1/commercial-accounts/{id}/subscription` — neither of those exact
+paths was ever registered by this service (no `/by-organization/` or
+`/{id}/subscription` sub-route existed before or after this change), so that
+client was already calling endpoints that 404 today; this change does not
+affect it either way.
+
+**Deliberately left in place — a real dependency, not an oversight:**
+
+- `POST /v1/commercial-accounts` (`CreateCommercialAccount`) and
+  `GET /v1/commercial-accounts/{id}` (`GetCommercialAccount`) are **not**
+  retired, even though the original version of this note listed them for
+  removal alongside memberships. Canonical COM-02 depends on them: `PUT
+  /v1/commercial/accounts/{id}/market` (`SetAccountMarket`) and `POST
+  /v1/commercial/subscriptions:start` (`StartSubscription`) both read the
+  `commercial_accounts` table directly (`internal/store/com02_subscription_store.go`
+  — `SetAccountMarket`'s `UPDATE commercial_accounts ... WHERE
+  commercial_account_id = $1` and `StartSubscription`'s `SELECT
+  organization_id, billing_currency_code, status, market_code FROM
+  commercial_accounts ... FOR UPDATE`), and both fail closed with
+  `ErrCommercialAccountNotFound`/`ErrAccountNotActive`/`ErrAccountMarketNotSet`
+  when the row doesn't already exist. `CreateCommercialAccount` is the only
+  code path in this service that inserts into `commercial_accounts`. Removing
+  it would make it impossible to onboard a new commercial account at all —
+  canonical COM-02 subscription sales would have no account to attach to.
+  This is exactly the "surviving capability reads data only a legacy route
+  wrote" case this pass was told to check for, not a bypass of the
+  entitlement invariant (creating/reading an account record isn't an
+  entitlement decision), so it stays. Flagging this explicitly since the
+  routes were initially assumed retirable along with memberships.
+- The underlying tables for everything retired above
+  (`commercial_subscriptions`, `evaluation_programs`,
+  `contract_entitlement_overlays`, `commercial_usage_meter_events`,
+  `subscription_change_requests`, `billing_source_transfers`,
+  `subscription_status_events`, `memberships`) are **not** dropped — no
+  down-migration touches them. Two reasons: (1) existing rows are real
+  customer history that must survive, and (2) migration 000007's
+  `reject_legacy_subscription_over_com02` trigger on the canonical
+  `subscriptions` table still queries `commercial_subscriptions` to refuse
+  selling a COM-02 subscription to an account that already holds a live
+  legacy one (`TestSubscription_MutuallyExclusiveWithDoc7Subscriptions`,
+  `internal/store/com02_subscription_store_test.go`) — a real, still-active
+  coupling between the canonical and legacy subscription models.
+- `store.Store` still declares, and `PgStore` still implements,
+  `CreateSubscription`, `GetSubscription`, `ResolveEntitlement`,
+  `RecordUsageEvent`, `TransitionSubscriptionStatus`,
+  `ListStatusEventsBySubscription`, `CreateEvaluationProgram`,
+  `GetEvaluationProgramBySubscription`, `CreateOverlay`,
+  `CreateChangeRequest`, `GetChangeRequest`, `ApplyChangeRequest`,
+  `CreateBillingSourceTransfer`, `UpdateSubscriptionPlan`,
+  `CreateMembership`, `GetMembership`, `ListMemberships`,
+  `DeactivateMembership`. None of these is reachable over HTTP any more —
+  only the `internal/handler` methods and route registrations that called
+  them are gone. They stay at the store layer because
+  `internal/store/rls_test.go` uses them, over a real
+  `NOSUPERUSER NOBYPASSRLS` Postgres role, to prove migration 000005's
+  row-level-security policies on these same tables still isolate tenants
+  correctly. Deleting the Go methods to match the HTTP retirement would have
+  forced either dropping that RLS regression coverage or rewriting it against
+  raw SQL — out of scope for an HTTP-surface retirement, and lower-value than
+  just leaving inert, unreachable persistence code in place. (Compare the
+  `financial-close-svc` migration-batch retirement: same principle — delete
+  the reachable bypass, don't delete a capability something else still reads.)
+- The domain `Request` DTOs that existed only to decode JSON for the removed
+  HTTP handlers (`CreateSubscriptionRequest`, `CreateMembershipRequest`,
+  `CreateEvaluationProgramRequest`, `CreateOverlayRequest`,
+  `RecordUsageEventRequest`, `SetSubscriptionStatusRequest`,
+  `TransferBillingSourceRequest`, `PreviewChangeRequest`) were removed — they
+  had no other reference once the handlers were gone. The domain structs the
+  store layer actually persists (`CommercialSubscription`, `UsageMeterEvent`,
+  `EvaluationProgram`, `ContractEntitlementOverlay`,
+  `SubscriptionChangeRequest`, `BillingSourceTransfer`,
+  `SubscriptionStatusEvent`, `Membership`, `ResolvedEntitlement`, etc.) were
+  left alone since the store methods above still use them.
+
+The `/v1/price-catalogs` and `/v1/plans` write routes remain retired through
+`retiredCatalogWrite` (unchanged by this pass); their GET routes stay for the
+same reason as before — existing legacy subscriptions still reference plans.
+
+Commit: `e5dbe0bb` on `satyaprakash-changes` ("commercial-account-svc: retire
+legacy entitlement-bypass HTTP routes (A3)") for the route/handler/test/
+domain removal; this SPEC_DEVIATIONS.md update is the following commit.
 
 ### A4. Command idempotency and outbox coverage is incomplete — partially closed 2026-11-07
 
@@ -226,7 +319,7 @@ replay-load wiring checked individually.
   (real Postgres: a retry under the same key with a different
   `sale_enabled` value still replays the original row).
 
-### A5. COM-03 policy publication invalidates globally, not per tenant
+### A5. COM-03 policy publication invalidates globally, not per tenant — closed 2026-11-21
 
 §4.3 says:
 
@@ -238,15 +331,76 @@ and §9 requires:
 > “09 | Downgrade scheduled but high-tier feature remains usable after
 > effective time | COM-03 revokes/limits at boundary; stale cache invalidated.”
 
-`PublishEntitlementPolicy` writes one outbox event with aggregate
-`entitlement_policy` / `grace-policy`. It does not recompute or emit an
-`entitlement_snapshot.changed` event for each affected tenant. The canonical
-`Evaluate` path is safe because it computes fresh, but a cache-fronted caller
-must invalidate the entire policy cache rather than a tenant's snapshot. There
-is no per-capability cache-revocation SLO or freshness metadata in the
-service, because there is no cached decision path to measure. This is
-fail-safe for the service's own reads but weaker than the per-tenant
-invalidation implied by the event contract.
+**Closed.** `PublishEntitlementPolicy` previously wrote only one outbox event
+with aggregate `entitlement_policy` / `grace-policy`. It never recomputed or
+emitted an `entitlement_snapshot.changed` event for each affected tenant, so a
+cache-fronted caller only got a correct per-tenant signal by coincidence of
+its own TTL expiring, not a real push.
+
+`entitlement_policy_versions` (migration 000010) is a single, global,
+platform-scoped ended-access grace policy — it names no organization and no
+capability. The only organizations a given policy version can actually
+change the answer for are those with no live subscription whose most recent
+one has already ended (`loadMostRecentlyEnded`); an organization with a live
+subscription is unaffected by it regardless of its content.
+
+Discovering that set safely was the real difficulty. `PublishEntitlementPolicy`
+runs on the seller plane with no tenant scope, and `subscriptions` (migration
+000007) carries only a bare `tenant_isolation_policy` — deliberately, with no
+seller- or boundary-worker bypass of its own (see the `declareOrgForSellerPlane`
+comment in `internal/store/com04_usage_store.go`, which documents this same
+fact for a different COM-04 read). Widening that policy to let the seller
+plane read live tenant subscription data in general would have been a far
+bigger surface than this one feature needs, and was rejected.
+
+Instead (migration 000024):
+
+1. `ended_subscription_index` is a new, narrow, durable table — one row per
+   organization whose most recent subscription currently has an `ends_at`
+   set — kept current by a trigger on `subscriptions` itself (`AFTER INSERT
+   OR UPDATE OF ends_at`). That is the exact column `setEndsAt` already
+   maintains for every real lifecycle transition this service has (`CancelNow`,
+   a scheduled cancellation taking effect, trial/term expiry, reactivation
+   clearing it back to `NULL`). The write happens inside the owning tenant's
+   own transaction — the same one that already calls `setEndsAt` — so it is
+   RLS-legal without any cross-tenant read ever happening. A migration-embedded
+   backfill (idempotent, `ON CONFLICT` upsert recomputed from current
+   `subscriptions` state) covers organizations that already ended before this
+   index existed, following this service's only existing backfill convention
+   (000009's `subscription_boundary_queue` backfill).
+2. `PublishEntitlementPolicy`'s own transaction reads this index — never
+   `subscriptions` directly — to enqueue one `entitlement_invalidation_queue`
+   row per organization whose indexed `ends_at` is at or before the policy's
+   own `effective_from`, in the same transaction as the policy write (same
+   durability as every other command in this service).
+3. A worker (`ProcessNextEntitlementInvalidation`), shaped exactly like
+   `subscription_boundary_queue`'s `ProcessNextBoundary` (`SKIP LOCKED`,
+   claim-one-row-per-transaction, backoff, parked `FAILED` after repeated
+   failure, run by `boundary.Worker` through a one-method adapter so the
+   existing ticker/batch machinery is reused rather than duplicated), drains
+   that queue and turns each row into the real per-tenant
+   `entitlement_snapshot.changed` event through the existing
+   `recomputeEntitlementsBatchTx` path — the same event `CreateSnapshot`,
+   `RecomputeEntitlements` and the boundary worker's own B2 remediation
+   already produce, not a new one-off event shape.
+
+`entitlement_invalidation_queue` itself is platform-only bookkeeping, not
+tenant data — no organization ever reads its own rows there — so unlike
+`subscription_boundary_queue` its RLS has no per-organization branch at all:
+only the seller plane (the writer) and the `boundary_worker` plane (the new
+worker) may see it.
+
+*Verification* (`internal/store/com03_entitlement_invalidation_store_test.go`,
+real Postgres as the NOSUPERUSER NOBYPASSRLS role):
+`TestEntitlement_PublishPolicyInvalidatesOnlyGenuinelyEndedOrgs` publishes a
+policy after one organization's subscription has genuinely ended (`CancelNow`)
+while a second, unrelated organization's subscription is still active, and
+proves `entitlement_invalidation_queue` holds exactly one row — the ended
+organization, carrying the published policy's own version — then drains it
+and proves the real `entitlement_snapshot.changed` outbox event lands for
+that organization only, with no new event for the still-active one.
+`TestEntitlement_InvalidationQueueHasNoDefaultVisibility` proves a plain
+connection with no plane/tenant declared sees zero rows in either new table.
 
 ### A6. Replay for evidence commands returns current state, not the original result
 
@@ -294,7 +448,7 @@ an event in a frozen or certified statement. The result is that the canonical
 requires once the window has closed. This was left in place because the
 existing tests explicitly assert the rejection; it remains an open A-item.
 
-### A8. COM-04 late events cannot always create an adjustment
+### A8. COM-04 late events cannot always create an adjustment — closed (B18)
 
 The automatic late path in `registerLateEvent`:
 
@@ -323,6 +477,25 @@ represent the adjustment. A durable late-event inbox with a pending
 adjustment that can be attached when a target exists would be the structural
 fix.
 
+**Closed.** Migration 000025 adds `pending_late_adjustments`, shaped like this
+service's other durable queues (`subscription_boundary_queue`,
+`entitlement_invalidation_queue`): when neither case above can find a target
+in the same transaction, `registerLateEvent` now persists the late event's
+full data there (instead of returning an error that rolled back the whole
+transaction, including the late `usage_event_records` row itself) and
+commits normally. `ProcessNextPendingLateAdjustment`
+(`internal/store/com04_pending_late_adjustments.go`), wired into
+`cmd/server/main.go` with the same ticker/batch/SKIP-LOCKED shape as the
+other two queues, re-resolves a target at its OWN "now" on every pass — not
+the original `observedAt` — and attaches the adjustment the moment one
+exists, through the exact same creation logic (`createLateAdjustment`)
+`registerLateEvent` already used for the case that worked immediately. See
+B18 for the real re-attachment moment this uncovered and the no-expiry
+decision. Tests:
+`internal/store/com04_pending_late_adjustments_test.go` —
+`TestUsage_PendingLateAdjustment_SameTermFrozen_AttachesOnceANewTermOpens`
+and `TestUsage_PendingLateAdjustment_PostFinalTerm_StaysPendingIndefinitely`.
+
 ### A9. COM-04 `ReopenWindow` does not carry adjustments or counts
 
 §4.4 lists `ReopenWindow` as a controlled-exception command, and §6 says:
@@ -339,7 +512,7 @@ does not reproduce the original certified total plus its adjustment lineage.
 The original is preserved, but the replacement's evidence is incomplete.
 This is a structural reopen/adjustment carry-forward gap.
 
-### A10. COM-05 never rates `ONE_TIME` or `DISCOUNT` components
+### A10. COM-05 never rated `ONE_TIME` or `DISCOUNT` components — closed 2026-11-20
 
 §4.5 requires:
 
@@ -360,12 +533,22 @@ and §4.1 defines:
 > “Discount/credit | type, value/cap, duration, eligibility, approval | Never
 > embedded as mutable invoice-line override.”
 
-`RateInvoiceBasis` rates only `RECURRING_FIXED`, `PER_UNIT` and `METERED`
-components. Its own comment says: “ONE_TIME and DISCOUNT components are not
-rated here (out of scope for this part of COM-05).” Approved discounts and
-one-time charges can be stored on a price version and approved on a
-subscription, but they never reach an invoice candidate. This is a material
-COM-05 rating gap.
+**Closed.** `RateInvoiceBasis` previously rated only `RECURRING_FIXED`,
+`PER_UNIT` and `METERED` components, with its own comment recording
+`ONE_TIME` and `DISCOUNT` as out of scope. Approved discounts and one-time
+charges could be stored on a price version and approved on a subscription,
+but never reached an invoice candidate — a material COM-05 rating gap at the
+time this register was first written.
+
+This is fixed: `RateInvoiceBasis` now also rates `ONE_TIME` components
+(explicit trigger/evidence, no hidden recurring conversion) and `DISCOUNT`
+components (bound policy version, eligibility, cap/duration), and
+`GenerateInvoiceCandidate` wires the approved discount/one-time facts
+through to the invoice candidate. See commits `b598d63e`
+("commercial-account-svc: add schema for ONE_TIME/DISCOUNT invoice lines"),
+`65e2ad0e` ("commercial-account-svc: rate ONE_TIME and DISCOUNT components
+onto invoices") and `7743d42a` ("commercial-account-svc: wire ONE_TIME/
+DISCOUNT facts into GenerateInvoiceCandidate"), all on `satyaprakash-changes`.
 
 ### A11. COM-05 collection health is incomplete
 
@@ -486,12 +669,14 @@ review of every restriction consumer.
   read tenant tax configuration. This matches §4.5's “merchant tax result”
   input and §5's dedicated seller tax context, but a reviewer could require
   a stronger tax-service integration or an amount-versus-rate check.
-- **B13. COM-05 discount/one-time rating was deferred.** A10 records the gap.
-  Rating a discount requires a bound discount policy version and an
-  eligibility decision; rating a one-time charge requires an explicit trigger
-  and evidence. Neither binding exists yet, so adding a line item from the
-  component alone would create an unsupported charge. This needs a separate
-  COM-05 rating extension.
+- **B13. COM-05 discount/one-time rating was deferred — closed 2026-11-20.**
+  A10 recorded the gap: rating a discount requires a bound discount policy
+  version and an eligibility decision; rating a one-time charge requires an
+  explicit trigger and evidence; neither binding existed at the time, so
+  adding a line item from the component alone would have created an
+  unsupported charge. Commits `b598d63e`/`65e2ad0e`/`7743d42a` added that
+  binding and wired it through `RateInvoiceBasis`/`GenerateInvoiceCandidate`;
+  see A10.
 - **B14. Dunning `SUSPENDED` uses the existing `RESTRICTED` level.** A12
   records the gap. The current `RestrictionLevel` has no `DENY`, and adding
   one requires a schema migration plus a review of every restriction
@@ -605,3 +790,27 @@ review of every restriction consumer.
     - Three deliberate breakages were each caught: the pilot tenant
       reverted, the seller-plane clause removed, and the statement
       organization dropped.
+- **B18. The pending-late-adjustment queue has no terminal/expiry state, and
+  re-attachment re-resolves at the worker's own "now".** Changed in this
+  pass (A8). Two decisions a reviewer could reverse:
+  - *No expiry.* §4.4/§9 negative path #18 say only "create prospective
+    adjustment"; nothing says a late correction ever expires. A subscription
+    that has permanently ended (no further term will ever open) therefore
+    leaves its pending item PENDING forever rather than FAILED/discarded —
+    the literal reading, chosen over inventing an expiry the spec does not
+    state. `attempts`/`last_error`/`next_attempt_at` still advance on every
+    no-target drain, so the retry history is real evidence, not a silent
+    no-op.
+  - *Re-attachment moment.* The structural fix note in A8 (and the task that
+    implemented it) first assumed certifying the FROZEN origin statement
+    would be the trigger. It is not: certifying the origin changes nothing
+    about whether a window LATER than it is open. The real trigger is a
+    later term opening — `resolveTerm`/`findOrCreateOpenStatement` are
+    re-run at the worker's `now` (its own call time) on every pass, not the
+    original `observedAt`, so a renewal that happens after the item was
+    queued is picked up on the very next drain.
+  - *Manual check:*
+    `internal/store/com04_pending_late_adjustments_test.go` proves both: the
+    same-term case stays PENDING across a certify-only step and only attaches
+    once a renewal opens term2; the post-final-term case stays PENDING across
+    repeated drains with no renewal at all.

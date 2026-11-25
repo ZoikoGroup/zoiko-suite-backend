@@ -49,6 +49,12 @@ type entityStatus struct {
 	EntityStatus string `json:"entity_status"`
 }
 
+type entityRecord struct {
+	EntityID              string `json:"legal_entity_id"`
+	TenantID               string `json:"tenant_id"`
+	PrimaryJurisdictionID  string `json:"primary_jurisdiction_id"`
+}
+
 // CheckEntity returns nil when the entity exists in tenantID,
 // domain.ErrLegalEntityNotFound when it does not (or belongs to another
 // tenant), and domain.ErrRegistryUnavailable when the registry cannot answer —
@@ -88,6 +94,55 @@ func (c *Client) CheckEntity(ctx context.Context, tenantID, legalEntityID string
 		return domain.ErrLegalEntityNotFound
 	}
 	return nil
+}
+
+// PrimaryJurisdiction reads a legal entity's registered primary jurisdiction —
+// the single authoritative source for this fact (tenant-entity-registry-svc
+// owns `legal_entities.primary_jurisdiction_id UUID NOT NULL`, set at
+// onboarding). Used by the WFC-05 consolidation backfill (migrate-duplicates)
+// to resolve jurisdiction_id for obligation-tracking-svc rows, which never
+// tracked jurisdiction themselves — this is a real lookup against the system
+// of record, never a fabricated or defaulted value. Fails closed exactly like
+// CheckEntity: an unreachable or malformed-response registry is
+// ErrRegistryUnavailable, never treated as "any jurisdiction is fine".
+func (c *Client) PrimaryJurisdiction(ctx context.Context, tenantID, legalEntityID string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.baseURL+"/v1/entities/"+url.PathEscape(legalEntityID), nil)
+	if err != nil {
+		return "", domain.ErrRegistryUnavailable
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-Tenant-Id", tenantID)
+	svcenvelope.ForwardTo(ctx, req)
+	idenv.Forward(ctx, req)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("tenant-entity-registry-svc unreachable — failing closed", zap.String("legal_entity_id", legalEntityID), zap.Error(err))
+		return "", domain.ErrRegistryUnavailable
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotFound:
+		return "", domain.ErrLegalEntityNotFound
+	default:
+		c.log.Error("tenant-entity-registry-svc answered unexpectedly — failing closed",
+			zap.Int("status", resp.StatusCode), zap.String("legal_entity_id", legalEntityID))
+		return "", domain.ErrRegistryUnavailable
+	}
+	var e entityRecord
+	if err := json.NewDecoder(resp.Body).Decode(&e); err != nil {
+		return "", fmt.Errorf("%w: malformed registry response: %v", domain.ErrRegistryUnavailable, err)
+	}
+	if e.TenantID != "" && !strings.EqualFold(e.TenantID, tenantID) {
+		return "", domain.ErrLegalEntityNotFound
+	}
+	if strings.TrimSpace(e.PrimaryJurisdictionID) == "" {
+		return "", fmt.Errorf("%w: entity record carries no primary_jurisdiction_id", domain.ErrRegistryUnavailable)
+	}
+	return e.PrimaryJurisdictionID, nil
 }
 
 // Noop admits every entity. Used only when no registry URL is configured in a

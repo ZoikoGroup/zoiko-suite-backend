@@ -143,7 +143,7 @@ func newListEnv(t *testing.T) *listEnv {
 	r.Use(envelope.MiddlewareWithMode(envelope.ServicePolicy(), envelope.ModeWriteStrict, nil))
 	h := handler.New(s, authz.NewClient(az.server(t)), zap.NewNop())
 	handler.RegisterRoutes(r, h)
-	handler.RegisterBNK0304Routes(r, h, s)
+	handler.RegisterBNK0304Routes(r, h, s, nil)
 	return &listEnv{f: &listFixture{t: t, admin: admin, conns: map[string]string{}}, router: r, authz: az}
 }
 

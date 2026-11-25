@@ -37,6 +37,27 @@ func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error {
 // about BNK-06's treasury-svc verification) keeps working unchanged.
 // Tests that specifically exercise the real verification set err.
 
+// stubCurrency stands in for currency-registry-svc. units defaults to 2
+// (USD's real minor-unit count) when unset, matching every existing test's
+// currency "USD" — so chaining .WithCurrency(&stubCurrency{}) in place of
+// no currency client changes nothing about what those tests already
+// asserted. A test exercising a different currency's precision sets units
+// explicitly.
+type stubCurrency struct {
+	units int
+	err   error
+}
+
+func (c *stubCurrency) MinorUnits(_ context.Context, _ string, _ time.Time) (int, error) {
+	if c.err != nil {
+		return 0, c.err
+	}
+	if c.units == 0 {
+		return 2, nil
+	}
+	return c.units, nil
+}
+
 type stubTreasury struct {
 	err            error
 	fingerprintErr error
@@ -88,7 +109,7 @@ func newTestRouterWithTreasury(st *stubStore, az *stubAuthz, provider *providera
 
 func newTestRouterFull(st *stubStore, az *stubAuthz, provider *provideradapter.StubProviderAdapter, treasury *stubTreasury, authorization *stubAuthorization) chi.Router {
 	logger := zap.NewNop()
-	h := handler.New(st, az, provider, treasury, authorization, logger)
+	h := handler.New(st, az, provider, treasury, authorization, logger).WithCurrency(&stubCurrency{})
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
 	handler.RegisterRoutes(r, h)

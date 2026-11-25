@@ -32,19 +32,16 @@ func (s *PgStore) VerifyBankAccountOwnership(ctx context.Context, p domain.Verif
 	var evidence *domain.OwnershipEvidence
 	acct := &domain.BankAccount{}
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
-		if err := tx.QueryRow(ctx, `SELECT `+bankAccountColumns+` FROM bank_accounts WHERE bank_account_id = $1 AND tenant_id = $2`,
-			p.BankAccountID, p.TenantID).Scan(
-			&acct.BankAccountID, &acct.TenantID, &acct.LegalEntityID, &acct.AccountName,
-			&acct.MaskedAccountNumber, &acct.BankIdentifier, &acct.CurrencyCode, &acct.AccountStatus,
-			&acct.BranchRef, &acct.Country, &acct.AccountType, &acct.RequestedOperationalUse, &acct.TokenVersion,
-			&acct.CreatedByPrincipalID, &acct.SuspendReason, &acct.CloseReason, &acct.CreatedAt, &acct.UpdatedAt); err != nil {
+		row := tx.QueryRow(ctx, `SELECT `+bankAccountColumns+` FROM bank_accounts WHERE bank_account_id = $1 AND tenant_id = $2`,
+			p.BankAccountID, p.TenantID)
+		if err := scanBankAccount(row, acct); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return domain.ErrBankAccountNotFound
 			}
 			return err
 		}
 
-		row := tx.QueryRow(ctx, `
+		row = tx.QueryRow(ctx, `
 			INSERT INTO bank_account_ownership_evidence (evidence_id, bank_account_id, tenant_id, verification_method, evidence_ref, verified_by_principal_id)
 			VALUES ($1,$2,$3,$4,$5,$6)
 			RETURNING evidence_id, bank_account_id, tenant_id, verification_method, evidence_ref, verified_by_principal_id, verified_at, superseded_by`,
@@ -347,6 +344,19 @@ func (s *PgStore) RotateAccountIdentifierToken(ctx context.Context, p domain.Rot
 		)
 		if err := scanBankAccount(row, &acct); err != nil {
 			return err
+		}
+		// p.NewAccountNumberToken is set by the handler only when
+		// TOKENIZATION_ENFORCED. scanBankAccount's RETURNING projection
+		// above read the PRIOR current token row (if any) into
+		// acct.AccountNumberToken; insertIdentifierToken below writes the
+		// new one and supersedes that prior row in the same transaction as
+		// this UPDATE, so the account is never left pointing at a stale
+		// token.
+		if p.NewAccountNumberToken != "" {
+			acct.AccountNumberToken = p.NewAccountNumberToken
+			if err := insertIdentifierToken(ctx, tx, &acct, "ROTATION"); err != nil {
+				return err
+			}
 		}
 		if err := s.recordAccountHistory(ctx, tx, &acct, p.ActorPrincipalID); err != nil {
 			return err

@@ -260,14 +260,25 @@ type BankStatement struct {
 	// authoritative record, not handler-local bookkeeping: a caller that
 	// cannot see the status, raw-source hash, source/batch ids and
 	// quarantine reason cannot prove which import it is looking at or
-	// whether the evidence was accepted. The raw payload itself is still
-	// not stored (see SPEC_DEVIATIONS.md A10).
+	// whether the evidence was accepted.
 	ContentHash          string `json:"content_hash,omitempty"`
 	SourceID             string `json:"source_id,omitempty"`
 	ImportBatchID        string `json:"import_batch_id,omitempty"`
 	Status               string `json:"status,omitempty"`
 	QuarantineReason     string `json:"quarantine_reason,omitempty"`
 	CreatedByPrincipalID string `json:"created_by_principal_id,omitempty"`
+
+	// RawFileDocumentID is the retrievable reference to the original
+	// statement file in document-vault-svc (SPEC_DEVIATIONS.md A10's
+	// "no raw payload, no raw file reference" — partially closed: content_hash
+	// above is still whatever the caller supplied, not re-derived here).
+	// Empty for a statement ingested with no raw file attached, or ingested
+	// before this field existed.
+	RawFileDocumentID string `json:"raw_file_document_id,omitempty"`
+	// RawFileChecksumSHA256 is document-vault-svc's own computed SHA-256 for
+	// the stored file, read back from its verify-digest query at ingest
+	// time — independent evidence, not a copy of ContentHash.
+	RawFileChecksumSHA256 string `json:"raw_file_checksum_sha256,omitempty"`
 }
 
 type CreateConnectionRequest struct {

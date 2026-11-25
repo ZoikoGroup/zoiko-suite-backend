@@ -59,6 +59,16 @@ type Store interface {
 
 	// Control-population read (docs/architecture/control-population-contract.md).
 	ControlPopulation(ctx context.Context, q domain.ControlPopulationQuery) (*domain.ControlPopulationPage, error)
+
+	// Tolerance policy governance (SPEC_DEVIATIONS A5/B15): a versioned
+	// replacement for MatchEntry's fixed 0.001 tolerance literal.
+	// PublishTolerancePolicy records a new, immutable, effective-dated
+	// version; ResolveTolerancePolicy returns the version (and its
+	// tolerance) effective for tenantID at the given instant — version 0,
+	// the fixed pre-governance 0.001, when the tenant has never published
+	// one effective yet.
+	PublishTolerancePolicy(ctx context.Context, tenantID string, v *domain.TolerancePolicyVersion) (*domain.TolerancePolicyVersion, error)
+	ResolveTolerancePolicy(ctx context.Context, tenantID string, at time.Time) (version int, tolerance domain.Decimal, err error)
 }
 
 type AuthZClient interface {
@@ -92,6 +102,14 @@ const (
 	// actionClosePair is checked on BOTH entities: a terminal close takes
 	// the pair out of each side's open set, so neither side alone may do it.
 	actionClosePair = "INTERCOMPANY_ENTRY_CLOSE"
+
+	// actionPublishTolerancePolicy governs a tenant-wide tolerance policy
+	// (SPEC_DEVIATIONS A5/B15), not any one pair or legal entity — the same
+	// "no single entity owns it" posture pg_store.go's enqueueEntryEvent
+	// already documents for this service's inherently two-entity pairs, so
+	// it is checked with an empty legalEntityID rather than inventing a
+	// per-entity scope a tenant-wide policy does not have.
+	actionPublishTolerancePolicy = "INTERCOMPANY_TOLERANCE_POLICY_PUBLISH"
 )
 
 type Handler struct {
@@ -125,6 +143,7 @@ func (h *Handler) WithEntityRegistry(c EntityRegistryClient) *Handler {
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/control-populations/{population}", h.GetControlPopulation)
 	r.Get("/v1/intercompany/reciprocal-balances", h.GetReciprocalBalances)
+	r.Post("/v1/intercompany/tolerance-policy", h.PublishTolerancePolicy)
 	r.Route("/v1/intercompany/entries", func(r chi.Router) {
 		r.Post("/", h.CreateEntry)
 		r.Get("/", h.ListEntries)
@@ -137,6 +156,60 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{id}/transitions", h.ListTransitions)
 		r.Get("/{id}/explanation", h.ExplainMismatch)
 	})
+}
+
+// ── POST /v1/intercompany/tolerance-policy ───────────────────────────────────────
+
+// PublishTolerancePolicy publishes a new, immutable, effective-dated
+// tolerance policy version for the caller's tenant (SPEC_DEVIATIONS A5/B15):
+// who may set a tolerance, when it takes effect, and (from the version it
+// resolves to) which one a later match attempt is evaluated under. It never
+// changes the tolerance's own value for an already-recorded attempt.
+func (h *Handler) PublishTolerancePolicy(w http.ResponseWriter, r *http.Request) {
+	var req domain.PublishTolerancePolicyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	if req.PolicyVersion < 1 || req.Reason == "" || req.EffectiveFrom.IsZero() {
+		writeError(w, http.StatusBadRequest, "invalid_tolerance_policy", string(domain.ErrInvalidTolerancePolicy))
+		return
+	}
+	amount, err := domain.ParseAmount(req.Tolerance)
+	if err != nil || amount.Sign() < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_tolerance_policy", string(domain.ErrInvalidTolerancePolicy))
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	// A tenant-wide policy, not any one pair or legal entity — see
+	// actionPublishTolerancePolicy's own comment for why legalEntityID is
+	// left empty here.
+	if err := h.authz.CheckAllowed(r.Context(), principalID, "", actionPublishTolerancePolicy); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	now := time.Now().UTC()
+	v := &domain.TolerancePolicyVersion{
+		PolicyVersion: req.PolicyVersion, Tolerance: domain.Decimal(domain.CanonicalAmount(amount)),
+		EffectiveFrom: req.EffectiveFrom, Reason: req.Reason, CreatedAt: now, CreatedByPrincipalID: principalID,
+	}
+	published, err := h.store.PublishTolerancePolicy(r.Context(), tenantID, v)
+	if errors.Is(err, domain.ErrTolerancePolicyVersionExists) {
+		writeError(w, http.StatusConflict, "tolerance_policy_version_exists", err.Error())
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to publish tolerance policy", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, published)
 }
 
 // ── POST /v1/intercompany/entries ────────────────────────────────────────────────
@@ -211,12 +284,22 @@ func (h *Handler) CreateEntry(w http.ResponseWriter, r *http.Request) {
 		UpdatedAt:                now,
 	}
 
+	// A5/B15: resolve the governed tolerance version effective for this
+	// tenant now, recorded on the create-time attempt even though it is not
+	// compared at create (B12) — every attempt says which version applied.
+	toleranceVersion, tolerance, _, err := h.resolveTolerance(r.Context(), tenantID, now)
+	if err != nil {
+		h.log.Error("failed to resolve tolerance policy", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
 	// ACC-11 A6: the source journal gets the same four checks MatchEntry
 	// runs on the target, at create time. A journal that fails one is a real
 	// accounting fact: the pair is created in MISMATCH with an attempt
 	// naming the rule, not refused with a 400 the caller cannot fix by
 	// retrying the same request.
-	attempt, err := h.verifySourceJournal(r.Context(), tenantID, entry, principalID, correlationID)
+	attempt, err := h.verifySourceJournal(r.Context(), tenantID, entry, principalID, correlationID, tolerance, toleranceVersion)
 	if err != nil {
 		h.log.Error("failed to verify source journal with GL", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "gl_query_failed", err.Error())
@@ -253,7 +336,7 @@ func (h *Handler) CreateEntry(w http.ResponseWriter, r *http.Request) {
 // A nil attempt with a nil error means the journal passed and the pair stays
 // UNMATCHED. An error is a dependency failure (general-ledger-svc or an
 // unreadable journal amount): the caller answers 503 and creates nothing.
-func (h *Handler) verifySourceJournal(ctx context.Context, tenantID string, entry *domain.IntercompanyEntry, principalID, correlationID string) (*domain.MatchAttempt, error) {
+func (h *Handler) verifySourceJournal(ctx context.Context, tenantID string, entry *domain.IntercompanyEntry, principalID, correlationID string, tolerance domain.Decimal, toleranceVersion int) (*domain.MatchAttempt, error) {
 	journal, failure, err := h.checkJournal(ctx, tenantID, entry.SourceJournalID, sourceJournalCheck(entry))
 	if err != nil {
 		return nil, err
@@ -277,7 +360,8 @@ func (h *Handler) verifySourceJournal(ctx context.Context, tenantID string, entr
 			ExpectedAmount: entry.CounterpartyAmount, ExpectedCurrency: entry.CounterpartyCurrencyCode,
 		},
 		ExaminedJournalIDs: []string{entry.SourceJournalID},
-		Tolerance:          toleranceDecimal(),
+		Tolerance:          tolerance,
+		ToleranceVersion:   toleranceVersion,
 		FiscalPeriod:       entry.FiscalPeriod,
 		AttemptedBy:        principalID,
 		CorrelationID:      &correlationID,
@@ -550,9 +634,20 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 
+	// A5/B15: resolve the governed tolerance version effective for this
+	// tenant right now, rather than reading the fixed matchTolerance
+	// literal. Every attempt records which version it used, even a
+	// mismatch, so ExplainMismatch's evidence is never silent about it.
+	toleranceVersion, tolerance, tol, err := h.resolveTolerance(r.Context(), tenantID, time.Now().UTC())
+	if err != nil {
+		h.log.Error("failed to resolve tolerance policy", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
 	// attempt is this call's evidence (ExplainMismatch): filled in as each
 	// check runs, and recorded with whichever outcome the match reaches.
-	attempt := newMatchAttempt(entry, req.TargetJournalID, principalID, correlationID)
+	attempt := newMatchAttempt(entry, req.TargetJournalID, principalID, correlationID, tolerance, toleranceVersion)
 
 	// Fetch the target journal and run the four checks every pairing side
 	// gets: it exists, its legal entity is the expected one, it is FINALIZED,
@@ -575,11 +670,14 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The journal amount is the larger of its total debits and total
-	// credits (SPEC_DEVIATIONS A5), summed exactly. Read before the checks'
-	// outcome is recorded so every attempt records what the journal held,
-	// whichever rule fails.
-	journalAmount, err := journalTotal(journal)
+	// The journal amount is the larger of total debits and total credits
+	// across only the lines general-ledger-svc's chart of accounts
+	// classifies IsIntercompanyAccount (SPEC_DEVIATIONS A5) — not the whole
+	// journal, which would also pull in an unrelated line (tax, a
+	// third-party leg) and let a journal of the right total but the wrong
+	// accounts match. Read before the checks' outcome is recorded so every
+	// attempt records what the journal held, whichever rule fails.
+	journalAmount, hasIntercompanyLines, err := intercompanyLineTotal(journal)
 	if err != nil {
 		h.log.Error("general-ledger-svc returned an unreadable journal amount", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "gl_query_failed", err.Error())
@@ -598,10 +696,22 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The target journal's amount must match the expected counterparty
-	// amount, compared exactly (big.Rat) within matchTolerance.
-	if diff := new(big.Rat).Sub(journalAmount, expected); diff.Abs(diff).Cmp(matchTolerance) > 0 {
-		reason := fmt.Sprintf("amount_mismatch: expected counterparty amount %s %s != journal amount %s %s",
+	// No line of the target journal posts to an account the chart
+	// classifies intercompany: there is nothing to compare the pair's
+	// amount against. A real accounting fact — the journal is real and
+	// FINALIZED, it simply isn't an intercompany entry — so this is a
+	// MISMATCH, not a 503 the caller would retry identically.
+	if !hasIntercompanyLines {
+		reason := fmt.Sprintf("no_intercompany_lines: target journal %s has no line posted to an account classified as intercompany", req.TargetJournalID)
+		h.recordMismatch(w, r, entry, attempt, idempotencyKey, domain.MatchRuleNoIntercompanyLines, reason)
+		return
+	}
+
+	// The target journal's intercompany-line amount must match the
+	// expected counterparty amount, compared exactly (big.Rat) within
+	// matchTolerance.
+	if diff := new(big.Rat).Sub(journalAmount, expected); diff.Abs(diff).Cmp(tol) > 0 {
+		reason := fmt.Sprintf("amount_mismatch: expected counterparty amount %s %s != journal's intercompany-line amount %s %s",
 			domain.CanonicalAmount(expected), entry.CounterpartyCurrencyCode, domain.CanonicalAmount(journalAmount), journal.CurrencyCode)
 		h.recordMismatch(w, r, entry, attempt, idempotencyKey, domain.MatchRuleAmountMismatch, reason)
 		return
@@ -675,13 +785,21 @@ func groupRelationshipAsOf(entry *domain.IntercompanyEntry) time.Time {
 	return end
 }
 
-// matchTolerance is the fixed tolerance a journal amount may differ from the
-// expected counterparty amount by (unchanged from the float-era 0.001; there
-// is no matching-policy version yet, SPEC_DEVIATIONS A5).
-var matchTolerance = big.NewRat(1, 1000)
-
-func toleranceDecimal() domain.Decimal {
-	return domain.Decimal(domain.CanonicalAmount(matchTolerance))
+// resolveTolerance reads the governed tolerance policy version effective for
+// tenantID at `at` (SPEC_DEVIATIONS A5/B15): h.store.ResolveTolerancePolicy
+// returns version 0 and the fixed pre-governance 0.001 when the tenant has
+// never published one. It returns the version, the Decimal to record on the
+// attempt, and the parsed *big.Rat the amount comparison actually uses.
+func (h *Handler) resolveTolerance(ctx context.Context, tenantID string, at time.Time) (version int, tolerance domain.Decimal, tol *big.Rat, err error) {
+	version, tolerance, err = h.store.ResolveTolerancePolicy(ctx, tenantID, at)
+	if err != nil {
+		return 0, "", nil, err
+	}
+	tol, err = tolerance.Rat()
+	if err != nil {
+		return 0, "", nil, fmt.Errorf("resolved tolerance %q is unreadable: %w", tolerance, err)
+	}
+	return version, tolerance, tol, nil
 }
 
 // journalCheck describes the four checks one side of a pair gets from
@@ -787,6 +905,14 @@ func (h *Handler) checkJournal(ctx context.Context, tenantID, journalID string, 
 // journalTotal is the larger of the journal's total debits and total
 // credits, summed exactly. An absent line amount counts as zero, as it did
 // when lines were decoded into float64.
+//
+// Used only for the create-time source-journal observation (A6's
+// checkSourceJournal, below): that call never compares the amount it
+// observes (B12 — "comparing the source journal's total here would reject
+// journals A5 knows are approximated... Source amount verification belongs
+// with A5"), so it is intentionally left as the whole-journal figure it
+// always was rather than switched to intercompanyLineTotal, which is
+// MatchEntry's own comparison basis, not an evidence-recording default.
 func journalTotal(j *ledger.JournalDetail) (*big.Rat, error) {
 	var debits, credits []string
 	for _, l := range j.Lines {
@@ -811,12 +937,64 @@ func journalTotal(j *ledger.JournalDetail) (*big.Rat, error) {
 	return totalDebit, nil
 }
 
+// intercompanyLineTotal is the larger of total debits and total credits
+// across only the journal's lines general-ledger-svc's chart of accounts
+// classifies IsIntercompanyAccount (SPEC_DEVIATIONS A5), summed exactly. An
+// absent line amount counts as zero, as it did when lines were decoded into
+// float64.
+//
+// found is false when the journal has no intercompany-designated line at
+// all — a journal that never carries one (an ordinary local entry someone
+// named by mistake) and a journal whose intercompany line the chart has
+// since reclassified both land here the same way: there is nothing to
+// compare the pair's amount against, which the caller turns into a
+// MISMATCH (MatchRuleNoIntercompanyLines) rather than treating the journal
+// total as a stand-in for it.
+//
+// Multiple intercompany-designated lines are summed, not matched against
+// only the first: this is the direct, line-scoped generalisation of what
+// the journal-total comparison already did (sum every debit, sum every
+// credit, take the larger), restricted to the lines the chart actually
+// designates intercompany rather than every line in the journal. A journal
+// that splits one intercompany position across several lines (e.g. by
+// dimension) still nets to the position's real total.
+func intercompanyLineTotal(j *ledger.JournalDetail) (total *big.Rat, found bool, err error) {
+	var debits, credits []string
+	for _, l := range j.Lines {
+		if !l.IsIntercompanyAccount {
+			continue
+		}
+		found = true
+		if l.DebitAmount != "" {
+			debits = append(debits, string(l.DebitAmount))
+		}
+		if l.CreditAmount != "" {
+			credits = append(credits, string(l.CreditAmount))
+		}
+	}
+	if !found {
+		return big.NewRat(0, 1), false, nil
+	}
+	totalDebit, err := domain.SumAmounts(debits)
+	if err != nil {
+		return nil, true, err
+	}
+	totalCredit, err := domain.SumAmounts(credits)
+	if err != nil {
+		return nil, true, err
+	}
+	if totalCredit.Cmp(totalDebit) > 0 {
+		return totalCredit, true, nil
+	}
+	return totalDebit, true, nil
+}
+
 // newMatchAttempt starts the evidence for one match attempt: what each side
 // of the pair expects, which journal is examined, and the tolerance. The
 // source side is expected but not re-examined at match time: it was verified
 // when the pair was created (SPEC_DEVIATIONS A6), and that create-time
 // attempt carries its observed fields.
-func newMatchAttempt(entry *domain.IntercompanyEntry, targetJournalID, principalID, correlationID string) *domain.MatchAttempt {
+func newMatchAttempt(entry *domain.IntercompanyEntry, targetJournalID, principalID, correlationID string, tolerance domain.Decimal, toleranceVersion int) *domain.MatchAttempt {
 	sourceJournalID := entry.SourceJournalID
 	return &domain.MatchAttempt{
 		IntercompanyEntryID: entry.IntercompanyEntryID,
@@ -827,7 +1005,8 @@ func newMatchAttempt(entry *domain.IntercompanyEntry, targetJournalID, principal
 			JournalID: &targetJournalID, ExpectedAmount: entry.CounterpartyAmount, ExpectedCurrency: entry.CounterpartyCurrencyCode,
 		},
 		ExaminedJournalIDs: []string{targetJournalID},
-		Tolerance:          toleranceDecimal(),
+		Tolerance:          tolerance,
+		ToleranceVersion:   toleranceVersion,
 		AttemptedBy:        principalID,
 		CorrelationID:      &correlationID,
 	}

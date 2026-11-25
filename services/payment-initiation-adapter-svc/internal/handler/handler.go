@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -36,6 +37,16 @@ type AuthzChecker interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
 }
 
+// CurrencyClient resolves a currency's real ISO 4217 minor-unit count from
+// currency-registry-svc (REF-02) — see internal/currency. Nil means the
+// per-currency decimal-places check (domain.ValidateCurrencyPrecision)
+// cannot be performed and PrepareAttempt fails closed rather than silently
+// skipping it, the same posture general-ledger-svc's/treasury-svc's own
+// currency clients use.
+type CurrencyClient interface {
+	MinorUnits(ctx context.Context, code string, asOf time.Time) (int, error)
+}
+
 type Handler struct {
 	store         store.Store
 	authz         AuthzChecker
@@ -47,12 +58,25 @@ type Handler struct {
 	payroll clients.PayrollClient
 	// engine drives live provider adapters (INT-07). Nil means every attempt uses the legacy stub.
 	engine *providers.Engine
-	log     *zap.Logger
+	log    *zap.Logger
+	// currency resolves a currency's real minor-unit count for
+	// PrepareAttempt's decimal-places check — see CurrencyClient. Nil means
+	// that check fails closed rather than silently skips.
+	currency CurrencyClient
 }
 
 // WithPayroll enables the PAYROLL_RUN_SVC authorization source.
 func (h *Handler) WithPayroll(p clients.PayrollClient) *Handler {
 	h.payroll = p
+	return h
+}
+
+// WithCurrency wires PrepareAttempt's per-currency decimal-places check to
+// a real currency-registry-svc client. Without it, PrepareAttempt refuses
+// every attempt (fail closed), same as every other required-but-unwired
+// dependency in this service.
+func (h *Handler) WithCurrency(c CurrencyClient) *Handler {
+	h.currency = c
 	return h
 }
 
@@ -147,6 +171,28 @@ func (h *Handler) PrepareAttempt(w http.ResponseWriter, r *http.Request) {
 	// read the same digits.
 	amount, err := domain.ValidatePositiveAmount(req.Amount)
 	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Currency-specific precision, separate from the column-capacity check
+	// above: a value that fits NUMERIC(18,4) can still have more decimal
+	// places than req.Currency actually allows (e.g. a fractional JPY
+	// amount, or a 3rd decimal place on USD/GBP). Fails closed if no
+	// currency client is configured or currency-registry-svc is
+	// unreachable — an amount whose real precision could not be confirmed
+	// must not be accepted as correct.
+	if h.currency == nil {
+		h.log.Error("PrepareAttempt: no currency client configured (CURRENCY_REGISTRY_URL) — failing closed")
+		writeError(w, http.StatusServiceUnavailable, "currency_registry_unavailable: cannot verify currency decimal precision")
+		return
+	}
+	minorUnit, err := h.currency.MinorUnits(r.Context(), req.Currency, time.Now())
+	if err != nil {
+		h.log.Error("PrepareAttempt: currency-registry-svc unavailable — failing closed", zap.String("currency", req.Currency), zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "currency_registry_unavailable: cannot verify currency decimal precision")
+		return
+	}
+	if err := domain.ValidateCurrencyPrecision(amount, minorUnit); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}

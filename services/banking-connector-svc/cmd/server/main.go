@@ -17,6 +17,7 @@ import (
 	"zoiko.io/banking-connector-svc/internal/authz"
 	"zoiko.io/banking-connector-svc/internal/clients"
 	"zoiko.io/banking-connector-svc/internal/config"
+	"zoiko.io/banking-connector-svc/internal/documentvault"
 	svcenvelope "zoiko.io/banking-connector-svc/internal/envelope"
 	"zoiko.io/banking-connector-svc/internal/handler"
 	"zoiko.io/banking-connector-svc/internal/health"
@@ -142,6 +143,7 @@ func main() {
 	// validation). pgStore already satisfies store.BNK02Store.
 	bankAcctClient := clients.NewBankAccountHTTPClient(cfg.TreasuryServiceURL)
 	vaultClient := clients.NewVaultHTTPClient(cfg.VaultServiceURL)
+	documentVaultClient := documentvault.NewHTTPClient(cfg.DocumentVaultServiceURL, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -173,7 +175,7 @@ func main() {
 
 		handler.RegisterRoutes(r, h)
 		handler.RegisterBNK02Routes(r, h, st, bankAcctClient, vaultClient)
-		handler.RegisterBNK0304Routes(r, h, st)
+		handler.RegisterBNK0304Routes(r, h, st, documentVaultClient)
 		handler.RegisterControlPopulationRoutes(r, h, st)
 	})
 

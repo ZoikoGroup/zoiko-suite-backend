@@ -251,6 +251,21 @@ listed gap remains; **Missing** = no route or no callable path.
   certification “Duplicate statement imported twice” and “Statement for
   wrong account accepted” cannot be proven from stored evidence alone
   (A11/A12).
+  **Partially closed 2026-11-20:** `IngestStatement` now accepts an optional
+  raw file (`raw_file_content_base64`/`raw_file_content_type`/
+  `raw_file_name`), stores it in document-vault-svc (the platform's real
+  evidence/file store — `internal/documentvault`) and persists the returned
+  `document_id` plus document-vault-svc's own computed SHA-256
+  (`raw_file_document_id`/`raw_file_checksum_sha256`, migration 012). A
+  disputed statement can now have its original bytes pulled back up and
+  independently re-hashed, not just compared against a caller-supplied
+  digest. Still open: `content_hash` itself remains caller-supplied rather
+  than server-computed, the raw file is optional (a caller can still omit
+  it), and `GetStatementRawReference`/`GetImportWatermark`/
+  `GetIngestionEvidence` are still not separate queries — the reference is
+  only visible today via `ListStatements`/the ingest response. No
+  `BankStatementSource` entity, declared period or parser/schema version was
+  added.
 - **A11. No import watermark, period, parser/schema version or ingestion
   evidence query.** `GetImportWatermark`, `GetStatement`,
   `GetStatementRawReference`, `GetIngestionEvidence` and

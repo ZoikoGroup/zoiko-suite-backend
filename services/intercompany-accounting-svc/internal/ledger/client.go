@@ -34,6 +34,15 @@ type JournalLine struct {
 	AccountCode  string         `json:"account_code"`
 	DebitAmount  domain.Decimal `json:"debit_amount"`
 	CreditAmount domain.Decimal `json:"credit_amount"`
+
+	// IsIntercompanyAccount is general-ledger-svc's server-resolved
+	// classification of AccountCode against its chart of accounts
+	// (SPEC_DEVIATIONS A5): "There is no intercompany-account resolution...
+	// Needs an intercompany account designation from the chart of accounts."
+	// general-ledger-svc now resolves it per line on this same GetJournal
+	// response, so MatchEntry can compare only the intercompany-designated
+	// line(s) of the target journal instead of the journal's whole total.
+	IsIntercompanyAccount bool `json:"is_intercompany_account"`
 }
 
 type Client struct {

@@ -48,7 +48,7 @@ func (e *entStub) RecomputeEntitlements(ctx context.Context, _ string, _ time.Ti
 	e.rec(ctx, "Recompute")
 	return nil, e.err
 }
-func (e *entStub) CreateSnapshot(ctx context.Context, _, _ string, _ time.Time, _ domain.IdempotencyClaim) ([]domain.CapabilityDecision, error) {
+func (e *entStub) CreateSnapshot(ctx context.Context, _, _ string, _ time.Time, _ domain.IdempotencyClaim, _ string) ([]domain.CapabilityDecision, error) {
 	e.rec(ctx, "CreateSnapshot")
 	return nil, e.err
 }

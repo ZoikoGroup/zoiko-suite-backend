@@ -412,6 +412,50 @@ func ValidateNonNegativeMoney(d Decimal) (*big.Rat, error) {
 	return r, nil
 }
 
+// ErrAmountExceedsCurrencyPrecision is returned when an amount's actual
+// decimal places exceed its currency's real ISO 4217 minor-unit count (e.g.
+// a JPY amount with any fractional part, or a USD amount with 3+ decimal
+// places). This is a DIFFERENT check from ValidateMoney/ErrAmountPrecision
+// above: MoneyScale (4) is this service's own column-storage capacity, the
+// same ceiling applied to every currency regardless of what that currency
+// actually allows. A value with 3 decimal places passes ValidateMoney for
+// every currency (it fits in NUMERIC(20,4)), but is only valid for a
+// 3-decimal currency like BHD — not for USD/GBP (2) or JPY (0). Checking
+// this requires knowing the specific currency's minor-unit count, which
+// this package does not maintain (see internal/currency): callers resolve
+// it from currency-registry-svc and pass it in here.
+var ErrAmountExceedsCurrencyPrecision = errorString("amount has more decimal places than this currency's minor-unit precision allows")
+
+// DecimalPlaces returns the minimal number of fractional digits needed to
+// render r exactly as a terminating decimal (0 for an integer, e.g. "7" or
+// "7.00"). It is the actual precision a caller used, not a column's
+// capacity — "7.50" is 2 decimal places by column scale but only needs 1 to
+// be written exactly.
+func DecimalPlaces(r *big.Rat) int {
+	if r.IsInt() {
+		return 0
+	}
+	scale, exact := terminatingScale(r.Denom())
+	if !exact {
+		// ParseAmount refuses non-terminating fractions, so this is
+		// unreachable for any value this package itself parsed.
+		return 12
+	}
+	return scale
+}
+
+// ValidateCurrencyPrecision refuses r if it uses more decimal places than
+// minorUnit allows for its real currency (e.g. minorUnit=0 for JPY,
+// 2 for USD/GBP, 3 for BHD). r is assumed already validated by ValidateMoney
+// (or a Positive/NonNegative variant) — this only adds the currency-specific
+// precision rule on top.
+func ValidateCurrencyPrecision(r *big.Rat, minorUnit int) error {
+	if DecimalPlaces(r) > minorUnit {
+		return ErrAmountExceedsCurrencyPrecision
+	}
+	return nil
+}
+
 // ValidateRate checks that d is a positive rate the NUMERIC(20,8) columns
 // store exactly. A rate is not money and has a different scale and bound,
 // so it does not share the money validators.
