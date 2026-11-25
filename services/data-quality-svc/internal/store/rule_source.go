@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/big"
 
 	"github.com/jackc/pgx/v5"
 
@@ -26,6 +25,7 @@ type ruleSpec struct {
 type ruleSource struct {
 	RuleSetVersionID *string
 	ContractID       *string
+	AssetID          string
 	ContractSHA256   string
 	Specs            []ruleSpec
 }
@@ -50,7 +50,7 @@ func sourceFromRuleSet(v *domain.DQRuleSetVersion) *ruleSource {
 }
 
 func sourceFromContract(c *domain.ContractVersion) *ruleSource {
-	src := &ruleSource{ContractID: &c.ContractID, ContractSHA256: c.ContentSHA256}
+	src := &ruleSource{ContractID: &c.ContractID, AssetID: c.AssetID, ContractSHA256: c.ContentSHA256}
 	mandatory := map[string]bool{}
 	for _, k := range c.Body.CertificationProfile.MandatoryRules {
 		mandatory[k] = true
@@ -126,41 +126,8 @@ func (sp ruleSpec) evaluate(ro domain.RuleOutcome) (domain.DQResultStatus, error
 //   - failures and no tolerance -> Fail (strict)
 //   - ABSOLUTE: Pass when the failure magnitude sum is within the tolerance
 //   - PERCENT:  Pass when failures as a percentage of evaluated records are within the tolerance
-//
-// The tolerance's scale and rounding mode are carried and frozen with the contract, but the comparison
-// here is exact: no rounding is applied before comparing, which can only be stricter than any rounding.
 func evaluateContractOutcome(t *domain.Tolerance, ro domain.RuleOutcome) (domain.DQResultStatus, error) {
-	if ro.PassCount == 0 && ro.FailCount == 0 {
-		return domain.ResultIndeterminate, nil
-	}
-	if ro.FailCount == 0 {
-		return domain.ResultPass, nil
-	}
-	if t == nil {
-		return domain.ResultFail, nil
-	}
-	limit, ok := new(big.Rat).SetString(t.Value)
-	if !ok {
-		return "", fmt.Errorf("rule %s: tolerance value %q is not a decimal", ro.RuleKey, t.Value)
-	}
-	var measured *big.Rat
-	switch t.Kind {
-	case "ABSOLUTE":
-		sum, ok := new(big.Rat).SetString(ro.FailureMagnitudeSum)
-		if !ok {
-			return "", fmt.Errorf("rule %s: failure_magnitude_sum %q is not a decimal", ro.RuleKey, ro.FailureMagnitudeSum)
-		}
-		measured = sum
-	case "PERCENT":
-		total := new(big.Rat).SetInt64(ro.PassCount + ro.FailCount)
-		measured = new(big.Rat).Quo(new(big.Rat).Mul(new(big.Rat).SetInt64(ro.FailCount), big.NewRat(100, 1)), total)
-	default:
-		return "", fmt.Errorf("rule %s: unknown tolerance kind %q", ro.RuleKey, t.Kind)
-	}
-	if measured.Cmp(limit) > 0 {
-		return domain.ResultFail, nil
-	}
-	return domain.ResultPass, nil
+	return domain.EvaluateTolerance(t, ro.RuleKey, ro.PassCount, ro.FailCount, ro.FailureMagnitudeSum)
 }
 
 func contractIDOf(run *domain.DQRun) string {

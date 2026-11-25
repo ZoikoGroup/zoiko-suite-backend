@@ -113,7 +113,10 @@ type DQRun struct {
 	RuleSetVersionID string `json:"ruleset_version_id,omitempty"`
 	// ContractID is the exact DQC-01 contract version the run was judged against, instead of a rule-set
 	// version. Exactly one of the two is set (DQC-02: an exact contract, never "latest").
-	ContractID            *string     `json:"contract_id,omitempty"`
+	ContractID *string `json:"contract_id,omitempty"`
+	// ObservationID is the observation the run's population was taken from, when it names one. The run's
+	// population is then exactly what was observed (same row count, the observation's evidence hash).
+	ObservationID         *string     `json:"observation_id,omitempty"`
 	PopulationRef         string      `json:"population_ref"`
 	PopulationRowCount    int64       `json:"population_row_count"`
 	PopulationContentHash string      `json:"population_content_hash"`
@@ -146,9 +149,11 @@ type RuleOutcome struct {
 
 type RunDQRequest struct {
 	// Exactly one rule source: a rule-set version, or an exact published contract version.
-	RuleSetVersionID      string        `json:"ruleset_version_id,omitempty"`
-	ContractAssetID       string        `json:"contract_asset_id,omitempty"`
-	ContractVersion       int           `json:"contract_version,omitempty"`
+	RuleSetVersionID string `json:"ruleset_version_id,omitempty"`
+	ContractAssetID  string `json:"contract_asset_id,omitempty"`
+	ContractVersion  int    `json:"contract_version,omitempty"`
+	// ObservationID optionally names the DQC-02 observation this population was taken from (contract runs only).
+	ObservationID         string        `json:"observation_id,omitempty"`
 	PopulationRef         string        `json:"population_ref"`
 	PopulationRowCount    int64         `json:"population_row_count"`
 	PopulationContentHash string        `json:"population_content_hash"`
@@ -422,6 +427,7 @@ func (e *BasisExistsError) Error() string {
 func (e *BasisExistsError) Unwrap() error { return ErrCertificationBasisExists }
 
 var (
+	ErrObservationMismatch         = errorString("the runs population is not what the observation it names recorded")
 	ErrObservationNotFound         = errorString("DQC-001 observation not found")
 	ErrEvidenceAlreadyRecorded     = errorString("a run for this exact evidence already exists, so it cannot supersede another run")
 	ErrObservationConflict         = errorString("an observation for this asset, window and source watermark already exists with different evidence; late-arriving evidence is a new observation at a later watermark")

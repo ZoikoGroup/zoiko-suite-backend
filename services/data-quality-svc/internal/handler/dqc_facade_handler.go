@@ -151,6 +151,8 @@ func (h *Handler) facadeError(w http.ResponseWriter, err error) bool {
 		h.respondJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "code": "DQC-015", "existing_certification_id": basis.ExistingID})
 	case errors.Is(err, domain.ErrObservationNotFound):
 		h.respondError(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, domain.ErrObservationMismatch):
+		h.respondError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, domain.ErrObservationConflict), errors.Is(err, domain.ErrEvidenceAlreadyRecorded):
 		h.respondError(w, http.StatusConflict, err.Error())
 	default:

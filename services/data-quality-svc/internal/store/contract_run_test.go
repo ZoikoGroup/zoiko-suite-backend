@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -487,3 +488,19 @@ func TestContractRun_DatabaseConstraints(t *testing.T) {
 }
 
 func newTestRunID() string { return "dqn_" + uuid.NewString() }
+
+// The tolerance's rounding mode and scale are applied: the same failure magnitude passes under DOWN and fails
+// under HALF_UP, because 50.9 is 50 and 51 respectively at scale 0, against a limit of 50.
+func TestContractRun_ToleranceRoundingDecidesTheResult(t *testing.T) {
+	f := newContractFixture(t)
+	outcome := domain.RuleOutcome{RuleKey: "amount-positive", PassCount: 99, FailCount: 1, FailureMagnitudeSum: "50.9"}
+	for mode, want := range map[string]domain.DQResultStatus{"DOWN": domain.ResultPass, "HALF_UP": domain.ResultFail} {
+		b := profiled(domain.CompatBackward)
+		b.Rules[0].Tolerance = &domain.Tolerance{Kind: "ABSOLUTE", Value: "50", Scale: 0, Rounding: mode, Population: "all invoices"}
+		c := f.published(orgA, "run.round."+strings.ToLower(mode), b)
+		run := f.mustContractRun(c, "pop-round-"+mode, outcome, pass("invoice-unique"), pass("memo-present"), pass("format-ok"))
+		if got := resultFor(t, f, run.RunID, "amount-positive").Status; got != want {
+			t.Fatalf("%s: %s, want %s", mode, got, want)
+		}
+	}
+}

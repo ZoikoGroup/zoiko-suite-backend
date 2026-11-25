@@ -370,6 +370,37 @@ func runDQInTx(ctx context.Context, tx pgx.Tx, tenantID string, req domain.RunDQ
 	// asset/contract/evidence returns same logical result"). Checked before the idempotency key is claimed, so
 	// returning the existing run consumes nothing. A reperform of identical evidence is refused: it would
 	// supersede a run with itself.
+	// A run that names an observation must be judged on exactly what was observed.
+	var observationID *string
+	if req.ObservationID != "" {
+		if !src.isContract() {
+			return nil, fmt.Errorf("%w: an observation can only be linked to a run judged against a contract", domain.ErrObservationMismatch)
+		}
+		obs, err := scanObservation(tx.QueryRow(ctx, `SELECT `+observationCols+` FROM dq_observations WHERE observation_run_id = $1`, req.ObservationID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrObservationNotFound
+		}
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case obs.AssetID != src.AssetID:
+			return nil, fmt.Errorf("%w: the observation is of a different asset than the contract", domain.ErrObservationMismatch)
+		case obs.RowCount != req.PopulationRowCount:
+			return nil, fmt.Errorf("%w: the observation recorded %d rows, the run says %d", domain.ErrObservationMismatch, obs.RowCount, req.PopulationRowCount)
+		case obs.EvidenceHash != req.PopulationContentHash:
+			return nil, fmt.Errorf("%w: the population content hash is not the observation's evidence hash", domain.ErrObservationMismatch)
+		case req.EvidenceAsOf != nil && req.EvidenceAsOf.After(obs.RecordedAt):
+			return nil, fmt.Errorf("%w: the evidence cannot have been observed after the observation was recorded", domain.ErrObservationMismatch)
+		}
+		if req.EvidenceAsOf == nil {
+			// Evidence is as old as the observation that recorded it.
+			asOf := obs.RecordedAt
+			req.EvidenceAsOf = &asOf
+		}
+		observationID = &obs.ObservationRunID
+	}
+
 	var fingerprint *string
 	if src.isContract() {
 		fp := evidenceFingerprint(*src.ContractID, req)
@@ -401,11 +432,11 @@ func runDQInTx(ctx context.Context, tx pgx.Tx, tenantID string, req domain.RunDQ
 	var run domain.DQRun
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO dq_runs (run_id, tenant_id, ruleset_version_id, contract_id, population_ref, population_row_count,
-			population_content_hash, status, supersedes_run_id, started_at, created_by, evidence_as_of, evidence_fingerprint)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			population_content_hash, status, supersedes_run_id, started_at, created_by, evidence_as_of, evidence_fingerprint, observation_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		RETURNING `+runColumns,
 		runID, tenantID, src.RuleSetVersionID, src.ContractID, req.PopulationRef, req.PopulationRowCount,
-		req.PopulationContentHash, finalStatus, supersedesRunID, now, actor, req.EvidenceAsOf, fingerprint,
+		req.PopulationContentHash, finalStatus, supersedesRunID, now, actor, req.EvidenceAsOf, fingerprint, observationID,
 	).Scan(runDest(&run)...); err != nil {
 		return nil, fmt.Errorf("insert dq run: %w", err)
 	}
@@ -466,12 +497,12 @@ func runDQInTx(ctx context.Context, tx pgx.Tx, tenantID string, req domain.RunDQ
 }
 
 const runColumns = `run_id, tenant_id, COALESCE(ruleset_version_id, ''), contract_id, population_ref, population_row_count,
-	population_content_hash, status, supersedes_run_id, started_at, completed_at, created_by, evidence_as_of`
+	population_content_hash, status, supersedes_run_id, started_at, completed_at, created_by, evidence_as_of, observation_id`
 
 // runDest lists the scan targets for runColumns, in order.
 func runDest(run *domain.DQRun) []any {
 	return []any{&run.RunID, &run.TenantID, &run.RuleSetVersionID, &run.ContractID, &run.PopulationRef, &run.PopulationRowCount,
-		&run.PopulationContentHash, &run.Status, &run.SupersedesRunID, &run.StartedAt, &run.CompletedAt, &run.CreatedBy, &run.EvidenceAsOf}
+		&run.PopulationContentHash, &run.Status, &run.SupersedesRunID, &run.StartedAt, &run.CompletedAt, &run.CreatedBy, &run.EvidenceAsOf, &run.ObservationID}
 }
 
 func scanRun(row pgx.Row) (*domain.DQRun, error) {

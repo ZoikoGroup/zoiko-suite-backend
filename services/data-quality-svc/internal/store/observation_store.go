@@ -116,13 +116,14 @@ func evidenceFingerprint(contractID string, req domain.RunDQRequest) string {
 		asOf = req.EvidenceAsOf.UTC().Format(time.RFC3339Nano)
 	}
 	raw, _ := json.Marshal(struct {
-		Contract string    `json:"contract"`
-		Ref      string    `json:"ref"`
-		Rows     int64     `json:"rows"`
-		Hash     string    `json:"hash"`
-		AsOf     string    `json:"as_of"`
-		Outcomes []outcome `json:"outcomes"`
-	}{contractID, req.PopulationRef, req.PopulationRowCount, req.PopulationContentHash, asOf, outs})
+		Contract    string    `json:"contract"`
+		Observation string    `json:"observation"`
+		Ref         string    `json:"ref"`
+		Rows        int64     `json:"rows"`
+		Hash        string    `json:"hash"`
+		AsOf        string    `json:"as_of"`
+		Outcomes    []outcome `json:"outcomes"`
+	}{contractID, req.ObservationID, req.PopulationRef, req.PopulationRowCount, req.PopulationContentHash, asOf, outs})
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }
