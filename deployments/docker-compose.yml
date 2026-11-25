@@ -343,7 +343,7 @@ services:
     command:
       - |
         set -e
-        for svc in identity-context-svc gateway-auth-svc tenant-entity-registry-svc authorization-svc ai-governance-svc governance-decision-log-svc policy-svc workflow-svc contract-lifecycle-svc decision-support-svc evidence-manifest-svc access-control-svc; do
+        for svc in identity-context-svc gateway-auth-svc tenant-entity-registry-svc authorization-svc ai-governance-svc governance-decision-log-svc policy-svc workflow-svc contract-lifecycle-svc decision-support-svc evidence-manifest-svc access-control-svc jurisdiction-rules-svc obligations-svc evidence-requirements-svc; do
           mkdir -p "/bootstrap/$$svc"
           if [ ! -f "/bootstrap/$$svc/token" ]; then
             head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "/bootstrap/$$svc/token"
@@ -1066,9 +1066,26 @@ services:
       KAFKA_GROUP_ID: "jurisdiction-rules-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.jurisdiction.events"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+      # Decision capture (DL-1, 25 Nov 2026): this engine relays its verdicts to
+      # governance-decision-log-svc from its outbox over the :8450 mTLS listener,
+      # with its own workload certificate, as svc-jurisdiction-rules (authorization 000046).
+      # Unset URL: records wait in the outbox (evidence fails safe).
+      GOVERNANCE_DECISION_LOG_MTLS_URL: "${JURISDICTION_DECISION_LOG_MTLS_URL:-https://governance-decision-log-svc:8450}"
+      LEDGER_PRINCIPAL_ID: "${JURISDICTION_LEDGER_PRINCIPAL_ID:-svc-jurisdiction-rules}"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
     volumes:
       - ./jurisdiction/dev-keys:/keys:ro
+      # Only this service's own bootstrap token (register M-01).
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: jurisdiction-rules-svc
     depends_on:
+      mtls-bootstrap-keygen:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       kafka:
@@ -1183,7 +1200,7 @@ services:
       MTLS_PORT: "8450"
       MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
       MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
-      IDENTITY_PEERS: "${DECISION_LOG_IDENTITY_PEERS:-policy-svc,workflow-svc,contract-lifecycle-svc,decision-support-svc,evidence-manifest-svc}"
+      IDENTITY_PEERS: "${DECISION_LOG_IDENTITY_PEERS:-policy-svc,workflow-svc,contract-lifecycle-svc,decision-support-svc,evidence-manifest-svc,authorization-svc,jurisdiction-rules-svc,obligations-svc,evidence-requirements-svc}"
       # Production hardening (11 Nov): the workload certificate is renewed at
       # two thirds of its lifetime, and :8450 refuses a client certificate on
       # mtls-management-svc's CRL (and every one while no current CRL is
@@ -1549,7 +1566,25 @@ services:
       IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
       IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
       IDENTITY_ISSUER: "identity-context-svc"
+      # Decision capture (DL-1, 25 Nov 2026): this engine relays its verdicts to
+      # governance-decision-log-svc from its outbox over the :8450 mTLS listener,
+      # with its own workload certificate, as svc-obligations (authorization 000046).
+      # Unset URL: records wait in the outbox (evidence fails safe).
+      GOVERNANCE_DECISION_LOG_MTLS_URL: "${OBLIGATIONS_DECISION_LOG_MTLS_URL:-https://governance-decision-log-svc:8450}"
+      LEDGER_PRINCIPAL_ID: "${OBLIGATIONS_LEDGER_PRINCIPAL_ID:-svc-obligations}"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
+    volumes:
+      # Only this service's own bootstrap token (register M-01).
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: obligations-svc
     depends_on:
+      mtls-bootstrap-keygen:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       kafka:
@@ -1743,6 +1778,12 @@ services:
       AUTHZ_MAX_JIT_SECONDS: "28800"
       AUTHZ_MAX_BREAK_GLASS_SECONDS: "7200"
       AUTHZ_MAX_SUPPORT_SECONDS: "14400"
+      # Decision capture (DL-1, 25 Nov 2026): this engine relays its verdicts to
+      # governance-decision-log-svc from its outbox over the :8450 mTLS listener,
+      # with its own workload certificate, as svc-authorization (authorization 000046).
+      # Unset URL: records wait in the outbox (evidence fails safe).
+      GOVERNANCE_DECISION_LOG_MTLS_URL: "${AUTHZ_DECISION_LOG_MTLS_URL:-https://governance-decision-log-svc:8450}"
+      LEDGER_PRINCIPAL_ID: "${AUTHZ_LEDGER_PRINCIPAL_ID:-svc-authorization}"
     volumes:
       # Only this service's own bootstrap token (register M-01): the
       # sub-directory authorization-svc/ of the keygen volume, so /bootstrap/token
@@ -3293,7 +3334,25 @@ services:
       IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
       IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
       IDENTITY_ISSUER: "identity-context-svc"
+      # Decision capture (DL-1, 25 Nov 2026): this engine relays its verdicts to
+      # governance-decision-log-svc from its outbox over the :8450 mTLS listener,
+      # with its own workload certificate, as svc-evidence-requirements (authorization 000046).
+      # Unset URL: records wait in the outbox (evidence fails safe).
+      GOVERNANCE_DECISION_LOG_MTLS_URL: "${EVIDENCE_DECISION_LOG_MTLS_URL:-https://governance-decision-log-svc:8450}"
+      LEDGER_PRINCIPAL_ID: "${EVIDENCE_LEDGER_PRINCIPAL_ID:-svc-evidence-requirements}"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
+    volumes:
+      # Only this service's own bootstrap token (register M-01).
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: evidence-requirements-svc
     depends_on:
+      mtls-bootstrap-keygen:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       kafka:
