@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -1826,5 +1827,42 @@ func TestListPendingSubmissions_API4Cursor(t *testing.T) {
 	}
 	if resp2.NextCursor != "" {
 		t.Fatalf("expected no next_cursor on last page")
+	}
+}
+
+// DL-2: the governance decision a workflow resolves comes from the body's
+// causation_id or X-Causation-Id; the two must agree when both are sent.
+func TestCreateWorkflow_DL2_CausationDecision(t *testing.T) {
+	withCausation := strings.Replace(validCreateBody(), `"stages"`, `"causation_id":"policy-dec-1","stages"`, 1)
+	cases := []struct {
+		name, body, header string
+		status             int
+		want               string
+	}{
+		{"header", validCreateBody(), "policy-dec-1", http.StatusCreated, "policy-dec-1"},
+		{"body", withCausation, "", http.StatusCreated, "policy-dec-1"},
+		{"both agree", withCausation, "policy-dec-1", http.StatusCreated, "policy-dec-1"},
+		{"none", validCreateBody(), "", http.StatusCreated, ""},
+		{"disagree", withCausation, "other-dec", http.StatusBadRequest, ""},
+		{"too long", validCreateBody(), strings.Repeat("x", 129), http.StatusBadRequest, ""},
+	}
+	for _, c := range cases {
+		store := &stubStore{
+			instance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "PENDING", RowVersion: 1},
+			stages:   []*domain.WorkflowStage{{WorkflowStageID: "s-1", StageOrder: 1}},
+		}
+		r := newTestRouterFull(store, &stubPublisher{}, &stubAuthz{})
+		req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows", bytes.NewBufferString(c.body)), "requester-1")
+		if c.header != "" {
+			req.Header.Set("X-Causation-Id", c.header)
+		}
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != c.status {
+			t.Fatalf("%s: status %d, want %d: %s", c.name, w.Code, c.status, w.Body.String())
+		}
+		if c.status == http.StatusCreated && store.createdParams.CausationDecisionID != c.want {
+			t.Fatalf("%s: causation %q, want %q", c.name, store.createdParams.CausationDecisionID, c.want)
+		}
 	}
 }

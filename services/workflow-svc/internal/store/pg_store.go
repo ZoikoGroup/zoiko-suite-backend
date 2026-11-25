@@ -221,14 +221,20 @@ func insertOutboxEventTx(ctx context.Context, tx pgx.Tx, tenantID, eventType, ag
 
 // ── workflow_instances ───────────────────────────────────────────────────────
 
-const instanceColumns = `workflow_instance_id, tenant_id, legal_entity_id, workflow_type, workflow_status, current_stage, initiated_by, correlation_id, started_at, completed_at, subject_type, subject_id, subject_version, subject_fingerprint, invalidated_at, invalidation_reason_code, invalidation_narrative, invalidation_evidence_refs, row_version, updated_at, created_by, plane, data_class, residency_region, idempotency_key, due_at, next_action_at, escalation_target, workflow_definition_id, workflow_definition_version, review_cycle, escalated_at`
+const instanceColumns = `workflow_instance_id, tenant_id, legal_entity_id, workflow_type, workflow_status, current_stage, initiated_by, correlation_id, started_at, completed_at, subject_type, subject_id, subject_version, subject_fingerprint, invalidated_at, invalidation_reason_code, invalidation_narrative, invalidation_evidence_refs, row_version, updated_at, created_by, plane, data_class, residency_region, idempotency_key, due_at, next_action_at, escalation_target, workflow_definition_id, workflow_definition_version, review_cycle, escalated_at, causation_decision_id`
 
 func scanInstance(row pgx.Row) (*domain.WorkflowInstance, error) {
 	w := &domain.WorkflowInstance{}
 	// idempotency_key (000013) and the definition reference (000016) are
 	// nullable: a workflow created without an Idempotency-Key or a definition
 	// has none, and scanning NULL into a plain string or int fails.
-	var idempotencyKey, definitionID, escalationTarget *string
+	//
+	// The targets follow instanceColumns one for one. 7a59de35 (WF-S1..S7)
+	// listed definitionID right after idempotency_key and dropped the
+	// definition-version holder, so every scan had 33 targets for 32 columns
+	// and failed (found 25 Nov 2026, DL-2).
+	var idempotencyKey, definitionID, escalationTarget, causationDecisionID *string
+	var definitionVersion *int
 	err := row.Scan(
 		&w.WorkflowInstanceID,
 		&w.TenantID,
@@ -255,15 +261,19 @@ func scanInstance(row pgx.Row) (*domain.WorkflowInstance, error) {
 		&w.DataClass,
 		&w.ResidencyRegion,
 		&idempotencyKey,
-		&definitionID,
 		&w.DueAt,
 		&w.NextActionAt,
 		&escalationTarget,
-		&w.WorkflowDefinitionID,
-		&w.WorkflowDefinitionVersion,
+		&definitionID,
+		&definitionVersion,
 		&w.ReviewCycle,
 		&w.EscalatedAt,
+		&causationDecisionID,
 	)
+	if definitionVersion != nil {
+		w.WorkflowDefinitionVersion = *definitionVersion
+	}
+	w.CausationDecisionID = causationDecisionID
 	if idempotencyKey != nil {
 		w.IdempotencyKey = *idempotencyKey
 	}
@@ -556,8 +566,8 @@ func (s *PgStore) CreateWorkflow(ctx context.Context, params domain.CreateWorkfl
 				subject_id, subject_version, subject_fingerprint, row_version,
 				created_by, plane, data_class, residency_region, idempotency_key,
 				due_at, next_action_at, escalation_target,
-				workflow_definition_id, workflow_definition_version, review_cycle
-			) VALUES (gen_random_uuid(), $1, $2, $3, 'PENDING', 1, $4, $5, NOW(), $6, $7, $8, $9, 1, $10, $11, $12, $13, $14, $15, NOW(), $16, $17, $18, 1)
+				workflow_definition_id, workflow_definition_version, review_cycle, causation_decision_id
+			) VALUES (gen_random_uuid(), $1, $2, $3, 'PENDING', 1, $4, $5, NOW(), $6, $7, $8, $9, 1, $10, $11, $12, $13, $14, $15, NOW(), $16, $17, $18, 1, NULLIF($19, ''))
 			RETURNING ` + instanceColumns + `;`
 
 		var scanErr error
@@ -565,8 +575,9 @@ func (s *PgStore) CreateWorkflow(ctx context.Context, params domain.CreateWorkfl
 			tenantID, params.LegalEntityID, params.WorkflowType, params.InitiatedBy,
 			params.CorrelationID, params.SubjectType, params.SubjectID, params.SubjectVersion,
 			params.SubjectFingerprint, params.CreatedBy, params.Plane, params.DataClass,
-			params.ResidencyRegion, params.IdempotencyKey, dueAt, params.NextActionAt,
-			params.EscalationTarget, params.WorkflowDefinitionID, params.WorkflowDefinitionVersion))
+			params.ResidencyRegion, params.IdempotencyKey, dueAt,
+			params.EscalationTarget, params.WorkflowDefinitionID, params.WorkflowDefinitionVersion,
+			params.CausationDecisionID))
 		if scanErr != nil {
 			if errors.Is(mapPgError(scanErr), domain.ErrInvalidIdentifier) {
 				return domain.ErrInvalidIdentifier

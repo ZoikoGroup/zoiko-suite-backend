@@ -136,6 +136,11 @@ func TestSignatureWorkflow_CreatedFromVerifiedDecision(t *testing.T) {
 	if json.Unmarshal(p.Signatory.Requirement, &req) != nil || req.MinDistinctSigners != 2 {
 		t.Fatalf("requirement %s", p.Signatory.Requirement)
 	}
+	// DL-2: the signatory decision is the governance decision the workflow
+	// resolves when the caller names no other.
+	if p.CausationDecisionID != sigDecision {
+		t.Fatalf("causation = %q, want the signatory decision %q", p.CausationDecisionID, sigDecision)
+	}
 }
 
 func TestSignatureWorkflow_RefusedUnlessVerifiedAndSufficient(t *testing.T) {

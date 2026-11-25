@@ -87,6 +87,12 @@ type WorkflowInstance struct {
 	// decided again (000020); EscalatedAt is when it was last escalated.
 	ReviewCycle int        `json:"review_cycle"`
 	EscalatedAt *time.Time `json:"escalated_at,omitempty"`
+
+	// CausationDecisionID is the governance decision this workflow resolves
+	// (an escalated policy, signatory or authorization decision), set when
+	// it starts (000027). Its governance-ledger records carry it as
+	// causation_id.
+	CausationDecisionID *string `json:"causation_decision_id,omitempty"`
 }
 
 // WorkflowStage is one approval gate in a workflow's ordered chain,
@@ -220,6 +226,9 @@ type CreateWorkflowParams struct {
 	// ExpiryHours: an instance started from this definition expires this
 	// long after it starts (000020).
 	ExpiryHours *int
+	// CausationDecisionID: the governance decision this workflow resolves
+	// ("" = none), stored on the instance (000027).
+	CausationDecisionID string
 	// R-001 §9.1 common columns
 	CreatedBy       string
 	Plane           string

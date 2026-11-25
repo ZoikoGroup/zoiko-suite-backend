@@ -687,8 +687,13 @@ func writeLedgerTx(ctx context.Context, tx pgx.Tx, inst *domain.WorkflowInstance
 	if c := corrOf(inst, meta); c != nil {
 		rec.CorrelationID = *c
 	}
-	if causationID != nil {
+	// An action's own causation wins; otherwise the record names the
+	// governance decision the workflow resolves (000027, DL-2), so the ledger
+	// links every approval to the escalation it answers.
+	if causationID != nil && *causationID != "" {
 		rec.CausationID = *causationID
+	} else if inst.CausationDecisionID != nil {
+		rec.CausationID = *inst.CausationDecisionID
 	}
 	if inst.SubjectType != nil {
 		rec.ActionSubjectType = *inst.SubjectType

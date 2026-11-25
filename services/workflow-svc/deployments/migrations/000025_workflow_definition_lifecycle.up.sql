@@ -30,7 +30,7 @@ ALTER TABLE workflow_definitions
 
 -- Map existing rows from is_active to definition_status
 UPDATE workflow_definitions
-SET definition_status = CASE WHEN is_active THEN 'PUBLISHED' ELSE 'RETIRED' END;
+SET definition_status = (CASE WHEN is_active THEN 'PUBLISHED' ELSE 'RETIRED' END)::definition_status;
 
 -- Indexes for common queries
 CREATE INDEX idx_workflow_definitions_status ON workflow_definitions (tenant_id, definition_status);
@@ -55,17 +55,19 @@ BEGIN
             -- OK
         END IF;
         
-        -- Check that no other columns changed
-        IF NEW.workflow_type <> OLD.workflow_type
-            OR NEW.version <> OLD.version
-            OR NEW.stages_json <> OLD.stages_json
-            OR NEW.name IS NOT DISTINCT FROM OLD.name THEN -- Actually allow name/description?
-            OR NEW.description <> OLD.description
-            OR NEW.checksum <> OLD.checksum
-            OR NEW.effective_from <> OLD.effective_from
-            OR NEW.expiry_hours IS NOT DISTINCT FROM OLD.expiry_hours
-            OR NEW.escalation_target IS NOT DISTINCT FROM OLD.escalation_target
-            OR NEW.emergency_allowed <> OLD.emergency_allowed
+        -- Check that no other columns changed. IS DISTINCT FROM, not <>: a
+        -- NULL on either side must count as a change (25 Nov 2026: the first
+        -- version did not parse and tested IS NOT DISTINCT FROM, i.e. "unchanged").
+        IF NEW.workflow_type IS DISTINCT FROM OLD.workflow_type
+            OR NEW.version IS DISTINCT FROM OLD.version
+            OR NEW.stages_json::text IS DISTINCT FROM OLD.stages_json::text
+            OR NEW.name IS DISTINCT FROM OLD.name
+            OR NEW.description IS DISTINCT FROM OLD.description
+            OR NEW.checksum IS DISTINCT FROM OLD.checksum
+            OR NEW.effective_from IS DISTINCT FROM OLD.effective_from
+            OR NEW.expiry_hours IS DISTINCT FROM OLD.expiry_hours
+            OR NEW.escalation_target IS DISTINCT FROM OLD.escalation_target
+            OR NEW.emergency_allowed IS DISTINCT FROM OLD.emergency_allowed
         THEN
             RAISE EXCEPTION 'PUBLISHED definition is immutable; only status and effective_to may change';
         END IF;

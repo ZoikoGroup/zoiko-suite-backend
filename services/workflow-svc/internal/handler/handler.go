@@ -584,6 +584,39 @@ type createWorkflowRequest struct {
 	// (SIGNATURE_REQUIRED) this workflow collects the signatures for. It is
 	// fetched from policy-svc and verified, never taken on the caller's word.
 	SignatoryDecisionID string `json:"signatory_decision_id,omitempty"`
+	// CausationID names the governance decision this workflow resolves (an
+	// escalated policy or authorization decision in the decision log). It
+	// defaults to the X-Causation-Id header and, failing both, to the bound
+	// signatory decision; when the header and the body both name one they
+	// must agree. Every ledger record of the workflow carries it as
+	// causation_id (DL-2).
+	CausationID string `json:"causation_id,omitempty"`
+}
+
+// maxCausationIDLen is the decision log's causation_id limit.
+const maxCausationIDLen = 128
+
+// causationDecision resolves the governance decision a new workflow resolves:
+// the body's causation_id or the X-Causation-Id header (which must agree when
+// both are sent), else the bound signatory decision. It answers the problem
+// with the request, or "".
+func causationDecision(r *http.Request, req createWorkflowRequest, binding *domain.SignatoryBinding) (string, string) {
+	body := strings.TrimSpace(req.CausationID)
+	header := strings.TrimSpace(r.Header.Get("X-Causation-Id"))
+	if body != "" && header != "" && body != header {
+		return "", "causation_id disagrees with X-Causation-Id"
+	}
+	id := body
+	if id == "" {
+		id = header
+	}
+	if id == "" && binding != nil {
+		id = binding.DecisionID
+	}
+	if len(id) > maxCausationIDLen {
+		return "", "causation_id must be at most 128 characters"
+	}
+	return id, ""
 }
 
 func (req createWorkflowRequest) missingField() string {
@@ -893,6 +926,11 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		}
 		binding = b
 	}
+	causation, problem := causationDecision(r, req, binding)
+	if problem != "" {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "causation_id", "message": problem})
+		return
+	}
 	instance, stages, created, err := h.store.CreateWorkflow(r.Context(), domain.CreateWorkflowParams{
 		// initiated_by is always the verified caller, never the request
 		// body �?" see requirePrincipal's doc comment.
@@ -906,6 +944,7 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		WorkflowDefinitionVersion: req.WorkflowDefinitionVersion,
 		DueAt:                     instanceDueAt,
 		Signatory:                 binding,
+		CausationDecisionID:       causation,
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrNoStages) {
