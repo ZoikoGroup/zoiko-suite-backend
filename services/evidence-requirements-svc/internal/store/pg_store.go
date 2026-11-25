@@ -36,6 +36,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/identity-envelope/decisionledger"
+
 	"zoiko.io/evidence-requirements-svc/internal/domain"
 	svcmiddleware "zoiko.io/evidence-requirements-svc/internal/middleware"
 )
@@ -43,6 +45,9 @@ import (
 type PgStore struct {
 	pool *pgxpool.Pool
 	log  *zap.Logger
+	// ledgerOn queues each new evaluation's governance-ledger record in its
+	// transaction (DL-6, SetDecisionLedger).
+	ledgerOn bool
 }
 
 func New(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
@@ -410,6 +415,13 @@ func (s *PgStore) RecordEvaluation(ctx context.Context, e *domain.EvidenceEvalua
 					INSERT INTO outbox (outbox_id, aggregate_type, aggregate_id, event_type, payload)
 					VALUES (gen_random_uuid(), $1, $2, $3, $4)
 				`, outboxEvent.AggregateType, outboxEvent.AggregateID, outboxEvent.EventType, outboxEvent.Payload); err != nil {
+					return err
+				}
+			}
+			// DL-6: the evaluation is a governance decision; its ledger
+			// record commits with it or not at all.
+			if s.ledgerOn {
+				if err := decisionledger.Enqueue(ctx, tx, evaluationRecord(e)); err != nil {
 					return err
 				}
 			}

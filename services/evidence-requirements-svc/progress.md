@@ -506,3 +506,19 @@ Audit files updated: `IMPLEMENTATION-PROGRESS.md` (API-3, API-4), `group2-govern
 - **schema-registry-svc**: register the two event schemas (asyncapi.yaml).
 - **this service, next pass**: authorize `GET /v1/pbc/requests/{id}` at the request's entity (Governance
   row 21); switch compose gates to enforce once callers send the envelope (D-ER-6).
+
+## Decision capture (DL-6, 25 Nov 2026)
+
+Doc 01 §7: every evidence evaluation (`POST /v1/evidence/evaluate`) reaches governance-decision-log-svc as
+`svc-evidence-requirements` (authorization-svc 000046): `EVIDENCE_<action>` with outcome `SATISFIED`,
+`NO_REQUIREMENTS_DEFINED` (both APPROVED) or `MISSING` (DENIED), domain `GOVERNANCE_COMPLIANCE`, `rule_basis`
+`requirements:<domain>/<action>@sha256:<digest of the requirement ids>` (the requirement-set version), the unmet
+requirements and the number of artifacts presented (never the artifacts). Queued in the evaluation's own
+transaction (`internal/store/decision_ledger.go`, `PgStore.SetDecisionLedger`), migration 000013
+`decision_log_outbox`; a replayed evaluation queues nothing new. Metrics `evidence_requirements_decision_log_*`.
+Test: `TestEvaluationRecord_OutcomesAndRequirementSetBasis`.
+
+Built before the 23 Nov D2-7 step table is ✅ (the assignment's order asked for after); the user asked on
+25 Nov 2026 for the whole assignment.
+
+The record is written to `decision_log_outbox` in the transaction of the decision it records and delivered by `identity-envelope/decisionledger`'s relay (lease-based claim, backoff to 10 minutes, a 409 parks the row for an operator, delivered rows purged after `LEDGER_RETENTION_HOURS`, default 168) to `GOVERNANCE_DECISION_LOG_MTLS_URL` with this service's own workload certificate (`mtlsclient`, bootstrap token `MTLS_BOOTSTRAP_TOKEN_PATH`). Deliveries are capped at `LEDGER_RELAY_MAX_PER_SECOND` (default 20): a ledger outage or a burst delays the evidence, it never fails or slows the decision. Status: 🔵 built, not verified (tracker "Assignment 25 Nov 2026").

@@ -31,6 +31,8 @@ import (
 	"go.uber.org/zap"
 	idenv "zoiko.io/identity-envelope"
 	apicontract "zoiko.io/identity-envelope/apicontract"
+	"zoiko.io/identity-envelope/decisionledger"
+	"zoiko.io/identity-envelope/mtlsclient"
 
 	"zoiko.io/evidence-requirements-svc/internal/authz"
 	"zoiko.io/evidence-requirements-svc/internal/config"
@@ -39,6 +41,7 @@ import (
 	"zoiko.io/evidence-requirements-svc/internal/esignature"
 	"zoiko.io/evidence-requirements-svc/internal/handler"
 	"zoiko.io/evidence-requirements-svc/internal/health"
+	"zoiko.io/evidence-requirements-svc/internal/ledgermetrics"
 	"zoiko.io/evidence-requirements-svc/internal/manifest"
 	svcmiddleware "zoiko.io/evidence-requirements-svc/internal/middleware"
 	"zoiko.io/evidence-requirements-svc/internal/mtls"
@@ -124,6 +127,38 @@ func main() {
 
 	// ── 4. Store, Kafka producer, authz + document-vault clients ─────────────
 	pgStore := store.New(pool, log)
+
+	// Decision capture (DL-6, 25 Nov 2026; Doc 01 s7): every evaluation is
+	// queued in decision_log_outbox (000013) in its own transaction and
+	// relayed to governance-decision-log-svc as LEDGER_PRINCIPAL_ID with this
+	// service's workload certificate. A ledger outage never fails an evaluation.
+	ledgerCtx, stopLedger := context.WithCancel(context.Background())
+	defer stopLedger()
+	ledgerQueue := decisionledger.NewPgQueue(pool)
+	ledgerGauges := ledgermetrics.New(prometheus.DefaultRegisterer)
+	go decisionledger.RunSampler(ledgerCtx, ledgerQueue, ledgerGauges, 15*time.Second,
+		time.Duration(cfg.LedgerRetentionHours)*time.Hour, log)
+	pgStore.SetDecisionLedger(cfg.LedgerPrincipalID != "")
+	if cfg.DecisionLogMTLSURL != "" && cfg.LedgerPrincipalID != "" {
+		ledgerIdentity := mtlsclient.Start(ledgerCtx, mtlsclient.Options{
+			ServiceName:        "evidence-requirements-svc",
+			ManagementURL:      cfg.MTLSManagementServiceURL,
+			BootstrapTokenPath: cfg.MTLSBootstrapTokenPath,
+		}, log)
+		ledgerRelay := decisionledger.NewRelay(ledgerQueue, &decisionledger.HTTPSender{
+			BaseURL: cfg.DecisionLogMTLSURL, Principal: cfg.LedgerPrincipalID,
+			KeyPrefix: "evidence-ledger", Purpose: "evidence_decision_evidence",
+			Client: ledgerIdentity.HTTPClient(5 * time.Second),
+		}, time.Duration(cfg.LedgerRelayIntervalMS)*time.Millisecond, log)
+		ledgerRelay.Observe(ledgerGauges)
+		ledgerRelay.SetMaxPerSecond(cfg.LedgerRelayMaxPerSecond)
+		ledgerRelay.Start()
+		defer ledgerRelay.Stop()
+		log.Info("decision-log relay: governance ledger over mTLS", zap.String("url", cfg.DecisionLogMTLSURL),
+			zap.String("principal", cfg.LedgerPrincipalID))
+	} else if cfg.LedgerPrincipalID != "" {
+		log.Warn("GOVERNANCE_DECISION_LOG_MTLS_URL unset — evaluations wait in decision_log_outbox until a relay runs")
+	}
 
 	// Kafka producer — connects lazily on first write, same posture as every
 	// other producer here: not a fail-fast startup dependency like Postgres.
