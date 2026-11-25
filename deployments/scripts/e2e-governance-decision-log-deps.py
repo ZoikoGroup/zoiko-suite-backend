@@ -41,6 +41,9 @@ ADMIN = "33333333-3333-3333-3333-333333333333"
 APPROVER = "66666666-6666-6666-6666-666666666666"
 PLATFORM = "00000000-0000-0000-0000-00000000f001"
 STRANGER = "e2e00000-0000-4000-8000-0000000000aa"
+# Only service identities record decisions (decision D-DL-2, 25 Nov 2026): the ledger
+# section writes as policy-svc's relay does, svc-policy vouched for by policy-svc's certificate.
+WRITER = "svc-policy"
 
 H = "http://127.0.0.1"
 GDL, AUTHZ, POLICY = f"{H}:8083", f"{H}:8089", f"{H}:8085"
@@ -204,11 +207,20 @@ def schema():
 # ── 1. authorization-svc edge ────────────────────────────────────────────────
 
 def authz_grants():
-    for action in ("GOVERNANCE_DECISION_RECORD", "GOVERNANCE_DECISION_READ", "GOVERNANCE_DECISION_REPLAY", "GOVERNANCE_EVIDENCE_SEAL"):
+    for action in ("GOVERNANCE_DECISION_READ", "GOVERNANCE_DECISION_REPLAY", "GOVERNANCE_EVIDENCE_SEAL"):
         s, _, b = call("POST", f"{AUTHZ}/v1/authorize", envelope(ADMIN, entity=PLATFORM),
                        {"principal_id": ADMIN, "legal_entity_id": PLATFORM, "action_type": action})
         check(f"authz: demo principal holds {action} on the platform scope", s == 200 and b.get("decision") == "PERMIT",
               f"HTTP {s} {b.get('decision')} {b.get('decision_basis', b.get('error', ''))}")
+    # D-DL-2 (25 Nov 2026): only service identities record decisions.
+    s, _, b = call("POST", f"{AUTHZ}/v1/authorize", envelope(ADMIN, entity=PLATFORM),
+                   {"principal_id": ADMIN, "legal_entity_id": PLATFORM, "action_type": "GOVERNANCE_DECISION_RECORD"})
+    check("authz: the demo principal does NOT hold GOVERNANCE_DECISION_RECORD (D-DL-2)", s == 200 and b.get("decision") == "DENY",
+          f"HTTP {s} {b.get('decision')} {b.get('decision_basis', b.get('error', ''))}")
+    s, _, b = call("POST", f"{AUTHZ}/v1/authorize", envelope(ADMIN, entity=PLATFORM),
+                   {"principal_id": WRITER, "legal_entity_id": PLATFORM, "action_type": "GOVERNANCE_DECISION_RECORD"})
+    check(f"authz: the service writer {WRITER} holds GOVERNANCE_DECISION_RECORD", s == 200 and b.get("decision") == "PERMIT",
+          f"HTTP {s} {b.get('decision')} {b.get('decision_basis', b.get('error', ''))}")
 
     s, _, b = gdl("GET", "/v1/decisions?limit=1", principal=STRANGER)
     check("read authz enforced: principal without GOVERNANCE_DECISION_READ → 403", s == 403, f"HTTP {s} {b.get('code')}")
@@ -229,10 +241,15 @@ def ledger():
     before_total = before.get("totals", {}).get("total", 0) if before_s == 200 else 0
 
     body = decision_body()
-    hdr = envelope(ADMIN, write=True)
-    hdr["Authorization"] = "Bearer " + admin_jwt()
-    s, _, d = call("POST", f"{GDL}/v1/decisions", hdr, body)
-    ok = check("record: POST /v1/decisions → 201", s == 201, f"HTTP {s} {brief(d)}")
+    # D-DL-2: a person, even the admin with every governance grant, cannot record.
+    ahdr = envelope(ADMIN, write=True)
+    ahdr["Authorization"] = "Bearer " + admin_jwt()
+    s, _, b = call("POST", f"{GDL}/v1/decisions", ahdr, body)
+    check("D-DL-2: the admin cannot record a decision → 403", s == 403, f"HTTP {s} {brief(b)}")
+
+    hdr = envelope(WRITER, write=True)
+    s, _, d = mtls_call(peer_cert(), "POST", "/v1/decisions", hdr, body)
+    ok = check("record: POST /v1/decisions as a service writer over mTLS → 201", s == 201, f"HTTP {s} {brief(d)}")
     if not ok:
         return state
     state["parent"] = d
@@ -243,24 +260,24 @@ def ledger():
           and d.get("tags") == body["tags"] and d.get("related_obligation_id") == "OB-2026-1123", brief(d))
     check("record: domain classified from action_type (CONTRACT → Legal & Contracts)", d.get("domain") == "LEGAL_CONTRACTS", d.get("domain"))
     check("record: status category from the outcome", d.get("status_category") == "PENDING", d.get("status_category"))
-    check("record: actor is the authenticated principal", d.get("actor_id") == ADMIN, d.get("actor_id"))
+    check("record: actor is the authenticated principal (the writer's service identity)", d.get("actor_id") == WRITER, d.get("actor_id"))
     check("F11: retention class EV-REGULATED, record class COMPLIANCE_EVIDENCE on the decision",
           d.get("retention_class") == "EV-REGULATED" and d.get("record_class") == "COMPLIANCE_EVIDENCE",
           f"{d.get('retention_class')} / {d.get('record_class')}")
     state["correlation"] = hdr["X-Correlation-ID"]
 
-    s, _, again = call("POST", f"{GDL}/v1/decisions", hdr, body)
+    s, _, again = mtls_call(peer_cert(), "POST", "/v1/decisions", hdr, body)
     check("idempotent repeat: same key + body → 200 with the stored row", s == 200 and again.get("curr_hash") == d["curr_hash"], f"HTTP {s}")
-    s, _, b = call("POST", f"{GDL}/v1/decisions", hdr, dict(body, outcome="DENIED"))
+    s, _, b = mtls_call(peer_cert(), "POST", "/v1/decisions", hdr, dict(body, outcome="DENIED"))
     check("same key, different body → 409 IDEMPOTENCY_MISMATCH", s == 409 and b.get("code") == "IDEMPOTENCY_MISMATCH", f"HTTP {s} {b.get('code')}")
-    s, _, b = gdl("POST", "/v1/decisions", body=dict(body, outcome="DENIED"))
+    s, _, b = gdl("POST", "/v1/decisions", principal=WRITER, body=dict(body, outcome="DENIED"))
     check("same decision_id, different content → 409 DECISION_ID_CONFLICT", s == 409 and b.get("code") == "DECISION_ID_CONFLICT", f"HTTP {s} {b.get('code')}")
-    s, _, b = gdl("POST", "/v1/decisions", body=decision_body(priority="URGENT"))
+    s, _, b = gdl("POST", "/v1/decisions", principal=WRITER, body=decision_body(priority="URGENT"))
     check("invalid priority → 400", s == 400, f"HTTP {s} {b.get('detail')}")
-    s, _, b = gdl("POST", "/v1/decisions", body=decision_body(domain="NOT_A_DOMAIN"))
+    s, _, b = gdl("POST", "/v1/decisions", principal=WRITER, body=decision_body(domain="NOT_A_DOMAIN"))
     check("unknown domain → 400 UNKNOWN_DOMAIN", s == 400 and b.get("code") == "UNKNOWN_DOMAIN", f"HTTP {s} {b.get('code')}")
 
-    s, _, f = gdl("POST", "/v1/decisions", body=decision_body(outcome="APPROVED", causation_id=d["decision_id"],
+    s, _, f = gdl("POST", "/v1/decisions", principal=WRITER, body=decision_body(outcome="APPROVED", causation_id=d["decision_id"],
                                                               title="Resolve: Approve vendor contract renewal"))
     check("follow-up recorded with causation_id", s == 201 and f.get("causation_id") == d["decision_id"]
           and f.get("chain_seq") == d["chain_seq"] + 1 and f.get("prev_hash") == d["curr_hash"], f"HTTP {s} {brief(f)}")
@@ -271,7 +288,7 @@ def ledger():
     check("list ?causation= returns the follow-up", s == 200 and [r["decision_id"] for r in lst.get("records", [])] == [f.get("decision_id")],
           f"HTTP {s} total {lst.get('total_count')}")
 
-    s, _, other = gdl("POST", "/v1/decisions", body=decision_body(action_type="DATA_ACCESS_EXCEPTION", outcome="ESCALATED",
+    s, _, other = gdl("POST", "/v1/decisions", principal=WRITER, body=decision_body(action_type="DATA_ACCESS_EXCEPTION", outcome="ESCALATED",
                                                                   title="Data access exception", priority="MEDIUM",
                                                                   jurisdiction_context="EU", tags=[]))
     check("second decision classified Data & Privacy", s == 201 and other.get("domain") == "DATA_PRIVACY", f"HTTP {s} {other.get('domain')}")
@@ -281,8 +298,10 @@ def ledger():
         s, _, lst = gdl("GET", "/v1/decisions?" + q)
         check(f"list filter {q.split('&')[0]} → {want}", s == 200 and lst.get("total_count") == want, f"HTTP {s} total {lst.get('total_count')}")
 
-    s, _, page1 = gdl("GET", f"/v1/decisions?q={RUN}&limit=2")
-    s2, _, page2 = gdl("GET", f"/v1/decisions?q={RUN}&limit=2&cursor={page1.get('next_cursor', '')}") if page1.get("next_cursor") else (0, {}, {})
+    # The writer's own three: the run's refused calls are in the ledger too since
+    # DL-3 (authorization-svc relays every DENY under the run's correlation id).
+    s, _, page1 = gdl("GET", f"/v1/decisions?q={RUN}&actor={WRITER}&limit=2")
+    s2, _, page2 = gdl("GET", f"/v1/decisions?q={RUN}&actor={WRITER}&limit=2&cursor={page1.get('next_cursor', '')}") if page1.get("next_cursor") else (0, {}, {})
     ids = [r["decision_id"] for r in page1.get("records", []) + page2.get("records", [])]
     check("cursor paging: two pages, three distinct decisions, total_count 3",
           s == 200 and s2 == 200 and len(set(ids)) == 3 and page1.get("total_count") == 3, f"{len(ids)} ids, total {page1.get('total_count')}")
@@ -431,7 +450,10 @@ def policy():
         return
 
     def pol(method, path, principal=ADMIN, body=None, entity=ENTITY, if_match=None):
+        # policy-svc runs POLICY_IDENTITY_VERIFY=enforce (18 Nov 2026): bare
+        # identity headers are 401, so every call carries the signed envelope.
         h = envelope(principal, write=method != "GET", entity=entity, purpose="POLICY_REVIEW")
+        h["Authorization"] = "Bearer " + person_jwt(principal)
         if if_match:
             h["If-Match"] = if_match
         return call("POST" if method == "POST" else method, POLICY + path, h, body)
@@ -567,9 +589,26 @@ def mtls_call(paths, method, path, headers, body=None):
     return r.status, dict(r.getheaders()), parsed
 
 
-def envelope_jwt():
+# Sign-ins for the principals the script acts as with a verified envelope.
+LOGINS = {ADMIN: ("admin@zoikosuite.com", "Zoiko@Governance1"), APPROVER: ("legal.counsel@zoikosuite.com", "Zoiko@Legal2026!")}
+_JWTS = {}
+
+
+def person_jwt(principal):
+    """principal's signed envelope, renewed before its 5-minute expiry."""
+    jwt, at = _JWTS.get(principal, (None, 0.0))
+    if not jwt or time.time() - at > 200:
+        jwt, why = envelope_jwt(principal)
+        if not jwt:
+            raise RuntimeError("no identity envelope: " + why)
+        _JWTS[principal] = (jwt, time.time())
+    return jwt
+
+
+def envelope_jwt(principal=ADMIN):
+    email, password = LOGINS[principal]
     s, _, b = call("POST", f"{IDENTITY}/v1/authenticate", {"Content-Type": "application/json"},
-                   {"tenant_id": TENANT, "email": "admin@zoikosuite.com", "password": "Zoiko@Governance1",
+                   {"tenant_id": TENANT, "email": email, "password": password,
                     "client_id": os.environ.get("IDENTITY_CONSOLE_CLIENT_ID", "zoiko-console"),
                     "client_secret": os.environ.get("IDENTITY_CONSOLE_CLIENT_SECRET", "local-dev-console-client-secret")})
     if s != 200 or not b.get("access_token"):
@@ -760,7 +799,7 @@ WHERE NOT EXISTS (SELECT 1 FROM principal_role_assignments a WHERE a.principal_i
 
 
 def record_granted(action, outcome):
-    s, _, d = gdl("POST", "/v1/decisions", body=decision_body(action_type=action, outcome=outcome,
+    s, _, d = gdl("POST", "/v1/decisions", principal=WRITER, body=decision_body(action_type=action, outcome=outcome,
                                                               rule_basis="E2E-F07:" + action, title=f"F07 {action} {outcome}"))
     return d.get("decision_id") if s == 201 else None
 
@@ -979,7 +1018,7 @@ def schema_contracts(state):
 # ── 11. scheduled sealing (run with DECISION_LOG_EVIDENCE_SEAL_INTERVAL short) ─
 
 def scheduled_seal(wait):
-    s, _, d = gdl("POST", "/v1/decisions", body=decision_body(title="Scheduled-seal probe", tags=[]))
+    s, _, d = gdl("POST", "/v1/decisions", principal=WRITER, body=decision_body(title="Scheduled-seal probe", tags=[]))
     if not check("scheduled seal: a new decision recorded", s == 201, f"HTTP {s}"):
         return
 

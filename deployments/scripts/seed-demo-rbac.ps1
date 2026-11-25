@@ -133,7 +133,7 @@ $ROLE_CODE = "CONSOLE_DEMO_OPERATOR"
 $PLATFORM_SCOPE = "00000000-0000-0000-0000-00000000f001"
 
 # Identity context service URL for getting envelopes.
-$IDENTITY_URL = "http://localhost:8080"
+$IDENTITY_URL = "http://127.0.0.1:8080"
 
 # Cache for identity envelopes (actor -> @{ token; expires }). TTL ≤ 4 min.
 $EnvelopeCache = @{}
@@ -462,16 +462,21 @@ $BUNDLES = @(
         Actions = @("VENDOR_DD_INITIATE", "VENDOR_DD_VIEW")
     },
     @{
-        # governance-decision-log-svc authorizes a write on the decision's legal
-        # entity, and a tenant-wide read (an unfiltered register, the summary,
-        # the evidence chain) and a seal on authzPlatformScopeID, so this grant
-        # is checked on the platform scope below. READ is the Governance Log
-        # console's register; REPLAY its replay command; GOVERNANCE_EVIDENCE_SEAL
-        # its "Seal package" (G-07).
+        # governance-decision-log-svc authorizes a tenant-wide read (an
+        # unfiltered register, the summary, the evidence chain) and a seal on
+        # authzPlatformScopeID, so this grant is checked on the platform scope
+        # below. READ is the Governance Log console's register; REPLAY is the
+        # auditors' API replay; GOVERNANCE_EVIDENCE_SEAL the API seal (the
+        # ledger also seals itself hourly).
+        #
+        # No GOVERNANCE_DECISION_RECORD (decision D-DL-2, 25 Nov 2026): people
+        # never write the ledger. Every governance engine records its own
+        # decisions as its service principal (authorization-svc 000043,
+        # 000046); this run REPLACES the bundle's actions, so it also takes
+        # RECORD back from every person who held it through this bundle.
         Code    = "GOVERNANCE_FULL"
         Service = "governance-decision-log-svc"
-        Actions = @("GOVERNANCE_DECISION_RECORD", "GOVERNANCE_DECISION_READ", "GOVERNANCE_DECISION_REPLAY",
-                    "GOVERNANCE_EVIDENCE_SEAL")
+        Actions = @("GOVERNANCE_DECISION_READ", "GOVERNANCE_DECISION_REPLAY", "GOVERNANCE_EVIDENCE_SEAL")
     },
     @{
         # policy-svc checks its actions against the legal entity when the
@@ -1119,10 +1124,15 @@ function Get-Envelope {
     }
 
     # Authenticate with identity-context-svc.
+    # The console's confidential client (IDP_CLIENT_AUTH=required since 3 Nov
+    # 2026); without it every sign-in was refused and the run fell back to bare
+    # headers, which authorization-svc's identity gate now answers 401.
     $authBody = @{
-        tenant_id = "11111111-1111-1111-1111-111111111111"
-        email     = $Email
-        password  = $Password
+        tenant_id     = "11111111-1111-1111-1111-111111111111"
+        email         = $Email
+        password      = $Password
+        client_id     = "zoiko-console"
+        client_secret = "local-dev-console-client-secret"
     } | ConvertTo-Json -Compress
 
     try {
@@ -1133,24 +1143,40 @@ function Get-Envelope {
     } catch {
         Write-Warning "Failed to authenticate $Email with identity-context-svc: $_"
         Write-Warning "Falling back to headers-only mode (works under warn)"
+        # Remember the failure for the cache's lifetime: retrying on every call
+        # made ~600 sign-ins a run and tripped identity-context-svc's per-IP
+        # limit (AUTH_RATE_IP_PER_MINUTE, 429) for every later caller.
+        $EnvelopeCache[$Actor] = @{ token = $null; expires = (Get-Date).AddSeconds($EnvelopeCacheTTL) }
         return $null
     }
 
     # Resolve context for the demo legal entity.
+    # /v1/context/resolve takes the bearer token in the body and answers the
+    # signed envelope as envelope_jwt (25 Nov 2026: this sent entity_id and read
+    # identity_token, which the service never answered).
     $resolveBody = @{
-        entity_id = "22222222-2222-2222-2222-222222222222"
+        bearer_token    = $accessToken
+        legal_entity_id = "22222222-2222-2222-2222-222222222222"
     } | ConvertTo-Json -Compress
 
     try {
         $resolveResp = Invoke-WebRequest -Uri "$IDENTITY_URL/v1/context/resolve" -Method POST `
             -ContentType "application/json" -Body $resolveBody `
-            -Headers @{ "Authorization" = "Bearer $accessToken" } `
+            -Headers @{
+                "X-Tenant-Id"       = "11111111-1111-1111-1111-111111111111"
+                "X-Legal-Entity-Id" = "22222222-2222-2222-2222-222222222222"
+                "X-Request-Id"      = [guid]::NewGuid().ToString()
+                "X-Correlation-ID"  = [guid]::NewGuid().ToString()
+                "Idempotency-Key"   = [guid]::NewGuid().ToString()
+                "X-Source-Channel"  = "api"
+            } `
             -UseBasicParsing -TimeoutSec 10
         $resolveResult = $resolveResp.Content | ConvertFrom-Json
-        $identityToken = $resolveResult.identity_token
+        $identityToken = $resolveResult.envelope_jwt
     } catch {
         Write-Warning "Failed to resolve context for ${Email}: $_"
         Write-Warning "Falling back to headers-only mode (works under warn)"
+        $EnvelopeCache[$Actor] = @{ token = $null; expires = (Get-Date).AddSeconds($EnvelopeCacheTTL) }
         return $null
     }
 
@@ -1321,6 +1347,31 @@ try {
 # database, so a legal-entity-only probe found nothing missing, skipped the
 # bundles, and never granted the platform scope that schema-registry-svc
 # actually authorizes against for an entity-less registration.
+# -- D-DL-2 (25 Nov 2026): people never record governance decisions --------
+#
+# GOVERNANCE_FULL no longer carries GOVERNANCE_DECISION_RECORD. The probe below
+# only looks for MISSING actions, so on a volume seeded before 25 Nov it finds
+# nothing to do and the bundle would keep RECORD. When the demo principal still
+# holds it, the bundle is posted again here: a bundle post replaces the
+# bundle's actions, which takes RECORD back from every person holding the role.
+# Service identities keep it through their own roles (authorization-svc
+# 000043, 000046).
+$recordProbe = Get-Decision -Action "GOVERNANCE_DECISION_RECORD" -Scope $PLATFORM_SCOPE
+if ($recordProbe.decision_outcome -eq "GRANTED") {
+    $governanceFull = $BUNDLES | Where-Object { $_.Code -eq "GOVERNANCE_FULL" }
+    Write-Host "D-DL-2  bundle GOVERNANCE_FULL without GOVERNANCE_DECISION_RECORD" -NoNewline
+    $result = Invoke-Authz -Actor $SEED_ADMIN_ID -Path "/v1/admin/roles/$ROLE_ID/permission-bundles" -Body @{
+        bundle_code       = $governanceFull.Code
+        permitted_actions = $governanceFull.Actions
+    }
+    Write-Host "  -> $($result.status) [$($result.body.permitted_actions -join ', ')]"
+    # The grant cache holds the old answer until AUTHZ_CACHE_TTL_SECONDS (5).
+    Start-Sleep -Seconds 6
+    if ((Get-Decision -Action "GOVERNANCE_DECISION_RECORD" -Scope $PLATFORM_SCOPE).decision_outcome -eq "GRANTED") {
+        throw "D-DL-2: $PRINCIPAL_ID still holds GOVERNANCE_DECISION_RECORD after GOVERNANCE_FULL was replaced (another role grants it?)"
+    }
+}
+
 $missing = @()
 foreach ($action in $ALL_ACTIONS) {
     if ((Get-Decision -Action $action -Scope $LEGAL_ENTITY).decision_outcome -ne "GRANTED") {
