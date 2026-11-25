@@ -33,6 +33,11 @@ const (
 	ExceptionRemediated    ExceptionStatus = "REMEDIATED"
 	ExceptionAcceptedRisk  ExceptionStatus = "ACCEPTED_RISK"
 	ExceptionClosed        ExceptionStatus = "CLOSED"
+	// ExceptionSuperseded: a later evidence run (a Reperform that froze a new snapshot
+	// generation) replaced this finding. It is reached only by that re-test, never
+	// by the transition command, and it is as final as CLOSED. ZS-SVC-Z-001 DQC-05
+	// "Re-test": remediation is cleared by new evidence, not by relabelling.
+	ExceptionSuperseded ExceptionStatus = "SUPERSEDED"
 )
 
 // exceptionEdges is the complete set of legal exception moves. CLOSED is
@@ -47,6 +52,9 @@ var exceptionEdges = map[ExceptionStatus][]ExceptionStatus{
 	ExceptionRemediated:   {ExceptionInvestigating, ExceptionClosed},
 	ExceptionAcceptedRisk: {},
 	ExceptionClosed:       {},
+	// No edge leads to SUPERSEDED: only Reperform writes it, so the transition
+	// command can never request it.
+	ExceptionSuperseded: {},
 }
 
 func ValidateExceptionTransition(from, to ExceptionStatus) error {
@@ -59,11 +67,13 @@ func ValidateExceptionTransition(from, to ExceptionStatus) error {
 }
 
 // Unresolved reports whether an exception still stands against its run.
-func (s ExceptionStatus) Unresolved() bool { return s != ExceptionClosed }
+func (s ExceptionStatus) Unresolved() bool { return s != ExceptionClosed && s != ExceptionSuperseded }
 
 // Working reports whether an exception is still being worked (it is neither
 // resolved nor accepted as risk). A run with a working exception is ExceptionsOpen.
-func (s ExceptionStatus) Working() bool { return s != ExceptionClosed && s != ExceptionAcceptedRisk }
+func (s ExceptionStatus) Working() bool {
+	return s != ExceptionClosed && s != ExceptionAcceptedRisk && s != ExceptionSuperseded
+}
 
 // ── Category, assertion, severity ───────────────────────────────────────────
 
@@ -214,6 +224,22 @@ func (p ExceptionPolicy) DueAt(raisedAt time.Time, s Severity) time.Time {
 // acceptance"; it defaults to false.
 type CertificationProfile struct {
 	PermitAcceptedRisk bool `json:"permit_accepted_risk"`
+
+	// MaxEvidenceAgeSeconds is the freshness window (ZS-SVC-Z-001 DQC-05: "evidence
+	// freshness window is explicit; stale evidence invalidates eligibility"). When
+	// set, the run cannot be certified once its oldest frozen population is older
+	// than this; the remedy is a Reperform that freezes current evidence. Absent
+	// means no expiry — the behaviour of every profile written before this field
+	// existed, whose digests are unchanged because the field is omitted when nil.
+	MaxEvidenceAgeSeconds *int64 `json:"max_evidence_age_seconds,omitempty"`
+}
+
+// Validate refuses a window that could never be met or never expire.
+func (p CertificationProfile) Validate() error {
+	if p.MaxEvidenceAgeSeconds != nil && *p.MaxEvidenceAgeSeconds <= 0 {
+		return fmt.Errorf("%w: certification_profile.max_evidence_age_seconds must be positive", ErrInvalidArgument)
+	}
+	return nil
 }
 
 // ── Commands ────────────────────────────────────────────────────────────────

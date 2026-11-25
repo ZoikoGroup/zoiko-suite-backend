@@ -118,8 +118,9 @@ func TestMatching_SubDimensionCannotHideInAggregate(t *testing.T) {
 		t.Fatalf("certify with an unbalanced sub-dimension: %v", err)
 	}
 	// Reperforming re-reads both populations (A8): the re-read freezes a new
-	// generation beside the original, and re-running the matcher against it
-	// does not raise the same variance twice.
+	// generation beside the original and re-tests it. The earlier generation's
+	// exceptions are SUPERSEDED (step D) and the new generation raises its own, so
+	// the LIVE set is still exactly the two variances, never four.
 	reperformed, err := f.s.Reperform(f.ctx, orgA, run.RunID, frozenAll(pops), "test-operator", f.claim("Reperform", run.RunID))
 	if err != nil {
 		t.Fatalf("reperform: %v", err)
@@ -127,8 +128,17 @@ func TestMatching_SubDimensionCannotHideInAggregate(t *testing.T) {
 	if reperformed.Status != domain.RunReperformed {
 		t.Fatalf("status after reperform: %s, want Reperformed", reperformed.Status)
 	}
-	if n := len(f.exceptions(run.RunID)); n != 2 {
-		t.Fatalf("balance exceptions after reperform: %d, want 2", n)
+	var live, superseded int
+	for _, e := range f.exceptions(run.RunID) {
+		switch e.Status {
+		case domain.ExceptionSuperseded:
+			superseded++
+		case domain.ExceptionOpen:
+			live++
+		}
+	}
+	if live != 2 || superseded != 2 {
+		t.Fatalf("after reperform: %d live and %d superseded balance exceptions, want 2 and 2", live, superseded)
 	}
 	snaps, err := f.s.GetPopulationSnapshots(f.ctx, orgA, run.RunID)
 	if err != nil || len(snaps) != 4 {

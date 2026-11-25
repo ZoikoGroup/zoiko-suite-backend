@@ -18,7 +18,8 @@ import (
 const exceptionColumns = `exception_id, tenant_id, run_id, kind, COALESCE(item_id, ''), COALESCE(side, ''), COALESCE(ref_id, ''),
 	COALESCE(currency, ''), dimension, dimension_value, reason, amount_minor_units, detail, status,
 	raised_at, raised_by, resolved_at, resolved_by_match_id, category, assertion, severity, materiality, exposure_minor_units,
-	owner_role, owner_principal, due_at, authority_ref, evidence_ref, root_cause_code, root_cause_note, accepted_by, accepted_at`
+	owner_role, owner_principal, due_at, authority_ref, evidence_ref, root_cause_code, root_cause_note, accepted_by, accepted_at,
+	raised_generation, superseded_at, superseded_by, superseded_by_generation, superseded_reason`
 
 func scanException(row pgx.Row) (*domain.ReconciliationException, error) {
 	var e domain.ReconciliationException
@@ -27,7 +28,8 @@ func scanException(row pgx.Row) (*domain.ReconciliationException, error) {
 		&e.DimensionValue, &e.Reason, &e.AmountMinorUnits, &detail, &e.Status, &e.RaisedAt, &e.RaisedBy, &e.ResolvedAt,
 		&e.ResolvedByMatchID, &e.Category, &e.Assertion, &e.Severity, &e.Materiality, &e.ExposureMinor,
 		&e.OwnerRole, &e.Owner, &e.DueAt, &e.AuthorityRef, &e.EvidenceRef, &e.RootCauseCode, &e.RootCauseNote,
-		&e.AcceptedBy, &e.AcceptedAt); err != nil {
+		&e.AcceptedBy, &e.AcceptedAt,
+		&e.RaisedGeneration, &e.SupersededAt, &e.SupersededBy, &e.SupersededByGeneration, &e.SupersededReason); err != nil {
 		return nil, err
 	}
 	if len(detail) > 0 {

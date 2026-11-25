@@ -94,3 +94,9 @@ func (s *PgStore) enqueueEvent(ctx context.Context, tx pgx.Tx, kind eventKind, t
 	}
 	return outbox.Enqueue(ctx, tx, env)
 }
+
+// WithClock replaces the time source, for tests. It governs certification
+// freshness (a run's evidence age) and the time a certification is sealed.
+func WithClock(now func() time.Time) Option {
+	return func(s *PgStore) { s.now = now }
+}

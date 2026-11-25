@@ -240,38 +240,53 @@ func TestEventingOutbox_EveryWriteEnqueuesOneCorrectlyKeyedEvent(t *testing.T) {
 		}, wantEvent{"reconciliation-certification.revoked", "CONTROL.CertificationRevoked", "reconciliation-certification", func() string { return certification }, "controller-erin"}},
 	}
 
-	for i, st := range steps {
+	// Events a write emits AHEAD of its own, in order. Reperform supersedes the
+	// exceptions raised on earlier generations (step D, migration 000014) and emits a
+	// status-changed event for each, so consumers tracking a break learn that it
+	// ended; the run's own reperformed event follows them. Here breakA is the one
+	// exception raised on generation 1.
+	before := map[string][]wantEvent{
+		"Reperform": {{"reconciliation-break.status-changed", "CONTROL.ExceptionUpdated", "reconciliation-break",
+			func() string { return breakA }, "reperformer"}},
+	}
+	seen := 0 // rows already accounted for by earlier steps
+	for _, st := range steps {
 		claim := f.claim(st.name, "every-write")
 		if err := st.write(claim); err != nil {
 			t.Fatalf("%s: %v", st.name, err)
 		}
+		// A write enqueues its own event, plus exactly the events it declares ahead of it.
+		wants := append(append([]wantEvent{}, before[st.name]...), st.want)
 		rows := f.outboxRows()
-		if len(rows) != i+1 {
-			t.Fatalf("%s: eventing_outbox has %d rows, want %d — each write enqueues exactly one event", st.name, len(rows), i+1)
+		if len(rows) != seen+len(wants) {
+			t.Fatalf("%s: eventing_outbox has %d rows, want %d — each write enqueues its own event and no undeclared ones", st.name, len(rows), seen+len(wants))
 		}
-		got, w := rows[i], st.want
-		aggID := w.aggregateID()
-		checks := []struct {
-			ok   bool
-			what string
-		}{
-			{got.eventType == prefix+w.canonical, "event_type " + got.eventType + ", want " + prefix + w.canonical},
-			{got.payload["event_type"] == w.legacy, "legacy event_type, want " + w.legacy},
-			{got.tenantID == orgA && got.payload["tenant_id"] == orgA, "tenant " + got.tenantID + ", want the caller's tenant"},
-			{got.payload["legal_entity_id"] == entityA, "legal_entity_id, want the definition's entity " + entityA},
-			{got.region == testEventRegion, "region " + got.region},
-			{got.aggregateID != nil && *got.aggregateID == aggID, "aggregate_id, want " + aggID},
-			{got.partitionKey == expectedPartitionKey(orgA, w.aggregate, aggID), "partition_key, want " + w.aggregate + " " + aggID},
-			{got.payload["actor_id"] == w.actor, "actor_id, want " + w.actor},
-			{claim.CorrelationID != "" && got.payload["correlation_id"] == claim.CorrelationID, "correlation_id, want " + claim.CorrelationID},
-			{got.payload["event_id"] == got.eventID && got.schemaVersion == "1.0.0", "event id / schema version"},
-			{got.state == outbox.StatePending, "publish_state " + got.state},
-		}
-		for _, c := range checks {
-			if !c.ok {
-				t.Errorf("%s: %s (row %+v)", st.name, c.what, got)
+		for j, w := range wants {
+			got := rows[seen+j]
+			aggID := w.aggregateID()
+			checks := []struct {
+				ok   bool
+				what string
+			}{
+				{got.eventType == prefix+w.canonical, "event_type " + got.eventType + ", want " + prefix + w.canonical},
+				{got.payload["event_type"] == w.legacy, "legacy event_type, want " + w.legacy},
+				{got.tenantID == orgA && got.payload["tenant_id"] == orgA, "tenant " + got.tenantID + ", want the caller's tenant"},
+				{got.payload["legal_entity_id"] == entityA, "legal_entity_id, want the definition's entity " + entityA},
+				{got.region == testEventRegion, "region " + got.region},
+				{got.aggregateID != nil && *got.aggregateID == aggID, "aggregate_id, want " + aggID},
+				{got.partitionKey == expectedPartitionKey(orgA, w.aggregate, aggID), "partition_key, want " + w.aggregate + " " + aggID},
+				{got.payload["actor_id"] == w.actor, "actor_id, want " + w.actor},
+				{claim.CorrelationID != "" && got.payload["correlation_id"] == claim.CorrelationID, "correlation_id, want " + claim.CorrelationID},
+				{got.payload["event_id"] == got.eventID && got.schemaVersion == "1.0.0", "event id / schema version"},
+				{got.state == outbox.StatePending, "publish_state " + got.state},
+			}
+			for _, c := range checks {
+				if !c.ok {
+					t.Errorf("%s: %s (row %+v)", st.name, c.what, got)
+				}
 			}
 		}
+		seen += len(wants)
 	}
 }
 

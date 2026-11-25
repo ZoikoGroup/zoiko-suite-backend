@@ -111,6 +111,7 @@ func (h *Handler) routes(r chi.Router) {
 	r.Get("/definitions/{definitionID}/rule-versions", h.ListRuleVersions)
 	r.Post("/definitions/{definitionID}/rule-versions/{version}/approve", h.ApproveRuleVersion)
 	r.Post("/runs", h.StartRun)
+	r.Post("/dqc/reconciliations/{definitionID}/runs", h.StartRun)
 	r.Get("/runs/{runID}", h.GetRun)
 	r.Post("/runs/{runID}:match", h.Match)
 	r.Post("/runs/{runID}:raise-exception", h.RaiseException)
@@ -119,6 +120,7 @@ func (h *Handler) routes(r chi.Router) {
 	r.Post("/runs/{runID}:revoke-certification", h.RevokeCertification)
 	r.Post("/runs/{runID}:supersede", h.SupersedeRun)
 	r.Get("/runs/{runID}/populations", h.GetPopulationSnapshots)
+	r.Get("/runs/{runID}/population-hashes", h.VerifyPopulationHashes)
 	r.Get("/runs/{runID}/matches", h.GetMatchResults)
 	r.Get("/runs/{runID}/exceptions", h.GetExceptions)
 	r.Get("/runs/{runID}/certification", h.GetCertification)
@@ -236,6 +238,24 @@ func (h *Handler) idempotencyClaim(r *http.Request, principalID, operation, reso
 // sending a removed field (tolerance_amount_minor_units, materiality_amount_
 // minor_units) is told so instead of silently getting a different rule — and
 // returns the body's hash for the idempotency claim.
+// readOptionalStrict is readStrict for a body that may be absent: an empty body is
+// the zero request, anything else must decode without unknown fields.
+func (h *Handler) readOptionalStrict(r *http.Request, v interface{}) (string, error) {
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		return "", err
+	}
+	if len(bytes.TrimSpace(raw)) > 0 {
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(v); err != nil {
+			return "", err
+		}
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
+}
+
 func (h *Handler) readStrict(r *http.Request, v interface{}) (string, error) {
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -393,6 +413,15 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.respondError(w, http.StatusBadRequest, "invalid request body")
 		return
+	}
+	// POST /dqc/reconciliations/{definitionID}/runs (ZS-SVC-Z-001 section 11) is this handler with the definition
+	// named in the path. A body that names a different one is a contradiction, not a choice.
+	if pathDef := chi.URLParam(r, "definitionID"); pathDef != "" {
+		if req.DefinitionID != "" && req.DefinitionID != pathDef {
+			h.respondError(w, http.StatusBadRequest, "definition_id in the body does not match the definition in the path")
+			return
+		}
+		req.DefinitionID = pathDef
 	}
 	if err := req.Validate(); err != nil {
 		h.respondFromError(w, err)
@@ -582,8 +611,17 @@ func (h *Handler) Certify(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
-	claim := h.idempotencyClaim(r, principalID, "Certify", runID, "", r.Header.Get("Idempotency-Key"))
-	got, err := h.store.Certify(r.Context(), tenantID, runID, principalID, authority, claim)
+	// The body is optional: it carries the lineage manifest reference the
+	// certification binds. It is part of the request hash, so a retry that changes
+	// it is a conflict and not a replay. Unknown fields are refused.
+	var req domain.CertifyRequest
+	reqHash, err := h.readOptionalStrict(r, &req)
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	claim := h.idempotencyClaim(r, principalID, "Certify", runID, reqHash, r.Header.Get("Idempotency-Key"))
+	got, err := h.store.CertifyWithEvidence(r.Context(), tenantID, runID, principalID, authority, req, claim)
 	if err != nil {
 		h.respondFromError(w, err)
 		return
@@ -695,6 +733,32 @@ func (h *Handler) GetPopulationSnapshots(w http.ResponseWriter, r *http.Request)
 		items = []domain.PopulationSnapshot{}
 	}
 	h.respondJSON(w, http.StatusOK, map[string]interface{}{"data": items, "count": len(items)})
+}
+
+// VerifyPopulationHashes re-derives each snapshot's content hash from its frozen items,
+// under the algorithm and serialization recorded with it, and reports every one
+// (ZS-SVC-Z-001 INV-24). Read-only; a mismatch or an unknown format is reported,
+// not repaired.
+func (h *Handler) VerifyPopulationHashes(w http.ResponseWriter, r *http.Request) {
+	tenantID, _, ok := h.authorizeRun(w, r, ActionReconciliationRead)
+	if !ok {
+		return
+	}
+	checks, err := h.store.VerifyPopulationHashes(r.Context(), tenantID, chi.URLParam(r, "runID"))
+	if err != nil {
+		h.respondFromError(w, err)
+		return
+	}
+	if checks == nil {
+		checks = []domain.PopulationHashCheck{}
+	}
+	verified := true
+	for _, c := range checks {
+		if !c.Verified {
+			verified = false
+		}
+	}
+	h.respondJSON(w, http.StatusOK, map[string]interface{}{"data": checks, "count": len(checks), "all_verified": verified})
 }
 
 func (h *Handler) GetMatchResults(w http.ResponseWriter, r *http.Request) {
@@ -921,6 +985,7 @@ func (h *Handler) respondFromError(w http.ResponseWriter, err error) {
 		errors.Is(err, domain.ErrReplacementNotTerminal), errors.Is(err, domain.ErrReplacementAlreadyUsed),
 		errors.Is(err, domain.ErrInvalidTransition), errors.Is(err, domain.ErrRunNotEvaluated),
 		errors.Is(err, domain.ErrRunNotEligible), errors.Is(err, domain.ErrNoEffectiveRules),
+		errors.Is(err, domain.ErrEvidenceStale), errors.Is(err, domain.ErrCertificationBasisExists),
 		errors.Is(err, domain.ErrDefinitionExists), errors.Is(err, domain.ErrRuleVersionConflict),
 		errors.Is(err, domain.ErrRuleVersionApproved), errors.Is(err, domain.ErrBackdatedRuleVersion):
 		h.respondError(w, http.StatusConflict, err.Error())

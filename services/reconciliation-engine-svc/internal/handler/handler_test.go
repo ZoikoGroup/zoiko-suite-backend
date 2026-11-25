@@ -66,6 +66,9 @@ type fakeStore struct {
 	approvals      []string
 	certifiers     []string
 	authorities    []*domain.AuthoritySnapshot
+	certReqs       []domain.CertifyRequest
+	hashChecks     []domain.PopulationHashCheck
+	claims         []domain.IdempotencyClaim
 	revocations    []domain.RevokeCertificationRequest
 	revokeErr      error
 }
@@ -86,6 +89,17 @@ func (s *fakeStore) Certify(_ context.Context, _, runID, actor string, authority
 	s.certifiers = append(s.certifiers, actor)
 	s.authorities = append(s.authorities, authority)
 	return &domain.Certification{CertificationID: "rcf_1", RunID: runID, Authority: authority}, nil
+}
+
+func (s *fakeStore) CertifyWithEvidence(ctx context.Context, tenantID, runID, actor string, authority *domain.AuthoritySnapshot,
+	req domain.CertifyRequest, claim domain.IdempotencyClaim) (*domain.Certification, error) {
+	s.certReqs = append(s.certReqs, req)
+	s.claims = append(s.claims, claim)
+	return s.Certify(ctx, tenantID, runID, actor, authority, claim)
+}
+
+func (s *fakeStore) VerifyPopulationHashes(_ context.Context, _, _ string) ([]domain.PopulationHashCheck, error) {
+	return s.hashChecks, nil
 }
 
 func (s *fakeStore) ApproveRuleVersion(_ context.Context, _, definitionID string, version int64, approver string,
@@ -492,5 +506,97 @@ func TestStartRun_RefusesUnapprovedRulesBeforeReadingSources(t *testing.T) {
 		http.MethodPost, "/v1/reconciliation/runs", `{"definition_id":"rdf_1","period_id":"2026-09"}`)
 	if w.Code != http.StatusConflict || calls != 0 || st.startCalls != 0 || len(st.failures) != 0 {
 		t.Fatalf("unapproved rules: %d %s, source reads %d, starts %d, failed runs %d", w.Code, w.Body, calls, st.startCalls, len(st.failures))
+	}
+}
+
+// The optional certify body carries the lineage manifest reference. It reaches
+// the store untouched, and it is part of the idempotency request hash so a retry
+// that changes it is a conflict and not a replay.
+func TestCertify_LineageReferenceBodyReachesTheStore_AndIsHashedIntoTheClaim(t *testing.T) {
+	run := &domain.ReconciliationRun{RunID: "rcr_1", LegalEntityID: entityA}
+	const path = "/v1/reconciliation/runs/rcr_1:certify"
+	body := `{"lineage_manifest_id":"dpm_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","lineage_manifest_sha256":"` + strings.Repeat("a", 64) + `"}`
+
+	st := &fakeStore{run: run}
+	w := serve(NewHandler(st, &recordingAuthz{}, failingFetcher{}, zap.NewNop()), http.MethodPost, path, body)
+	if w.Code != http.StatusCreated || len(st.certReqs) != 1 {
+		t.Fatalf("certify: %d %s, requests %v", w.Code, w.Body, st.certReqs)
+	}
+	if st.certReqs[0].LineageManifestID == nil || *st.certReqs[0].LineageManifestID != "dpm_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" {
+		t.Fatalf("the store did not receive the lineage reference: %+v", st.certReqs[0])
+	}
+	withBody := st.claims[0].RequestSHA256
+
+	st2 := &fakeStore{run: run}
+	serve(NewHandler(st2, &recordingAuthz{}, failingFetcher{}, zap.NewNop()), http.MethodPost, path, "")
+	if st2.claims[0].RequestSHA256 == withBody {
+		t.Fatal("the request hash ignores the body: changing the lineage reference would replay as the same request")
+	}
+	if st2.certReqs[0].LineageManifestID != nil {
+		t.Fatalf("an empty body should carry no reference: %+v", st2.certReqs[0])
+	}
+}
+
+// Unknown fields are refused rather than ignored: a typo'd field must not be
+// silently dropped from what a certification binds.
+func TestCertify_UnknownBodyField_Is400_AndStoreUntouched(t *testing.T) {
+	st := &fakeStore{run: &domain.ReconciliationRun{RunID: "rcr_1", LegalEntityID: entityA}}
+	w := serve(NewHandler(st, &recordingAuthz{}, failingFetcher{}, zap.NewNop()), http.MethodPost,
+		"/v1/reconciliation/runs/rcr_1:certify", `{"lineage_manifest":"oops"}`)
+	if w.Code != http.StatusBadRequest || len(st.certifiers) != 0 {
+		t.Fatalf("unknown field: %d %s, certifiers %v", w.Code, w.Body, st.certifiers)
+	}
+}
+
+type staleStore struct {
+	*fakeStore
+	err error
+}
+
+func (s *staleStore) CertifyWithEvidence(_ context.Context, _, _, _ string, _ *domain.AuthoritySnapshot,
+	_ domain.CertifyRequest, _ domain.IdempotencyClaim) (*domain.Certification, error) {
+	return nil, s.err
+}
+
+func TestCertify_StaleEvidenceAndDuplicateBasis_Are409(t *testing.T) {
+	run := &domain.ReconciliationRun{RunID: "rcr_1", LegalEntityID: entityA}
+	for _, e := range []error{domain.ErrEvidenceStale, domain.ErrCertificationBasisExists} {
+		w := serve(NewHandler(&staleStore{fakeStore: &fakeStore{run: run}, err: e}, &recordingAuthz{}, failingFetcher{}, zap.NewNop()),
+			http.MethodPost, "/v1/reconciliation/runs/rcr_1:certify", "")
+		if w.Code != http.StatusConflict {
+			t.Errorf("%v: status = %d, want 409", e, w.Code)
+		}
+	}
+}
+
+// The hash verification route is a read: it needs the read permission on the run's
+// entity, and says plainly whether every snapshot re-derived (INV-24).
+func TestVerifyPopulationHashes_NeedsReadAndReportsAllVerified(t *testing.T) {
+	run := &domain.ReconciliationRun{RunID: "rcr_1", LegalEntityID: entityA}
+	const path = "/v1/reconciliation/runs/rcr_1/population-hashes"
+	good := domain.PopulationHashCheck{SnapshotID: "rps_1", Side: "Bank", Generation: 1, HashAlgorithm: "sha256",
+		HashSerialization: "rpop-v1", StoredHash: "a", RecomputedHash: "a", Verified: true}
+	bad := domain.PopulationHashCheck{SnapshotID: "rps_2", Side: "Ledger", Generation: 1, HashAlgorithm: "sha256",
+		HashSerialization: "rpop-v9", StoredHash: "b", Reason: "unknown population hash format: serialization \"rpop-v9\""}
+
+	az := &recordingAuthz{}
+	w := serve(NewHandler(&fakeStore{run: run, hashChecks: []domain.PopulationHashCheck{good}}, az, failingFetcher{}, zap.NewNop()), http.MethodGet, path, "")
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"all_verified":true`) ||
+		len(az.actions) != 1 || az.actions[0] != ActionReconciliationRead || az.entities[0] != entityA {
+		t.Fatalf("verified run: %d %s, checks %v on %v", w.Code, w.Body, az.actions, az.entities)
+	}
+
+	// One unverifiable snapshot is enough: the run is not reported verified.
+	w = serve(NewHandler(&fakeStore{run: run, hashChecks: []domain.PopulationHashCheck{good, bad}}, &recordingAuthz{}, failingFetcher{}, zap.NewNop()),
+		http.MethodGet, path, "")
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"all_verified":false`) || !strings.Contains(w.Body.String(), "rpop-v9") {
+		t.Fatalf("a run with an unverifiable snapshot: %d %s", w.Code, w.Body)
+	}
+
+	// Without the read permission nothing is revealed.
+	w = serve(NewHandler(&fakeStore{run: run, hashChecks: []domain.PopulationHashCheck{good}},
+		&recordingAuthz{deny: map[string]bool{ActionReconciliationRead: true}}, failingFetcher{}, zap.NewNop()), http.MethodGet, path, "")
+	if w.Code != http.StatusForbidden || strings.Contains(w.Body.String(), "rps_1") {
+		t.Fatalf("read denied: %d %s", w.Code, w.Body)
 	}
 }

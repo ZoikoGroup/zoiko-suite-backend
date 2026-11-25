@@ -2,6 +2,7 @@ package domain
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -55,6 +56,12 @@ type CertifiedPopulation struct {
 	DeclaredRowCount *int64            `json:"declared_row_count,omitempty"`
 	DeclaredTotals   map[string]string `json:"declared_totals,omitempty"`
 	ContentHash      string            `json:"content_hash"`
+	// FrozenAt is when this side was frozen — the moment its evidence was
+	// observed. Certification freshness is measured from the oldest of them.
+	FrozenAt time.Time `json:"frozen_at"`
+	// How ContentHash was made. Empty on certifications sealed before migration 000015.
+	HashAlgorithm     string `json:"hash_algorithm,omitempty"`
+	HashSerialization string `json:"hash_serialization,omitempty"`
 }
 
 // MatchedItem is one side of a manual match, as frozen.
@@ -190,4 +197,32 @@ type CertificationRevocation struct {
 	Authority                 AuthoritySnapshot `json:"authority_snapshot"`
 	RevokedBy                 string            `json:"revoked_by"`
 	RevokedAt                 time.Time         `json:"revoked_at"`
+}
+
+// CertifyRequest carries the optional references a certification binds beyond
+// the run itself. The lineage manifest is a reference into the lineage authority
+// (data-lineage-svc): it is recorded in the basis, not fetched or re-verified
+// here — the same posture as a population's declared totals.
+type CertifyRequest struct {
+	LineageManifestID     *string `json:"lineage_manifest_id,omitempty"`
+	LineageManifestSHA256 *string `json:"lineage_manifest_sha256,omitempty"`
+}
+
+var (
+	lineageManifestIDRe = regexp.MustCompile(`^dpm_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	sha256HexRe         = regexp.MustCompile(`^[0-9a-f]{64}$`)
+)
+
+func (r CertifyRequest) Validate() error {
+	bad := func(m string) error { return fmt.Errorf("%w: %s", ErrInvalidArgument, m) }
+	if (r.LineageManifestID == nil) != (r.LineageManifestSHA256 == nil) {
+		return bad("lineage_manifest_id and lineage_manifest_sha256 must be given together")
+	}
+	if r.LineageManifestID != nil && !lineageManifestIDRe.MatchString(*r.LineageManifestID) {
+		return bad("lineage_manifest_id must look like dpm_<uuid>")
+	}
+	if r.LineageManifestSHA256 != nil && !sha256HexRe.MatchString(*r.LineageManifestSHA256) {
+		return bad("lineage_manifest_sha256 must be a lowercase sha256 hex digest")
+	}
+	return nil
 }
