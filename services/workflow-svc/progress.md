@@ -213,3 +213,19 @@ plain assignment and inside a `CASE`/`IN` comparison in the same query
 confuses Postgres's type inference (`inconsistent types deduced for
 parameter $1`, SQLSTATE 42P08). Fixed with an explicit `::VARCHAR` cast in
 both occurrences.
+
+## Decision capture (DL-2, 25 Nov 2026)
+
+A workflow started for an escalated governance decision stores it (`causation_id` in the body or
+`X-Causation-Id`, which must agree; default the bound signatory decision) in `workflow_instances.causation_decision_id`
+(migration 000027). Every ledger record the workflow writes carries it as `causation_id` unless the action names
+its own, so the decision log links the escalation to the approval that resolved it. Tests:
+`TestCreateWorkflow_DL2_CausationDecision`, `TestSignatureWorkflow_CreatedFromVerifiedDecision` (handler);
+`TestPgStore_DL2_LedgerRecordsCarryTheResolvedDecision` (store).
+
+**Blocked (25 Nov 2026):** the store suite fails on this HEAD: `CreateWorkflow` as rewritten by 7a59de35
+(WF-S1..S7) inserts `workflow_stages.quorum_approvers`, a column no migration creates, and other WF-S SQL names
+tables that do not exist (`authorization_svc_role_holders`, `workflow_stages.tenant_id`). DL-2 fixed what it
+touched (scanInstance read 33 targets for 32 columns; the instance INSERT passed 19 arguments for 18 placeholders;
+migration 000025 did not parse). Store suite on a scratch DB: 33 pass / 35 fail, every failure in `CreateWorkflow`.
+The user chose (25 Nov) to repair WF-S separately. The running image (18 Nov) predates WF-S and DL-2.

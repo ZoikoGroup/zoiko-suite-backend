@@ -458,3 +458,27 @@ checksums re-recorded with the reconciliation as their method. Suite 215 / 0 / 0
       svc-decision-support READ (authorization-svc 000042); writers
       svc-policy / svc-workflow by 000043.
 - [x] Both event names registered in schema-registry-svc (R9).
+
+## Automatic decision capture (25 Nov 2026, tracker DL-0…DL-9)
+
+Every governance engine now writes its own verdicts here; people only read,
+verify and export (decision D-DL-2). Writers and their words: CONTEXT.md
+"Writers".
+
+- 000020: outcome categories for REQUIRE_APPROVAL, CERTIFIED, RELEASED,
+  PUBLISHED, ACTIVATED, UNBLOCKED, SUPERSEDED, WITHDRAWN, ROLLED_BACK, RAISED,
+  WAIVED, SATISFIED, MISSING, NO_REQUIREMENTS_DEFINED and workflow's APPROVE,
+  REJECT, CANCELLED, INVALIDATED, EXPIRED, REOPENED (seven quorum votes read
+  OTHER before); domain keywords for jurisdiction, obligation and access
+  actions. `TestSummary_WriterOutcomesAreCategorised`.
+- New peers on :8450 (`IDENTITY_PEERS`): authorization-svc,
+  jurisdiction-rules-svc, obligations-svc, evidence-requirements-svc, each with
+  its own bootstrap token; their principals hold RECORD by authorization-svc
+  000046. `deployments/scripts/probe-decision-log-writers.py` appends once per
+  certificate.
+- The human GOVERNANCE_FULL bundle no longer carries
+  GOVERNANCE_DECISION_RECORD (`seed-demo-rbac.ps1`); the console has no write
+  command left (frontend `app/admin/governance`).
+- End to end: `deployments/scripts/e2e-decision-capture.py`.
+
+Status: 🔵 built, not verified.
