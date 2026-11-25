@@ -8,6 +8,7 @@ package events_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/segmentio/kafka-go"
@@ -44,21 +45,19 @@ func decode(t *testing.T, msg kafka.Message) envelope {
 	return env
 }
 
-func TestPublish_EnvelopeCarriesJurisdictionAndActor(t *testing.T) {
-	w := &fakeWriter{}
-	p := events.NewKafkaPublisherWithWriter(w, "zoiko.tax-rules.events", zap.NewNop())
-
-	err := p.Publish(context.Background(), events.PublishParams{
+func TestNewEvent_EnvelopeCarriesJurisdictionAndActor(t *testing.T) {
+	evt := events.NewEvent(events.PublishParams{
 		EventType: "tax_rule.updated", RuleID: "trule-1", TenantID: "tenant-1",
 		Jurisdiction: "uk-england", ActorID: "updater-1", CorrelationID: "corr-1",
 		Payload: map[string]string{"status": "ACTIVE"},
 	})
+	data, err := json.Marshal(evt)
 	require.NoError(t, err)
-	require.Len(t, w.msgs, 1)
 
-	env := decode(t, w.msgs[0])
+	env := decode(t, kafka.Message{Value: data})
 	assert.Equal(t, "tax_rule.updated", env.EventType)
 	assert.Equal(t, "1.0", env.EventVersion)
+	assert.Equal(t, "1.0", evt.SchemaVersion)
 	assert.Equal(t, "tax-rules-svc", env.SourceService)
 	assert.Equal(t, "uk-england", env.Jurisdiction)
 	assert.Equal(t, "updater-1", env.ActorID)
@@ -66,21 +65,33 @@ func TestPublish_EnvelopeCarriesJurisdictionAndActor(t *testing.T) {
 	assert.NotEmpty(t, env.EventID)
 }
 
-func TestPublish_RepeatEventsOnSameRule_GetDistinctEventIDs(t *testing.T) {
+func TestNewEvent_RepeatEventsOnSameRule_GetDistinctEventIDs(t *testing.T) {
+	p := events.PublishParams{EventType: "tax_rule.created", RuleID: "trule-1", TenantID: "tenant-1"}
+	assert.NotEqual(t, events.NewEvent(p).EventID, events.NewEvent(p).EventID)
+}
+
+func TestPublishOutbox_KeysByAggregateAndCarriesStableEventID(t *testing.T) {
 	w := &fakeWriter{}
 	p := events.NewKafkaPublisherWithWriter(w, "zoiko.tax-rules.events", zap.NewNop())
 
-	for i := 0; i < 2; i++ {
-		err := p.Publish(context.Background(), events.PublishParams{
-			EventType: "tax_rule.created", RuleID: "trule-1", TenantID: "tenant-1",
-			ActorID: "creator-1", CorrelationID: "corr-x",
-			Payload: map[string]int{"attempt": i + 1},
-		})
-		require.NoError(t, err)
-	}
+	require.NoError(t, p.PublishOutbox(context.Background(), "ob-1", "trule-1", []byte(`{"event_type":"tax_rule.created"}`)))
+	require.Len(t, w.msgs, 1)
+	assert.Equal(t, "trule-1", string(w.msgs[0].Key))
+	assert.JSONEq(t, `{"event_type":"tax_rule.created"}`, string(w.msgs[0].Value))
+	require.Len(t, w.msgs[0].Headers, 1)
+	assert.Equal(t, "X-Event-ID", w.msgs[0].Headers[0].Key)
+	assert.Equal(t, "ob-1", string(w.msgs[0].Headers[0].Value))
+}
 
-	require.Len(t, w.msgs, 2)
-	first := decode(t, w.msgs[0])
-	second := decode(t, w.msgs[1])
-	assert.NotEqual(t, first.EventID, second.EventID)
+type failingWriter struct{}
+
+func (failingWriter) WriteMessages(context.Context, ...kafka.Message) error {
+	return errors.New("broker down")
+}
+
+// The former Publish logged and returned nil on a broker failure; the outbox
+// relay must see the error so it keeps the row and retries.
+func TestPublishOutbox_ReturnsBrokerError(t *testing.T) {
+	p := events.NewKafkaPublisherWithWriter(failingWriter{}, "zoiko.tax-rules.events", zap.NewNop())
+	require.Error(t, p.PublishOutbox(context.Background(), "ob-1", "trule-1", []byte(`{}`)))
 }

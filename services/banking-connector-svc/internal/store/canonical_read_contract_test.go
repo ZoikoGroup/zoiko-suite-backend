@@ -63,14 +63,30 @@ func TestCanonicalTransactionRead_CrossServiceContract(t *testing.T) {
 	txnID := norm.Transaction.TransactionID
 
 	// The cmd/server stack, minus logging/recovery that change nothing here.
-	// authorization-svc is never consulted by this read; the client points
-	// nowhere so an unexpected call would fail rather than pass.
+	// The read is authorized (BANKING_TRANSACTION_READ for the owning
+	// connection's legal entity); the stand-in grants exactly that to the
+	// reconciliation client's principal, for le-x, and nothing else.
+	az := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var q struct {
+			PrincipalID   string `json:"principal_id"`
+			LegalEntityID string `json:"legal_entity_id"`
+			ActionType    string `json:"action_type"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&q)
+		out := "DENIED"
+		if q.PrincipalID == "recon-matcher" && q.LegalEntityID == "le-x" && q.ActionType == handler.BANKING_TRANSACTION_READ {
+			out = "GRANTED"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"decision_outcome": out})
+	}))
+	t.Cleanup(az.Close)
 	router := func(mode envelope.Mode) chi.Router {
 		r := chi.NewRouter()
 		r.Use(chimiddleware.RequestID)
 		r.Use(middleware.TenantContext)
 		r.Use(envelope.MiddlewareWithMode(envelope.ServicePolicy(), mode, nil))
-		h := handler.New(s, authz.NewClient("http://127.0.0.1:1"), zap.NewNop())
+		h := handler.New(s, authz.NewClient(az.URL), zap.NewNop())
 		handler.RegisterRoutes(r, h)
 		handler.RegisterBNK0304Routes(r, h, s, nil)
 		return r
@@ -130,6 +146,16 @@ func TestCanonicalTransactionRead_CrossServiceContract(t *testing.T) {
 	t.Run("write-strict refuses no principal with 401", func(t *testing.T) {
 		if rec := get(router(envelope.ModeWriteStrict), tenantOnly); rec.Code != http.StatusUnauthorized {
 			t.Fatalf("expected 401 from requirePrincipal, got %d: %s", rec.Code, rec.Body.String())
+		}
+	})
+	t.Run("a principal without BANKING_TRANSACTION_READ is refused with 403", func(t *testing.T) {
+		other := map[string]string{}
+		for k, v := range reconClient {
+			other[k] = v
+		}
+		other[envelope.HeaderActorSubjectID] = "someone-else"
+		if rec := get(router(envelope.ModeWriteStrict), other); rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403, got %d: %s", rec.Code, rec.Body.String())
 		}
 	})
 	t.Run("strict refuses tenant+principal without the rest of the envelope", func(t *testing.T) {

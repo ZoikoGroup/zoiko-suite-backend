@@ -301,6 +301,15 @@ func (h *Handler) CreateRequest(w http.ResponseWriter, r *http.Request) {
 // service call (X-Source-Channel: system — e.g. purchase-order-svc verifying a
 // requisition is APPROVED); it is still tenant-scoped. Anything else must have
 // a principal holding PR_REQUEST_READ.
+//
+// The system declaration is NOT verifiable: any in-cluster caller can set the
+// header, and no service identity reaches this service on inbound calls (its
+// mTLS identity is client-side only, toward authorization-svc). It never
+// overrides a principal, and edge traffic always carries one (gateway-auth-svc
+// sets X-Principal-Id), so it cannot be used from outside the cluster to skip
+// authorization. Replacing it with a verifiable workload identity is an open
+// platform decision; TestGetRequest_SystemChannelNeverOverridesAPrincipal pins
+// the current behaviour.
 func (h *Handler) authorizeRead(w http.ResponseWriter, r *http.Request, scope string) bool {
 	principalID := r.Header.Get("X-Principal-Id")
 	if principalID == "" {

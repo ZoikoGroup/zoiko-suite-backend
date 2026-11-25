@@ -29,8 +29,10 @@ import (
 	"zoiko.io/procurement-workflow-svc/internal/events"
 	"zoiko.io/procurement-workflow-svc/internal/handler"
 	"zoiko.io/procurement-workflow-svc/internal/health"
+	"zoiko.io/procurement-workflow-svc/internal/idempotency"
 	svcmiddleware "zoiko.io/procurement-workflow-svc/internal/middleware"
 	"zoiko.io/procurement-workflow-svc/internal/mtls"
+	"zoiko.io/procurement-workflow-svc/internal/outbox"
 	"zoiko.io/procurement-workflow-svc/internal/store"
 	"zoiko.io/procurement-workflow-svc/internal/telemetry"
 )
@@ -292,6 +294,15 @@ func main() {
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 
+	// Transactional outbox: the store writes procurement.requested,
+	// procurement.approval.started and procurement.completed in the case
+	// change's own transaction; the relay delivers them with retry and marks
+	// each row published. It reads across tenants by declaring
+	// app.outbox_relay (migration 000004).
+	relayCtx, relayCancel := context.WithCancel(context.Background())
+	defer relayCancel()
+	go outbox.NewRelay(pool, publisher, 1500*time.Millisecond, 50, log).Start(relayCtx)
+
 	var httpClientForAuthz *http.Client
 	authzBaseURL := cfg.AuthZServiceURL
 	if cfg.AuthzMTLSEnabled {
@@ -326,7 +337,12 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, authzClient, spendClient, orderClient, log)
+	// Replay protection for material writes: a retried POST/PUT with the same
+	// Idempotency-Key gets the first answer instead of running twice. Placed after
+	// the envelope middleware, which guarantees the key and tenant are present.
+	r.Use(idempotency.Middleware(idempotency.NewPgStore(pool), log))
+
+	h := handler.New(pgStore, authzClient, spendClient, orderClient, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

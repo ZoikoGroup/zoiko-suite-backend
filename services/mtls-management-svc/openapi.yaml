@@ -40,6 +40,29 @@ paths:
                   status: { type: string, example: ok }
                   service: { type: string, example: mtls-management-svc }
 
+  /readyz:
+    get:
+      summary: Readiness probe (pings the database, 2s timeout)
+      operationId: Readyz
+      responses:
+        '200':
+          description: Database reachable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ready }
+        '503':
+          description: Database unreachable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: unavailable }
+                  reason: { type: string }
+
   /v1/mtls/crl:
     get:
       summary: Certificate Revocation List (CRL)

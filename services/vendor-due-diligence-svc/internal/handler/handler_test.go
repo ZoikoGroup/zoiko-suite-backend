@@ -143,6 +143,10 @@ func (s *stubStore) ListEvidence(_ context.Context, checkID string) ([]domain.Ve
 	return s.evidence[checkID], nil
 }
 
+func (s *stubStore) ApproveVendorProfile(_ context.Context, id, approvedBy string) (*domain.VendorProfile, error) {
+	return nil, domain.ErrVendorProfileNotFound
+}
+
 func (s *stubStore) CreateVendorProfile(_ context.Context, p *domain.VendorProfile) error {
 	if s.noTenant {
 		return domain.ErrTenantMissing

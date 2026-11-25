@@ -33,11 +33,13 @@ type taskHandler struct {
 func RegisterTaskRoutes(r chi.Router, h *Handler, taskStore store.TaskStore) {
 	th := &taskHandler{Handler: h, store: taskStore}
 	r.Route("/v1/cases", func(r chi.Router) {
+		r.Use(withEventMeta)
 		r.Post("/", th.CreateCase)
 		r.Get("/{case_id}", th.GetCase)
 		r.Post("/{case_id}/close", th.CloseCase)
 	})
 	r.Route("/v1/tasks", func(r chi.Router) {
+		r.Use(withEventMeta)
 		r.Post("/", th.CreateTask)
 		r.Get("/", th.ListQueue)
 		r.Get("/{task_id}", th.GetTask)
@@ -94,12 +96,36 @@ func (h *taskHandler) CreateCase(w http.ResponseWriter, r *http.Request) {
 
 // GetCase — BIZ-05's own GetCase query.
 func (h *taskHandler) GetCase(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	c, err := h.store.GetCase(r.Context(), chi.URLParam(r, "case_id"))
 	if err != nil {
 		h.writeTaskErr(w, err)
 		return
 	}
+	if !h.authorizeRead(w, r, c.LegalEntityID, actionTaskRead) {
+		return
+	}
 	writeJSON(w, http.StatusOK, c)
+}
+
+// loadTaskForRead resolves {task_id} in the caller's tenant and authorizes a
+// TASK_READ against the task's legal entity; every per-task GET goes through
+// it before serving anything about the task.
+func (h *taskHandler) loadTaskForRead(w http.ResponseWriter, r *http.Request) (*domain.Task, bool) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return nil, false
+	}
+	t, err := h.store.GetTask(r.Context(), chi.URLParam(r, "task_id"))
+	if err != nil {
+		h.writeTaskErr(w, err)
+		return nil, false
+	}
+	if !h.authorizeRead(w, r, t.LegalEntityID, actionTaskRead) {
+		return nil, false
+	}
+	return t, true
 }
 
 type closeCaseRequest struct {
@@ -170,6 +196,10 @@ func (h *taskHandler) CreateTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "legal_entity_id, task_type, linked_object_type, and linked_object_id are required")
 		return
 	}
+	if req.Priority != "" && !domain.ValidTaskPriority(req.Priority) {
+		writeError(w, http.StatusBadRequest, "priority must be one of LOW, MEDIUM, HIGH, CRITICAL")
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionTaskCreate); err != nil {
 		h.writeAuthzErr(w, err)
 		return
@@ -191,9 +221,8 @@ func (h *taskHandler) CreateTask(w http.ResponseWriter, r *http.Request) {
 
 // GetTask — BIZ-05's own GetTask query.
 func (h *taskHandler) GetTask(w http.ResponseWriter, r *http.Request) {
-	t, err := h.store.GetTask(r.Context(), chi.URLParam(r, "task_id"))
-	if err != nil {
-		h.writeTaskErr(w, err)
+	t, ok := h.loadTaskForRead(w, r)
+	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, t)
@@ -511,6 +540,9 @@ func (h *taskHandler) ListQueue(w http.ResponseWriter, r *http.Request) {
 
 // GetSLAState — BIZ-05's own GetSLAState query.
 func (h *taskHandler) GetSLAState(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.loadTaskForRead(w, r); !ok {
+		return
+	}
 	taskID := chi.URLParam(r, "task_id")
 	state, err := h.store.GetSLAState(r.Context(), middleware.GetTenantID(r.Context()), taskID)
 	if err != nil {
@@ -522,6 +554,9 @@ func (h *taskHandler) GetSLAState(w http.ResponseWriter, r *http.Request) {
 
 // GetLinkedObjectStatus — BIZ-05's own GetLinkedObjectStatus query.
 func (h *taskHandler) GetLinkedObjectStatus(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.loadTaskForRead(w, r); !ok {
+		return
+	}
 	taskID := chi.URLParam(r, "task_id")
 	status, err := h.store.GetLinkedObjectStatus(r.Context(), middleware.GetTenantID(r.Context()), taskID)
 	if err != nil {
@@ -533,6 +568,9 @@ func (h *taskHandler) GetLinkedObjectStatus(w http.ResponseWriter, r *http.Reque
 
 // GetTaskHistory — BIZ-05's own GetHistory query.
 func (h *taskHandler) GetTaskHistory(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.loadTaskForRead(w, r); !ok {
+		return
+	}
 	taskID := chi.URLParam(r, "task_id")
 	history, err := h.store.GetTaskHistory(r.Context(), middleware.GetTenantID(r.Context()), taskID)
 	if err != nil {

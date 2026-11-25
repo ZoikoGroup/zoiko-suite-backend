@@ -82,22 +82,45 @@ func (h *findingHandler) CreateFinding(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *findingHandler) GetFinding(w http.ResponseWriter, r *http.Request) {
-	finding, err := h.store.GetFinding(r.Context(), chi.URLParam(r, "finding_id"))
-	if err != nil {
-		h.writeFindingErr(w, err)
+	finding, ok := h.loadFindingForRead(w, r)
+	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, finding)
+}
+
+// loadFindingForRead resolves {finding_id} in the caller's tenant and
+// authorizes an AUDIT_FINDING_READ against the finding's legal entity; every
+// per-finding GET goes through it before serving anything about it.
+func (h *findingHandler) loadFindingForRead(w http.ResponseWriter, r *http.Request) (*domain.AuditFinding, bool) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return nil, false
+	}
+	finding, err := h.store.GetFinding(r.Context(), chi.URLParam(r, "finding_id"))
+	if err != nil {
+		h.writeFindingErr(w, err)
+		return nil, false
+	}
+	if !h.authorizeRead(w, r, finding.LegalEntityID, actionAuditFindingRead) {
+		return nil, false
+	}
+	return finding, true
 }
 
 // GetMisstatementSummary is the AUD-NEG-028 read — see
 // PgStore.GetMisstatementSummary's own doc comment for how "is_corrected"
 // is derived rather than stored-and-mutated.
 func (h *findingHandler) GetMisstatementSummary(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.loadFindingForRead(w, r); !ok {
+		return
+	}
 	summary, err := h.store.GetMisstatementSummary(r.Context(), chi.URLParam(r, "finding_id"))
 	if err != nil {
 		h.writeFindingErr(w, err)
 		return
+	}
+	if summary == nil {
+		summary = []domain.MisstatementRecord{}
 	}
 	writeJSON(w, http.StatusOK, summary)
 }
@@ -311,12 +334,22 @@ func (h *findingHandler) ResolveScopeLimitation(w http.ResponseWriter, r *http.R
 	if !ok {
 		return
 	}
-	tenantID := middleware.GetTenantID(r.Context())
-	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, actionFindingManage); err != nil {
+	limitationID := chi.URLParam(r, "limitation_id")
+	limitation, err := h.store.GetScopeLimitation(r.Context(), limitationID)
+	if err != nil {
+		h.writeFindingErr(w, err)
+		return
+	}
+	finding, err := h.store.GetFinding(r.Context(), limitation.FindingID)
+	if err != nil {
+		h.writeFindingErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, finding.LegalEntityID, actionFindingManage); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
-	updated, err := h.store.ResolveScopeLimitation(r.Context(), domain.ResolveScopeLimitationParams{LimitationID: chi.URLParam(r, "limitation_id"), TenantID: tenantID})
+	updated, err := h.store.ResolveScopeLimitation(r.Context(), domain.ResolveScopeLimitationParams{LimitationID: limitationID, TenantID: middleware.GetTenantID(r.Context())})
 	if err != nil {
 		h.writeFindingErr(w, err)
 		return
@@ -325,10 +358,16 @@ func (h *findingHandler) ResolveScopeLimitation(w http.ResponseWriter, r *http.R
 }
 
 func (h *findingHandler) ListOpenScopeLimitations(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.loadFindingForRead(w, r); !ok {
+		return
+	}
 	limitations, err := h.store.ListOpenScopeLimitations(r.Context(), middleware.GetTenantID(r.Context()), chi.URLParam(r, "finding_id"))
 	if err != nil {
 		h.writeFindingErr(w, err)
 		return
+	}
+	if limitations == nil {
+		limitations = []domain.ScopeLimitation{}
 	}
 	writeJSON(w, http.StatusOK, limitations)
 }

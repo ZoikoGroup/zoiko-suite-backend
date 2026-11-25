@@ -52,14 +52,46 @@ paths:
                   status: { type: string, example: ok }
                   service: { type: string, example: carta-svc }
 
+  /readyz:
+    get:
+      summary: Readiness probe
+      description: |
+        Public (no identity headers). Pings the Postgres pool with a 2s
+        timeout; 503 when the database is unreachable, because every record
+        this service serves lives only there.
+      operationId: Readyz
+      responses:
+        '200':
+          description: Database reachable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ready }
+        '503':
+          description: Database unreachable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: unavailable }
+                  reason: { type: string }
+
   /v1/carta/evaluate:
     post:
       summary: Evaluate an access request
       description: |
         Scores an access request and returns ALLOW / STEP_UP_MFA / ISOLATE / DENY.
-        Exempt from principal requirement — called during authentication.
-        Requires tenant header. The subject being evaluated is passed as
+        Requires the tenant header. The subject being evaluated is passed as
         `context.subject_id` in the request body.
+
+        A principal is not required (gateway-auth-svc calls this during
+        authentication with the tenant header only). When `X-Principal-Id`
+        IS presented, the caller is authorized `CARTA_EVALUATE` on
+        `legal_entity_id` and recorded as `evaluated_by`. Every assessment
+        emits `assessment.created` through the transactional outbox.
       operationId: EvaluateAccess
       requestBody:
         required: true
@@ -83,8 +115,18 @@ paths:
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: The presented principal is not authorized CARTA_EVALUATE on that legal entity
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '500':
           description: Failed to save assessment
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: authorization-svc unreachable while checking a presented principal
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -102,10 +144,10 @@ paths:
         - name: legal_entity_id
           in: query
           required: true
-          schema: { type: string, format: uuid }
+          schema: { type: string }
         - name: subject_id
           in: query
-          schema: { type: string, format: uuid }
+          schema: { type: string }
       responses:
         '200':
           description: List of assessments
@@ -159,6 +201,48 @@ paths:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
 
+  /v1/carta/assessments/{id}/reevaluate:
+    post:
+      summary: Re-evaluate an assessment
+      description: Scores the assessment's recorded access context again with the current model and records the result as a new assessment. The original is not changed.
+      operationId: ReevaluateAssessment
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '201':
+          description: The new assessment, with the previous assessment id and decision
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  assessment: { $ref: '#/components/schemas/CartaAssessment' }
+                  previous_assessment_id: { type: string }
+                  previous_decision: { type: string }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to re-evaluate (CARTA_ASSESSMENT_REEVALUATE)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Assessment not found in this tenant
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          description: The recorded context can no longer be evaluated
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
 components:
   schemas:
     Problem:
@@ -186,34 +270,47 @@ components:
         current_version: { type: integer, format: int64 }
         decision_id: { type: string }
 
+    AccessContext:
+      type: object
+      required: [subject_id, action_requested]
+      properties:
+        subject_id: { type: string }
+        subject_type: { type: string, description: 'USER, SERVICE_ACCOUNT or BOT' }
+        device_trust_level: { type: integer, minimum: 0, maximum: 100 }
+        ip_address: { type: string }
+        is_known_location: { type: boolean }
+        resource_sensitivity: { type: string, description: 'LOW, MEDIUM, HIGH or RESTRICTED' }
+        action_requested: { type: string }
+        time_of_day_hour: { type: integer, minimum: 0, maximum: 23 }
+
     EvaluateRequest:
       type: object
-      required: [context]
+      required: [legal_entity_id, context]
       properties:
-        context:
-          type: object
-          required: [subject_id]
-          properties:
-            subject_id: { type: string, format: uuid }
-            ip: { type: string, format: ipv4 }
-            device_trust_level: { type: integer, minimum: 0, maximum: 100 }
-            user_agent: { type: string }
-            location: { type: string }
-            timestamp: { type: string, format: date-time }
+        legal_entity_id: { type: string }
+        context: { $ref: '#/components/schemas/AccessContext' }
 
     CartaAssessment:
       type: object
+      required: [id, tenant_id, legal_entity_id, subject_id, context, trust_score, risk_level, decision, risk_factors, assessment_timestamp]
       properties:
         id: { type: string, format: uuid }
-        tenant_id: { type: string, format: uuid }
-        legal_entity_id: { type: string, format: uuid }
-        subject_id: { type: string, format: uuid }
+        tenant_id: { type: string }
+        legal_entity_id: { type: string }
+        subject_id: { type: string }
+        context: { $ref: '#/components/schemas/AccessContext' }
+        trust_score: { type: number, minimum: 0, maximum: 100 }
+        risk_level: { type: string, enum: [LOW, MEDIUM, HIGH, CRITICAL] }
         decision: { type: string, enum: [ALLOW, STEP_UP_MFA, ISOLATE, DENY] }
-        score: { type: integer, minimum: 0, maximum: 100 }
         risk_factors:
           type: array
           items: { type: string }
-        created_at: { type: string, format: date-time }
+        assessment_timestamp: { type: string, format: date-time }
+        evaluated_by:
+          type: string
+          description: |
+            Verified principal (X-Principal-Id) that requested the evaluation.
+            Absent when the caller presented none (gateway-auth-svc).
 
     AssessmentListResponse:
       type: object

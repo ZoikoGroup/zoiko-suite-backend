@@ -52,6 +52,29 @@ paths:
                   status: { type: string, example: ok }
                   service: { type: string, example: siem-integration-svc }
 
+  /readyz:
+    get:
+      summary: Readiness probe (pings the database, 2s timeout)
+      operationId: Readyz
+      responses:
+        '200':
+          description: Database reachable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ready }
+        '503':
+          description: Database unreachable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: unavailable }
+                  reason: { type: string }
+
   /v1/siem/exporters:
     post:
       summary: Create a SIEM exporter
@@ -167,6 +190,117 @@ paths:
               schema: { $ref: '#/components/schemas/Problem' }
         '404':
           description: Exporter not found in this tenant
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/siem/exporters/{id}/pause:
+    post:
+      summary: Pause a SIEM exporter
+      description: ACTIVE to PAUSED. A paused exporter accepts no events until resumed.
+      operationId: PauseExporter
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Exporter in its new status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SIEMExporter' }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to change that exporter (SIEM_EXPORTER_UPDATE)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Exporter not found in this tenant
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: The exporter is not in a status this change accepts
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/siem/exporters/{id}/resume:
+    post:
+      summary: Resume a paused SIEM exporter
+      description: PAUSED to ACTIVE.
+      operationId: ResumeExporter
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Exporter in its new status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SIEMExporter' }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to change that exporter (SIEM_EXPORTER_UPDATE)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Exporter not found in this tenant
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: The exporter is not in a status this change accepts
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/siem/exporters/{id}/disable:
+    post:
+      summary: Disable a SIEM exporter
+      description: ACTIVE or PAUSED to DISABLED, which is final.
+      operationId: DisableExporter
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Exporter in its new status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SIEMExporter' }
+        '401':
+          description: Missing tenant or principal
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: Not authorized to change that exporter (SIEM_EXPORTER_UPDATE)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: Exporter not found in this tenant
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: The exporter is not in a status this change accepts
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }

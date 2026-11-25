@@ -45,9 +45,7 @@ func (c *SpendControlsClient) SubmitCheck(ctx context.Context, tenantID, princip
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Tenant-Id", tenantID)
-	req.Header.Set("X-Principal-Id", principalID)
-	req.Header.Set("X-Correlation-ID", correlationID)
+	setEnvelope(req, tenantID, principalID, legalEntityID, correlationID, "spend-check:"+correlationID)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

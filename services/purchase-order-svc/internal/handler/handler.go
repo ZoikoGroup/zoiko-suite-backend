@@ -58,9 +58,10 @@ type PurchaseRequestClient interface {
 
 // Action types checked against authorization-svc. PO_ISSUE, PO_AMEND and
 // PO_CLOSE are the original three; the rest are new with the governed
-// lifecycle. Reads are scoped to the caller's tenant rather than authorized,
-// matching the rest of the commercial-ops chain.
+// lifecycle. PO_READ authorizes every read (purchase-request-svc's
+// authorizeRead shape); reads are also scoped to the caller's tenant.
 const (
+	actionReadOrder          = "PO_READ"
 	actionCreateOrder        = "PO_CREATE"
 	actionSubmitOrder        = "PO_SUBMIT"
 	actionApproveOrder       = "PO_APPROVE"
@@ -337,11 +338,80 @@ func (h *Handler) verifyApprovalBasis(ctx context.Context, tenantID, principalID
 
 // GetOrder returns the order with its lines.
 func (h *Handler) GetOrder(w http.ResponseWriter, r *http.Request) {
-	d, ok := h.loadDetail(w, r)
+	d, ok := h.loadDetailForRead(w, r)
 	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, d)
+}
+
+// readCaller resolves who is reading. A request with an X-Principal-Id is a
+// principal read and is authorized with PO_READ (checkRead). A request with no
+// principal is served ONLY when it declares itself an internal service call
+// (X-Source-Channel: system) — accounts-payable-svc's PO matching and
+// goods-service-receipt-svc's receipt validation read this way today; it is
+// still tenant-scoped. This is purchase-request-svc's authorizeRead rule.
+// That declaration is not verifiable (no service identity reaches this
+// service): the gateway always sets X-Principal-Id on edge traffic, so the
+// principal-less path is reachable only from inside the cluster. Anything else
+// is 401.
+func (h *Handler) readCaller(w http.ResponseWriter, r *http.Request) (principalID string, ok bool) {
+	principalID = r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		if strings.EqualFold(r.Header.Get("X-Source-Channel"), "system") {
+			return "", true
+		}
+		writeError(w, http.StatusUnauthorized, "identity_missing", domain.ErrIdentityMissing.Error())
+		return "", false
+	}
+	return principalID, true
+}
+
+// checkRead authorizes a principal's read in scope (a legal entity, or the
+// tenant when none is named): 403 on deny, 503 when authorization-svc cannot
+// answer. A declared internal service call (principalID "") is not checked.
+func (h *Handler) checkRead(w http.ResponseWriter, r *http.Request, principalID, scope string) bool {
+	if principalID == "" {
+		return true
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, scope, actionReadOrder); err != nil {
+		h.writeAuthzErr(w, err)
+		return false
+	}
+	return true
+}
+
+// loadDetailForRead resolves the caller, loads the order with its lines in the
+// caller's tenant and authorizes the read against the order's legal entity.
+func (h *Handler) loadDetailForRead(w http.ResponseWriter, r *http.Request) (*domain.OrderDetail, bool) {
+	principalID, ok := h.readCaller(w, r)
+	if !ok {
+		return nil, false
+	}
+	d, ok := h.loadDetail(w, r)
+	if !ok {
+		return nil, false
+	}
+	if !h.checkRead(w, r, principalID, d.LegalEntityID) {
+		return nil, false
+	}
+	return d, true
+}
+
+// loadHeaderForRead is loadDetailForRead for the header only.
+func (h *Handler) loadHeaderForRead(w http.ResponseWriter, r *http.Request, op string) (*domain.PurchaseOrder, bool) {
+	principalID, ok := h.readCaller(w, r)
+	if !ok {
+		return nil, false
+	}
+	po, ok := h.loadHeader(w, r, op)
+	if !ok {
+		return nil, false
+	}
+	if !h.checkRead(w, r, principalID, po.LegalEntityID) {
+		return nil, false
+	}
+	return po, true
 }
 
 func (h *Handler) loadDetail(w http.ResponseWriter, r *http.Request) (*domain.OrderDetail, bool) {
@@ -396,6 +466,17 @@ func (h *Handler) ListOrders(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
 		return
 	}
+	principalID, ok := h.readCaller(w, r)
+	if !ok {
+		return
+	}
+	scope := legalEntityID
+	if scope == "" {
+		scope = tenantID
+	}
+	if !h.checkRead(w, r, principalID, scope) {
+		return
+	}
 	list, err := h.store.ListOrders(r.Context(), domain.ListOrdersFilter{
 		TenantID: tenantID, LegalEntityID: legalEntityID, Status: q.Get("status"),
 	})
@@ -418,7 +499,7 @@ func (h *Handler) ListOrders(w http.ResponseWriter, r *http.Request) {
 // first. The order is resolved first so an unknown id is a 404 rather than an
 // empty list.
 func (h *Handler) ListAmendments(w http.ResponseWriter, r *http.Request) {
-	if _, ok := h.loadHeader(w, r, "ListAmendments"); !ok {
+	if _, ok := h.loadHeaderForRead(w, r, "ListAmendments"); !ok {
 		return
 	}
 	list, err := h.store.ListAmendments(r.Context(), chi.URLParam(r, "purchase_order_id"))
@@ -435,7 +516,7 @@ func (h *Handler) ListAmendments(w http.ResponseWriter, r *http.Request) {
 // ListRevisions: the superseded revisions (immutable snapshots), plus which
 // revision is current.
 func (h *Handler) ListRevisions(w http.ResponseWriter, r *http.Request) {
-	po, ok := h.loadHeader(w, r, "ListRevisions")
+	po, ok := h.loadHeaderForRead(w, r, "ListRevisions")
 	if !ok {
 		return
 	}
@@ -458,7 +539,7 @@ func (h *Handler) GetRevision(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_field", "revision must be a positive integer")
 		return
 	}
-	d, ok := h.loadDetail(w, r)
+	d, ok := h.loadDetailForRead(w, r)
 	if !ok {
 		return
 	}
@@ -486,7 +567,7 @@ func (h *Handler) GetRevision(w http.ResponseWriter, r *http.Request) {
 
 // GetHistory is the append-only transition history.
 func (h *Handler) GetHistory(w http.ResponseWriter, r *http.Request) {
-	po, ok := h.loadHeader(w, r, "GetHistory")
+	po, ok := h.loadHeaderForRead(w, r, "GetHistory")
 	if !ok {
 		return
 	}
@@ -504,6 +585,9 @@ func (h *Handler) GetHistory(w http.ResponseWriter, r *http.Request) {
 // GetOpenQuantity is the per-line ordered/received/invoiced/open figures
 // (cross-service contract #2).
 func (h *Handler) GetOpenQuantity(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.loadHeaderForRead(w, r, "GetOpenQuantity"); !ok {
+		return
+	}
 	lines, ok, err := h.store.OpenQuantity(r.Context(), chi.URLParam(r, "purchase_order_id"))
 	if err != nil {
 		h.writeStoreErr(w, "GetOpenQuantity", err)
@@ -528,6 +612,9 @@ func (h *Handler) GetInvoiceStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) fulfilment(w http.ResponseWriter, r *http.Request, name string, done func(domain.LineProgress) float64) {
+	if _, ok := h.loadHeaderForRead(w, r, "Get"+name+"Status"); !ok {
+		return
+	}
 	lines, ok, err := h.store.OpenQuantity(r.Context(), chi.URLParam(r, "purchase_order_id"))
 	if err != nil {
 		h.writeStoreErr(w, "Get"+name+"Status", err)
@@ -555,7 +642,7 @@ func (h *Handler) fulfilment(w http.ResponseWriter, r *http.Request, name string
 // maker-checker forbids this caller (an order's preparer/submitter is never
 // offered Approve).
 func (h *Handler) GetAvailableActions(w http.ResponseWriter, r *http.Request) {
-	po, ok := h.loadHeader(w, r, "GetAvailableActions")
+	po, ok := h.loadHeaderForRead(w, r, "GetAvailableActions")
 	if !ok {
 		return
 	}

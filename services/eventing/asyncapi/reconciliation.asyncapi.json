@@ -7,6 +7,9 @@
         "analyzed": {
           "$ref": "#/components/messages/job.analyzed"
         },
+        "archived": {
+          "$ref": "#/components/messages/job.archived"
+        },
         "resolution-recommended": {
           "$ref": "#/components/messages/job.resolution-recommended"
         },
@@ -28,6 +31,18 @@
         "summary": "Job: analyzed.",
         "title": "job analyzed",
         "x-zoiko-event-type": "com.zoikosuite.reconciliation.job.analyzed",
+        "x-zoiko-origin": "extension"
+      },
+      "job.archived": {
+        "contentType": "application/json",
+        "description": "Producer: Reconciliation Intelligence Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Reconciliation (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.reconciliation.job.archived",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Job: archived.",
+        "title": "job archived",
+        "x-zoiko-event-type": "com.zoikosuite.reconciliation.job.archived",
         "x-zoiko-origin": "extension"
       },
       "job.resolution-recommended": {
@@ -184,6 +199,9 @@
       "messages": [
         {
           "$ref": "#/channels/job/messages/analyzed"
+        },
+        {
+          "$ref": "#/channels/job/messages/archived"
         },
         {
           "$ref": "#/channels/job/messages/resolution-recommended"

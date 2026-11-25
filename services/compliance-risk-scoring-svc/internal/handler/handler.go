@@ -1,321 +1,440 @@
+// Package handler is the HTTP layer: it parses requests, builds the caller
+// context from the envelope headers and delegates every route to exactly one
+// method of internal/service. No business rule lives here.
 package handler
 
 import (
-	"context"
-	"encoding/json"
-	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
-	"zoiko.io/compliance-risk-scoring-svc/internal/authz"
 	"zoiko.io/compliance-risk-scoring-svc/internal/domain"
 	svcenvelope "zoiko.io/compliance-risk-scoring-svc/internal/envelope"
-	"zoiko.io/compliance-risk-scoring-svc/internal/events"
 	"zoiko.io/compliance-risk-scoring-svc/internal/health"
 	customMiddleware "zoiko.io/compliance-risk-scoring-svc/internal/middleware"
+	"zoiko.io/compliance-risk-scoring-svc/internal/problem"
+	"zoiko.io/compliance-risk-scoring-svc/internal/service"
 	"zoiko.io/compliance-risk-scoring-svc/internal/store"
 )
 
-// AuthZClient is the subset of the authz client used by write handlers to
-// enforce fail-closed authorization checks against authorization-svc.
-type AuthZClient interface {
-	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
-}
-
-const (
-	actionRiskScoreCreate         = "RISK_SCORE_CREATE"
-	actionRiskThresholdRuleCreate = "RISK_THRESHOLD_RULE_CREATE"
-	actionRiskAssessmentArchive   = "RISK_ASSESSMENT_ARCHIVE"
-)
-
+// Handler serves every route of the service.
 type Handler struct {
-	store     store.Store
-	publisher *events.Publisher
-	authz     AuthZClient
-	logger    *zap.Logger
+	service *service.Service
+	ready   health.Pinger
+	logger  *zap.Logger
 }
 
-func NewHandler(s store.Store, p *events.Publisher, a AuthZClient, l *zap.Logger) *Handler {
-	return &Handler{
-		store:     s,
-		publisher: p,
-		authz:     a,
-		logger:    l,
-	}
+// NewHandler builds a Handler. ready decides /readyz (normally the store).
+func NewHandler(svc *service.Service, ready health.Pinger, logger *zap.Logger) *Handler {
+	return &Handler{service: svc, ready: ready, logger: logger}
 }
 
+// NewRouter wires middleware and routes.
+//
+// Middleware order (house convention): RequestID, RealIP, Recoverer, tenant
+// gate, canonical input envelope. /healthz and /readyz are exempted by both
+// the tenant gate and the envelope policy, so probes need no headers.
 func NewRouter(h *Handler) http.Handler {
 	r := chi.NewRouter()
 
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
-	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
-
-	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
-	// Recoverer so a refusal is still traced, and ahead of every handler so no
-	// request reaches business logic without a resolved tenant, actor,
-	// correlation and — on material writes — an idempotency key.
-	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+	r.Use(customMiddleware.TenantMiddleware)
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	// /healthz stays OUTSIDE the tenant gate. Liveness and readiness
-	// probes carry no tenant, so a blanket tenant requirement would 401
-	// every probe and the orchestrator would restart the container in a
-	// loop — a security fix that takes the service down.
 	r.Get("/healthz", health.Handler())
+	r.Get("/readyz", health.ReadyHandler(h.ready))
 
-	// Everything below requires a gateway-verified tenant. Applied via
-	// With() on the route subtree rather than as a path exemption inside
-	// the middleware: comparing r.URL.Path to skip an auth gate is a
-	// classic bypass source (traversal, trailing slash, case). The route
-	// tree is the source of truth for what is and is not protected.
-	r.With(customMiddleware.TenantMiddleware).Route("/v1/risk-scores", func(r chi.Router) {
+	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
+		problem.Write(w, r, http.StatusNotFound, "route_not_found", "no route matches "+r.Method+" "+r.URL.Path, nil)
+	})
+	r.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
+		problem.Write(w, r, http.StatusMethodNotAllowed, "method_not_allowed", r.Method+" is not allowed on "+r.URL.Path, nil)
+	})
+
+	r.Route("/v1/risk-scores", func(r chi.Router) {
+		// Scores
 		r.Post("/calculate", h.CalculateRiskScore)
-		r.Get("/", h.ListAssessments)
+		r.Get("/", h.ListRiskScores)
+		r.Get("/model", h.GetScoringModel)
+		r.Get("/subjects/{subjectType}/{subjectId}/history", h.GetSubjectHistory)
+
+		// Threshold rules (static paths win over /{id} in chi)
 		r.Get("/thresholds", h.ListThresholdRules)
 		r.Post("/thresholds", h.CreateThresholdRule)
-		r.Get("/{id}", h.GetAssessmentByID)
-		r.Delete("/{id}", h.ArchiveAssessment)
+		r.Get("/thresholds/effective", h.GetEffectiveThresholds)
+		r.Get("/thresholds/{id}", h.GetThresholdRule)
+		r.Put("/thresholds/{id}", h.UpdateThresholdRule)
+		r.Post("/thresholds/{id}/approve", h.ApproveThresholdRule)
+		r.Post("/thresholds/{id}/retire", h.RetireThresholdRule)
+
+		r.Get("/{id}", h.GetRiskScore)
+		r.Post("/{id}/review", h.ReviewRiskScore)
+		r.Post("/{id}/archive", h.ArchiveRiskScore)
+		// DELETE is kept for clients of the 000001-era API. It archives —
+		// scores are never deleted.
+		r.Delete("/{id}", h.ArchiveRiskScore)
 	})
 
 	return r
 }
 
+// ---------------------------------------------------------------------------
+// Scores
+// ---------------------------------------------------------------------------
+
+// CalculateRiskScore handles POST /v1/risk-scores/calculate.
 func (h *Handler) CalculateRiskScore(w http.ResponseWriter, r *http.Request) {
-	tenantID := customMiddleware.GetTenantID(r.Context())
-
-	var req domain.CalculateRiskScoreRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	if err := req.Validate(); err != nil {
-		h.respondError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionRiskScoreCreate); err != nil {
-		h.writeAuthzErr(w, err)
-		return
-	}
-
-	compositeScore, tier, breakdowns := domain.ComputeRiskScore(&req, "", tenantID)
-
-	assessment := &domain.RiskScoreAssessment{
-		LegalEntityID:         req.LegalEntityID,
-		AssessmentName:        req.AssessmentName,
-		CompositeRiskScore:    compositeScore,
-		RiskTier:              tier,
-		OpenObligationsCount:  req.OpenObligationsCount,
-		PolicyViolationsCount: req.PolicyViolationsCount,
-		AuditExceptionsCount:  req.AuditExceptionsCount,
-		PrivacyIncidentsCount: req.PrivacyIncidentsCount,
-		TaxPenaltiesCount:     req.TaxPenaltiesCount,
-		Status:                "ACTIVE",
-	}
-
-	if err := h.store.CreateAssessment(r.Context(), tenantID, assessment, breakdowns); err != nil {
-		h.logger.Error("failed to save risk assessment", zap.Error(err))
-		h.respondError(w, http.StatusInternalServerError, "failed to calculate risk score")
-		return
-	}
-
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "risk_score.calculated", SubjectID: assessment.ID, TenantID: tenantID,
-		LegalEntityID: assessment.LegalEntityID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: assessment,
-	})
-
-	if tier == domain.TierHigh || tier == domain.TierCritical {
-		_ = h.publisher.Publish(r.Context(), events.PublishParams{
-			EventType: "risk_threshold.exceeded", SubjectID: assessment.ID, TenantID: tenantID,
-			LegalEntityID: assessment.LegalEntityID, ActorID: principalID,
-			CorrelationID: r.Header.Get("X-Correlation-ID"),
-			Payload: map[string]interface{}{
-				"assessment_id": assessment.ID,
-				"risk_tier":     tier,
-				"score":         compositeScore,
-			},
-		})
-	}
-
-	h.respondJSON(w, http.StatusCreated, assessment)
-}
-
-func (h *Handler) ListAssessments(w http.ResponseWriter, r *http.Request) {
-	tenantID := customMiddleware.GetTenantID(r.Context())
-	legalEntityID := r.URL.Query().Get("legal_entity_id")
-	tier := r.URL.Query().Get("risk_tier")
-
-	assessments, err := h.store.ListAssessments(r.Context(), tenantID, legalEntityID, tier)
+	var request domain.CalculateRiskScoreRequest
+	cmd, err := readCommand(w, r, &request, false)
 	if err != nil {
-		h.logger.Error("failed to list assessments", zap.Error(err))
-		h.respondError(w, http.StatusInternalServerError, "failed to query assessments")
+		h.writeError(w, r, err)
 		return
 	}
-
-	if assessments == nil {
-		assessments = []domain.RiskScoreAssessment{}
-	}
-
-	h.respondJSON(w, http.StatusOK, map[string]interface{}{
-		"data":  assessments,
-		"count": len(assessments),
-	})
-}
-
-func (h *Handler) GetAssessmentByID(w http.ResponseWriter, r *http.Request) {
-	tenantID := customMiddleware.GetTenantID(r.Context())
-	id := chi.URLParam(r, "id")
-
-	assessment, err := h.store.GetAssessmentByID(r.Context(), tenantID, id)
+	result, err := h.service.CalculateScore(r.Context(), cmd, request)
 	if err != nil {
-		h.respondError(w, http.StatusNotFound, "risk assessment not found")
+		h.writeError(w, r, err)
 		return
 	}
-
-	h.respondJSON(w, http.StatusOK, assessment)
+	writeCommandResult(w, result)
 }
 
+// ListRiskScores handles GET /v1/risk-scores.
+func (h *Handler) ListRiskScores(w http.ResponseWriter, r *http.Request) {
+	query, err := queryContext(r)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	filter, err := assessmentFilter(r)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	page, err := pageRequest(r)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	result, err := h.service.ListScores(r.Context(), query, filter, page)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// GetRiskScore handles GET /v1/risk-scores/{id}.
+func (h *Handler) GetRiskScore(w http.ResponseWriter, r *http.Request) {
+	query, err := queryContext(r)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	id, err := uuidParam(r, "id")
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	assessment, err := h.service.GetScore(r.Context(), query, id)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	w.Header().Set("ETag", service.ETagForVersion(assessment.Version))
+	writeJSON(w, http.StatusOK, assessment)
+}
+
+// GetSubjectHistory handles GET /v1/risk-scores/subjects/{subjectType}/{subjectId}/history.
+func (h *Handler) GetSubjectHistory(w http.ResponseWriter, r *http.Request) {
+	query, err := queryContext(r)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	subjectType, subjectID, err := subjectParams(r)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	page, err := pageRequest(r)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	history, err := h.service.GetSubjectHistory(r.Context(), query, subjectType, subjectID, page)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, history)
+}
+
+// ReviewRiskScore handles POST /v1/risk-scores/{id}/review.
+func (h *Handler) ReviewRiskScore(w http.ResponseWriter, r *http.Request) {
+	id, err := uuidParam(r, "id")
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	var request domain.ReviewRiskScoreRequest
+	cmd, err := readCommand(w, r, &request, false)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	result, err := h.service.ReviewScore(r.Context(), cmd, id, request)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	writeCommandResult(w, result)
+}
+
+// ArchiveRiskScore handles POST /v1/risk-scores/{id}/archive and the legacy
+// DELETE /v1/risk-scores/{id}. The body ({"reason": "..."}) is optional.
+func (h *Handler) ArchiveRiskScore(w http.ResponseWriter, r *http.Request) {
+	id, err := uuidParam(r, "id")
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	var request domain.ArchiveRiskScoreRequest
+	cmd, err := readCommand(w, r, &request, true)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	result, err := h.service.ArchiveScore(r.Context(), cmd, id, request)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	writeCommandResult(w, result)
+}
+
+// GetScoringModel handles GET /v1/risk-scores/model: the factor weights,
+// saturation points and default bands every score is computed with, so a
+// stored factor breakdown can be re-derived by hand.
+func (h *Handler) GetScoringModel(w http.ResponseWriter, r *http.Request) {
+	if _, err := queryContext(r); err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, domain.CurrentModel)
+}
+
+// ---------------------------------------------------------------------------
+// Threshold rules
+// ---------------------------------------------------------------------------
+
+// CreateThresholdRule handles POST /v1/risk-scores/thresholds.
 func (h *Handler) CreateThresholdRule(w http.ResponseWriter, r *http.Request) {
-	tenantID := customMiddleware.GetTenantID(r.Context())
-
-	var body struct {
-		domain.RiskThresholdRule
-		LegalEntityID string `json:"legal_entity_id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		h.respondError(w, http.StatusBadRequest, "invalid request body")
+	var input domain.ThresholdRuleInput
+	cmd, err := readCommand(w, r, &input, false)
+	if err != nil {
+		h.writeError(w, r, err)
 		return
 	}
-	rule := body.RiskThresholdRule
-
-	if rule.RuleName == "" || rule.RiskCategory == "" {
-		h.respondError(w, http.StatusBadRequest, "rule_name and risk_category are required")
+	result, err := h.service.CreateThresholdRule(r.Context(), cmd, input)
+	if err != nil {
+		h.writeError(w, r, err)
 		return
 	}
-	if body.LegalEntityID == "" {
-		h.respondError(w, http.StatusBadRequest, "legal_entity_id is required")
-		return
-	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, body.LegalEntityID, actionRiskThresholdRuleCreate); err != nil {
-		h.writeAuthzErr(w, err)
-		return
-	}
-
-	if rule.HighThreshold == 0 {
-		rule.HighThreshold = 60.0
-	}
-	if rule.CriticalThreshold == 0 {
-		rule.CriticalThreshold = 80.0
-	}
-	if rule.NotificationChannel == "" {
-		rule.NotificationChannel = "GOVERNANCE_DESK"
-	}
-	rule.IsActive = true
-
-	if err := h.store.CreateThresholdRule(r.Context(), tenantID, &rule); err != nil {
-		h.logger.Error("failed to create threshold rule", zap.Error(err))
-		h.respondError(w, http.StatusInternalServerError, "failed to create threshold rule")
-		return
-	}
-
-	h.respondJSON(w, http.StatusCreated, rule)
+	writeCommandResult(w, result)
 }
 
+// ListThresholdRules handles GET /v1/risk-scores/thresholds.
 func (h *Handler) ListThresholdRules(w http.ResponseWriter, r *http.Request) {
-	tenantID := customMiddleware.GetTenantID(r.Context())
-
-	rules, err := h.store.ListThresholdRules(r.Context(), tenantID)
+	query, err := queryContext(r)
 	if err != nil {
-		h.logger.Error("failed to list threshold rules", zap.Error(err))
-		h.respondError(w, http.StatusInternalServerError, "failed to query threshold rules")
+		h.writeError(w, r, err)
 		return
 	}
-
-	if rules == nil {
-		rules = []domain.RiskThresholdRule{}
-	}
-
-	h.respondJSON(w, http.StatusOK, map[string]interface{}{
-		"data":  rules,
-		"count": len(rules),
-	})
-}
-
-func (h *Handler) ArchiveAssessment(w http.ResponseWriter, r *http.Request) {
-	tenantID := customMiddleware.GetTenantID(r.Context())
-	id := chi.URLParam(r, "id")
-
-	assessment, err := h.store.GetAssessmentByID(r.Context(), tenantID, id)
+	status, err := enumQuery(r, "status", func(v string) bool { return domain.ThresholdStatus(v).IsValid() },
+		"DRAFT, ACTIVE, SUPERSEDED, RETIRED")
 	if err != nil {
-		h.respondError(w, http.StatusNotFound, "assessment not found")
+		h.writeError(w, r, err)
 		return
 	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
+	category, err := enumQuery(r, "risk_category", func(v string) bool { return domain.RiskCategory(v).IsThresholdCategory() },
+		"COMPOSITE, REGULATORY_OBLIGATIONS, POLICY_VIOLATIONS, AUDIT_EXCEPTIONS, DATA_PRIVACY, TAX_COMPLIANCE")
+	if err != nil {
+		h.writeError(w, r, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, assessment.LegalEntityID, actionRiskAssessmentArchive); err != nil {
-		h.writeAuthzErr(w, err)
+	page, err := pageRequest(r)
+	if err != nil {
+		h.writeError(w, r, err)
 		return
 	}
-
-	if err := h.store.ArchiveAssessment(r.Context(), tenantID, id); err != nil {
-		h.respondError(w, http.StatusNotFound, "assessment not found")
+	result, err := h.service.ListThresholdRules(r.Context(), query, store.ThresholdFilter{Status: status, RiskCategory: category}, page)
+	if err != nil {
+		h.writeError(w, r, err)
 		return
 	}
-
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "risk_assessment.archived", SubjectID: id, TenantID: tenantID,
-		LegalEntityID: assessment.LegalEntityID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"),
-		Payload:       map[string]string{"id": id, "status": "ARCHIVED"},
-	})
-
-	h.respondJSON(w, http.StatusOK, map[string]string{
-		"message": "risk assessment archived successfully",
-		"id":      id,
-	})
+	writeJSON(w, http.StatusOK, result)
 }
 
-func (h *Handler) respondJSON(w http.ResponseWriter, code int, payload interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(payload)
-}
-
-func (h *Handler) respondError(w http.ResponseWriter, code int, message string) {
-	h.respondJSON(w, code, map[string]string{"error": message})
-}
-
-func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
-	principalID := r.Header.Get("X-Principal-Id")
-	if principalID == "" {
-		h.respondError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
-		return "", false
-	}
-	return principalID, true
-}
-
-func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
-	if errors.Is(err, authz.ErrAuthorizationDenied) {
-		h.respondError(w, http.StatusForbidden, "not authorized to perform this action")
+// GetEffectiveThresholds handles GET /v1/risk-scores/thresholds/effective?as_of=YYYY-MM-DD.
+func (h *Handler) GetEffectiveThresholds(w http.ResponseWriter, r *http.Request) {
+	query, err := queryContext(r)
+	if err != nil {
+		h.writeError(w, r, err)
 		return
 	}
-	h.respondError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+	asOf, err := dateQuery(r, "as_of")
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	result, err := h.service.GetEffectiveThresholds(r.Context(), query, asOf)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// GetThresholdRule handles GET /v1/risk-scores/thresholds/{id}.
+func (h *Handler) GetThresholdRule(w http.ResponseWriter, r *http.Request) {
+	query, err := queryContext(r)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	id, err := uuidParam(r, "id")
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	rule, err := h.service.GetThresholdRule(r.Context(), query, id)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	w.Header().Set("ETag", service.ETagForVersion(rule.Version))
+	writeJSON(w, http.StatusOK, rule)
+}
+
+// UpdateThresholdRule handles PUT /v1/risk-scores/thresholds/{id} (DRAFT
+// only, If-Match required).
+func (h *Handler) UpdateThresholdRule(w http.ResponseWriter, r *http.Request) {
+	id, err := uuidParam(r, "id")
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	var input domain.ThresholdRuleInput
+	cmd, err := readCommand(w, r, &input, false)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	result, err := h.service.UpdateThresholdRule(r.Context(), cmd, id, input)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	writeCommandResult(w, result)
+}
+
+// ApproveThresholdRule handles POST /v1/risk-scores/thresholds/{id}/approve.
+func (h *Handler) ApproveThresholdRule(w http.ResponseWriter, r *http.Request) {
+	id, err := uuidParam(r, "id")
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	var request domain.ThresholdTransitionRequest
+	cmd, err := readCommand(w, r, &request, true)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	result, err := h.service.ApproveThresholdRule(r.Context(), cmd, id, request)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	writeCommandResult(w, result)
+}
+
+// RetireThresholdRule handles POST /v1/risk-scores/thresholds/{id}/retire.
+func (h *Handler) RetireThresholdRule(w http.ResponseWriter, r *http.Request) {
+	id, err := uuidParam(r, "id")
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	var request domain.ThresholdTransitionRequest
+	cmd, err := readCommand(w, r, &request, true)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	result, err := h.service.RetireThresholdRule(r.Context(), cmd, id, request)
+	if err != nil {
+		h.writeError(w, r, err)
+		return
+	}
+	writeCommandResult(w, result)
+}
+
+// ---------------------------------------------------------------------------
+// Query parsing helpers specific to these routes
+// ---------------------------------------------------------------------------
+
+func assessmentFilter(r *http.Request) (store.AssessmentFilter, error) {
+	var filter store.AssessmentFilter
+	var err error
+
+	filter.LegalEntityID = strings.TrimSpace(r.URL.Query().Get("legal_entity_id"))
+	if len(filter.LegalEntityID) > domain.MaxIdentifierLength {
+		return filter, domain.BadRequest("invalid_filter", "legal_entity_id must be at most 64 characters")
+	}
+	if filter.RiskTier, err = enumQuery(r, "risk_tier", func(v string) bool { return domain.RiskTier(v).IsValid() },
+		"LOW, MODERATE, HIGH, CRITICAL"); err != nil {
+		return filter, err
+	}
+	if filter.Status, err = enumQuery(r, "status", func(v string) bool { return domain.ScoreStatus(v).IsValid() },
+		"ACTIVE, SUPERSEDED, ARCHIVED"); err != nil {
+		return filter, err
+	}
+	if filter.ReviewStatus, err = enumQuery(r, "review_status", isReviewStatus,
+		"NOT_REQUIRED, PENDING_REVIEW, CONFIRMED, DISMISSED, ESCALATED"); err != nil {
+		return filter, err
+	}
+	if filter.SubjectType, err = enumQuery(r, "subject_type", func(v string) bool { return domain.SubjectType(v).IsValid() },
+		"LEGAL_ENTITY, OBLIGATION, FILING, CONTROL"); err != nil {
+		return filter, err
+	}
+	filter.SubjectID = strings.TrimSpace(r.URL.Query().Get("subject_id"))
+	if len(filter.SubjectID) > domain.MaxSubjectIDLength {
+		return filter, domain.BadRequest("invalid_filter", "subject_id must be at most 128 characters")
+	}
+	return filter, nil
+}
+
+func isReviewStatus(value string) bool {
+	switch domain.ReviewStatus(value) {
+	case domain.ReviewNotRequired, domain.ReviewPending, domain.ReviewConfirmed, domain.ReviewDismissed, domain.ReviewEscalated:
+		return true
+	}
+	return false
+}
+
+func subjectParams(r *http.Request) (domain.SubjectType, string, error) {
+	subjectType := domain.SubjectType(strings.ToUpper(chi.URLParam(r, "subjectType")))
+	if !subjectType.IsValid() {
+		return "", "", domain.BadRequest("invalid_subject_type", "subjectType must be one of LEGAL_ENTITY, OBLIGATION, FILING, CONTROL")
+	}
+	subjectID := chi.URLParam(r, "subjectId")
+	if subjectID == "" || len(subjectID) > domain.MaxSubjectIDLength {
+		return "", "", domain.BadRequest("invalid_subject_id", "subjectId must be 1..128 characters")
+	}
+	return subjectType, subjectID, nil
 }

@@ -45,8 +45,7 @@ func (c *PurchaseOrderClient) IssueOrder(ctx context.Context, tenantID, principa
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Tenant-Id", tenantID)
-	req.Header.Set("X-Principal-Id", principalID)
+	setEnvelope(req, tenantID, principalID, legalEntityID, caseID, "issue-order:"+caseID)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

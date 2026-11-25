@@ -25,4 +25,6 @@ WORKDIR /app
 COPY --from=builder /server /app/server
 COPY --from=builder /healthcheck /app/healthcheck
 EXPOSE 8144
+# cmd/healthcheck probes the public /healthz endpoint.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD ["/app/healthcheck"]
 ENTRYPOINT ["/app/server"]

@@ -43,7 +43,7 @@ func TestAnalyze_UpstreamAmountInexact_RefusedNoJob(t *testing.T) {
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("expected 502, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if jobs, _ := memStore.ListJobs(t.Context(), "tenant-test", "LE-1", "", ""); len(jobs) != 0 {
+	if jobs, _ := memStore.ListJobs(t.Context(), "tenant-test", "LE-1", "", "", 0, 0); len(jobs) != 0 {
 		t.Fatalf("a refused analysis must not create a job, found %d", len(jobs))
 	}
 }

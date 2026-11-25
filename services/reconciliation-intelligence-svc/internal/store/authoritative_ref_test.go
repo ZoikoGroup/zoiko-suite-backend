@@ -31,7 +31,7 @@ func approvedSuggestion(t *testing.T, s *store.PgStore, tenantID string, rec dom
 		t.Fatalf("CreateJob: %v", err)
 	}
 	itemID = job.UnmatchedItems[0].ID
-	if _, err := s.ApplyResolution(ctx, tenantID, job.ID, itemID, domain.StatusApproved, "", nil, job.LegalEntityID, "actor-2", "corr-2"); err != nil {
+	if _, err := s.ApplyResolution(ctx, tenantID, job.ID, itemID, domain.StatusApproved, "", nil, job.LegalEntityID, "actor-2", "corr-2", 0); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
 	return job.ID, itemID
@@ -50,7 +50,7 @@ func TestPgStore_ExecutedAccountingAction_RecordsJournalRef(t *testing.T) {
 		tenantID := uuid.New().String()
 		jobID, itemID := approvedSuggestion(t, s, tenantID, rec)
 
-		_, err := s.ApplyResolution(ctx, tenantID, jobID, itemID, domain.StatusExecuted, "posted JE-1042", nil, "le-us", "actor-3", "corr-3")
+		_, err := s.ApplyResolution(ctx, tenantID, jobID, itemID, domain.StatusExecuted, "posted JE-1042", nil, "le-us", "actor-3", "corr-3", 0)
 		if !errors.Is(err, domain.ErrAuthoritativeRefRequired) {
 			t.Fatalf("%s EXECUTED without a journal: %v, want ErrAuthoritativeRefRequired", rec, err)
 		}
@@ -60,7 +60,7 @@ func TestPgStore_ExecutedAccountingAction_RecordsJournalRef(t *testing.T) {
 		}
 
 		ref := &domain.AuthoritativeRef{Kind: domain.AuthoritativeRefGLJournal, JournalID: testJournalID}
-		executed, err := s.ApplyResolution(ctx, tenantID, jobID, itemID, domain.StatusExecuted, "", ref, "le-us", "actor-3", "corr-3")
+		executed, err := s.ApplyResolution(ctx, tenantID, jobID, itemID, domain.StatusExecuted, "", ref, "le-us", "actor-3", "corr-3", 0)
 		if err != nil || executed.AuthoritativeRef == nil || executed.AuthoritativeRef.JournalID != testJournalID {
 			t.Fatalf("%s EXECUTED with a journal: %+v %v", rec, executed, err)
 		}
@@ -99,20 +99,20 @@ func TestPgStore_ManualReviewReferenceIsOptional(t *testing.T) {
 	if err != nil || got.UnmatchedItems[0].AuthoritativeRef != nil {
 		t.Fatalf("APPROVED suggestion read back with a reference: %+v %v", got, err)
 	}
-	if _, err := s.ApplyResolution(ctx, tenantID, jobID, itemID, domain.StatusExecuted, "reviewed; bank corrected the line", nil, "le-us", "actor-3", "corr-3"); err != nil {
+	if _, err := s.ApplyResolution(ctx, tenantID, jobID, itemID, domain.StatusExecuted, "reviewed; bank corrected the line", nil, "le-us", "actor-3", "corr-3", 0); err != nil {
 		t.Fatalf("MANUAL_REVIEW EXECUTED without a journal: %v", err)
 	}
 
 	tenantID = uuid.New().String()
 	jobID, itemID = approvedSuggestion(t, s, tenantID, domain.RecommendationManualReview)
 	ref := &domain.AuthoritativeRef{Kind: domain.AuthoritativeRefGLJournal, JournalID: testJournalID}
-	if _, err := s.ApplyResolution(ctx, tenantID, jobID, itemID, domain.StatusExecuted, "", ref, "le-us", "actor-3", "corr-3"); err != nil {
+	if _, err := s.ApplyResolution(ctx, tenantID, jobID, itemID, domain.StatusExecuted, "", ref, "le-us", "actor-3", "corr-3", 0); err != nil {
 		t.Fatalf("MANUAL_REVIEW EXECUTED with a journal: %v", err)
 	}
 
 	tenantID = uuid.New().String()
 	jobID, itemID = approvedSuggestion(t, s, tenantID, domain.RecommendationConfirmDuplicate)
-	if _, err := s.ApplyResolution(ctx, tenantID, jobID, itemID, domain.StatusExecuted, "", ref, "le-us", "actor-3", "corr-3"); !errors.Is(err, domain.ErrInvalidAuthoritativeRef) {
+	if _, err := s.ApplyResolution(ctx, tenantID, jobID, itemID, domain.StatusExecuted, "", ref, "le-us", "actor-3", "corr-3", 0); !errors.Is(err, domain.ErrInvalidAuthoritativeRef) {
 		t.Fatalf("CONFIRM_DUPLICATE EXECUTED with a journal: %v, want ErrInvalidAuthoritativeRef", err)
 	}
 }
@@ -195,7 +195,7 @@ func TestMigration000007_LegacyExecutionsStandAndDownRefuses(t *testing.T) {
 	tenantID = uuid.New().String()
 	jobID, itemID := approvedSuggestion(t, s, tenantID, domain.RecommendationWriteOff)
 	ref := &domain.AuthoritativeRef{Kind: domain.AuthoritativeRefGLJournal, JournalID: testJournalID}
-	if _, err := s.ApplyResolution(ctx, tenantID, jobID, itemID, domain.StatusExecuted, "", ref, "le-us", "actor-3", "corr-3"); err != nil {
+	if _, err := s.ApplyResolution(ctx, tenantID, jobID, itemID, domain.StatusExecuted, "", ref, "le-us", "actor-3", "corr-3", 0); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	_, err = pool.Exec(ctx, down)

@@ -21,9 +21,11 @@ import (
 	"zoiko.io/tax-determination-svc/internal/events"
 	"zoiko.io/tax-determination-svc/internal/handler"
 	"zoiko.io/tax-determination-svc/internal/health"
+	"zoiko.io/tax-determination-svc/internal/idempotency"
 	"zoiko.io/tax-determination-svc/internal/jurisdiction"
 	"zoiko.io/tax-determination-svc/internal/middleware"
 	"zoiko.io/tax-determination-svc/internal/mtls"
+	"zoiko.io/tax-determination-svc/internal/outbox"
 	"zoiko.io/tax-determination-svc/internal/registry"
 	"zoiko.io/tax-determination-svc/internal/rules"
 	"zoiko.io/tax-determination-svc/internal/store"
@@ -91,7 +93,15 @@ func main() {
 	jurisdictionClient := jurisdiction.NewClient(cfg.JurisdictionRulesURL)
 	registryClient := registry.NewClient(cfg.TenantEntityRegistryURL)
 
-	h := handler.New(pgStore, publisher, authzClient, rulesClient, jurisdictionClient, registryClient, logger)
+	h := handler.New(pgStore, authzClient, rulesClient, jurisdictionClient, registryClient, logger)
+
+	// Transactional outbox relay: delivers the events the store writes in the
+	// same transaction as each change, retrying until Kafka accepts them.
+	relayCtx, relayCancel := context.WithCancel(context.Background())
+	defer relayCancel()
+	if pool != nil {
+		go outbox.NewRelay(pool, publisher, 1500*time.Millisecond, 50, logger).Start(relayCtx)
+	}
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -105,6 +115,11 @@ func main() {
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+
+	// Replay protection for material writes: a retried POST/PUT with the same
+	// Idempotency-Key gets the first answer instead of running twice. Placed after
+	// the envelope middleware, which guarantees the key and tenant are present.
+	r.Use(idempotency.Middleware(idempotency.NewPgStore(pool), logger))
 
 	r.Get("/healthz", health.HealthzHandler)
 	r.Get("/readyz", health.ReadyzHandler(pool))
@@ -134,6 +149,7 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
+	relayCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("server shutdown forced", zap.Error(err))
 	}

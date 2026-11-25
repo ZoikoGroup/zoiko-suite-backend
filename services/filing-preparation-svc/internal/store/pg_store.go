@@ -2,11 +2,13 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/filing-preparation-svc/internal/domain"
@@ -81,6 +83,9 @@ func (s *PgStore) Create(ctx context.Context, d *domain.FilingDraft) error {
 		string(d.ValidationStatus), d.BlockReasons, d.Notes, d.CreatedBy, d.CreatedAt, d.UpdatedAt,
 	)
 	if err != nil {
+		if isUniqueViolation(err) {
+			return domain.ErrDuplicateDraft
+		}
 		return fmt.Errorf("insert filing draft: %w", err)
 	}
 	return tx.Commit(ctx)
@@ -100,7 +105,7 @@ func (s *PgStore) GetByID(ctx context.Context, id string) (*domain.FilingDraft, 
 	var statusStr string
 	err = tx.QueryRow(ctx, `
 		SELECT draft_id, tenant_id, legal_entity_id, jurisdiction_id, filing_type,
-		       period_key, due_date, payload_data, evidence_manifest_ref,
+		       period_key, due_date::text, payload_data, evidence_manifest_ref,
 		       validation_status, block_reasons, notes, created_by, created_at, updated_at
 		FROM filing_drafts WHERE draft_id = $1`, id,
 	).Scan(
@@ -131,7 +136,7 @@ func (s *PgStore) List(ctx context.Context, legalEntityID, jurisdictionID, filin
 
 	rows, err := tx.Query(ctx, `
 		SELECT draft_id, tenant_id, legal_entity_id, jurisdiction_id, filing_type,
-		       period_key, due_date, payload_data, evidence_manifest_ref,
+		       period_key, due_date::text, payload_data, evidence_manifest_ref,
 		       validation_status, block_reasons, notes, created_by, created_at, updated_at
 		FROM filing_drafts
 		WHERE ($1 = '' OR legal_entity_id = $1)
@@ -172,6 +177,15 @@ func (s *PgStore) Update(ctx context.Context, d *domain.FilingDraft) error {
 	defer func() { _ = tx.Rollback(ctx) }()
 	if err := s.setRLS(ctx, tx); err != nil {
 		return err
+	}
+	// A draft handed over for submission is frozen: what was finalized is
+	// what gets filed.
+	current, err := lockDraftStatus(ctx, tx, d.DraftID)
+	if err != nil {
+		return err
+	}
+	if current == domain.StatusReadyForSubmission {
+		return domain.ErrDraftAlreadyFinal
 	}
 	d.UpdatedAt = time.Now().UTC()
 
@@ -230,21 +244,6 @@ func (s *PgStore) Finalize(ctx context.Context, id string, req *domain.FinalizeD
 	if err != nil {
 		return nil, err
 	}
-	if d.ValidationStatus != domain.StatusPrepared {
-		if d.ValidationStatus == domain.StatusBlocked {
-			return nil, domain.ErrValidationBlocked
-		}
-		if d.ValidationStatus == domain.StatusReadyForSubmission {
-			return nil, domain.ErrDraftAlreadyFinal
-		}
-		return nil, domain.ErrValidationRequired
-	}
-
-	d.ValidationStatus = domain.StatusReadyForSubmission
-	if req.Notes != "" {
-		d.Notes = req.Notes
-	}
-	d.UpdatedAt = time.Now().UTC()
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -254,6 +253,28 @@ func (s *PgStore) Finalize(ctx context.Context, id string, req *domain.FinalizeD
 	if err := s.setRLS(ctx, tx); err != nil {
 		return nil, err
 	}
+
+	// Evidence before completion: only a draft whose evidence validation
+	// passed (PREPARED) may be finalized. Checked under the row lock.
+	current, err := lockDraftStatus(ctx, tx, id)
+	if err != nil {
+		return nil, err
+	}
+	switch current {
+	case domain.StatusPrepared:
+	case domain.StatusBlocked:
+		return nil, domain.ErrValidationBlocked
+	case domain.StatusReadyForSubmission:
+		return nil, domain.ErrDraftAlreadyFinal
+	default:
+		return nil, domain.ErrDraftNotPrepared
+	}
+
+	d.ValidationStatus = domain.StatusReadyForSubmission
+	if req.Notes != "" {
+		d.Notes = req.Notes
+	}
+	d.UpdatedAt = time.Now().UTC()
 
 	_, err = tx.Exec(ctx, `
 		UPDATE filing_drafts
@@ -268,4 +289,20 @@ func (s *PgStore) Finalize(ctx context.Context, id string, req *domain.FinalizeD
 		return nil, err
 	}
 	return d, nil
+}
+
+// lockDraftStatus reads a draft's validation_status under FOR UPDATE.
+func lockDraftStatus(ctx context.Context, tx pgx.Tx, id string) (domain.ValidationStatus, error) {
+	var status string
+	err := tx.QueryRow(ctx, `SELECT validation_status FROM filing_drafts WHERE draft_id=$1 FOR UPDATE`, id).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", domain.ErrDraftNotFound
+	}
+	return domain.ValidationStatus(status), err
+}
+
+// isUniqueViolation reports a Postgres 23505 (unique_violation).
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }

@@ -11,7 +11,6 @@ import (
 
 	"zoiko.io/compliance-status-svc/internal/authz"
 	"zoiko.io/compliance-status-svc/internal/domain"
-	"zoiko.io/compliance-status-svc/internal/events"
 	"zoiko.io/compliance-status-svc/internal/middleware"
 	"zoiko.io/compliance-status-svc/internal/store"
 )
@@ -23,6 +22,18 @@ const (
 	actionComplianceStatusEvaluate = "COMPLIANCE_STATUS_EVALUATE"
 	actionComplianceGapCreate      = "COMPLIANCE_GAP_CREATE"
 	actionComplianceGapResolve     = "COMPLIANCE_GAP_RESOLVE"
+
+	// Read actions: GET /, GET /{id} and GET /gaps used to be served to any
+	// caller in the tenant without an authorization decision.
+	actionComplianceStatusRead = "COMPLIANCE_STATUS_READ"
+	actionComplianceGapRead    = "COMPLIANCE_GAP_READ"
+)
+
+// Stable error codes for refusals added by the actor and segregation-of-
+// duties rules.
+const (
+	codeActorMismatch       = "actor_mismatch"
+	codeSegregationOfDuties = "segregation_of_duties"
 )
 
 // AuthZClient checks whether a principal is authorized to perform an action
@@ -31,15 +42,46 @@ type AuthZClient interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
 }
 
+// Handler serves the compliance-status API. Events are not published from
+// here: every write emits its event through the store's transactional
+// outbox, delivered by internal/outbox.Relay.
 type Handler struct {
-	store     store.Store
-	publisher events.Publisher
-	authz     AuthZClient
-	logger    *zap.Logger
+	store  store.Store
+	authz  AuthZClient
+	logger *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthZClient, logger *zap.Logger) *Handler {
-	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+func New(st store.Store, az AuthZClient, logger *zap.Logger) *Handler {
+	return &Handler{store: st, authz: az, logger: logger}
+}
+
+// eventMeta is the acting principal and correlation of a write.
+func eventMeta(r *http.Request, principalID string) store.EventMeta {
+	return store.EventMeta{ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID")}
+}
+
+// authorizeRead requires a principal (401) holding action for scope (403 on
+// deny, 503 when authorization-svc is unreachable). Pattern:
+// purchase-request-svc authorizeRead.
+func (h *Handler) authorizeRead(w http.ResponseWriter, r *http.Request, scope, action string) bool {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return false
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, scope, action); err != nil {
+		h.writeAuthzErr(w, err)
+		return false
+	}
+	return true
+}
+
+// listScope is the legal entity a list is filtered to, or the tenant when it
+// spans entities (purchase-request-svc ListRequests).
+func listScope(r *http.Request) string {
+	if le := r.URL.Query().Get("legal_entity_id"); le != "" {
+		return le
+	}
+	return middleware.GetTenantID(r.Context())
 }
 
 // requirePrincipal extracts the calling principal from the X-Principal-Id
@@ -97,6 +139,12 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
+	// The actor is the authenticated principal: an absent created_by is
+	// filled from it, a different one is refused.
+	if req.CreatedBy != "" && req.CreatedBy != principalID {
+		writeCoded(w, http.StatusForbidden, codeActorMismatch, "created_by must be the authenticated principal (X-Principal-Id)")
+		return
+	}
 
 	c := &domain.ComplianceHealth{
 		TenantID:             tenantID,
@@ -110,24 +158,22 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 		OpenExceptions:       req.OpenExceptions,
 		Notes:                req.Notes,
 		EffectiveFrom:        req.EffectiveFrom,
-		CreatedBy:            req.CreatedBy,
+		CreatedBy:            principalID,
 	}
 
-	if err := h.store.Evaluate(r.Context(), c); err != nil {
+	if err := h.store.Evaluate(r.Context(), c, eventMeta(r, principalID)); err != nil {
 		h.logger.Error("evaluate compliance status failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to evaluate compliance status")
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "compliance.status.changed", SubjectID: c.StatusID, TenantID: tenantID,
-		LegalEntityID: c.LegalEntityID, Jurisdiction: c.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: c,
-	})
 	writeJSON(w, http.StatusOK, c)
 }
 
 func (h *Handler) GetByID(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	c, err := h.store.GetByID(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, domain.ErrStatusRecordNotFound) {
@@ -135,6 +181,9 @@ func (h *Handler) GetByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to get compliance status record")
+		return
+	}
+	if !h.authorizeRead(w, r, c.LegalEntityID, actionComplianceStatusRead) {
 		return
 	}
 	writeJSON(w, http.StatusOK, c)
@@ -145,6 +194,10 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	jurisdictionID := r.URL.Query().Get("jurisdiction_id")
 	domainName := r.URL.Query().Get("domain_name")
 	status := r.URL.Query().Get("status")
+
+	if !h.authorizeRead(w, r, listScope(r), actionComplianceStatusRead) {
+		return
+	}
 
 	records, err := h.store.List(r.Context(), legalEntityID, jurisdictionID, domainName, status)
 	if err != nil {
@@ -194,16 +247,11 @@ func (h *Handler) CreateGap(w http.ResponseWriter, r *http.Request) {
 		RemediationPlan: req.RemediationPlan,
 	}
 
-	if err := h.store.CreateGap(r.Context(), g); err != nil {
+	if err := h.store.CreateGap(r.Context(), g, eventMeta(r, principalID)); err != nil {
 		h.logger.Error("create compliance gap failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to log compliance gap")
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "compliance.gap.detected", SubjectID: g.GapID, TenantID: tenantID,
-		LegalEntityID: g.LegalEntityID, Jurisdiction: g.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: g,
-	})
 	writeJSON(w, http.StatusCreated, g)
 }
 
@@ -212,6 +260,10 @@ func (h *Handler) ListGaps(w http.ResponseWriter, r *http.Request) {
 	domainName := r.URL.Query().Get("domain_name")
 	severity := r.URL.Query().Get("severity")
 	status := r.URL.Query().Get("status")
+
+	if !h.authorizeRead(w, r, listScope(r), actionComplianceGapRead) {
+		return
+	}
 
 	gaps, err := h.store.ListGaps(r.Context(), legalEntityID, domainName, severity, status)
 	if err != nil {
@@ -229,7 +281,6 @@ func (h *Handler) ListGaps(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) ResolveGap(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	var req domain.ResolveGapRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -256,24 +307,28 @@ func (h *Handler) ResolveGap(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
+	// Segregation of duties: the principal who logged the gap may not
+	// resolve it. Re-checked by the store under the row lock.
+	if existing.CreatedBy != nil && *existing.CreatedBy == principalID {
+		writeCoded(w, http.StatusForbidden, codeSegregationOfDuties, domain.ErrSegregationOfDuties.Error())
+		return
+	}
 
-	g, err := h.store.ResolveGap(r.Context(), id, &req)
+	g, err := h.store.ResolveGap(r.Context(), id, &req, eventMeta(r, principalID))
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrGapNotFound):
 			writeError(w, http.StatusNotFound, "compliance gap not found")
 		case errors.Is(err, domain.ErrGapAlreadyResolved):
 			writeError(w, http.StatusConflict, "compliance gap is already resolved")
+		case errors.Is(err, domain.ErrSegregationOfDuties):
+			writeCoded(w, http.StatusForbidden, codeSegregationOfDuties, domain.ErrSegregationOfDuties.Error())
 		default:
+			h.logger.Error("resolve compliance gap failed", zap.Error(err))
 			writeError(w, http.StatusInternalServerError, "failed to resolve compliance gap")
 		}
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "compliance.gap.resolved", SubjectID: id, TenantID: tenantID,
-		LegalEntityID: g.LegalEntityID, Jurisdiction: g.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: g,
-	})
 	writeJSON(w, http.StatusOK, g)
 }
 
@@ -285,4 +340,10 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// writeCoded is writeError plus a stable machine-readable code (the "error"
+// field keeps its existing human-readable meaning).
+func writeCoded(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg, "code": code})
 }

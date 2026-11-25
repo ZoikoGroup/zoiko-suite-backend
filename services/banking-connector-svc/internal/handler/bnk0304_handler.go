@@ -48,6 +48,18 @@ type BNK0304Handler struct {
 
 // RegisterBNK0304Routes mounts BNK-03/04's routes on r. Called separately
 // from RegisterRoutes in cmd/server/main.go.
+func RegisterBNK0304Routes(r chi.Router, h *Handler, bnk0304Store store.BNK0304Store) {
+	bh := &BNK0304Handler{Handler: h, bnk0304Store: bnk0304Store}
+	// Full paths, not r.Route(...): a Route on /v1/banking/statements shadowed
+	// the legacy POST /v1/banking/statements registered by RegisterRoutes.
+	r.Post("/v1/banking/statements/ingest", bh.IngestStatement)
+	r.Post("/v1/banking/statements/{id}/validate", bh.ValidateStatement)
+	r.Post("/v1/banking/statements/{id}/accept", bh.AcceptStatement)
+	r.Post("/v1/banking/statements/{id}/quarantine", bh.QuarantineStatement)
+	r.Post("/v1/banking/statements/{id}/reprocess", bh.ReprocessQuarantinedStatement)
+	r.Post("/v1/banking/transactions/normalize", bh.NormalizeTransaction)
+	r.Post("/v1/banking/transactions/{id}/re-normalize", bh.ReNormalizeTransaction)
+	r.Post("/v1/banking/transactions/quarantine", bh.QuarantineTransaction)
 func RegisterBNK0304Routes(r chi.Router, h *Handler, bnk0304Store store.BNK0304Store, documentVault documentvault.Client) {
 	bh := &BNK0304Handler{Handler: h, bnk0304Store: bnk0304Store, documentVault: documentVault}
 	r.Route("/v1/banking/statements", func(r chi.Router) {
@@ -63,12 +75,12 @@ func RegisterBNK0304Routes(r chi.Router, h *Handler, bnk0304Store store.BNK0304S
 		r.Post("/quarantine", bh.QuarantineTransaction)
 	})
 	r.Post("/v1/banking/transaction-mappings", bh.CreateTransactionMapping)
-	r.Route("/v1/banking/canonical-transactions", func(r chi.Router) {
-		r.Get("/", bh.ListCanonicalTransactions)
-		r.Get("/{id}", bh.GetCanonicalTransaction)
-		r.Get("/{id}/raw-lineage", bh.GetRawLineage)
-		r.Get("/{id}/normalization-version", bh.GetNormalizationVersion)
-	})
+	// Full paths, not r.Route("/v1/banking/canonical-transactions", ...), for
+	// the same route-shadowing reason as RegisterRoutes.
+	r.Get("/v1/banking/canonical-transactions", bh.ListCanonicalTransactions)
+	r.Get("/v1/banking/canonical-transactions/{id}", bh.GetCanonicalTransaction)
+	r.Get("/v1/banking/canonical-transactions/{id}/raw-lineage", bh.GetRawLineage)
+	r.Get("/v1/banking/canonical-transactions/{id}/normalization-version", bh.GetNormalizationVersion)
 	r.Get("/v1/banking/mapping-exceptions", bh.ListMappingExceptions)
 	r.Post("/v1/banking/mapping-exceptions/{id}/approve", bh.ApproveMappingException)
 }
@@ -349,10 +361,10 @@ func (h *BNK0304Handler) QuarantineTransaction(w http.ResponseWriter, r *http.Re
 // ApproveMappingException is BNK-04's maker-checker resolution — the
 // approving principal must differ from whoever raised the exception,
 // enforced at the store layer (domain.ErrMappingExceptionSelfApproval),
-// not just checked here. Authorized as a platform-level action (empty
-// legal_entity_id) rather than per-legal-entity: mapping exceptions are an
-// internal control activity typically worked by a shared ops/finance
-// team across entities, not a legal-entity-scoped business operation.
+// not just checked here. Authorized for the legal entity that owns the
+// exception's statement line (line -> statement -> connection): approving
+// creates that entity's canonical transaction, so the decision is the
+// entity's. It used to be asked with an empty legal entity.
 
 func (h *BNK0304Handler) ApproveMappingException(w http.ResponseWriter, r *http.Request) {
 	var req domain.ApproveMappingExceptionParams
@@ -368,7 +380,12 @@ func (h *BNK0304Handler) ApproveMappingException(w http.ResponseWriter, r *http.
 	req.TenantID = middleware.GetTenantID(r.Context())
 	req.ApproverPrincipalID = principalID
 	req.CorrelationID = r.Header.Get("X-Correlation-ID")
-	if err := h.authz.CheckAllowed(r.Context(), principalID, "", BANKING_MAPPING_EXCEPTION_APPROVE); err != nil {
+	legalEntityID, err := h.bnk0304Store.MappingExceptionLegalEntity(r.Context(), req.TenantID, req.ExceptionID)
+	if err != nil {
+		h.writeTransactionErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, BANKING_MAPPING_EXCEPTION_APPROVE); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
@@ -418,7 +435,19 @@ func (h *BNK0304Handler) CreateTransactionMapping(w http.ResponseWriter, r *http
 func (h *BNK0304Handler) GetCanonicalTransaction(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	tenantID := middleware.GetTenantID(r.Context())
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	// 404 for a missing or foreign transaction before authorization is asked;
+	// then the read is authorized for the owning connection's legal entity.
+	legalEntityID, err := h.bnk0304Store.TransactionLegalEntity(r.Context(), tenantID, id)
+	if err != nil {
+		h.writeTransactionErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, BANKING_TRANSACTION_READ); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 	txn, err := h.bnk0304Store.GetCanonicalTransaction(r.Context(), tenantID, id)

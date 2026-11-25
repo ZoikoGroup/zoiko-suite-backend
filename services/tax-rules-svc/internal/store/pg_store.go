@@ -2,22 +2,57 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/tax-rules-svc/internal/domain"
+	"zoiko.io/tax-rules-svc/internal/events"
 	"zoiko.io/tax-rules-svc/internal/middleware"
+	"zoiko.io/tax-rules-svc/internal/outbox"
 )
 
 type Store interface {
-	CreateTaxRule(ctx context.Context, r *domain.TaxRule) error
+	CreateTaxRule(ctx context.Context, r *domain.TaxRule, meta EventMeta) error
 	GetTaxRule(ctx context.Context, id string) (*domain.TaxRule, error)
 	ListTaxRules(ctx context.Context, jurisdictionID, category, status string) ([]domain.TaxRule, error)
-	UpdateTaxRule(ctx context.Context, r *domain.TaxRule) error
+	UpdateTaxRule(ctx context.Context, r *domain.TaxRule, meta EventMeta) error
+}
+
+// Event types written to the outbox. Unchanged from the former direct publish.
+const (
+	EventTaxRuleCreated = "tax_rule.created"
+	EventTaxRuleUpdated = "tax_rule.updated"
+)
+
+// EventMeta is the request context a write's domain event carries: who did it
+// and under which correlation. The store writes the event to outbox_events in
+// the same transaction as the change.
+type EventMeta struct {
+	ActorID       string
+	CorrelationID string
+}
+
+// writeEvent inserts the domain event for rule into the outbox using the
+// business transaction tx, so the change and its event commit together.
+func writeEvent(ctx context.Context, tx pgx.Tx, eventType string, r *domain.TaxRule, meta EventMeta) error {
+	tenantID := middleware.GetTenantID(ctx)
+	evt := events.NewEvent(events.PublishParams{
+		EventType: eventType, RuleID: r.RuleID, TenantID: tenantID,
+		Jurisdiction: r.JurisdictionID, ActorID: meta.ActorID,
+		CorrelationID: meta.CorrelationID, Payload: r,
+	})
+	_, err := outbox.Insert(ctx, tx, outbox.Event{
+		AggregateType: "tax_rule", AggregateID: r.RuleID, EventType: eventType,
+		TenantID: tenantID, ActorID: meta.ActorID, CorrelationID: meta.CorrelationID,
+		Payload: evt,
+	})
+	return err
 }
 
 type PgStore struct {
@@ -37,7 +72,7 @@ func (s *PgStore) setRLS(ctx context.Context, tx pgx.Tx) error {
 	return err
 }
 
-func (s *PgStore) CreateTaxRule(ctx context.Context, r *domain.TaxRule) error {
+func (s *PgStore) CreateTaxRule(ctx context.Context, r *domain.TaxRule, meta EventMeta) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -73,7 +108,13 @@ func (s *PgStore) CreateTaxRule(ctx context.Context, r *domain.TaxRule) error {
 		r.CreatedBy, r.CreatedAt, r.UpdatedAt,
 	)
 	if err != nil {
+		if isUniqueViolation(err) {
+			return domain.ErrDuplicateRuleCode
+		}
 		return fmt.Errorf("insert tax rule: %w", err)
+	}
+	if err := writeEvent(ctx, tx, EventTaxRuleCreated, r, meta); err != nil {
+		return err
 	}
 
 	return tx.Commit(ctx)
@@ -160,7 +201,7 @@ func (s *PgStore) ListTaxRules(ctx context.Context, jurisdictionID, category, st
 	return out, nil
 }
 
-func (s *PgStore) UpdateTaxRule(ctx context.Context, r *domain.TaxRule) error {
+func (s *PgStore) UpdateTaxRule(ctx context.Context, r *domain.TaxRule, meta EventMeta) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -185,8 +226,17 @@ func (s *PgStore) UpdateTaxRule(ctx context.Context, r *domain.TaxRule) error {
 	if err != nil {
 		return fmt.Errorf("update tax rule: %w", err)
 	}
+	if err := writeEvent(ctx, tx, EventTaxRuleUpdated, r, meta); err != nil {
+		return err
+	}
 
 	return tx.Commit(ctx)
+}
+
+// isUniqueViolation reports a Postgres 23505 (unique_violation).
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
 func errorsIs(err, target error) bool {

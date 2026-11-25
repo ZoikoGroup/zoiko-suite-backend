@@ -1,12 +1,14 @@
 package domain
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -102,21 +104,29 @@ type BankStatementLine struct {
 // state is bank-reconciliation-svc's to report, so the honest values here
 // are "not measured", not 0 and 0%.
 type ReconciliationJob struct {
-	ID                      string                     `json:"id"`
-	TenantID                string                     `json:"tenant_id"`
-	LegalEntityID           string                     `json:"legal_entity_id"`
-	JobName                 string                     `json:"job_name"`
-	BankReconciliationRunID string                     `json:"bank_reconciliation_run_id,omitempty"`
-	SourceSystemA           SourceSystem               `json:"source_system_a"`
-	SourceSystemB           SourceSystem               `json:"source_system_b,omitempty"`
-	TotalProcessedCount     int                        `json:"total_processed_count"`
-	MatchedCount            *int                       `json:"matched_count,omitempty"`
-	UnmatchedCount          int                        `json:"unmatched_count"`
-	ReconciliationRate      *float64                   `json:"reconciliation_rate,omitempty"` // 0.00 to 100.00%; legacy jobs only
-	Status                  string                     `json:"status"`                        // COMPLETED, ARCHIVED
-	AnalyzedAt              time.Time                  `json:"analyzed_at"`
-	CreatedAt               time.Time                  `json:"created_at"`
-	UnmatchedItems          []ReconciliationSuggestion `json:"unmatched_items,omitempty"`
+	ID                      string       `json:"id"`
+	TenantID                string       `json:"tenant_id"`
+	LegalEntityID           string       `json:"legal_entity_id"`
+	JobName                 string       `json:"job_name"`
+	BankReconciliationRunID string       `json:"bank_reconciliation_run_id,omitempty"`
+	SourceSystemA           SourceSystem `json:"source_system_a"`
+	SourceSystemB           SourceSystem `json:"source_system_b,omitempty"`
+	TotalProcessedCount     int          `json:"total_processed_count"`
+	MatchedCount            *int         `json:"matched_count,omitempty"`
+	UnmatchedCount          int          `json:"unmatched_count"`
+	ReconciliationRate      *float64     `json:"reconciliation_rate,omitempty"` // 0.00 to 100.00%; legacy jobs only
+	Status                  string       `json:"status"`                        // COMPLETED, ARCHIVED
+	// RequestedBy is the principal who ran the analysis (migration 000013);
+	// the SoD rule refuses that principal's own APPROVED / EXECUTED decisions.
+	RequestedBy string `json:"requested_by,omitempty"`
+	// Version is the aggregate version behind the ETag / If-Match contract;
+	// every decision and the archive increment it.
+	Version        int                        `json:"version"`
+	ArchivedAt     *time.Time                 `json:"archived_at,omitempty"`
+	ArchivedBy     string                     `json:"archived_by,omitempty"`
+	AnalyzedAt     time.Time                  `json:"analyzed_at"`
+	CreatedAt      time.Time                  `json:"created_at"`
+	UnmatchedItems []ReconciliationSuggestion `json:"unmatched_items,omitempty"`
 }
 
 // ReconciliationSuggestion is one advisory suggestion about an UNMATCHED
@@ -189,7 +199,14 @@ type ReconciliationSuggestion struct {
 	ToleranceVersion int                      `json:"tolerance_version,omitempty"`
 	Recommendation   ResolutionRecommendation `json:"recommendation"`
 	SuggestionStatus SuggestionStatus         `json:"suggestion_status"`
-	ResolutionNotes  string                   `json:"resolution_notes,omitempty"`
+	// ResolutionStatus is the pre-rename alias of SuggestionStatus kept for one
+	// release (A9/B5); it always carries the same value.
+	ResolutionStatus SuggestionStatus `json:"resolution_status,omitempty"`
+	ResolutionNotes  string           `json:"resolution_notes,omitempty"`
+	// DecidedBy / DecidedAt record who made the latest human decision and
+	// when (ZS-SVC-Z-001 INV-18). Empty while RECOMMENDED.
+	DecidedBy string     `json:"decided_by,omitempty"`
+	DecidedAt *time.Time `json:"decided_at,omitempty"`
 	// AuthoritativeRef is the owning domain's record that carried out an
 	// EXECUTED suggestion (A5). Set only on EXECUTED, and always on an
 	// EXECUTED WRITE_OFF or TIMING_ADJUSTMENT executed after migration 000007.
@@ -222,6 +239,9 @@ func (s ReconciliationSuggestion) MarshalJSON() ([]byte, error) {
 // UNMATCHED statement lines are to be analyzed. The lines themselves are
 // read from bank-reconciliation-svc, never accepted from the caller.
 type AnalyzeReconciliationRequest struct {
+	// TenantID is optional and may only repeat X-Tenant-Id: the header is the
+	// authority, and a disagreeing body is refused (403), never reinterpreted.
+	TenantID                string `json:"tenant_id,omitempty"`
 	LegalEntityID           string `json:"legal_entity_id"`
 	JobName                 string `json:"job_name"`
 	BankReconciliationRunID string `json:"bank_reconciliation_run_id"`
@@ -245,7 +265,11 @@ func (r *ApplyResolutionRequest) UnmarshalJSON(data []byte) error {
 		ResolutionNotes  string            `json:"resolution_notes"`
 		AuthoritativeRef *AuthoritativeRef `json:"authoritative_ref"`
 	}
-	if err := json.Unmarshal(data, &wire); err != nil {
+	// Unknown fields are refused: a decision body is small and fixed, and a
+	// silently ignored field (e.g. an amount) would read as accepted.
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&wire); err != nil {
 		return err
 	}
 	if wire.SuggestionStatus != "" && wire.ResolutionStatus != "" && wire.SuggestionStatus != wire.ResolutionStatus {
@@ -302,6 +326,11 @@ func (r *AnalyzeReconciliationRequest) Validate() error {
 	}
 	if r.JobName == "" {
 		return fmt.Errorf("job_name is required")
+	}
+	// reconciliation_jobs.job_name is VARCHAR(128): longer names failed the
+	// INSERT and surfaced as a 500 instead of the caller's 400.
+	if utf8.RuneCountInString(r.JobName) > MaxJobNameLength {
+		return fmt.Errorf("job_name must be at most %d characters", MaxJobNameLength)
 	}
 	if r.BankReconciliationRunID == "" {
 		return fmt.Errorf("bank_reconciliation_run_id is required")
@@ -542,4 +571,66 @@ func duplicateItem(dup, anchor BankStatementLine, dupAmount, anchorAmount *big.R
 		CreatedAt:                  now,
 		UpdatedAt:                  now,
 	}
+}
+
+// MaxJobNameLength matches reconciliation_jobs.job_name VARCHAR(128).
+const MaxJobNameLength = 128
+
+// Job list paging bounds: every list is bounded, never "all rows".
+const (
+	DefaultJobListLimit = 50
+	MaxJobListLimit     = 200
+)
+
+// KnownJobStatuses are the reconciliation_jobs.status values a list may filter on.
+var KnownJobStatuses = map[string]bool{"ANALYZING": true, "COMPLETED": true, "ARCHIVED": true}
+
+// KnownSourceSystems are the source_system_a values a list may filter on.
+var KnownSourceSystems = map[SourceSystem]bool{
+	SourceGeneralLedger: true, SourceBankStatement: true, SourceInvoices: true, SourcePayrollJournal: true,
+}
+
+// ErrItemNotFound: the unmatched item does not exist in this job (or tenant).
+// Handlers answer 404 with this fixed message; the underlying store error is
+// logged, never returned to the caller.
+var ErrItemNotFound = errors.New("unmatched item not found")
+
+// ErrJobArchived: decisions are refused on an ARCHIVED job, whose suggestions
+// are kept read-only as the audit trail.
+var ErrJobArchived = errors.New("reconciliation job is archived; its suggestions are read-only")
+
+// ErrJobNotFound: no such job in this tenant (or hidden by RLS).
+var ErrJobNotFound = errors.New("reconciliation job not found")
+
+// ErrSegregationOfDuties: the principal who requested the analysis may not
+// approve or execute its suggestions (Global Authorization / SoD standard:
+// requestor self-approval is denied). Rejecting stays allowed: it changes no
+// record and only discards the recommendation.
+var ErrSegregationOfDuties = errors.New("the analysis requester may not approve or execute its own suggestions")
+
+// ErrVersionMismatch: the If-Match version is not the job's current version.
+var ErrVersionMismatch = errors.New("the job has changed since the given version")
+
+// RequiresIndependentDecider reports whether a decision to `to` must be made
+// by someone other than the analysis requester.
+func RequiresIndependentDecider(to SuggestionStatus) bool {
+	return to == StatusApproved || to == StatusExecuted
+}
+
+// CheckJobCommand applies the rules every job command shares, in order:
+// archived jobs are read-only, a sent If-Match version must be current, and
+// a decision that needs an independent decider is refused for the requester.
+// requestedBy is "" for jobs analysed before migration 000013 (no SoD check
+// is possible for those).
+func CheckJobCommand(status, requestedBy string, version int, actorID string, expectedVersion int, needsIndependentDecider bool) error {
+	if status == "ARCHIVED" {
+		return ErrJobArchived
+	}
+	if expectedVersion > 0 && expectedVersion != version {
+		return ErrVersionMismatch
+	}
+	if needsIndependentDecider && requestedBy != "" && requestedBy == actorID {
+		return ErrSegregationOfDuties
+	}
+	return nil
 }

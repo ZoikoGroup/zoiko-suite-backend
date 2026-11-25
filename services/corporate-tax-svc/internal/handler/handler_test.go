@@ -13,7 +13,7 @@ import (
 
 	"zoiko.io/corporate-tax-svc/internal/authz"
 	"zoiko.io/corporate-tax-svc/internal/domain"
-	"zoiko.io/corporate-tax-svc/internal/events"
+	"zoiko.io/corporate-tax-svc/internal/store"
 )
 
 // ─── Stub Store ───────────────────────────────────────────────────────────────
@@ -21,6 +21,7 @@ import (
 type stubStore struct {
 	returns map[string]*domain.TaxReturn
 	nexus   map[string]*domain.NexusRecord
+	metas   []store.EventMeta
 }
 
 func newStubStore() *stubStore {
@@ -30,7 +31,8 @@ func newStubStore() *stubStore {
 	}
 }
 
-func (s *stubStore) Create(_ context.Context, r *domain.TaxReturn) error {
+func (s *stubStore) Create(_ context.Context, r *domain.TaxReturn, meta store.EventMeta) error {
+	s.metas = append(s.metas, meta)
 	if r.ReturnID == "" {
 		r.ReturnID = "ctret-test-001"
 	}
@@ -58,13 +60,15 @@ func (s *stubStore) List(_ context.Context, _, _, _ string, _ int) ([]domain.Tax
 	return out, nil
 }
 
-func (s *stubStore) Update(_ context.Context, r *domain.TaxReturn) error {
+func (s *stubStore) Update(_ context.Context, r *domain.TaxReturn, meta store.EventMeta) error {
+	s.metas = append(s.metas, meta)
 	r.Compute()
 	s.returns[r.ReturnID] = r
 	return nil
 }
 
-func (s *stubStore) Submit(_ context.Context, id, submittedBy string) (*domain.TaxReturn, error) {
+func (s *stubStore) Submit(_ context.Context, id, submittedBy string, meta store.EventMeta) (*domain.TaxReturn, error) {
+	s.metas = append(s.metas, meta)
 	r, ok := s.returns[id]
 	if !ok {
 		return nil, domain.ErrTaxReturnNotFound
@@ -77,7 +81,8 @@ func (s *stubStore) Submit(_ context.Context, id, submittedBy string) (*domain.T
 	return r, nil
 }
 
-func (s *stubStore) Assess(_ context.Context, id string, req *domain.AssessTaxReturnRequest) (*domain.TaxReturn, error) {
+func (s *stubStore) Assess(_ context.Context, id string, req *domain.AssessTaxReturnRequest, assessedBy string, meta store.EventMeta) (*domain.TaxReturn, error) {
+	s.metas = append(s.metas, meta)
 	r, ok := s.returns[id]
 	if !ok {
 		return nil, domain.ErrTaxReturnNotFound
@@ -118,16 +123,6 @@ func (s *stubStore) ListNexusRecords(_ context.Context, legalEntityID, jurisdict
 	return out, nil
 }
 
-// ─── Stub Publisher ───────────────────────────────────────────────────────────
-
-type stubPublisher struct{}
-
-func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error {
-	return nil
-}
-
-var _ events.Publisher = (*stubPublisher)(nil)
-
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 func newStubAuthzServer(t *testing.T) *authz.Client {
@@ -141,7 +136,7 @@ func newStubAuthzServer(t *testing.T) *authz.Client {
 
 func newTestHandler(t *testing.T) *Handler {
 	logger, _ := zap.NewDevelopment()
-	return New(newStubStore(), &stubPublisher{}, newStubAuthzServer(t), logger)
+	return New(newStubStore(), newStubAuthzServer(t), logger)
 }
 
 func buildRequest(method, path string, body interface{}) *http.Request {

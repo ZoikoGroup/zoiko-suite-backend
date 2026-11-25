@@ -13,11 +13,12 @@ import (
 
 	"zoiko.io/vat-gst-svc/internal/authz"
 	"zoiko.io/vat-gst-svc/internal/domain"
-	"zoiko.io/vat-gst-svc/internal/events"
+	"zoiko.io/vat-gst-svc/internal/store"
 )
 
 type stubStore struct {
 	returns map[string]*domain.VATReturn
+	metas   []store.EventMeta
 }
 
 func newStubStore() *stubStore {
@@ -26,7 +27,8 @@ func newStubStore() *stubStore {
 	}
 }
 
-func (s *stubStore) CreateVATReturn(_ context.Context, r *domain.VATReturn) error {
+func (s *stubStore) CreateVATReturn(_ context.Context, r *domain.VATReturn, meta store.EventMeta) error {
+	s.metas = append(s.metas, meta)
 	if r.ReturnID == "" {
 		r.ReturnID = "vret-test-001"
 	}
@@ -53,13 +55,15 @@ func (s *stubStore) ListVATReturns(_ context.Context, _, _, _ string) ([]domain.
 	return out, nil
 }
 
-func (s *stubStore) UpdateVATReturn(_ context.Context, r *domain.VATReturn) error {
+func (s *stubStore) UpdateVATReturn(_ context.Context, r *domain.VATReturn, meta store.EventMeta) error {
+	s.metas = append(s.metas, meta)
 	r.NetTaxPayable = r.OutputTaxAmount - r.InputTaxAmount
 	s.returns[r.ReturnID] = r
 	return nil
 }
 
-func (s *stubStore) FileVATReturn(_ context.Context, id, filedBy string) (*domain.VATReturn, error) {
+func (s *stubStore) FileVATReturn(_ context.Context, id, filedBy string, meta store.EventMeta) (*domain.VATReturn, error) {
+	s.metas = append(s.metas, meta)
 	r, ok := s.returns[id]
 	if !ok {
 		return nil, domain.ErrVATReturnNotFound
@@ -71,14 +75,6 @@ func (s *stubStore) FileVATReturn(_ context.Context, id, filedBy string) (*domai
 	r.FiledBy = &filedBy
 	return r, nil
 }
-
-type stubPublisher struct{}
-
-func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error {
-	return nil
-}
-
-var _ events.Publisher = (*stubPublisher)(nil)
 
 // stubAuthz is a test double for AuthzChecker. By default it grants every
 // request; tests that need to exercise the deny/unavailable paths can flip
@@ -95,7 +91,7 @@ var _ AuthzChecker = (*stubAuthz)(nil)
 
 func newTestHandler() *Handler {
 	logger, _ := zap.NewDevelopment()
-	return New(newStubStore(), &stubPublisher{}, &stubAuthz{}, logger)
+	return New(newStubStore(), &stubAuthz{}, logger)
 }
 
 func buildRequest(method, path string, body interface{}) *http.Request {
@@ -165,7 +161,7 @@ func TestFileVATReturn(t *testing.T) {
 
 	// File return
 	fileBody := domain.FileVATReturnRequest{
-		FiledBy: "tax-director",
+		FiledBy: "principal-test-01",
 	}
 	wFile := httptest.NewRecorder()
 	r.ServeHTTP(wFile, buildRequest(http.MethodPost, "/v1/vat-returns/"+created.ReturnID+"/file", fileBody))
@@ -198,7 +194,7 @@ func TestCreateVATReturn_MissingPrincipalHeader(t *testing.T) {
 
 func TestCreateVATReturn_AuthzDenied(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
-	h := New(newStubStore(), &stubPublisher{}, &stubAuthz{err: authz.ErrAuthorizationDenied}, logger)
+	h := New(newStubStore(), &stubAuthz{err: authz.ErrAuthorizationDenied}, logger)
 	body := domain.CreateVATReturnRequest{
 		LegalEntityID:  "le-001",
 		JurisdictionID: "uk-england",
@@ -213,7 +209,7 @@ func TestCreateVATReturn_AuthzDenied(t *testing.T) {
 
 func TestCreateVATReturn_AuthzServiceUnavailable(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
-	h := New(newStubStore(), &stubPublisher{}, &stubAuthz{err: authz.ErrAuthzServiceUnavailable}, logger)
+	h := New(newStubStore(), &stubAuthz{err: authz.ErrAuthzServiceUnavailable}, logger)
 	body := domain.CreateVATReturnRequest{
 		LegalEntityID:  "le-001",
 		JurisdictionID: "uk-england",
@@ -242,7 +238,7 @@ func TestFileVATReturn_MissingPrincipalHeader(t *testing.T) {
 	var created domain.VATReturn
 	_ = json.NewDecoder(wCreate.Body).Decode(&created)
 
-	fileReq := buildRequest(http.MethodPost, "/v1/vat-returns/"+created.ReturnID+"/file", domain.FileVATReturnRequest{FiledBy: "tax-director"})
+	fileReq := buildRequest(http.MethodPost, "/v1/vat-returns/"+created.ReturnID+"/file", domain.FileVATReturnRequest{FiledBy: "principal-test-01"})
 	fileReq.Header.Del("X-Principal-Id")
 
 	wFile := httptest.NewRecorder()

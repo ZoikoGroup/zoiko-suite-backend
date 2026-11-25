@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
 	"zoiko.io/tax-rules-svc/internal/authz"
 	"zoiko.io/tax-rules-svc/internal/domain"
-	"zoiko.io/tax-rules-svc/internal/events"
 	"zoiko.io/tax-rules-svc/internal/middleware"
 	"zoiko.io/tax-rules-svc/internal/store"
 )
@@ -28,14 +28,16 @@ const (
 )
 
 type Handler struct {
-	store     store.Store
-	publisher events.Publisher
-	authz     AuthZClient
-	logger    *zap.Logger
+	store  store.Store
+	authz  AuthZClient
+	logger *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthZClient, logger *zap.Logger) *Handler {
-	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+// New builds the handler. Domain events are no longer published from here:
+// the store writes them to the transactional outbox inside the business
+// transaction and internal/outbox.Relay delivers them.
+func New(st store.Store, az AuthZClient, logger *zap.Logger) *Handler {
+	return &Handler{store: st, authz: az, logger: logger}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -57,6 +59,18 @@ func (h *Handler) CreateTaxRule(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.JurisdictionID == "" || req.RuleCode == "" || req.Name == "" || req.Category == "" {
 		writeError(w, http.StatusBadRequest, "jurisdiction_id, rule_code, name, and category are required")
+		return
+	}
+	if !domain.ValidCategory(req.Category) {
+		writeError(w, http.StatusBadRequest, "category must be one of VAT, GST, SALES_TAX, CORPORATE_INCOME, WITHHOLDING, EXCISE, CUSTOMS")
+		return
+	}
+	if !validDate(req.EffectiveFrom) {
+		writeError(w, http.StatusBadRequest, "effective_from is required as a date in YYYY-MM-DD format")
+		return
+	}
+	if req.EffectiveTo != nil && !validDate(*req.EffectiveTo) {
+		writeError(w, http.StatusBadRequest, "effective_to must be a date in YYYY-MM-DD format")
 		return
 	}
 
@@ -84,17 +98,17 @@ func (h *Handler) CreateTaxRule(w http.ResponseWriter, r *http.Request) {
 		CreatedBy:          principalID,
 	}
 
-	if err := h.store.CreateTaxRule(r.Context(), rule); err != nil {
+	meta := store.EventMeta{ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID")}
+	if err := h.store.CreateTaxRule(r.Context(), rule, meta); err != nil {
+		if errors.Is(err, domain.ErrDuplicateRuleCode) {
+			writeError(w, http.StatusConflict, "tax rule with this jurisdiction_id, rule_code and version already exists")
+			return
+		}
 		h.logger.Error("create tax rule failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to create tax rule")
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "tax_rule.created", RuleID: rule.RuleID, TenantID: tenantID,
-		Jurisdiction: rule.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: rule,
-	})
 	writeJSON(w, http.StatusCreated, rule)
 }
 
@@ -137,7 +151,6 @@ func (h *Handler) ListTaxRules(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) UpdateTaxRule(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	existing, err := h.store.GetTaxRule(r.Context(), id)
 	if err != nil {
@@ -160,6 +173,18 @@ func (h *Handler) UpdateTaxRule(w http.ResponseWriter, r *http.Request) {
 	var req domain.UpdateTaxRuleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Category != "" && !domain.ValidCategory(req.Category) {
+		writeError(w, http.StatusBadRequest, "category must be one of VAT, GST, SALES_TAX, CORPORATE_INCOME, WITHHOLDING, EXCISE, CUSTOMS")
+		return
+	}
+	if req.Status != "" && !domain.ValidStatus(req.Status) {
+		writeError(w, http.StatusBadRequest, "status must be one of DRAFT, ACTIVE, DEPRECATED")
+		return
+	}
+	if req.EffectiveTo != nil && !validDate(*req.EffectiveTo) {
+		writeError(w, http.StatusBadRequest, "effective_to must be a date in YYYY-MM-DD format")
 		return
 	}
 
@@ -195,17 +220,13 @@ func (h *Handler) UpdateTaxRule(w http.ResponseWriter, r *http.Request) {
 		existing.EffectiveTo = req.EffectiveTo
 	}
 
-	if err := h.store.UpdateTaxRule(r.Context(), existing); err != nil {
+	meta := store.EventMeta{ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID")}
+	if err := h.store.UpdateTaxRule(r.Context(), existing, meta); err != nil {
 		h.logger.Error("update tax rule failed", zap.Error(err), zap.String("rule_id", id))
 		writeError(w, http.StatusInternalServerError, "failed to update tax rule")
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "tax_rule.updated", RuleID: id, TenantID: tenantID,
-		Jurisdiction: existing.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: existing,
-	})
 	writeJSON(w, http.StatusOK, existing)
 }
 
@@ -224,6 +245,11 @@ func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
 		return
 	}
 	writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+}
+
+func validDate(s string) bool {
+	_, err := time.Parse("2006-01-02", s)
+	return err == nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

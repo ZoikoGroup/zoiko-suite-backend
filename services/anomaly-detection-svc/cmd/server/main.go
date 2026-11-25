@@ -9,19 +9,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
 	"zoiko.io/anomaly-detection-svc/internal/authz"
 	"zoiko.io/anomaly-detection-svc/internal/config"
-	svcenvelope "zoiko.io/anomaly-detection-svc/internal/envelope"
 	"zoiko.io/anomaly-detection-svc/internal/events"
 	"zoiko.io/anomaly-detection-svc/internal/handler"
-	"zoiko.io/anomaly-detection-svc/internal/health"
-	"zoiko.io/anomaly-detection-svc/internal/middleware"
 	"zoiko.io/anomaly-detection-svc/internal/mtls"
+	"zoiko.io/anomaly-detection-svc/internal/outbox"
 	"zoiko.io/anomaly-detection-svc/internal/store"
 	"zoiko.io/anomaly-detection-svc/internal/telemetry"
 )
@@ -82,24 +78,19 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
 
-	h := handler.New(st, publisher, authzClient, logger)
+	h := handler.New(st, authzClient, logger)
 
-	r := chi.NewRouter()
-	r.Use(chimiddleware.RequestID)
-	r.Use(chimiddleware.RealIP)
-	r.Use(chimiddleware.Logger)
-	r.Use(chimiddleware.Recoverer)
-	r.Use(middleware.TenantContext)
+	// Transactional outbox relay: store commands write AI.AnomalyDetected /
+	// AI.AnomalyDispositioned into anomaly_outbox in the same transaction as
+	// the state change; this loop publishes them to Kafka (at least once).
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	relayDone := make(chan struct{})
+	go func() {
+		defer close(relayDone)
+		outbox.NewRelay(dbpool, publisher, logger).Run(relayCtx)
+	}()
 
-	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
-	// Recoverer and telemetry so a refusal is still traced, and ahead of every
-	// handler so no request reaches business logic without a resolved tenant,
-	// actor, correlation and — on material writes — an idempotency key.
-	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
-	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
-
-	r.Get("/healthz", health.Handler())
-	handler.RegisterRoutes(r, h)
+	r := handler.NewRouter(h, dbpool)
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,
@@ -128,5 +119,7 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("server forced to shutdown", zap.Error(err))
 	}
+	stopRelay()
+	<-relayDone
 	logger.Info("anomaly-detection-svc stopped cleanly")
 }

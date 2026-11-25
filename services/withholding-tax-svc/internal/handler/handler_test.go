@@ -189,7 +189,7 @@ func TestCreateAndRemitObligation(t *testing.T) {
 		WithholdingRatePercent: 10.0,
 		Currency:               "USD",
 		EffectiveFrom:          "2026-01-01",
-		CreatedBy:              "admin",
+		CreatedBy:              "user-001",
 	}
 	body, _ := json.Marshal(reqPayload)
 
@@ -250,5 +250,39 @@ func TestCreateAndRemitObligation(t *testing.T) {
 	r.ServeHTTP(updateW, updateReq)
 	if updateW.Code != http.StatusConflict {
 		t.Fatalf("expected status 409 Conflict when updating REMITTED obligation, got %d", updateW.Code)
+	}
+}
+
+// TestCreateObligation_InputGuards proves the two create-path fixes: created_by
+// can't be claimed for another principal, and a malformed effective_from is a
+// 400 instead of reaching Postgres as a 500.
+func TestCreateObligation_InputGuards(t *testing.T) {
+	r, _ := setupTestRouter(t)
+	cases := []struct {
+		name          string
+		createdBy     string
+		effectiveFrom string
+		want          int
+	}{
+		{"created_by spoofed", "admin", "2026-01-01", http.StatusForbidden},
+		{"bad effective_from", "", "01/01/2026", http.StatusBadRequest},
+		{"effective_from defaults", "", "", http.StatusCreated},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, _ := json.Marshal(domain.CreateObligationRequest{
+				LegalEntityID: "entity-001", JurisdictionID: "US-CA", CounterpartyID: "vendor-99",
+				PaymentReference: "INV-GUARD-" + string(rune('A'+i)), GrossPaymentAmount: 100,
+				Currency: "USD", EffectiveFrom: tc.effectiveFrom, CreatedBy: tc.createdBy,
+			})
+			req := httptest.NewRequest("POST", "/v1/withholding-tax", bytes.NewBuffer(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Principal-Id", "user-001")
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != tc.want {
+				t.Fatalf("expected %d, got %d: %s", tc.want, w.Code, w.Body.String())
+			}
+		})
 	}
 }

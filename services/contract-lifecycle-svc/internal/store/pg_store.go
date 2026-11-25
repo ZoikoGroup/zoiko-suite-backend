@@ -30,28 +30,39 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/contract-lifecycle-svc/internal/domain"
+	"zoiko.io/contract-lifecycle-svc/internal/events"
 	"zoiko.io/contract-lifecycle-svc/internal/middleware"
+	"zoiko.io/contract-lifecycle-svc/internal/outbox"
 )
+
+// Audit identifies who caused a write and the request it belongs to. ActorID
+// is the authenticated principal (X-Principal-Id) — never a request-body
+// value — and is what every *_by column of the write records. It is also
+// stamped on the outbox event the write emits in the same transaction.
+type Audit struct {
+	ActorID       string
+	CorrelationID string
+}
 
 // Store defines all persistence operations for the contract lifecycle service.
 type Store interface {
-	CreateContract(ctx context.Context, c *domain.Contract) error
+	CreateContract(ctx context.Context, c *domain.Contract, a Audit) error
 	GetContract(ctx context.Context, id string) (*domain.Contract, error)
 	ListContracts(ctx context.Context, legalEntityID string) ([]domain.Contract, error)
 	// UpdateContract is LEG-05's named CreateVersion command: it may only act
 	// while the contract is DRAFT or REVIEW — an approved-for-signature
 	// version is immutable (LEG-05 §7.1).
-	UpdateContract(ctx context.Context, c *domain.Contract, changeSummary string) error
-	SubmitReview(ctx context.Context, id, submittedBy string) (*domain.Contract, error)
-	// ApproveContract moves REVIEW -> APPROVED. approvedBy is re-checked
+	UpdateContract(ctx context.Context, c *domain.Contract, changeSummary string, a Audit) error
+	SubmitReview(ctx context.Context, id string, a Audit) (*domain.Contract, error)
+	// ApproveContract moves REVIEW -> APPROVED. The approver (a.ActorID) is re-checked
 	// against the locked row's submitter for segregation of duties, the same
 	// two-layer pattern used across this codebase.
-	ApproveContract(ctx context.Context, id, approvedBy, governanceDecisionID string) (*domain.Contract, error)
-	SendForSignature(ctx context.Context, id, sentBy string) (*domain.Contract, error)
-	RecordExecution(ctx context.Context, id string, req *domain.RecordExecutionRequest) (*domain.Contract, error)
-	AmendContract(ctx context.Context, id string, req *domain.AmendContractRequest) (*domain.Contract, error)
-	RenewContract(ctx context.Context, id string, req *domain.RenewContractRequest) (*domain.Contract, error)
-	TerminateContract(ctx context.Context, id string, req *domain.TerminateContractRequest) (*domain.Contract, error)
+	ApproveContract(ctx context.Context, id, governanceDecisionID string, a Audit) (*domain.Contract, error)
+	SendForSignature(ctx context.Context, id string, a Audit) (*domain.Contract, error)
+	RecordExecution(ctx context.Context, id string, req *domain.RecordExecutionRequest, a Audit) (*domain.Contract, error)
+	AmendContract(ctx context.Context, id string, req *domain.AmendContractRequest, a Audit) (*domain.Contract, error)
+	RenewContract(ctx context.Context, id string, req *domain.RenewContractRequest, a Audit) (*domain.Contract, error)
+	TerminateContract(ctx context.Context, id string, req *domain.TerminateContractRequest, a Audit) (*domain.Contract, error)
 	ListContractVersions(ctx context.Context, contractID string) ([]domain.ContractVersion, error)
 }
 
@@ -101,6 +112,36 @@ func (s *PgStore) setRLS(ctx context.Context, tx pgx.Tx) error {
 	return err
 }
 
+// emit writes the domain event for c into the transactional outbox using the
+// caller's transaction, so the state change and its event commit or roll back
+// together. The payload is the full envelope, exactly as the previous direct
+// publish built it.
+func (s *PgStore) emit(ctx context.Context, tx pgx.Tx, eventType string, c *domain.Contract, a Audit) error {
+	if a.ActorID == "" {
+		return fmt.Errorf("emit %s: actor is required", eventType)
+	}
+	id := uuid.NewString()
+	_, err := outbox.Insert(ctx, tx, outbox.Event{
+		OutboxEventID: id,
+		AggregateType: "contract",
+		AggregateID:   c.ContractID,
+		EventType:     eventType,
+		TenantID:      c.TenantID,
+		LegalEntityID: c.LegalEntityID,
+		ActorID:       a.ActorID,
+		CorrelationID: a.CorrelationID,
+		Payload: events.NewEvent(id, events.PublishParams{
+			EventType: eventType, ContractID: c.ContractID, TenantID: c.TenantID,
+			LegalEntityID: c.LegalEntityID, ActorID: a.ActorID, CorrelationID: a.CorrelationID,
+			Payload: c,
+		}),
+	})
+	if err != nil {
+		return fmt.Errorf("emit %s: %w", eventType, err)
+	}
+	return nil
+}
+
 // snapshotVersion creates an immutable version record for audit lineage.
 func (s *PgStore) snapshotVersion(ctx context.Context, tx pgx.Tx, c *domain.Contract, summary string) error {
 	v := &domain.ContractVersion{
@@ -129,7 +170,7 @@ func (s *PgStore) snapshotVersion(ctx context.Context, tx pgx.Tx, c *domain.Cont
 }
 
 // CreateContract inserts a new contract in DRAFT status.
-func (s *PgStore) CreateContract(ctx context.Context, c *domain.Contract) error {
+func (s *PgStore) CreateContract(ctx context.Context, c *domain.Contract, a Audit) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -172,6 +213,9 @@ func (s *PgStore) CreateContract(ctx context.Context, c *domain.Contract) error 
 	if err := s.snapshotVersion(ctx, tx, c, "Initial draft"); err != nil {
 		return fmt.Errorf("snapshot version: %w", err)
 	}
+	if err := s.emit(ctx, tx, "contract.created", c, a); err != nil {
+		return err
+	}
 
 	return tx.Commit(ctx)
 }
@@ -196,7 +240,8 @@ func (s *PgStore) GetContract(ctx context.Context, id string) (*domain.Contract,
 		       submitted_at, submitted_by, approved_at, approved_by, signature_sent_at, executed_at, signed_by,
 		       effective_at, amended_at, amended_by, renewed_at, renewed_by,
 		       terminated_at, terminated_by, termination_note,
-		       currency, total_value, document_vault_id, governance_decision_id, created_by, created_at, updated_at
+		       currency, total_value, document_vault_id, governance_decision_id, created_by, created_at, updated_at,
+		       execution_recorded_by
 		FROM contracts WHERE contract_id = $1 AND tenant_id = $2`,
 		id, middleware.GetTenantID(ctx),
 	).Scan(
@@ -207,6 +252,7 @@ func (s *PgStore) GetContract(ctx context.Context, id string) (*domain.Contract,
 		&c.EffectiveAt, &c.AmendedAt, &c.AmendedBy, &c.RenewedAt, &c.RenewedBy,
 		&c.TerminatedAt, &c.TerminatedBy, &c.TerminationNote,
 		&c.Currency, &c.TotalValue, &c.DocumentVaultID, &c.GovernanceDecisionID, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt,
+		&c.ExecutionRecordedBy,
 	)
 	if err != nil {
 		if errorsIs(err, pgx.ErrNoRows) {
@@ -239,7 +285,8 @@ func (s *PgStore) ListContracts(ctx context.Context, legalEntityID string) ([]do
 		       submitted_at, submitted_by, approved_at, approved_by, signature_sent_at, executed_at, signed_by,
 		       effective_at, amended_at, amended_by, renewed_at, renewed_by,
 		       terminated_at, terminated_by, termination_note,
-		       currency, total_value, document_vault_id, governance_decision_id, created_by, created_at, updated_at
+		       currency, total_value, document_vault_id, governance_decision_id, created_by, created_at, updated_at,
+		       execution_recorded_by
 		FROM contracts
 		WHERE tenant_id = $2 AND ($1 = '' OR legal_entity_id = $1)
 		ORDER BY created_at DESC`,
@@ -262,6 +309,7 @@ func (s *PgStore) ListContracts(ctx context.Context, legalEntityID string) ([]do
 			&c.EffectiveAt, &c.AmendedAt, &c.AmendedBy, &c.RenewedAt, &c.RenewedBy,
 			&c.TerminatedAt, &c.TerminatedBy, &c.TerminationNote,
 			&c.Currency, &c.TotalValue, &c.DocumentVaultID, &c.GovernanceDecisionID, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt,
+			&c.ExecutionRecordedBy,
 		); err != nil {
 			return nil, err
 		}
@@ -280,7 +328,7 @@ func (s *PgStore) ListContracts(ctx context.Context, legalEntityID string) ([]do
 // what makes this refuse past that point, by locking the row and checking
 // status before any write, the same pattern as every other protected
 // transition in this codebase.
-func (s *PgStore) UpdateContract(ctx context.Context, c *domain.Contract, changeSummary string) error {
+func (s *PgStore) UpdateContract(ctx context.Context, c *domain.Contract, changeSummary string, a Audit) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -323,6 +371,9 @@ func (s *PgStore) UpdateContract(ctx context.Context, c *domain.Contract, change
 	if err := s.snapshotVersion(ctx, tx, c, changeSummary); err != nil {
 		return fmt.Errorf("snapshot version: %w", err)
 	}
+	if err := s.emit(ctx, tx, "contract.updated", c, a); err != nil {
+		return err
+	}
 
 	return tx.Commit(ctx)
 }
@@ -340,7 +391,8 @@ func (s *PgStore) lockContract(ctx context.Context, tx pgx.Tx, id string) (*doma
 		       submitted_at, submitted_by, approved_at, approved_by, signature_sent_at, executed_at, signed_by,
 		       effective_at, amended_at, amended_by, renewed_at, renewed_by,
 		       terminated_at, terminated_by, termination_note,
-		       currency, total_value, document_vault_id, governance_decision_id, created_by, created_at, updated_at
+		       currency, total_value, document_vault_id, governance_decision_id, created_by, created_at, updated_at,
+		       execution_recorded_by
 		FROM contracts WHERE contract_id = $1 AND tenant_id = $2 FOR UPDATE`,
 		id, middleware.GetTenantID(ctx),
 	).Scan(
@@ -351,6 +403,7 @@ func (s *PgStore) lockContract(ctx context.Context, tx pgx.Tx, id string) (*doma
 		&c.EffectiveAt, &c.AmendedAt, &c.AmendedBy, &c.RenewedAt, &c.RenewedBy,
 		&c.TerminatedAt, &c.TerminatedBy, &c.TerminationNote,
 		&c.Currency, &c.TotalValue, &c.DocumentVaultID, &c.GovernanceDecisionID, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt,
+		&c.ExecutionRecordedBy,
 	)
 	if err != nil {
 		if errorsIs(err, pgx.ErrNoRows) {
@@ -365,7 +418,7 @@ func (s *PgStore) lockContract(ctx context.Context, tx pgx.Tx, id string) (*doma
 }
 
 // SubmitReview moves DRAFT -> REVIEW.
-func (s *PgStore) SubmitReview(ctx context.Context, id, submittedBy string) (*domain.Contract, error) {
+func (s *PgStore) SubmitReview(ctx context.Context, id string, a Audit) (*domain.Contract, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -385,6 +438,7 @@ func (s *PgStore) SubmitReview(ctx context.Context, id, submittedBy string) (*do
 
 	now := time.Now().UTC()
 	c.Status = domain.ContractStatusReview
+	submittedBy := a.ActorID
 	c.SubmittedBy = &submittedBy
 	c.SubmittedAt = &now
 	c.UpdatedAt = now
@@ -394,6 +448,9 @@ func (s *PgStore) SubmitReview(ctx context.Context, id, submittedBy string) (*do
 		WHERE contract_id=$5 AND tenant_id=$6`,
 		string(c.Status), c.SubmittedBy, c.SubmittedAt, c.UpdatedAt, id, middleware.GetTenantID(ctx),
 	); err != nil {
+		return nil, err
+	}
+	if err := s.emit(ctx, tx, "contract.submitted_for_review", c, a); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -407,7 +464,8 @@ func (s *PgStore) SubmitReview(ctx context.Context, id, submittedBy string) (*do
 // "self-approval blocked") is re-checked against the locked row: the
 // principal who submitted the contract for review may not be the one who
 // approves it.
-func (s *PgStore) ApproveContract(ctx context.Context, id, approvedBy, governanceDecisionID string) (*domain.Contract, error) {
+func (s *PgStore) ApproveContract(ctx context.Context, id, governanceDecisionID string, a Audit) (*domain.Contract, error) {
+	approvedBy := a.ActorID
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -448,6 +506,9 @@ func (s *PgStore) ApproveContract(ctx context.Context, id, approvedBy, governanc
 	if err := s.snapshotVersion(ctx, tx, c, "Contract approved"); err != nil {
 		return nil, err
 	}
+	if err := s.emit(ctx, tx, "contract.approved", c, a); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -457,7 +518,7 @@ func (s *PgStore) ApproveContract(ctx context.Context, id, approvedBy, governanc
 // SendForSignature moves the Signature dimension NOT_REQUESTED -> SENT.
 // Requires the contract already be APPROVED — the Instrument lifecycle
 // dimension is untouched, per LEG-05 §2.2's orthogonality rule.
-func (s *PgStore) SendForSignature(ctx context.Context, id, sentBy string) (*domain.Contract, error) {
+func (s *PgStore) SendForSignature(ctx context.Context, id string, a Audit) (*domain.Contract, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -487,6 +548,9 @@ func (s *PgStore) SendForSignature(ctx context.Context, id, sentBy string) (*dom
 	); err != nil {
 		return nil, err
 	}
+	if err := s.emit(ctx, tx, "contract.sent_for_signature", c, a); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -501,7 +565,11 @@ func (s *PgStore) SendForSignature(ctx context.Context, id, sentBy string) (*dom
 // scheduler this service does not have — documented limitation, same
 // honesty as the voter-roster and tax-jurisdiction deferrals elsewhere in
 // this codebase.
-func (s *PgStore) RecordExecution(ctx context.Context, id string, req *domain.RecordExecutionRequest) (*domain.Contract, error) {
+//
+// signed_by is signing evidence (the signatory named on the instrument), not
+// the caller; the authenticated principal who recorded the execution is
+// stored separately as execution_recorded_by.
+func (s *PgStore) RecordExecution(ctx context.Context, id string, req *domain.RecordExecutionRequest, a Audit) (*domain.Contract, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -527,7 +595,10 @@ func (s *PgStore) RecordExecution(ctx context.Context, id string, req *domain.Re
 	c.SignatureStatus = domain.SignatureStatusCompleted
 	c.ExecutedAt = &now
 	c.EffectiveAt = &now
-	c.SignedBy = &req.SignedBy
+	signedBy := req.SignedBy
+	c.SignedBy = &signedBy
+	recordedBy := a.ActorID
+	c.ExecutionRecordedBy = &recordedBy
 	c.DocumentVaultID = req.DocumentVaultID
 	c.UpdatedAt = now
 	c.Version++
@@ -535,14 +606,17 @@ func (s *PgStore) RecordExecution(ctx context.Context, id string, req *domain.Re
 	if _, err := tx.Exec(ctx, `
 		UPDATE contracts
 		SET status=$1, signature_status=$2, executed_at=$3, effective_at=$4, signed_by=$5,
-		    document_vault_id=$6, version=$7, updated_at=$8
+		    document_vault_id=$6, version=$7, updated_at=$8, execution_recorded_by=$11
 		WHERE contract_id=$9 AND tenant_id=$10`,
 		string(c.Status), string(c.SignatureStatus), c.ExecutedAt, c.EffectiveAt, c.SignedBy,
-		c.DocumentVaultID, c.Version, c.UpdatedAt, id, middleware.GetTenantID(ctx),
+		c.DocumentVaultID, c.Version, c.UpdatedAt, id, middleware.GetTenantID(ctx), c.ExecutionRecordedBy,
 	); err != nil {
 		return nil, err
 	}
 	if err := s.snapshotVersion(ctx, tx, c, "Contract executed and effective"); err != nil {
+		return nil, err
+	}
+	if err := s.emit(ctx, tx, "contract.executed", c, a); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -555,7 +629,10 @@ func (s *PgStore) RecordExecution(ctx context.Context, id string, req *domain.Re
 // contract itself stays EFFECTIVE throughout — amendment is an event and a
 // new immutable version, not a new status (see migration 000003's doc
 // comment for why).
-func (s *PgStore) AmendContract(ctx context.Context, id string, req *domain.AmendContractRequest) (*domain.Contract, error) {
+//
+// amended_by is the authenticated principal (a.ActorID), never the body's
+// amended_by — the handler refuses a body value that disagrees.
+func (s *PgStore) AmendContract(ctx context.Context, id string, req *domain.AmendContractRequest, a Audit) (*domain.Contract, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -586,7 +663,8 @@ func (s *PgStore) AmendContract(ctx context.Context, id string, req *domain.Amen
 		c.TotalValue = req.TotalValue
 	}
 	now := time.Now().UTC()
-	c.AmendedBy = &req.AmendedBy
+	amendedBy := a.ActorID
+	c.AmendedBy = &amendedBy
 	c.AmendedAt = &now
 	c.UpdatedAt = now
 	c.Version++
@@ -605,7 +683,11 @@ func (s *PgStore) AmendContract(ctx context.Context, id string, req *domain.Amen
 	if summary == "" {
 		summary = "Contract amended"
 	}
+	const eventType = "contract.amended"
 	if err := s.snapshotVersion(ctx, tx, c, summary); err != nil {
+		return nil, err
+	}
+	if err := s.emit(ctx, tx, eventType, c, a); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -617,7 +699,9 @@ func (s *PgStore) AmendContract(ctx context.Context, id string, req *domain.Amen
 // RenewContract extends an EFFECTIVE contract's term. Like AmendContract,
 // the contract stays EFFECTIVE — renewal is an event and a new version, not
 // a status change.
-func (s *PgStore) RenewContract(ctx context.Context, id string, req *domain.RenewContractRequest) (*domain.Contract, error) {
+//
+// renewed_by is the authenticated principal (a.ActorID).
+func (s *PgStore) RenewContract(ctx context.Context, id string, req *domain.RenewContractRequest, a Audit) (*domain.Contract, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -636,8 +720,10 @@ func (s *PgStore) RenewContract(ctx context.Context, id string, req *domain.Rene
 	}
 
 	now := time.Now().UTC()
-	c.EffectiveTo = &req.NewEffectiveTo
-	c.RenewedBy = &req.RenewedBy
+	newEffectiveTo := req.NewEffectiveTo
+	c.EffectiveTo = &newEffectiveTo
+	renewedBy := a.ActorID
+	c.RenewedBy = &renewedBy
 	c.RenewedAt = &now
 	c.UpdatedAt = now
 	c.Version++
@@ -654,7 +740,11 @@ func (s *PgStore) RenewContract(ctx context.Context, id string, req *domain.Rene
 	if summary == "" {
 		summary = "Contract renewed"
 	}
+	const eventType = "contract.renewed"
 	if err := s.snapshotVersion(ctx, tx, c, summary); err != nil {
+		return nil, err
+	}
+	if err := s.emit(ctx, tx, eventType, c, a); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -667,7 +757,9 @@ func (s *PgStore) RenewContract(ctx context.Context, id string, req *domain.Rene
 // metadata. Only a contract that has actually reached APPROVED or later may
 // be terminated — a DRAFT/REVIEW contract was never in force and has
 // nothing to terminate.
-func (s *PgStore) TerminateContract(ctx context.Context, id string, req *domain.TerminateContractRequest) (*domain.Contract, error) {
+//
+// terminated_by is the authenticated principal (a.ActorID).
+func (s *PgStore) TerminateContract(ctx context.Context, id string, req *domain.TerminateContractRequest, a Audit) (*domain.Contract, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -691,9 +783,11 @@ func (s *PgStore) TerminateContract(ctx context.Context, id string, req *domain.
 	now := time.Now().UTC()
 	todayStr := now.Format("2006-01-02")
 	c.Status = domain.ContractStatusTerminated
-	c.TerminatedBy = &req.TerminatedBy
+	terminatedBy := a.ActorID
+	c.TerminatedBy = &terminatedBy
 	c.TerminatedAt = &now
-	c.TerminationNote = &req.TerminationNote
+	note := req.TerminationNote
+	c.TerminationNote = &note
 	c.EffectiveTo = &todayStr
 	c.UpdatedAt = now
 	c.Version++
@@ -711,6 +805,9 @@ func (s *PgStore) TerminateContract(ctx context.Context, id string, req *domain.
 	}
 
 	if err := s.snapshotVersion(ctx, tx, c, "Contract terminated: "+req.TerminationNote); err != nil {
+		return nil, err
+	}
+	if err := s.emit(ctx, tx, "contract.terminated", c, a); err != nil {
 		return nil, err
 	}
 

@@ -34,6 +34,7 @@ type deadlineHandler struct {
 func RegisterDeadlineRoutes(r chi.Router, h *Handler, deadlineStore store.DeadlineStore) {
 	dh := &deadlineHandler{Handler: h, store: deadlineStore}
 	r.Route("/v1/deadlines", func(r chi.Router) {
+		r.Use(withEventMeta)
 		r.Post("/", dh.CreateDeadline)
 		r.Post("/mirror", dh.MirrorAuthoritativeDeadline)
 		r.Get("/upcoming", dh.ListUpcoming)
@@ -423,10 +424,11 @@ func (h *deadlineHandler) Escalate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, esc)
 }
 
-// ListUpcoming — BIZ-08's own ListUpcoming query. Publishes
+// ListUpcoming — BIZ-08's own ListUpcoming query. Emits
 // DeadlineDueSoon for exactly the deadlines this call is the first to
-// observe crossing the threshold — see store.ListUpcoming's own doc
-// comment.
+// observe crossing the threshold — the store writes it to the outbox in the
+// same transaction that sets due_soon_notified_at, so the mark and the
+// notification can no longer diverge.
 func (h *deadlineHandler) ListUpcoming(w http.ResponseWriter, r *http.Request) {
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -455,9 +457,10 @@ func (h *deadlineHandler) ListUpcoming(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, deadlines)
 }
 
-// ListOverdue — BIZ-08's own ListOverdue query. Publishes DeadlineOverdue
+// ListOverdue — BIZ-08's own ListOverdue query. Emits DeadlineOverdue
 // for exactly the deadlines this call is the first to observe as
-// overdue — see store.ListOverdue's own doc comment.
+// overdue, through the outbox in the same transaction as
+// overdue_notified_at (see ListUpcoming).
 func (h *deadlineHandler) ListOverdue(w http.ResponseWriter, r *http.Request) {
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {

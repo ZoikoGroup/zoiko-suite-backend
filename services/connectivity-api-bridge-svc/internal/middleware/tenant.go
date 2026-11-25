@@ -31,6 +31,13 @@ const TenantIDKey contextKey = "tenant_id"
 // here is cosmetic, not functional.
 func TenantContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Liveness/readiness probes carry no identity headers (orchestrator,
+		// Docker HEALTHCHECK, frontend health page); they touch no tenant data.
+		switch r.URL.Path {
+		case "/healthz", "/readyz", "/health":
+			next.ServeHTTP(w, r)
+			return
+		}
 		tenantID := r.Header.Get("X-Tenant-Id")
 		if tenantID == "" {
 			w.Header().Set("Content-Type", "application/json")

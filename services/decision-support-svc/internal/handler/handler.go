@@ -1,272 +1,338 @@
+// Package handler is decision-support-svc's HTTP layer. Each handler does
+// the same four things, in order:
+//
+//  1. read the caller (tenant + principal) and the request (path, query, body)
+//  2. call one service.Service method
+//  3. on error, render an RFC 9457 problem (problem.go)
+//  4. on success, render the JSON body (and ETag for a single recommendation)
+//
+// Business rules live in internal/service, never here.
 package handler
 
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
-	"strconv"
-	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/google/uuid"
 	"go.uber.org/zap"
 
-	"zoiko.io/decision-support-svc/internal/clients"
 	"zoiko.io/decision-support-svc/internal/domain"
-	svcmiddleware "zoiko.io/decision-support-svc/internal/middleware"
 )
 
-type Store interface {
-	CreateRecommendation(ctx context.Context, r *domain.Recommendation) (created bool, err error)
-	GetRecommendation(ctx context.Context, recommendationID string) (*domain.Recommendation, error)
-	ListRecommendations(ctx context.Context, legalEntityID, subjectReference string) ([]domain.Recommendation, error)
+// RecommendationService is the subset of *service.Service the handlers use.
+type RecommendationService interface {
+	CreateRecommendation(ctx context.Context, caller domain.CallerContext, idem domain.IdempotencyInput, req domain.CreateRecommendationRequest) (*domain.Recommendation, bool, error)
+	GetRecommendation(ctx context.Context, caller domain.CallerContext, recommendationID string) (*domain.Recommendation, error)
+	ListRecommendations(ctx context.Context, caller domain.CallerContext, filter domain.ListFilter) (*domain.Page, error)
+	ListDispositions(ctx context.Context, caller domain.CallerContext, recommendationID string) ([]domain.Disposition, error)
+	Decide(ctx context.Context, caller domain.CallerContext, idem domain.IdempotencyInput, cmd domain.DecisionCommand) (*domain.Recommendation, bool, error)
 }
 
-type Publisher interface {
-	PublishRecommended(ctx context.Context, r domain.Recommendation)
-}
-
-type AuthZClient interface {
-	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
-}
-
-// HistorySource looks up prior governance decisions to ground a
-// recommendation in real precedent.
-type HistorySource interface {
-	ListPriorDecisions(ctx context.Context, tenantID, legalEntityID, actionType string, limit int) ([]clients.PriorDecision, error)
-}
-
-const (
-	actionRecommendationRequest = "DECISION_SUPPORT_REQUEST"
-	actionRecommendationView    = "DECISION_SUPPORT_VIEW"
-
-	historySampleSize = 30
-)
-
+// Handler serves the /v1/recommendations API.
 type Handler struct {
-	store     Store
-	publisher Publisher
-	authz     AuthZClient
-	history   HistorySource
-	log       *zap.Logger
+	service RecommendationService
+	log     *zap.Logger
 }
 
-func New(store Store, publisher Publisher, authz AuthZClient, history HistorySource, log *zap.Logger) *Handler {
-	return &Handler{store: store, publisher: publisher, authz: authz, history: history, log: log}
+// New builds a Handler.
+func New(service RecommendationService, log *zap.Logger) *Handler {
+	return &Handler{service: service, log: log}
 }
 
+// RegisterRoutes mounts every route. ROUTES.md documents each one.
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/recommendations", func(r chi.Router) {
-		r.Post("/", h.RequestRecommendation)
+		r.Post("/", h.CreateRecommendation)
 		r.Get("/", h.ListRecommendations)
 		r.Get("/{recommendation_id}", h.GetRecommendation)
+		r.Get("/{recommendation_id}/dispositions", h.ListDispositions)
+		r.Post("/{recommendation_id}/accept", h.AcceptRecommendation)
+		r.Post("/{recommendation_id}/reject", h.RejectRecommendation)
+		r.Post("/{recommendation_id}/expire", h.ExpireRecommendation)
+		r.Post("/{recommendation_id}/supersede", h.SupersedeRecommendation)
 	})
 }
 
-// ── POST /v1/recommendations ──────────────────────────────────────────────────
-
-// RequestRecommendation computes a recommendation from real historical
-// precedent (governance-decision-log-svc), not an invented heuristic.
+// CreateRecommendation handles POST /v1/recommendations.
 //
-// Per doctrine §15 ("intelligence services fail without mutating source
-// execution... reporting services fail degraded, not destructive"), if
-// governance-decision-log-svc is unreachable or has no matching history,
-// this returns a NO_HISTORY recommendation rather than a 503 — a
-// recommendation is advisory only, so degrading gracefully is correct here
-// in a way it would NOT be for a governed write like a spend check.
+// Validation: X-Tenant-Id and X-Principal-Id required (401); Idempotency-Key
+// required (400); body must be a JSON object with legal_entity_id (UUID,
+// equal to X-Legal-Entity-Id), subject_type, subject_reference and
+// action_type (400); body tenant_id, if sent, must equal X-Tenant-Id (403);
+// oversight_class O4 is refused (422).
+// Writes: one recommendation in REVIEW_REQUIRED, its creation history entry,
+// the decision_support.recommendation.proposed outbox event and the
+// idempotency record — in one transaction.
+// Success: 201 with the recommendation and its ETag. A replay of the same
+// Idempotency-Key and body returns the original 201 body with
+// Idempotent-Replayed: true; the same key with a different body is 422.
+// Errors: 400, 401, 403 (tenant mismatch / authz denied), 422, 503.
+func (h *Handler) CreateRecommendation(w http.ResponseWriter, r *http.Request) {
+	caller, err := callerFromRequest(r)
+	if err != nil {
+		h.writeProblem(w, r, err)
+		return
+	}
+
+	rawBody, err := readBody(r)
+	if err != nil {
+		h.writeProblem(w, r, err)
+		return
+	}
+	idem, err := idempotencyFromRequest(r, caller.PrincipalID, rawBody)
+	if err != nil {
+		h.writeProblem(w, r, err)
+		return
+	}
+	var req domain.CreateRecommendationRequest
+	if err := decodeJSON(rawBody, &req, false); err != nil {
+		h.writeProblem(w, r, err)
+		return
+	}
+
+	rec, replayed, err := h.service.CreateRecommendation(r.Context(), caller, idem, req)
+	if err != nil {
+		h.writeProblem(w, r, err)
+		return
+	}
+
+	writeRecommendation(w, http.StatusCreated, rec, replayed)
+}
+
+// ListRecommendations handles GET /v1/recommendations.
 //
-// Idempotent on (tenant_id, correlation_id).
-func (h *Handler) RequestRecommendation(w http.ResponseWriter, r *http.Request) {
-	var req domain.RequestRecommendationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
-		return
-	}
-	if req.LegalEntityID == "" || req.SubjectType == "" || req.SubjectReference == "" || req.ActionType == "" || req.CorrelationID == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, subject_type, subject_reference, action_type, correlation_id are required")
-		return
-	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionRecommendationRequest); err != nil {
-		h.writeAuthzErr(w, err)
-		return
-	}
-
-	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	recommendedAction, confidence, rationale, sampled := h.computeRecommendation(r.Context(), tenantID, req.LegalEntityID, req.ActionType)
-
-	rec := &domain.Recommendation{
-		RecommendationID:       uuid.NewString(),
-		TenantID:               tenantID,
-		LegalEntityID:          req.LegalEntityID,
-		SubjectType:            req.SubjectType,
-		SubjectReference:       req.SubjectReference,
-		ActionType:             req.ActionType,
-		RecommendedAction:      recommendedAction,
-		ConfidenceScore:        confidence,
-		Rationale:              rationale,
-		PriorDecisionsSampled:  sampled,
-		RequestedByPrincipalID: principalID,
-		CorrelationID:          req.CorrelationID,
-		CreatedAt:              time.Now().UTC(),
-	}
-
-	created, err := h.store.CreateRecommendation(r.Context(), rec)
-	if err != nil {
-		h.log.Error("failed to record recommendation", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
-		return
-	}
-	if created {
-		h.publisher.PublishRecommended(r.Context(), *rec)
-	}
-
-	writeJSON(w, http.StatusCreated, rec)
-}
-
-// computeRecommendation samples up to historySampleSize prior governance
-// decisions for the same legal entity + action type, and recommends
-// whichever outcome was most frequent, with confidence = its share of the
-// sample. Any failure to reach governance-decision-log-svc degrades to
-// NO_HISTORY rather than failing the request.
-func (h *Handler) computeRecommendation(ctx context.Context, tenantID, legalEntityID, actionType string) (domain.RecommendedAction, float64, string, int) {
-	decisions, err := h.history.ListPriorDecisions(ctx, tenantID, legalEntityID, actionType, historySampleSize)
-	if err != nil {
-		h.log.Warn("governance-decision-log-svc unreachable, degrading to NO_HISTORY", zap.Error(err))
-		return domain.RecommendedActionNoHistory, 0, "governance-decision-log-svc unreachable; no historical basis available", 0
-	}
-	if len(decisions) == 0 {
-		return domain.RecommendedActionNoHistory, 0, "no prior decisions found for this legal entity and action type", 0
-	}
-
-	counts := map[string]int{}
-	for _, d := range decisions {
-		counts[d.Outcome]++
-	}
-
-	var topOutcome string
-	var topCount int
-	for outcome, count := range counts {
-		if count > topCount {
-			topOutcome, topCount = outcome, count
-		}
-	}
-
-	total := len(decisions)
-	confidence := float64(topCount) / float64(total)
-
-	var recommended domain.RecommendedAction
-	switch topOutcome {
-	case "GRANTED":
-		recommended = domain.RecommendedActionApprove
-	case "DENIED":
-		recommended = domain.RecommendedActionReject
-	default:
-		recommended = domain.RecommendedActionEscalate
-	}
-
-	rationale := formatRationale(topOutcome, topCount, total)
-	return recommended, confidence, rationale, total
-}
-
-func formatRationale(topOutcome string, topCount, total int) string {
-	return topOutcome + " in " + strconv.Itoa(topCount) + " of the last " + strconv.Itoa(total) + " decisions for this legal entity and action type"
-}
-
-// ── GET /v1/recommendations ───────────────────────────────────────────────────
-
+// Validation: X-Tenant-Id and X-Principal-Id required (401). Optional query:
+// legal_entity_id (UUID), subject_type, subject_reference, action_type,
+// status (one of the lifecycle states), limit (1-200, default 50) and cursor
+// (from a previous page's next_cursor) — any malformed value is 400.
+// Authorization: DECISION_SUPPORT_VIEW on legal_entity_id, or on PLATFORM
+// scope when the list is not filtered by legal entity.
+// Success: 200 {"items": [...], "next_cursor": "..." | null}, newest first.
+// Errors: 400, 401, 403, 503.
 func (h *Handler) ListRecommendations(w http.ResponseWriter, r *http.Request) {
-	legalEntityID := r.URL.Query().Get("legal_entity_id")
-	subjectReference := r.URL.Query().Get("subject_reference")
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if legalEntityID != "" {
-		if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionRecommendationView); err != nil {
-			h.writeAuthzErr(w, err)
-			return
-		}
-	}
-
-	list, err := h.store.ListRecommendations(r.Context(), legalEntityID, subjectReference)
+	caller, err := callerFromRequest(r)
 	if err != nil {
-		h.log.Error("failed to list recommendations", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		h.writeProblem(w, r, err)
 		return
 	}
-	if list == nil {
-		list = []domain.Recommendation{}
+
+	filter, err := listFilterFromQuery(r)
+	if err != nil {
+		h.writeProblem(w, r, err)
+		return
 	}
-	writeJSON(w, http.StatusOK, list)
+
+	page, err := h.service.ListRecommendations(r.Context(), caller, filter)
+	if err != nil {
+		h.writeProblem(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, page)
 }
 
-// ── GET /v1/recommendations/{recommendation_id} ───────────────────────────────
-
+// GetRecommendation handles GET /v1/recommendations/{recommendation_id}.
+//
+// Validation: X-Tenant-Id and X-Principal-Id required (401);
+// recommendation_id must be a UUID (400).
+// Authorization: DECISION_SUPPORT_VIEW on the recommendation's legal entity.
+// Success: 200 with the recommendation and ETag: "<version>" — send it back
+// as If-Match on a decision.
+// Errors: 400, 401, 403, 404 (unknown id, or another tenant's), 503.
 func (h *Handler) GetRecommendation(w http.ResponseWriter, r *http.Request) {
-	recommendationID := chi.URLParam(r, "recommendation_id")
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	rec, err := h.store.GetRecommendation(r.Context(), recommendationID)
+	caller, err := callerFromRequest(r)
 	if err != nil {
-		h.writeStoreErr(w, err)
+		h.writeProblem(w, r, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, rec.LegalEntityID, actionRecommendationView); err != nil {
-		h.writeAuthzErr(w, err)
+
+	recommendationID, err := recommendationIDFromPath(r)
+	if err != nil {
+		h.writeProblem(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, rec)
-}
 
-// ── Helpers ────────────────────────────────────────────────────────────────
-
-func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
-	principalID := r.Header.Get("X-Principal-Id")
-	if principalID == "" {
-		writeError(w, http.StatusUnauthorized, "identity_missing", string(domain.ErrIdentityMissing))
-		return "", false
-	}
-	return principalID, true
-}
-
-func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
-	if errors.Is(err, domain.ErrAuthorizationDenied) {
-		writeError(w, http.StatusForbidden, "forbidden", err.Error())
-	} else {
-		writeError(w, http.StatusServiceUnavailable, "authz_unavailable", err.Error())
-	}
-}
-
-func (h *Handler) writeStoreErr(w http.ResponseWriter, err error) {
-	if errors.Is(err, domain.ErrRecommendationNotFound) {
-		writeError(w, http.StatusNotFound, "not_found", err.Error())
+	rec, err := h.service.GetRecommendation(r.Context(), caller, recommendationID)
+	if err != nil {
+		h.writeProblem(w, r, err)
 		return
 	}
-	h.log.Error("decision support store error", zap.Error(err))
-	writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+
+	writeRecommendation(w, http.StatusOK, rec, false)
 }
 
-func writeError(w http.ResponseWriter, status int, code, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"error_code":    code,
-		"error_message": msg,
+// ListDispositions handles GET /v1/recommendations/{recommendation_id}/dispositions.
+//
+// Validation: X-Tenant-Id and X-Principal-Id required (401);
+// recommendation_id must be a UUID (400).
+// Authorization: DECISION_SUPPORT_VIEW on the recommendation's legal entity.
+// Success: 200 {"items": [...]} — the append-only history, oldest first,
+// starting with the creation entry (from_status absent, to_status
+// REVIEW_REQUIRED).
+// Errors: 400, 401, 403, 404, 503.
+func (h *Handler) ListDispositions(w http.ResponseWriter, r *http.Request) {
+	caller, err := callerFromRequest(r)
+	if err != nil {
+		h.writeProblem(w, r, err)
+		return
+	}
+
+	recommendationID, err := recommendationIDFromPath(r)
+	if err != nil {
+		h.writeProblem(w, r, err)
+		return
+	}
+
+	history, err := h.service.ListDispositions(r.Context(), caller, recommendationID)
+	if err != nil {
+		h.writeProblem(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"items": history})
+}
+
+// AcceptRecommendation handles POST /v1/recommendations/{recommendation_id}/accept.
+//
+// Records a human decision to accept the advice. It does NOT execute the
+// recommended action: the governed action must still be submitted to its
+// owning service, which re-authorizes it (AIG-04 §7.3, NP-38).
+// Validation: caller (401), Idempotency-Key (400), recommendation_id UUID
+// (400), If-Match required (428) and well-formed (400); optional body
+// {reason, downstream_action_ref, approval_reference}; approval_reference
+// is required for O3 (400).
+// Rules: If-Match must equal the current version (412); status must be
+// REVIEW_REQUIRED (409); the requester of an O2/O3 recommendation cannot
+// accept it (403 segregation_of_duties); expires_at must not have passed
+// (409 review_deadline_passed).
+// Writes: status ACCEPTED + decided_by/decided_at, a history entry, the
+// decision_support.recommendation.accepted event and a governance decision
+// log record (both via the outbox), and the idempotency record.
+// Success: 200 with the updated recommendation and its new ETag.
+// Errors: 400, 401, 403, 404, 409, 412, 422 (key reused), 428, 503.
+func (h *Handler) AcceptRecommendation(w http.ResponseWriter, r *http.Request) {
+	h.decide(w, r, domain.StatusAccepted)
+}
+
+// RejectRecommendation handles POST /v1/recommendations/{recommendation_id}/reject.
+//
+// Records a human decision to reject the advice ("REJECTED -> no downstream
+// authority"). Validation as for accept, plus body reason is required (400).
+// Rules: If-Match (412), REVIEW_REQUIRED only (409), expires_at not passed
+// (409). The requester may reject their own recommendation.
+// Writes: status REJECTED, history entry, decision_support.recommendation.rejected
+// event and governance decision log record (outbox), idempotency record.
+// Success: 200 with the updated recommendation.
+// Errors: 400, 401, 403, 404, 409, 412, 422, 428, 503.
+func (h *Handler) RejectRecommendation(w http.ResponseWriter, r *http.Request) {
+	h.decide(w, r, domain.StatusRejected)
+}
+
+// ExpireRecommendation handles POST /v1/recommendations/{recommendation_id}/expire.
+//
+// Closes the review window without a decision (NP-40 "Review deadline
+// expires -> Escalate/expire; never auto-accept"). After expires_at no
+// reason is needed; before it, body reason is required (400).
+// Rules: If-Match (412), REVIEW_REQUIRED only (409).
+// Writes: status EXPIRED, history entry, decision_support.recommendation.expired
+// event (outbox), idempotency record.
+// Success: 200 with the updated recommendation.
+// Errors: 400, 401, 403, 404, 409, 412, 422, 428, 503.
+func (h *Handler) ExpireRecommendation(w http.ResponseWriter, r *http.Request) {
+	h.decide(w, r, domain.StatusExpired)
+}
+
+// SupersedeRecommendation handles POST /v1/recommendations/{recommendation_id}/supersede.
+//
+// Replaces this recommendation with a newer one ("SUPERSEDED -> replacement
+// output/review linked"). Body: replacement_recommendation_id (UUID,
+// required, 400) and optional reason.
+// Rules: If-Match (412); this recommendation must be REVIEW_REQUIRED (409);
+// the replacement must exist in the tenant (422 replacement_not_found), be
+// a different recommendation for the same legal entity, subject and action
+// (422 replacement_mismatched) and itself be REVIEW_REQUIRED (409).
+// Writes: status SUPERSEDED + superseded_by link, the replacement's
+// supersedes link (its version also increments), history entry,
+// decision_support.recommendation.superseded event (outbox), idempotency record.
+// Success: 200 with the superseded recommendation.
+// Errors: 400, 401, 403, 404, 409, 412, 422, 428, 503.
+func (h *Handler) SupersedeRecommendation(w http.ResponseWriter, r *http.Request) {
+	h.decide(w, r, domain.StatusSuperseded)
+}
+
+// decide is the shared body of the four decision handlers: it differs only
+// in the target status.
+func (h *Handler) decide(w http.ResponseWriter, r *http.Request, target domain.Status) {
+	caller, err := callerFromRequest(r)
+	if err != nil {
+		h.writeProblem(w, r, err)
+		return
+	}
+
+	recommendationID, err := recommendationIDFromPath(r)
+	if err != nil {
+		h.writeProblem(w, r, err)
+		return
+	}
+
+	rawBody, err := readBody(r)
+	if err != nil {
+		h.writeProblem(w, r, err)
+		return
+	}
+	idem, err := idempotencyFromRequest(r, caller.PrincipalID, rawBody)
+	if err != nil {
+		h.writeProblem(w, r, err)
+		return
+	}
+	var req domain.DecisionRequest
+	if err := decodeJSON(rawBody, &req, true); err != nil {
+		h.writeProblem(w, r, err)
+		return
+	}
+
+	expectedVersion, err := expectedVersionFromRequest(r)
+	if err != nil {
+		h.writeProblem(w, r, err)
+		return
+	}
+
+	rec, replayed, err := h.service.Decide(r.Context(), caller, idem, domain.DecisionCommand{
+		RecommendationID: recommendationID,
+		TargetStatus:     target,
+		ExpectedVersion:  expectedVersion,
+		Request:          req,
 	})
+	if err != nil {
+		h.writeProblem(w, r, err)
+		return
+	}
+
+	writeRecommendation(w, http.StatusOK, rec, replayed)
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
+// ── response helpers ─────────────────────────────────────────────────────────
+
+func writeRecommendation(w http.ResponseWriter, status int, rec *domain.Recommendation, replayed bool) {
+	w.Header().Set("ETag", rec.ETag())
+	if replayed {
+		w.Header().Set("Idempotent-Replayed", "true")
+	}
+	writeJSON(w, status, rec)
+}
+
+func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+func (h *Handler) logError(r *http.Request, message string, err error) {
+	h.log.Error(message,
+		zap.String("method", r.Method),
+		zap.String("path", r.URL.Path),
+		zap.String("correlation_id", r.Header.Get("X-Correlation-ID")),
+		zap.Error(err),
+	)
 }

@@ -236,7 +236,7 @@ func (h *Handler) PromoteBatch(w http.ResponseWriter, r *http.Request) {
 		LegalEntityID: job.LegalEntityID, BookID: req.BookID, BatchCode: req.BatchCode, Kind: "OPENING",
 		CutoverDate: req.CutoverDate, SourceSystem: job.SourceSystem, SourceExtractRef: req.SourceExtractRef,
 		SourceExtractHash: req.SourceExtractHash, MappingRef: req.MappingRef,
-		SourceTotals: glclient.Totals{Debit: req.SourceTotals.Debit, Credit: req.SourceTotals.Credit},
+		SourceTotals:  glclient.Totals{Debit: req.SourceTotals.Debit, Credit: req.SourceTotals.Credit},
 		ControlTotals: controlTotals, Lines: lines,
 	}
 

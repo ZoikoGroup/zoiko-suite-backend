@@ -30,6 +30,13 @@ type stubStore struct {
 	// tenant scope reached it.
 	tenantMissing bool
 	failWith      error
+
+	// outbox stands in for the real store's outbox: EvaluateSpend writes the
+	// two breach events for a FRESH BLOCKED decision in its own transaction
+	// (internal/store, DB-tested). eventCorrelation records the correlation id
+	// the handler handed down for them.
+	outbox           *stubPublisher
+	eventCorrelation string
 }
 
 func newStubStore() *stubStore {
@@ -155,6 +162,11 @@ func (s *stubStore) EvaluateSpend(_ context.Context, in domain.SpendEvaluation) 
 	}
 	if projected > policy.ThresholdAmount {
 		d.Outcome, d.Basis = "BLOCKED", "threshold_exceeded"
+		s.eventCorrelation = in.EventCorrelationID
+		if s.outbox != nil {
+			s.outbox.breached++
+			s.outbox.blocked++
+		}
 	} else {
 		d.Outcome, d.Basis = "ALLOWED", "within_threshold"
 	}
@@ -223,15 +235,9 @@ func (s *stubStore) ListConsumptions(_ context.Context, legalEntityID, spendPoli
 	return out, nil
 }
 
+// stubPublisher counts the outbox events the stub store wrote.
 type stubPublisher struct {
 	breached, blocked int
-}
-
-func (p *stubPublisher) PublishThresholdBreached(_ context.Context, _, _ string, _ domain.SpendCheckRequest, _ domain.SpendPolicy, _ float64) {
-	p.breached++
-}
-func (p *stubPublisher) PublishBlockApplied(_ context.Context, _, _ string, _ domain.SpendCheckRequest, _ domain.SpendPolicy) {
-	p.blocked++
 }
 
 type stubAuthZ struct {
@@ -266,7 +272,10 @@ func newRouterWithTenant(s *stubStore, pub *stubPublisher, authz *stubAuthZ, ten
 			next.ServeHTTP(w, req)
 		})
 	})
-	h := handler.New(s, pub, authz, zap.NewNop())
+	if s.outbox == nil {
+		s.outbox = pub
+	}
+	h := handler.New(s, authz, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -595,6 +604,9 @@ func TestSubmitCheck_ExceedsThreshold_Blocked(t *testing.T) {
 	}
 	if pub.breached != 1 || pub.blocked != 1 {
 		t.Errorf("expected 1 breach + 1 block event, got breached=%d blocked=%d", pub.breached, pub.blocked)
+	}
+	if s.eventCorrelation == "" {
+		t.Error("the handler must hand the request correlation id down for the outbox events")
 	}
 
 	// A blocked attempt IS recorded now — refusals used to exist only as Kafka

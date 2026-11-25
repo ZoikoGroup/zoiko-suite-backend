@@ -131,13 +131,13 @@ func TestSupplierEligibility_BlocksCreateSubmitAndIssue(t *testing.T) {
 	}
 	e.supplier.active("SUP-1")
 	e.command(t, o.PurchaseOrderID, "submit", "maker", nil)
-	e.command(t, o.PurchaseOrderID, "approve", "checker", domain.CommandRequest{ExpectedVersion: version(decode[domain.OrderDetail](t, e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID, nil, "")))})
+	e.command(t, o.PurchaseOrderID, "approve", "checker", domain.CommandRequest{ExpectedVersion: version(decode[domain.OrderDetail](t, e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID, nil, "reader")))})
 	e.supplier.set("SUP-1", supplier.Eligibility{Status: "ON_HOLD", IsOnHold: true})
 	rec = e.command(t, o.PurchaseOrderID, "issue", "buyer", nil)
 	if rec.Code != http.StatusUnprocessableEntity || codeOf(t, rec) != "SUPPLIER_NOT_ELIGIBLE" {
 		t.Fatalf("issue to a held supplier without an exception: %d %s", rec.Code, rec.Body.String())
 	}
-	if got := decode[domain.OrderDetail](t, e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID, nil, "")); got.Status != domain.OrderStatusApproved {
+	if got := decode[domain.OrderDetail](t, e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID, nil, "reader")); got.Status != domain.OrderStatusApproved {
 		t.Errorf("a refused issue changed the status to %s", got.Status)
 	}
 }
@@ -228,7 +228,7 @@ func TestApprove_PreparerRefused_ByAuthorizationSvcAndByStore(t *testing.T) {
 	e.authz.sodRules = true
 	o := e.createDraft(t)
 	e.command(t, o.PurchaseOrderID, "submit", "maker", nil)
-	cur := decode[domain.OrderDetail](t, e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID, nil, ""))
+	cur := decode[domain.OrderDetail](t, e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID, nil, "reader"))
 
 	rec := e.command(t, o.PurchaseOrderID, "approve", "maker", domain.CommandRequest{ExpectedVersion: version(cur)})
 	if rec.Code != http.StatusForbidden {
@@ -245,7 +245,7 @@ func TestApprove_PreparerRefused_ByAuthorizationSvcAndByStore(t *testing.T) {
 	if rec.Code != http.StatusForbidden || codeOf(t, rec) != "SOD_CONFLICT" {
 		t.Fatalf("the store's own maker-checker rule: %d %s", rec.Code, rec.Body.String())
 	}
-	if got := decode[domain.OrderDetail](t, e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID, nil, "")); got.Status != domain.OrderStatusPendingApproval {
+	if got := decode[domain.OrderDetail](t, e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID, nil, "reader")); got.Status != domain.OrderStatusPendingApproval {
 		t.Errorf("a refused approval changed the status to %s", got.Status)
 	}
 
@@ -260,7 +260,7 @@ func TestApprove_HighValueThreshold_RequiresHighValueAction(t *testing.T) {
 	e := newEnv(handler.Options{HighValueThreshold: 50})
 	o := e.createDraft(t) // total 60 > 50
 	e.command(t, o.PurchaseOrderID, "submit", "maker", nil)
-	cur := decode[domain.OrderDetail](t, e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID, nil, ""))
+	cur := decode[domain.OrderDetail](t, e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID, nil, "reader"))
 
 	e.authz.err, e.authz.denyOnly = domain.ErrAuthorizationDenied, "PO_APPROVE_HIGHVALUE"
 	if rec := e.command(t, o.PurchaseOrderID, "approve", "checker", domain.CommandRequest{ExpectedVersion: version(cur)}); rec.Code != http.StatusForbidden {
@@ -310,7 +310,7 @@ func TestFullGovernedFlow_RecordsEvidenceAndEvents(t *testing.T) {
 			t.Errorf("%s was never checked", a)
 		}
 	}
-	hist := decode[[]domain.OrderEvent](t, e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID+"/history", nil, ""))
+	hist := decode[[]domain.OrderEvent](t, e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID+"/history", nil, "reader"))
 	if len(hist) != 4 {
 		t.Errorf("history has %d rows, want 4", len(hist))
 	}
@@ -430,7 +430,7 @@ func TestAmend_MaterialChange_ReapprovalAndRevisionEndpoints(t *testing.T) {
 	}
 
 	// The superseded revision is preserved and readable (GetPORevision).
-	list := e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID+"/revisions", nil, "")
+	list := e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID+"/revisions", nil, "reader")
 	var lr struct {
 		Current   int               `json:"current_revision"`
 		Revisions []json.RawMessage `json:"revisions"`
@@ -439,7 +439,7 @@ func TestAmend_MaterialChange_ReapprovalAndRevisionEndpoints(t *testing.T) {
 	if lr.Current != 2 || len(lr.Revisions) != 1 {
 		t.Fatalf("revisions: current=%d n=%d, want 2 and 1", lr.Current, len(lr.Revisions))
 	}
-	old := e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID+"/revisions/1", nil, "")
+	old := e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID+"/revisions/1", nil, "reader")
 	var ov struct {
 		Current  bool `json:"current"`
 		Snapshot struct {
@@ -453,14 +453,14 @@ func TestAmend_MaterialChange_ReapprovalAndRevisionEndpoints(t *testing.T) {
 	if old.Code != http.StatusOK || ov.Current || ov.Snapshot.Total != 60 || ov.Snapshot.Lines[0].Quantity != 10 {
 		t.Fatalf("revision 1 must hold the ORIGINAL issued content: %d %s", old.Code, old.Body.String())
 	}
-	cur := e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID+"/revisions/2", nil, "")
+	cur := e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID+"/revisions/2", nil, "reader")
 	if !strings.Contains(cur.Body.String(), `"current":true`) {
 		t.Errorf("revision 2 should be served as the current one: %s", cur.Body.String())
 	}
-	if rec := e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID+"/revisions/9", nil, ""); rec.Code != http.StatusNotFound {
+	if rec := e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID+"/revisions/9", nil, "reader"); rec.Code != http.StatusNotFound {
 		t.Errorf("unknown revision: expected 404, got %d", rec.Code)
 	}
-	if rec := e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID+"/revisions/abc", nil, ""); rec.Code != http.StatusBadRequest {
+	if rec := e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID+"/revisions/abc", nil, "reader"); rec.Code != http.StatusBadRequest {
 		t.Errorf("malformed revision: expected 400, got %d", rec.Code)
 	}
 }
@@ -514,7 +514,7 @@ func TestAmend_BelowProgress_Conflict(t *testing.T) {
 func TestGetOrder_ContractShape_LinesAndRevision(t *testing.T) {
 	e := newEnv()
 	o := e.issued(t)
-	rec := e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID, nil, "")
+	rec := e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID, nil, "reader")
 	var raw map[string]json.RawMessage
 	_ = json.Unmarshal(rec.Body.Bytes(), &raw)
 	for _, k := range []string{"purchase_order_id", "tenant_id", "legal_entity_id", "po_status", "total_amount", "currency_code", "revision", "version", "lines"} {
@@ -543,7 +543,7 @@ func TestGetOrder_ContractShape_LinesAndRevision(t *testing.T) {
 func TestGetOrder_LegacyHeaderOnly_HasEmptyLinesArray(t *testing.T) {
 	e := newEnv()
 	legacy := decode[domain.OrderDetail](t, e.post("/v1/purchase-orders/", validIssueReq(), "principal-1"))
-	rec := e.do(http.MethodGet, "/v1/purchase-orders/"+legacy.PurchaseOrderID, nil, "")
+	rec := e.do(http.MethodGet, "/v1/purchase-orders/"+legacy.PurchaseOrderID, nil, "reader")
 	if !strings.Contains(rec.Body.String(), `"lines":[]`) {
 		t.Errorf("expected an empty lines array, got %s", rec.Body.String())
 	}
@@ -552,7 +552,7 @@ func TestGetOrder_LegacyHeaderOnly_HasEmptyLinesArray(t *testing.T) {
 func TestOpenQuantity_And_Statuses(t *testing.T) {
 	e := newEnv()
 	o := e.issued(t)
-	rec := e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID+"/open-quantity", nil, "")
+	rec := e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID+"/open-quantity", nil, "reader")
 	var oq struct {
 		Lines []map[string]any `json:"lines"`
 	}
@@ -566,13 +566,13 @@ func TestOpenQuantity_And_Statuses(t *testing.T) {
 		}
 	}
 	for _, p := range []string{"receipt-status", "invoice-status"} {
-		r := e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID+"/"+p, nil, "")
+		r := e.do(http.MethodGet, "/v1/purchase-orders/"+o.PurchaseOrderID+"/"+p, nil, "reader")
 		if r.Code != http.StatusOK || !strings.Contains(r.Body.String(), `"status":"NOT_STARTED"`) {
 			t.Errorf("%s: %d %s", p, r.Code, r.Body.String())
 		}
 	}
 	for _, p := range []string{"open-quantity", "receipt-status", "invoice-status"} {
-		if r := e.do(http.MethodGet, "/v1/purchase-orders/00000000-0000-0000-0000-000000000000/"+p, nil, ""); r.Code != http.StatusNotFound {
+		if r := e.do(http.MethodGet, "/v1/purchase-orders/00000000-0000-0000-0000-000000000000/"+p, nil, "reader"); r.Code != http.StatusNotFound {
 			t.Errorf("%s for an unknown order: expected 404, got %d", p, r.Code)
 		}
 	}
@@ -729,7 +729,7 @@ func TestErrors_CarryStableCodes(t *testing.T) {
 			r.Lines = nil
 			return e.post("/v1/purchase-orders/draft", r, "maker")
 		}},
-		{"not found", "ORDER_NOT_FOUND", func() *httpRec { return e.do(http.MethodGet, "/v1/purchase-orders/nope", nil, "") }},
+		{"not found", "ORDER_NOT_FOUND", func() *httpRec { return e.do(http.MethodGet, "/v1/purchase-orders/nope", nil, "reader") }},
 		{"tenant", "TENANT_SCOPE_MISSING", func() *httpRec { return e.doAs(http.MethodGet, "/v1/purchase-orders/", nil, "", "") }},
 		{"identity", "IDENTITY_MISSING", func() *httpRec { return e.post("/v1/purchase-orders/draft", validDraft(), "") }},
 	}
@@ -740,7 +740,7 @@ func TestErrors_CarryStableCodes(t *testing.T) {
 		}
 	}
 	// The pre-existing `error` field is unchanged for consumers that read it.
-	rec := e.do(http.MethodGet, "/v1/purchase-orders/nope", nil, "")
+	rec := e.do(http.MethodGet, "/v1/purchase-orders/nope", nil, "reader")
 	var body map[string]string
 	_ = json.Unmarshal(rec.Body.Bytes(), &body)
 	if body["error"] != "order_not_found" {

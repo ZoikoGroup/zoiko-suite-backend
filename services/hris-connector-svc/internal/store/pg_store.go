@@ -10,8 +10,22 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/hris-connector-svc/internal/domain"
+	"zoiko.io/hris-connector-svc/internal/events"
 	"zoiko.io/hris-connector-svc/internal/middleware"
+	"zoiko.io/hris-connector-svc/internal/outbox"
 )
+
+// enqueue writes ev to the outbox inside tx. The envelope is built here, at
+// commit time, from the verified tenant; the payload is marshalled now, after
+// the store has filled ids and timestamps.
+func enqueue(ctx context.Context, tx pgx.Tx, aggregateType string, ev events.PublishParams) error {
+	ev.TenantID = middleware.GetTenantID(ctx)
+	return outbox.Insert(ctx, tx, outbox.Event{
+		AggregateType: aggregateType, AggregateID: ev.AggregateID, EventType: ev.EventType,
+		TenantID: ev.TenantID, LegalEntityID: ev.LegalEntityID, ActorID: ev.ActorID, CorrelationID: ev.CorrelationID,
+		Payload: events.NewEvent(ev),
+	})
+}
 
 type PgStore struct {
 	pool *pgxpool.Pool
@@ -50,7 +64,7 @@ func (p *PgStore) withTenant(ctx context.Context, fn func(pgx.Tx) error) error {
 	return tx.Commit(ctx)
 }
 
-func (p *PgStore) CreateIntegration(ctx context.Context, integration *domain.HrisIntegration) error {
+func (p *PgStore) CreateIntegration(ctx context.Context, integration *domain.HrisIntegration, ev events.PublishParams) error {
 	tenantID := middleware.GetTenantID(ctx)
 	if integration.IntegrationID == "" {
 		integration.IntegrationID = uuid.New().String()
@@ -65,8 +79,11 @@ func (p *PgStore) CreateIntegration(ctx context.Context, integration *domain.Hri
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 	`
 	return p.withTenant(ctx, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, query, integration.IntegrationID, integration.TenantID, integration.LegalEntityID, integration.ProviderName, integration.ApiEndpoint, integration.Status, integration.CreatedAt, integration.UpdatedAt)
-		return err
+		if _, err := tx.Exec(ctx, query, integration.IntegrationID, integration.TenantID, integration.LegalEntityID, integration.ProviderName, integration.ApiEndpoint, integration.Status, integration.CreatedAt, integration.UpdatedAt); err != nil {
+			return err
+		}
+		ev.AggregateID = integration.IntegrationID
+		return enqueue(ctx, tx, "hris_integration", ev)
 	})
 }
 
@@ -139,7 +156,7 @@ func (p *PgStore) ListIntegrations(ctx context.Context, legalEntityID string) ([
 	return res, nil
 }
 
-func (p *PgStore) CreateSyncJob(ctx context.Context, job *domain.SyncJob) error {
+func (p *PgStore) CreateSyncJob(ctx context.Context, job *domain.SyncJob, ev events.PublishParams) error {
 	tenantID := middleware.GetTenantID(ctx)
 	if job.JobID == "" {
 		job.JobID = uuid.New().String()
@@ -152,8 +169,11 @@ func (p *PgStore) CreateSyncJob(ctx context.Context, job *domain.SyncJob) error 
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 	`
 	return p.withTenant(ctx, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, query, job.JobID, job.IntegrationID, job.TenantID, job.SyncType, job.RecordsSynced, job.Status, job.ErrorMessage, job.StartedAt, job.CompletedAt)
-		return err
+		if _, err := tx.Exec(ctx, query, job.JobID, job.IntegrationID, job.TenantID, job.SyncType, job.RecordsSynced, job.Status, job.ErrorMessage, job.StartedAt, job.CompletedAt); err != nil {
+			return err
+		}
+		ev.AggregateID = job.JobID
+		return enqueue(ctx, tx, "sync_job", ev)
 	})
 }
 

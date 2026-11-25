@@ -91,6 +91,9 @@ func (s *PgStore) CreateException(ctx context.Context, c *domain.ExceptionCase) 
 	if err != nil {
 		return fmt.Errorf("insert exception case: %w", err)
 	}
+	if err := enqueue(ctx, tx, EventExceptionCreated, exceptionSubject(c), c); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 
@@ -103,15 +106,33 @@ func (s *PgStore) GetExceptionByID(ctx context.Context, id string) (*domain.Exce
 	if err := s.setRLS(ctx, tx); err != nil {
 		return nil, err
 	}
+	c, err := loadException(ctx, tx, id, false)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
 
+// loadException reads a case and its escalation history inside tx; with
+// forUpdate the case row is locked so a write re-checks its state under the
+// lock. Errors reading the escalations are returned (they used to be
+// swallowed, silently returning a case with a partial history).
+func loadException(ctx context.Context, tx pgx.Tx, id string, forUpdate bool) (*domain.ExceptionCase, error) {
+	lock := ""
+	if forUpdate {
+		lock = " FOR UPDATE"
+	}
 	var c domain.ExceptionCase
 	var sevStr, statStr string
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		SELECT exception_case_id, tenant_id, legal_entity_id, jurisdiction_id, exception_type,
 		       severity_level, linked_object_type, linked_object_id, description, case_status,
 		       assigned_to_role, assigned_to_user, escalated_at, closed_at, closed_by,
 		       closure_reason, created_by, created_at, updated_at
-		FROM exception_cases WHERE exception_case_id = $1`, id,
+		FROM exception_cases WHERE exception_case_id = $1`+lock, id,
 	).Scan(
 		&c.ExceptionCaseID, &c.TenantID, &c.LegalEntityID, &c.JurisdictionID, &c.ExceptionType,
 		&sevStr, &c.LinkedObjectType, &c.LinkedObjectID, &c.Description, &statStr,
@@ -127,31 +148,38 @@ func (s *PgStore) GetExceptionByID(ctx context.Context, id string) (*domain.Exce
 	c.SeverityLevel = domain.SeverityLevel(sevStr)
 	c.CaseStatus = domain.CaseStatus(statStr)
 
-	// Fetch escalations
 	rows, err := tx.Query(ctx, `
 		SELECT escalation_record_id, tenant_id, exception_case_id, escalated_to_role,
 		       escalated_to_user, escalation_reason, escalation_status, escalated_by,
 		       escalated_at, resolved_at, response_notes, created_at, updated_at
 		FROM escalation_records WHERE exception_case_id = $1 ORDER BY escalated_at ASC`, id,
 	)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var e domain.EscalationRecord
-			var escStatStr string
-			if err := rows.Scan(
-				&e.EscalationRecordID, &e.TenantID, &e.ExceptionCaseID, &e.EscalatedToRole,
-				&e.EscalatedToUser, &e.EscalationReason, &escStatStr, &e.EscalatedBy,
-				&e.EscalatedAt, &e.ResolvedAt, &e.ResponseNotes, &e.CreatedAt, &e.UpdatedAt,
-			); err == nil {
-				e.EscalationStatus = domain.EscalationStatus(escStatStr)
-				c.Escalations = append(c.Escalations, e)
-			}
-		}
+	if err != nil {
+		return nil, fmt.Errorf("read escalation records: %w", err)
 	}
-
-	_ = tx.Commit(ctx)
+	defer rows.Close()
+	for rows.Next() {
+		var e domain.EscalationRecord
+		var escStatStr string
+		if err := rows.Scan(
+			&e.EscalationRecordID, &e.TenantID, &e.ExceptionCaseID, &e.EscalatedToRole,
+			&e.EscalatedToUser, &e.EscalationReason, &escStatStr, &e.EscalatedBy,
+			&e.EscalatedAt, &e.ResolvedAt, &e.ResponseNotes, &e.CreatedAt, &e.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan escalation record: %w", err)
+		}
+		e.EscalationStatus = domain.EscalationStatus(escStatStr)
+		c.Escalations = append(c.Escalations, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read escalation records: %w", err)
+	}
 	return &c, nil
+}
+
+func exceptionSubject(c *domain.ExceptionCase) eventSubject {
+	return eventSubject{aggregateType: "exception_case", id: c.ExceptionCaseID, tenantID: c.TenantID,
+		legalEntityID: c.LegalEntityID, jurisdiction: c.JurisdictionID}
 }
 
 func (s *PgStore) ListExceptions(ctx context.Context, legalEntityID, caseStatus, severityLevel, exceptionType string) ([]domain.ExceptionCase, error) {
@@ -202,15 +230,13 @@ func (s *PgStore) ListExceptions(ctx context.Context, legalEntityID, caseStatus,
 	return out, nil
 }
 
+// EscalateException records an escalation. req.EscalatedBy is the acting
+// principal (the handler sets it from X-Principal-Id). The case state is
+// re-checked under the row lock.
 func (s *PgStore) EscalateException(ctx context.Context, id string, req *domain.EscalateCaseRequest) (*domain.EscalationRecord, *domain.ExceptionCase, error) {
-	c, err := s.GetExceptionByID(ctx, id)
-	if err != nil {
-		return nil, nil, err
+	if req.EscalatedBy == "" {
+		return nil, nil, domain.ErrActorRequired
 	}
-	if c.CaseStatus == domain.CaseClosed || c.CaseStatus == domain.CaseResolved {
-		return nil, nil, domain.ErrCaseAlreadyClosed
-	}
-
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -218,6 +244,13 @@ func (s *PgStore) EscalateException(ctx context.Context, id string, req *domain.
 	defer func() { _ = tx.Rollback(ctx) }()
 	if err := s.setRLS(ctx, tx); err != nil {
 		return nil, nil, err
+	}
+	c, err := loadException(ctx, tx, id, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	if c.CaseStatus == domain.CaseClosed || c.CaseStatus == domain.CaseResolved {
+		return nil, nil, domain.ErrCaseAlreadyClosed
 	}
 
 	now := time.Now().UTC()
@@ -268,21 +301,25 @@ func (s *PgStore) EscalateException(ctx context.Context, id string, req *domain.
 		return nil, nil, fmt.Errorf("update exception case on escalation: %w", err)
 	}
 
+	if err := enqueue(ctx, tx, EventExceptionEscalated, exceptionSubject(c), map[string]interface{}{
+		"escalation_record": &escRecord,
+		"exception_case":    c,
+	}); err != nil {
+		return nil, nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, nil, err
 	}
 	return &escRecord, c, nil
 }
 
+// ResolveException closes a case. req.ClosedBy is the acting principal (the
+// handler sets it from X-Principal-Id); it must differ from the case's
+// creator (segregation of duties), re-checked here under the row lock.
 func (s *PgStore) ResolveException(ctx context.Context, id string, req *domain.ResolveCaseRequest) (*domain.ExceptionCase, error) {
-	c, err := s.GetExceptionByID(ctx, id)
-	if err != nil {
-		return nil, err
+	if req.ClosedBy == "" {
+		return nil, domain.ErrActorRequired
 	}
-	if c.CaseStatus == domain.CaseClosed || c.CaseStatus == domain.CaseResolved {
-		return nil, domain.ErrCaseAlreadyClosed
-	}
-
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -290,6 +327,16 @@ func (s *PgStore) ResolveException(ctx context.Context, id string, req *domain.R
 	defer func() { _ = tx.Rollback(ctx) }()
 	if err := s.setRLS(ctx, tx); err != nil {
 		return nil, err
+	}
+	c, err := loadException(ctx, tx, id, true)
+	if err != nil {
+		return nil, err
+	}
+	if c.CaseStatus == domain.CaseClosed || c.CaseStatus == domain.CaseResolved {
+		return nil, domain.ErrCaseAlreadyClosed
+	}
+	if c.CreatedBy == req.ClosedBy {
+		return nil, domain.ErrSelfApprovalNotAllowed
 	}
 
 	now := time.Now().UTC()
@@ -307,6 +354,9 @@ func (s *PgStore) ResolveException(ctx context.Context, id string, req *domain.R
 	)
 	if err != nil {
 		return nil, fmt.Errorf("resolve exception case: %w", err)
+	}
+	if err := enqueue(ctx, tx, EventExceptionClosed, exceptionSubject(c), c); err != nil {
+		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err

@@ -40,6 +40,13 @@ const (
 	ActionResetRequest   = "CONNECTOR_CHECKPOINT_RESET_REQUEST"
 	ActionResetDecide    = "CONNECTOR_CHECKPOINT_RESET_APPROVE"
 	ActionProfilePublish = "EXTERNAL_PROFILE_PUBLISH"
+
+	// Read actions. A connector read is authorized for the connector's legal
+	// entity; a list for the requested (or the caller's) legal entity; a
+	// provider-profile read for the caller's own entity, since profiles are
+	// platform reference data every tenant may be allowed to see.
+	ActionRead        = "CONNECTOR_READ"
+	ActionProfileRead = "EXTERNAL_PROFILE_READ"
 )
 
 type Handler struct {
@@ -177,6 +184,45 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 	return true
 }
 
+// callerScope is the legal entity a read without an object of its own is
+// authorized for: the caller's X-Legal-Entity-Id, else the tenant, exactly as
+// the inbound and outbound read guards resolve it.
+func callerScope(r *http.Request) string {
+	if e := r.Header.Get("X-Legal-Entity-Id"); e != "" {
+		return e
+	}
+	return middleware.GetTenantID(r.Context())
+}
+
+// authorizeRead requires a principal (401) and authorizes action for
+// legalEntityID (403 on denial, 503 when authorization-svc gives no decision).
+func (h *Handler) authorizeRead(w http.ResponseWriter, r *http.Request, legalEntityID, action string) bool {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return false
+	}
+	return h.authorize(w, r, principalID, legalEntityID, action)
+}
+
+// loadForRead resolves {id} within the caller's tenant (404 for a missing or
+// foreign connector, before any authorization is asked) and authorizes
+// CONNECTOR_READ for the connector's legal entity.
+func (h *Handler) loadForRead(w http.ResponseWriter, r *http.Request) (*domain.ApiBridge, bool) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return nil, false
+	}
+	b, err := h.store.GetBridgeByID(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeProblem(w, r, err)
+		return nil, false
+	}
+	if !h.authorize(w, r, principalID, b.LegalEntityID, ActionRead) {
+		return nil, false
+	}
+	return b, true
+}
+
 // command runs a lifecycle command on a connector: it resolves the caller,
 // looks the connector up (for its legal entity), authorizes the action, then
 // calls run. A missing or foreign connector is 404 before any authorization is
@@ -268,9 +314,8 @@ func (h *Handler) CreateBridge(w http.ResponseWriter, r *http.Request) {
 var errCreateFields = errors.New("legal_entity_id and bridge_name/provider_name are required")
 
 func (h *Handler) GetByID(w http.ResponseWriter, r *http.Request) {
-	b, err := h.store.GetBridgeByID(r.Context(), chi.URLParam(r, "id"))
-	if err != nil {
-		writeProblem(w, r, err)
+	b, ok := h.loadForRead(w, r)
+	if !ok {
 		return
 	}
 	populateAliases(b)
@@ -278,7 +323,15 @@ func (h *Handler) GetByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListBridges(w http.ResponseWriter, r *http.Request) {
-	bridges, err := h.store.ListBridges(r.Context(), r.URL.Query().Get("legal_entity_id"))
+	entity := r.URL.Query().Get("legal_entity_id")
+	scope := entity
+	if scope == "" {
+		scope = callerScope(r)
+	}
+	if !h.authorizeRead(w, r, scope, ActionRead) {
+		return
+	}
+	bridges, err := h.store.ListBridges(r.Context(), entity)
 	if err != nil {
 		writeProblem(w, r, err)
 		return
@@ -485,14 +538,13 @@ func (h *Handler) IngestPayload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListLogs(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
 	// 404 for a connector that is not the caller's, as on every other route; an
 	// empty 200 would answer for an id that does not exist or belongs to someone else.
-	if _, err := h.store.GetBridgeByID(r.Context(), id); err != nil {
-		writeProblem(w, r, err)
+	b, ok := h.loadForRead(w, r)
+	if !ok {
 		return
 	}
-	logs, err := h.store.ListIngestionLogs(r.Context(), id)
+	logs, err := h.store.ListIngestionLogs(r.Context(), b.BridgeID)
 	if err != nil {
 		writeProblem(w, r, err)
 		return
@@ -503,7 +555,11 @@ func (h *Handler) ListLogs(w http.ResponseWriter, r *http.Request) {
 // ── evidence ──────────────────────────────────────────────────────────────────
 
 func (h *Handler) ListChanges(w http.ResponseWriter, r *http.Request) {
-	c, err := h.store.ListChanges(r.Context(), chi.URLParam(r, "id"))
+	b, ok := h.loadForRead(w, r)
+	if !ok {
+		return
+	}
+	c, err := h.store.ListChanges(r.Context(), b.BridgeID)
 	if err != nil {
 		writeProblem(w, r, err)
 		return
@@ -512,7 +568,11 @@ func (h *Handler) ListChanges(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListApprovals(w http.ResponseWriter, r *http.Request) {
-	a, err := h.store.ListApprovals(r.Context(), chi.URLParam(r, "id"))
+	b, ok := h.loadForRead(w, r)
+	if !ok {
+		return
+	}
+	a, err := h.store.ListApprovals(r.Context(), b.BridgeID)
 	if err != nil {
 		writeProblem(w, r, err)
 		return
@@ -521,7 +581,11 @@ func (h *Handler) ListApprovals(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ProfileStatus(w http.ResponseWriter, r *http.Request) {
-	s, err := h.svc.ProfileStatusOf(r.Context(), chi.URLParam(r, "id"))
+	b, ok := h.loadForRead(w, r)
+	if !ok {
+		return
+	}
+	s, err := h.svc.ProfileStatusOf(r.Context(), b.BridgeID)
 	if err != nil {
 		writeProblem(w, r, err)
 		return
@@ -530,7 +594,11 @@ func (h *Handler) ProfileStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetHealth(w http.ResponseWriter, r *http.Request) {
-	health, err := h.store.GetHealth(r.Context(), chi.URLParam(r, "id"))
+	b, ok := h.loadForRead(w, r)
+	if !ok {
+		return
+	}
+	health, err := h.store.GetHealth(r.Context(), b.BridgeID)
 	if err != nil {
 		writeProblem(w, r, err)
 		return
@@ -539,7 +607,11 @@ func (h *Handler) GetHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListHealthTransitions(w http.ResponseWriter, r *http.Request) {
-	t, err := h.store.ListHealthTransitions(r.Context(), chi.URLParam(r, "id"), 100)
+	b, ok := h.loadForRead(w, r)
+	if !ok {
+		return
+	}
+	t, err := h.store.ListHealthTransitions(r.Context(), b.BridgeID, 100)
 	if err != nil {
 		writeProblem(w, r, err)
 		return
@@ -582,7 +654,11 @@ func (h *Handler) ReportHealth(w http.ResponseWriter, r *http.Request) {
 // ── checkpoints ───────────────────────────────────────────────────────────────
 
 func (h *Handler) ListCheckpoints(w http.ResponseWriter, r *http.Request) {
-	c, err := h.store.ListCheckpoints(r.Context(), chi.URLParam(r, "id"))
+	b, ok := h.loadForRead(w, r)
+	if !ok {
+		return
+	}
+	c, err := h.store.ListCheckpoints(r.Context(), b.BridgeID)
 	if err != nil {
 		writeProblem(w, r, err)
 		return
@@ -696,6 +772,9 @@ func (h *Handler) PublishProfile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListProfiles(w http.ResponseWriter, r *http.Request) {
+	if !h.authorizeRead(w, r, callerScope(r), ActionProfileRead) {
+		return
+	}
 	list, err := h.store.ListProfiles(r.Context(), r.URL.Query().Get("provider_key"))
 	if err != nil {
 		writeProblem(w, r, err)
@@ -707,6 +786,9 @@ func (h *Handler) ListProfiles(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetProfile(w http.ResponseWriter, r *http.Request) {
 	v, ok := profileVersion(w, r)
 	if !ok {
+		return
+	}
+	if !h.authorizeRead(w, r, callerScope(r), ActionProfileRead) {
 		return
 	}
 	p, err := h.store.GetProfile(r.Context(), chi.URLParam(r, "key"), v)

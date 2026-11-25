@@ -60,7 +60,7 @@ func (a *recordingAuthz) CheckAllowed(ctx context.Context, principalID, legalEnt
 
 func deadlineRouter(az AuthZClient, fd *fakeDeadlines) *chi.Mux {
 	logger, _ := zap.NewDevelopment()
-	h := New(newMockStore(), &mockPublisher{}, az, logger)
+	h := New(newMockStore(), az, logger)
 	r := chi.NewRouter()
 	RegisterDeadlineRoutes(r, h, fd)
 	return r

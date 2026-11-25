@@ -2,7 +2,7 @@ package store
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"sync"
 	"time"
 
@@ -16,7 +16,28 @@ type Store interface {
 	ListExporters(ctx context.Context, tenantID, legalEntityID string) ([]domain.SIEMExporter, error)
 	StreamEvent(ctx context.Context, tenantID string, evt *domain.SIEMEvent) error
 	ListEvents(ctx context.Context, tenantID, exporterID string) ([]domain.SIEMEvent, error)
+	// SetExporterStatus moves an exporter to `to` when its current status is
+	// one of `from`. ErrNotFound when the exporter is not in the tenant;
+	// ErrInvalidTransition when it exists in another status.
+	SetExporterStatus(ctx context.Context, tenantID, id string, from []domain.ExporterStatus, to domain.ExporterStatus) (*domain.SIEMExporter, error)
+	// Ping reports whether the store can serve requests; /readyz calls it.
+	Ping(ctx context.Context) error
 }
+
+// ErrNotFound is an exporter that does not exist in the caller's tenant; one
+// in another tenant is indistinguishable from one that does not exist.
+var ErrNotFound = errors.New("exporter not found")
+
+// ErrCredentialSealingUnavailable refuses to persist an auth_token when no
+// credential key is configured: the token is stored sealed or not at all.
+// ErrInvalidTransition is an exporter that exists but is not in a status the
+// requested change accepts (e.g. resuming one that is ACTIVE or DISABLED).
+var ErrInvalidTransition = errors.New("exporter is not in a status this change accepts")
+
+var ErrCredentialSealingUnavailable = errors.New("credential sealing key not configured")
+
+// MemoryStore is the in-process Store used by unit tests only. cmd/server
+// wires PgStore: exporters and security events must survive a restart.
 
 type MemoryStore struct {
 	mu        sync.RWMutex
@@ -48,9 +69,31 @@ func (m *MemoryStore) GetExporterByID(ctx context.Context, tenantID, id string) 
 	defer m.mu.RUnlock()
 	exp, ok := m.exporters[id]
 	if !ok || exp.TenantID != tenantID {
-		return nil, fmt.Errorf("exporter not found")
+		return nil, ErrNotFound
 	}
 	return exp, nil
+}
+
+func (m *MemoryStore) SetExporterStatus(ctx context.Context, tenantID, id string, from []domain.ExporterStatus, to domain.ExporterStatus) (*domain.SIEMExporter, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	exp, ok := m.exporters[id]
+	if !ok || exp.TenantID != tenantID {
+		return nil, ErrNotFound
+	}
+	allowed := false
+	for _, f := range from {
+		if exp.Status == f {
+			allowed = true
+		}
+	}
+	if !allowed {
+		return nil, ErrInvalidTransition
+	}
+	exp.Status = to
+	exp.UpdatedAt = time.Now().UTC()
+	out := *exp
+	return &out, nil
 }
 
 func (m *MemoryStore) ListExporters(ctx context.Context, tenantID, legalEntityID string) ([]domain.SIEMExporter, error) {
@@ -74,13 +117,14 @@ func (m *MemoryStore) StreamEvent(ctx context.Context, tenantID string, evt *dom
 	defer m.mu.Unlock()
 	exp, ok := m.exporters[evt.ExporterID]
 	if !ok || exp.TenantID != tenantID {
-		return fmt.Errorf("exporter not found")
+		return ErrNotFound
 	}
 	now := time.Now()
 	evt.ID = uuid.New().String()
 	evt.TenantID = tenantID
 	evt.Status = "DELIVERED"
 	evt.Timestamp = now
+	evt.ExternalDelivery = domain.ExternalDeliveryNotPerformed
 	m.events[evt.ID] = evt
 
 	exp.EventsSent++
@@ -104,3 +148,6 @@ func (m *MemoryStore) ListEvents(ctx context.Context, tenantID, exporterID strin
 	}
 	return result, nil
 }
+
+// Ping always succeeds: the map is in process.
+func (m *MemoryStore) Ping(context.Context) error { return nil }

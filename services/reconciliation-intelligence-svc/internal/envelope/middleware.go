@@ -1,10 +1,10 @@
 package envelope
 
 import (
-	"encoding/json"
 	"net/http"
 	"os"
 	"strings"
+	"zoiko.io/reconciliation-intelligence-svc/internal/problem"
 )
 
 // Mode controls what Middleware does with a request that fails §4.
@@ -82,7 +82,7 @@ func MiddlewareWithMode(policy Policy, mode Mode, report Reporter) func(http.Han
 
 			if err := policy.Validate(e, r); err != nil {
 				if enforced(mode, policy.materialWrite(r)) {
-					writeViolation(w, err)
+					writeViolation(w, r, err)
 					return
 				}
 				if report != nil {
@@ -118,19 +118,10 @@ func enforced(mode Mode, isWrite bool) bool {
 // schema-registry-svc already showed what that costs when the structure is the
 // point: a caller cannot tell which of five headers it is missing from a folded
 // sentence. Keeping violations structured lets the console list them.
-func writeViolation(w http.ResponseWriter, err *ValidationError) {
-	w.Header().Set("Content-Type", "application/json")
+func writeViolation(w http.ResponseWriter, r *http.Request, err *ValidationError) {
 	w.Header().Set("X-Envelope-Contract", "violated")
-	w.WriteHeader(StatusFor(err))
-	_ = json.NewEncoder(w).Encode(struct {
-		Error      string      `json:"error"`
-		Detail     string      `json:"detail"`
-		Service    string      `json:"service,omitempty"`
-		Violations []Violation `json:"violations"`
-	}{
-		Error:      "envelope_incomplete",
-		Detail:     err.Error(),
-		Service:    err.Service,
-		Violations: err.Violations,
+	problem.WriteWith(w, r, StatusFor(err), "envelope_incomplete", err.Error(), map[string]any{
+		"service":    err.Service,
+		"violations": err.Violations,
 	})
 }

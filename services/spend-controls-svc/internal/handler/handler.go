@@ -34,11 +34,6 @@ type Store interface {
 	ListConsumptions(ctx context.Context, legalEntityID, spendPolicyID string) ([]domain.SpendConsumption, error)
 }
 
-type Publisher interface {
-	PublishThresholdBreached(ctx context.Context, correlationID, actorID string, check domain.SpendCheckRequest, policy domain.SpendPolicy, projected float64)
-	PublishBlockApplied(ctx context.Context, correlationID, actorID string, check domain.SpendCheckRequest, policy domain.SpendPolicy)
-}
-
 type AuthZClient interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
 }
@@ -52,14 +47,15 @@ const (
 var validPeriods = map[string]bool{"PER_TRANSACTION": true, "MONTHLY": true, "ANNUAL": true}
 
 type Handler struct {
-	store     Store
-	publisher Publisher
-	authz     AuthZClient
-	log       *zap.Logger
+	store Store
+	authz AuthZClient
+	log   *zap.Logger
 }
 
-func New(store Store, publisher Publisher, authz AuthZClient, log *zap.Logger) *Handler {
-	return &Handler{store: store, publisher: publisher, authz: authz, log: log}
+// New builds the handler. Events are no longer published from here: the
+// store writes them to the transactional outbox (see internal/events).
+func New(store Store, authz AuthZClient, log *zap.Logger) *Handler {
+	return &Handler{store: store, authz: authz, log: log}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -288,6 +284,14 @@ func (h *Handler) DeactivatePolicy(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ListConsumptions(w http.ResponseWriter, r *http.Request) {
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
 	spendPolicyID := r.URL.Query().Get("spend_policy_id")
+	// spend_policy_id is a uuid column; an unparseable filter used to reach
+	// Postgres and come back as a 503 store_unavailable.
+	if spendPolicyID != "" {
+		if _, err := uuid.Parse(spendPolicyID); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_spend_policy_id", "spend_policy_id must be a UUID")
+			return
+		}
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -355,6 +359,8 @@ func (h *Handler) SubmitCheck(w http.ResponseWriter, r *http.Request) {
 		SourceReference: req.SourceReference,
 		CorrelationID:   req.CorrelationID,
 		PrincipalID:     principalID,
+		// Carried on the outbox events of a BLOCKED decision.
+		EventCorrelationID: getCorrelationID(r),
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrCurrencyMismatch) {
@@ -368,14 +374,9 @@ func (h *Handler) SubmitCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Events fire only for a fresh block. Re-publishing on a replayed decision
-	// would tell every downstream consumer that a second breach occurred, when
-	// the caller merely retried the first one.
-	if decision.Outcome == "BLOCKED" && !decision.Replayed && decision.Policy != nil {
-		correlationID := getCorrelationID(r)
-		h.publisher.PublishThresholdBreached(r.Context(), correlationID, principalID, req, *decision.Policy, decision.ProjectedTotal)
-		h.publisher.PublishBlockApplied(r.Context(), correlationID, principalID, req, *decision.Policy)
-	}
+	// spend.threshold.breached / spend.block.applied for a fresh block are
+	// written to the outbox by EvaluateSpend in the decision's own transaction
+	// (never for a replay); the relay publishes them with retry.
 
 	resp := domain.SpendCheckResponse{
 		DecisionOutcome:  decision.Outcome,

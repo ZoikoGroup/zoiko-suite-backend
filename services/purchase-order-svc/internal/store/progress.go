@@ -178,42 +178,62 @@ func (s *PgStore) OpenQuantity(ctx context.Context, orderID string) (lines []dom
 // BeginIdempotent claims (tenant, scope, key). An earlier claim that never
 // completed (a crash mid-command) is taken over after a minute so a retry is
 // not locked out forever; a completed one is returned for replay.
+//
+// Every idempotency statement runs in withRLS under the caller's tenant: the
+// table is FORCE ROW LEVEL SECURITY (000009) keyed on tenant_key, so the
+// policy confines it as well as the explicit tenant_key predicate.
 func (s *PgStore) BeginIdempotent(ctx context.Context, scope, key, requestHash string) (*domain.IdempotencyRecord, bool, error) {
 	tenantKey := svcmiddleware.TenantFromContext(ctx)
-	tag, err := s.pool.Exec(ctx, `
-		INSERT INTO idempotency_keys (tenant_key, scope, idem_key, request_hash)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (tenant_key, scope, idem_key) DO UPDATE
-			SET request_hash = EXCLUDED.request_hash, created_at = NOW()
-			WHERE idempotency_keys.status_code IS NULL AND idempotency_keys.created_at < NOW() - INTERVAL '60 seconds'`,
-		tenantKey, scope, key, requestHash)
+	if tenantKey == "" {
+		return nil, false, fmt.Errorf("%w: no tenant scope for idempotency key", domain.ErrStoreUnavailable)
+	}
+	var rec *domain.IdempotencyRecord
+	created := false
+	err := s.withRLS(ctx, tenantKey, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			INSERT INTO idempotency_keys (tenant_key, scope, idem_key, request_hash)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (tenant_key, scope, idem_key) DO UPDATE
+				SET request_hash = EXCLUDED.request_hash, created_at = NOW()
+				WHERE idempotency_keys.status_code IS NULL AND idempotency_keys.created_at < NOW() - INTERVAL '60 seconds'`,
+			tenantKey, scope, key, requestHash)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 1 {
+			created = true
+			return nil
+		}
+		var r domain.IdempotencyRecord
+		var status *int
+		if err := tx.QueryRow(ctx, `
+			SELECT request_hash, status_code, response_body FROM idempotency_keys
+			WHERE tenant_key = $1 AND scope = $2 AND idem_key = $3`, tenantKey, scope, key,
+		).Scan(&r.RequestHash, &status, &r.Body); err != nil {
+			return err
+		}
+		if status != nil {
+			r.Completed, r.StatusCode = true, *status
+		}
+		rec = &r
+		return nil
+	})
 	if err != nil {
 		s.log.Error("pg BeginIdempotent failed", zap.Error(err))
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	if tag.RowsAffected() == 1 {
-		return nil, true, nil
-	}
-	var rec domain.IdempotencyRecord
-	var status *int
-	if err := s.pool.QueryRow(ctx, `
-		SELECT request_hash, status_code, response_body FROM idempotency_keys
-		WHERE tenant_key = $1 AND scope = $2 AND idem_key = $3`, tenantKey, scope, key,
-	).Scan(&rec.RequestHash, &status, &rec.Body); err != nil {
-		s.log.Error("pg BeginIdempotent read failed", zap.Error(err))
-		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	if status != nil {
-		rec.Completed, rec.StatusCode = true, *status
-	}
-	return &rec, false, nil
+	return rec, created, nil
 }
 
 func (s *PgStore) CompleteIdempotent(ctx context.Context, scope, key string, statusCode int, body []byte) error {
-	_, err := s.pool.Exec(ctx, `
-		UPDATE idempotency_keys SET status_code = $4, response_body = $5, completed_at = NOW()
-		WHERE tenant_key = $1 AND scope = $2 AND idem_key = $3 AND status_code IS NULL`,
-		svcmiddleware.TenantFromContext(ctx), scope, key, statusCode, body)
+	tenantKey := svcmiddleware.TenantFromContext(ctx)
+	err := s.withRLS(ctx, tenantKey, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			UPDATE idempotency_keys SET status_code = $4, response_body = $5, completed_at = NOW()
+			WHERE tenant_key = $1 AND scope = $2 AND idem_key = $3 AND status_code IS NULL`,
+			tenantKey, scope, key, statusCode, body)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
@@ -221,18 +241,36 @@ func (s *PgStore) CompleteIdempotent(ctx context.Context, scope, key string, sta
 }
 
 func (s *PgStore) ReleaseIdempotent(ctx context.Context, scope, key string) error {
-	_, err := s.pool.Exec(ctx, `
-		DELETE FROM idempotency_keys WHERE tenant_key = $1 AND scope = $2 AND idem_key = $3 AND status_code IS NULL`,
-		svcmiddleware.TenantFromContext(ctx), scope, key)
+	tenantKey := svcmiddleware.TenantFromContext(ctx)
+	err := s.withRLS(ctx, tenantKey, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			DELETE FROM idempotency_keys WHERE tenant_key = $1 AND scope = $2 AND idem_key = $3 AND status_code IS NULL`,
+			tenantKey, scope, key)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return nil
 }
 
+// PurgeIdempotency deletes keys older than olderThan across every tenant. It
+// has no tenant, so it declares app.idempotency_purge in its own transaction;
+// the 000009 policy admits that flag for reads and deletes only.
 func (s *PgStore) PurgeIdempotency(ctx context.Context, olderThan time.Duration) (int64, error) {
-	tag, err := s.pool.Exec(ctx, `DELETE FROM idempotency_keys WHERE created_at < NOW() - make_interval(secs => $1)`, olderThan.Seconds())
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
+		return 0, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback error discarded intentionally on commit path
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.idempotency_purge', 'true', true)"); err != nil {
+		return 0, fmt.Errorf("%w: set_config app.idempotency_purge: %v", domain.ErrStoreUnavailable, err)
+	}
+	tag, err := tx.Exec(ctx, `DELETE FROM idempotency_keys WHERE created_at < NOW() - make_interval(secs => $1)`, olderThan.Seconds())
+	if err != nil {
+		return 0, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return tag.RowsAffected(), nil

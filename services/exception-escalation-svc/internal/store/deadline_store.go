@@ -19,8 +19,9 @@ import (
 type DeadlineStore interface {
 	CreateDeadline(ctx context.Context, p domain.CreateDeadlineParams) (*domain.Deadline, error)
 	// MirrorAuthoritativeDeadline returns the superseded deadline's id
-	// when this call superseded a prior live mirror, so the caller can
-	// publish DeadlineSuperseded against it.
+	// when this call superseded a prior live mirror. DeadlineCreated and
+	// DeadlineSuperseded are written to the outbox inside the same
+	// transaction.
 	MirrorAuthoritativeDeadline(ctx context.Context, p domain.MirrorAuthoritativeDeadlineParams) (d *domain.Deadline, supersededDeadlineID string, err error)
 	GetDeadline(ctx context.Context, deadlineID string) (*domain.Deadline, error)
 	GetSourceDeadline(ctx context.Context, tenantID, deadlineID string) (*domain.DeadlineSourceInfo, error)
@@ -33,8 +34,9 @@ type DeadlineStore interface {
 	Escalate(ctx context.Context, p domain.EscalateParams) (*domain.DeadlineEscalation, error)
 	// ListUpcoming/ListOverdue return the matching deadlines plus the ids
 	// among them that were JUST observed crossing their threshold for the
-	// first time by this very call — the caller publishes
-	// DeadlineDueSoon/DeadlineOverdue for exactly those ids. See migration
+	// first time by this very call — DeadlineDueSoon/DeadlineOverdue for
+	// exactly those ids is written to the outbox in the same transaction
+	// that sets the *_notified_at mark. See migration
 	// 000005's own doc comment for why this read-triggers-write shape
 	// exists instead of a background clock service.
 	ListUpcoming(ctx context.Context, p domain.ListUpcomingParams) (deadlines []domain.Deadline, justNotifiedIDs []string, err error)

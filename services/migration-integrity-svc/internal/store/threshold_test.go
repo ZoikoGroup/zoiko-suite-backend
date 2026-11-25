@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"zoiko.io/migration-integrity-svc/internal/domain"
+	"zoiko.io/migration-integrity-svc/internal/store"
 )
 
 func TestPgStore_IntegrityScoreThresholdPersistsAndIsReadBack(t *testing.T) {
@@ -29,13 +30,13 @@ func TestPgStore_IntegrityScoreThresholdPersistsAndIsReadBack(t *testing.T) {
 		IntegrityScore: 90, IntegrityScoreThreshold: 80.5,
 		Status: domain.JobStatusCompleted, StartedAt: &now, CompletedAt: &now,
 	}
-	require.NoError(t, s.CreateJob(context.Background(), tenantID, job, nil, nil, "principal-1", "corr-1"))
+	require.NoError(t, s.CreateJob(context.Background(), tenantID, job, nil, nil, "principal-1", "corr-1", store.IdempotencyClaim{}))
 
 	read, err := s.GetJobByID(context.Background(), tenantID, job.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 80.5, read.IntegrityScoreThreshold, "get must return the stored bar")
 
-	jobs, err := s.ListJobs(context.Background(), tenantID, "le-uk-1", "")
+	jobs, _, err := s.ListJobs(context.Background(), tenantID, store.ListFilter{LegalEntityID: "le-uk-1", Limit: 50})
 	require.NoError(t, err)
 	require.Len(t, jobs, 1)
 	assert.Equal(t, 80.5, jobs[0].IntegrityScoreThreshold, "list must return the stored bar")
