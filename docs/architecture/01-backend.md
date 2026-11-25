@@ -605,6 +605,8 @@ No domain service may execute a material action without passing through it.
 
 Every governance decision is itself evidence. This is a non-negotiable architectural rule.
 
+*Decision capture (recorded 25 Nov 2026, tracker "Assignment 25 Nov 2026"): each engine relays its own verdicts to governance-decision-log-svc, so no person records a decision. Policy (`svc-policy`), Workflow & Approvals (`svc-workflow`), Authorization (`svc-authorization`, only `DENY` and `REQUIRE_APPROVAL`; every permit stays in its access-decision log, decision D-DL-1), Jurisdiction (`svc-jurisdiction-rules`: pack certify, release, block, withdraw, rollback, supersede, interpretation and import approval, calendar publish, payment-term approval), Obligations (`svc-obligations`: evaluate, clock waive) and Evidence Requirements (`svc-evidence-requirements`: evaluate). The ledger record is written to the engine's outbox in the decision's own transaction and delivered over mTLS (evidence fails safe: a ledger outage delays it, never the action). A workflow that resolves an escalated decision carries that decision as `causation_id`. The Governance Log console is read-only (decision D-DL-2). Writer catalogue: `services/governance-decision-log-svc/CONTEXT.md` "Writers".*
+
 # **08 · EVIDENCE ARCHITECTURE**
 
 Most enterprise systems log activity. ZoikoSuite produces **defensible evidence**.

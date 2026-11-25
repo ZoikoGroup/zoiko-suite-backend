@@ -842,6 +842,8 @@ Errors carry the GCP §16 stable class in `code`. A conflict between two equally
 **Critical Constraint**
  Every governance decision must be queryable by audit, actor, entity, action, rule basis, and time range.
 
+*Writers (recorded 25 Nov 2026, DL-0): policy-svc, workflow-svc, authorization-svc (`DENY` / `REQUIRE_APPROVAL` only), jurisdiction-rules-svc, obligations-svc and evidence-requirements-svc append through the :8450 mTLS listener as their service principals (`svc-<name>`, `GOVERNANCE_DECISION_RECORD` by authorization-svc migrations 000043 and 000046), each from a transactional outbox; the person who caused the decision is in `evaluation_context.on_behalf_of`. Only service identities hold `GOVERNANCE_DECISION_RECORD` (D-DL-2); people read, verify and export. Outcome words and domain keywords of the new writers: migration 000020. Catalogue: `services/governance-decision-log-svc/CONTEXT.md` "Writers".*
+
 # **09 · IDENTITY, SCOPE ****&**** FOUNDATION SERVICES**
 
 ## **9.1 Identity Context Service**
