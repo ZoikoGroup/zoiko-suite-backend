@@ -147,6 +147,18 @@ jobs:
       # If it is missing or stale this step will fail — which is the
       # correct behavior: a missing go.sum means CI was not verifying
       # the module graph integrity.
+      # embedded-postgres downloads its Postgres binary from Maven Central on every run. Several matrix
+      # jobs start at once and Maven Central answers some of them with a non-200 (the library reports any
+      # non-200 as "no version found matching 16.9.0"), so retries alone do not save the job. Caching the
+      # download means a job only goes to Maven Central when the cache is cold.
+      - name: Cache embedded Postgres binaries
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.embedded-postgres-go
+          key: epg-${{ runner.os }}-${{ hashFiles(format('services/{0}/go.sum', matrix.service)) }}
+          restore-keys: |
+            epg-${{ runner.os }}-
+
       - name: Verify module graph (go mod verify)
         working-directory: services/${{ matrix.service }}
         run: go mod verify
@@ -265,7 +277,19 @@ jobs:
         # Uses embedded-postgres (downloads real Postgres binaries automatically).
         # No separate Postgres service container is needed.
         # Proves /healthz and /readyz return 200 against a real DB.
-        run: go test -v -tags=integration -count=1 -timeout=600s ./cmd/server/
+        # The binaries are resolved from Maven Central at test start; a transient
+        # "no version found matching" there fails the run in ~4s. Retry the whole
+        # step a couple of times so a registry blip is not a red build; a real
+        # test failure still fails all three attempts.
+        run: |
+          for attempt in 1 2 3; do
+            if go test -v -tags=integration -count=1 -timeout=600s ./cmd/server/; then
+              exit 0
+            fi
+            echo "::warning::integration attempt ${attempt} failed"
+            sleep $((attempt * 30))
+          done
+          exit 1
 
       - name: Integration test — jurisdiction-rules registry suite with embedded Postgres
         if: matrix.service == 'jurisdiction-rules-svc'
@@ -273,7 +297,16 @@ jobs:
         # ZS-JUR-001: every database guard (append-only evidence, status edges, independence, rollout gates)
         # is proved only here, against a real Postgres. embedded-postgres downloads the binaries, so no
         # service container is needed.
-        run: go test -v -tags=integration -count=1 -timeout=900s ./internal/registryit/
+        # Binaries come from Maven Central; retry so a transient "no version found" is not a red build.
+        run: |
+          for attempt in 1 2 3; do
+            if go test -v -tags=integration -count=1 -timeout=900s ./internal/registryit/; then
+              exit 0
+            fi
+            echo "::warning::integration attempt ${attempt} failed"
+            sleep $((attempt * 30))
+          done
+          exit 1
 
       - name: Integration test — store isolation/pipeline (PgStore → DB)
         if: matrix.service == 'access-control-svc' || matrix.service == 'workflow-history-svc' || matrix.service == 'tenant-entity-registry-svc' || matrix.service == 'accounts-receivable-svc' || matrix.service == 'purchase-request-svc' || matrix.service == 'purchase-order-svc' || matrix.service == 'treasury-svc' || matrix.service == 'financial-close-svc' || matrix.service == 'bank-reconciliation-svc' || matrix.service == 'intercompany-accounting-svc' || matrix.service == 'consolidation-svc' || matrix.service == 'invoice-approval-svc' || matrix.service == 'employee-master-svc' || matrix.service == 'employment-contracts-svc' || matrix.service == 'payroll-run-svc' || matrix.service == 'compensation-svc' || matrix.service == 'benefits-svc' || matrix.service == 'payroll-tax-svc' || matrix.service == 'payroll-exceptions-svc' || matrix.service == 'leave-absence-svc' || matrix.service == 'org-structure-svc' || matrix.service == 'offboarding-severance-svc' || matrix.service == 'workforce-compliance-svc' || matrix.service == 'evidence-requirements-svc' || matrix.service == 'payment-initiation-adapter-svc' || matrix.service == 'payment-status-svc' || matrix.service == 'tax-authority-interface-svc'
@@ -292,7 +325,16 @@ jobs:
             sleep 1
           done
 
-          go test -v -tags=integration -count=1 -timeout=600s ./internal/store/
+          # Some stores start embedded Postgres, whose binaries come from Maven Central;
+          # retry so a transient "no version found matching" is not a red build.
+          for attempt in 1 2 3; do
+            if go test -v -tags=integration -count=1 -timeout=600s ./internal/store/; then
+              exit 0
+            fi
+            echo "::warning::integration attempt ${attempt} failed"
+            sleep $((attempt * 30))
+          done
+          exit 1
 
 
   # ─── Suivo public assistant: supply chain (Doc 06 §12, §24; Doc 08 §07) ────
