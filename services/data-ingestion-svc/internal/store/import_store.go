@@ -591,14 +591,14 @@ func (s *PgStore) OpenContent(ctx context.Context, tenantID, batchID string) (io
 
 const itemCols = `batch_id, row_no, tenant_id, row_hash, item_values, status, error_codes, idempotency_key, attempts, next_attempt_at,
 	locked_until, domain_status, COALESCE(result_ref, ''), COALESCE(last_error_class, ''), COALESCE(quarantine_reason, ''),
-	COALESCE(quarantine_owner, ''), COALESCE(quarantined_by, ''), updated_at`
+	COALESCE(quarantine_owner, ''), COALESCE(quarantined_by, ''), updated_at, release_generation`
 
 func scanItem(r pgx.Row) (*imports.Item, error) {
 	var it imports.Item
 	var st string
 	var vals, errs []byte
 	if err := r.Scan(&it.BatchID, &it.RowNo, &it.TenantID, &it.RowHash, &vals, &st, &errs, &it.IdempotencyKey, &it.Attempts, &it.NextAttemptAt,
-		&it.LockedUntil, &it.DomainStatus, &it.ResultRef, &it.LastErrorClass, &it.QuarantineReason, &it.QuarantineOwner, &it.QuarantinedBy, &it.UpdatedAt); err != nil {
+		&it.LockedUntil, &it.DomainStatus, &it.ResultRef, &it.LastErrorClass, &it.QuarantineReason, &it.QuarantineOwner, &it.QuarantinedBy, &it.UpdatedAt, &it.ReleaseGeneration); err != nil {
 		return nil, err
 	}
 	it.Status = imports.ItemStatus(st)
@@ -775,7 +775,7 @@ func (s *PgStore) ClaimItems(ctx context.Context, tenantID, batchID string, now 
 			FROM c WHERE i.batch_id = $1 AND i.row_no = c.row_no
 			RETURNING i.batch_id, i.row_no, i.tenant_id, i.row_hash, i.item_values, i.status, i.error_codes, i.idempotency_key, i.attempts,
 				i.next_attempt_at, i.locked_until, i.domain_status, COALESCE(i.result_ref, ''), COALESCE(i.last_error_class, ''),
-				COALESCE(i.quarantine_reason, ''), COALESCE(i.quarantine_owner, ''), COALESCE(i.quarantined_by, ''), i.updated_at`,
+				COALESCE(i.quarantine_reason, ''), COALESCE(i.quarantine_owner, ''), COALESCE(i.quarantined_by, ''), i.updated_at, i.release_generation`,
 			batchID, now, limit, lease.Seconds(), tenantID)
 		if err != nil {
 			return err
@@ -807,11 +807,25 @@ func (s *PgStore) FinishItem(ctx context.Context, tenantID, batchID string, rowN
 		if tag.RowsAffected() == 0 {
 			return nil // a person moved the item meanwhile (quarantined it); their decision stands
 		}
+		// An item that was released from quarantine has just been re-validated by the owning domain:
+		// record how that ended (TC-08), before any new quarantine episode begins.
+		if res.Status != imports.ItemPending {
+			if err := recordRevalidation(ctx, tx, tenantID, batchID, rowNo, res.Status); err != nil {
+				return err
+			}
+		}
+		if res.Status == imports.ItemQuarantined {
+			if err := insertLedger(ctx, tx, ledgerRow{tenantID: tenantID, batchID: batchID, rowNo: rowNo, kind: imports.LedgerQuarantined,
+				actor: imports.SystemActor, reason: orDefault(res.QuarantineReason, "quarantined by the import executor"),
+				owner: orDefault(res.QuarantineOwner, "unassigned")}); err != nil {
+				return err
+			}
+		}
 		return emitEvents(ctx, tx, tenantID, batchID, events)
 	})
 }
 
-func (s *PgStore) QuarantineItem(ctx context.Context, tenantID, batchID string, rowNo int, reason, owner, by string, events []imports.Event) error {
+func (s *PgStore) QuarantineItem(ctx context.Context, tenantID, batchID string, rowNo int, reason, owner, by, correlationID string, events []imports.Event) error {
 	return s.imp(ctx, tenantID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `UPDATE import_items SET status = 'QUARANTINED', quarantine_reason = $4, quarantine_owner = $5, quarantined_by = $6, locked_until = NULL
 			WHERE batch_id = $1 AND row_no = $2 AND tenant_id = $3 AND status = 'PENDING'`, batchID, rowNo, tenantID, clip(reason, 80), clip(owner, 255), by)
@@ -825,6 +839,10 @@ func (s *PgStore) QuarantineItem(ctx context.Context, tenantID, batchID string, 
 				return imports.ErrItemNotFound
 			}
 			return fmt.Errorf("%w: only a pending item can be quarantined", imports.ErrInvalidState)
+		}
+		if err := insertLedger(ctx, tx, ledgerRow{tenantID: tenantID, batchID: batchID, rowNo: rowNo, kind: imports.LedgerQuarantined,
+			actor: by, reason: reason, owner: owner, correlationID: correlationID}); err != nil {
+			return err
 		}
 		return emitEvents(ctx, tx, tenantID, batchID, events)
 	})
@@ -841,8 +859,12 @@ func (s *PgStore) RetryItem(ctx context.Context, tenantID, batchID string, rowNo
 		if err != nil {
 			return err
 		}
-		if st != "QUARANTINED" && st != "FAILED" {
-			return fmt.Errorf("%w: only a quarantined or failed item can be retried (%s)", imports.ErrRetryNotAllowed, st)
+		if st == "QUARANTINED" {
+			// INV-12: leaving quarantine is a governed decision, not a retry (RequestRelease / DecideRelease).
+			return imports.ErrReleaseRequired
+		}
+		if st != "FAILED" {
+			return fmt.Errorf("%w: only a failed item can be retried (%s)", imports.ErrRetryNotAllowed, st)
 		}
 		if retries >= maxRetries {
 			return fmt.Errorf("%w: it has been retried %d times already", imports.ErrRetryNotAllowed, retries)

@@ -21,15 +21,19 @@ type Event struct {
 
 // Event types.
 const (
-	EventValidated          = "import.validated"
-	EventPreviewApproved    = "import.preview-approved"
-	EventStarted            = "import.started"
-	EventItemQuarantined    = "import.item-quarantined"
-	EventCompleted          = "import.completed"
-	EventReconciled         = "import.reconciled"
-	EventReconciliationFail = "import.reconciliation-failed"
-	EventBatchQuarantined   = "import.quarantined"
-	EventBatchFailed        = "import.failed"
+	EventValidated            = "import.validated"
+	EventPreviewApproved      = "import.preview-approved"
+	EventStarted              = "import.started"
+	EventItemQuarantined      = "import.item-quarantined"
+	EventItemReleaseRequested = "import.item-release-requested"
+	EventItemReleased         = "import.item-released"
+	EventItemReleaseRefused   = "import.item-release-refused"
+	EventItemRevalidated      = "import.item-revalidated"
+	EventCompleted            = "import.completed"
+	EventReconciled           = "import.reconciled"
+	EventReconciliationFail   = "import.reconciliation-failed"
+	EventBatchQuarantined     = "import.quarantined"
+	EventBatchFailed          = "import.failed"
 )
 
 // Patch names the batch columns a transition may set. A nil pointer leaves the column alone.
@@ -140,8 +144,25 @@ type Repo interface {
 	ActivateItems(ctx context.Context, tenantID, batchID string) (pending, skipped int, err error)
 	ClaimItems(ctx context.Context, tenantID, batchID string, now time.Time, limit int, lease time.Duration) ([]Item, error)
 	FinishItem(ctx context.Context, tenantID, batchID string, rowNo int, res ItemResult, events []Event) error
-	QuarantineItem(ctx context.Context, tenantID, batchID string, rowNo int, reason, owner, by string, events []Event) error
+	// QuarantineItem holds a pending item back and records the episode in the quarantine ledger.
+	QuarantineItem(ctx context.Context, tenantID, batchID string, rowNo int, reason, owner, by, correlationID string, events []Event) error
+	// RetryItem puts a FAILED item back in the queue. A QUARANTINED item is refused with
+	// ErrReleaseRequired: it leaves quarantine only through the governed release below.
 	RetryItem(ctx context.Context, tenantID, batchID string, rowNo int, now time.Time, maxAttempts int) error
+
+	// RequestRelease asks for a quarantined item to be released, naming the correction made in the
+	// owning domain. The item stays quarantined until someone else decides.
+	RequestRelease(ctx context.Context, tenantID, batchID string, rowNo int, by, reason, correctionRef, correlationID string, events []Event) error
+	// DecideRelease answers the item's open release request. release=true re-queues the item so the
+	// owning domain re-validates it; false leaves it quarantined. The decider must be independent of
+	// the requester and of whoever quarantined the item.
+	// answersRequest, when non-zero, is the ledger id of the release request the decision was made on: if the
+	// item's open request is any other, the decision is refused with ErrStaleRelease (optimistic concurrency).
+	DecideRelease(ctx context.Context, tenantID, batchID string, rowNo int, by, reason, correlationID string, release bool, answersRequest int64, now time.Time, maxRetries int, events []Event) error
+	// QuarantineLedger is the append-only history of an item (rowNo > 0) or of the whole batch (rowNo 0).
+	QuarantineLedger(ctx context.Context, tenantID, batchID string, rowNo int) ([]LedgerEntry, error)
+	// QuarantineCounts are the numbers the quarantine state is derived from.
+	QuarantineCounts(ctx context.Context, tenantID, batchID string) (quarantined, total, openRequests int, err error)
 	Pending(ctx context.Context, tenantID, batchID string) (int, error)
 	CountMissingRefs(ctx context.Context, tenantID, batchID string) (int, error)
 
