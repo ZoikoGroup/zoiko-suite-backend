@@ -175,22 +175,23 @@ func scanVersion(row pgx.Row) (*domain.TransformationVersion, error) {
 
 // ── RecordDerivation ─────────────────────────────────────────────────────────
 
-const edgeColumns = `edge_id, tenant_id, source_entity_id, activity_id, derived_entity_id, supersedes_edge_id, reason, created_at, created_by`
+const edgeColumns = `edge_id, tenant_id, source_entity_id, activity_id, derived_entity_id, supersedes_edge_id, reason, created_at, created_by, source_version, derived_version`
 
 func scanEdge(row pgx.Row) (*domain.LineageEdge, error) {
 	var e domain.LineageEdge
 	if err := row.Scan(&e.EdgeID, &e.TenantID, &e.SourceEntityID, &e.ActivityID, &e.DerivedEntityID,
-		&e.SupersedesEdgeID, &e.Reason, &e.CreatedAt, &e.CreatedBy); err != nil {
+		&e.SupersedesEdgeID, &e.Reason, &e.CreatedAt, &e.CreatedBy, &e.SourceVersion, &e.DerivedVersion); err != nil {
 		return nil, err
 	}
 	return &e, nil
 }
 
-const activityColumns = `activity_id, tenant_id, activity_type, transformation_version, agent, occurred_at`
+const activityColumns = `activity_id, tenant_id, activity_type, transformation_version, agent, occurred_at, run_id, build_version, config_digest, environment, region`
 
 func scanActivity(row pgx.Row) (*domain.LineageActivity, error) {
 	var a domain.LineageActivity
-	if err := row.Scan(&a.ActivityID, &a.TenantID, &a.ActivityType, &a.TransformationVersion, &a.Agent, &a.OccurredAt); err != nil {
+	if err := row.Scan(&a.ActivityID, &a.TenantID, &a.ActivityType, &a.TransformationVersion, &a.Agent, &a.OccurredAt,
+		&a.RunID, &a.BuildVersion, &a.ConfigDigest, &a.Environment, &a.Region); err != nil {
 		return nil, err
 	}
 	return &a, nil
@@ -219,11 +220,24 @@ func (s *PgStore) RecordDerivation(ctx context.Context, tenantID string, req dom
 			return fmt.Errorf("derived entity: %w", err)
 		}
 
-		existing, err := findCurrentMatchingEdge(ctx, tx, tenantID, source.EntityID, derived.EntityID, req.ActivityType, req.TransformationVersion)
+		existing, err := findCurrentMatchingEdge(ctx, tx, tenantID, source.EntityID, derived.EntityID, req.ActivityType, req.TransformationVersion, req.ProvenanceFields)
 		if err != nil {
 			return err
 		}
 		if existing != nil {
+			// Same run, same pins: a retry. But one run_id cannot have run two
+			// builds or two configurations — that is two different facts
+			// claiming one identity, and silently returning the first would
+			// hide the second (NP-33/NP-34).
+			if req.RunID != nil {
+				prev, err := scanActivity(tx.QueryRow(ctx, `SELECT `+activityColumns+` FROM lineage_activities WHERE activity_id = $1`, existing.ActivityID))
+				if err != nil {
+					return err
+				}
+				if !sameStrPtr(prev.BuildVersion, req.BuildVersion) || !sameStrPtr(prev.ConfigDigest, req.ConfigDigest) {
+					return domain.ErrRunProvenanceConflict
+				}
+			}
 			out = existing
 			return nil
 		}
@@ -246,24 +260,40 @@ func (s *PgStore) RecordDerivation(ctx context.Context, tenantID string, req dom
 		activityID := newID(domain.PrefixLineageActivity)
 		now := time.Now().UTC()
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO lineage_activities (activity_id, tenant_id, activity_type, transformation_version, agent, occurred_at)
-			VALUES ($1, $2, $3, $4, $5, $6)`,
-			activityID, tenantID, req.ActivityType, versionName, req.Agent, now); err != nil {
+			INSERT INTO lineage_activities (activity_id, tenant_id, activity_type, transformation_version, agent, occurred_at,
+				run_id, build_version, config_digest, environment, region)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+			activityID, tenantID, req.ActivityType, versionName, req.Agent, now,
+			req.RunID, req.BuildVersion, req.ConfigDigest, req.Environment, req.Region); err != nil {
 			return fmt.Errorf("insert activity: %w", err)
 		}
 
 		got, err := scanEdge(tx.QueryRow(ctx, `
-			INSERT INTO lineage_edges (edge_id, tenant_id, source_entity_id, activity_id, derived_entity_id, created_by)
-			VALUES ($1, $2, $3, $4, $5, $6)
+			INSERT INTO lineage_edges (edge_id, tenant_id, source_entity_id, activity_id, derived_entity_id, created_by,
+				source_version, derived_version)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 			RETURNING `+edgeColumns,
-			edgeID, tenantID, source.EntityID, activityID, derived.EntityID, actor))
+			edgeID, tenantID, source.EntityID, activityID, derived.EntityID, actor,
+			req.SourceVersion, req.DerivedVersion))
 		if err != nil {
 			return fmt.Errorf("insert edge: %w", err)
 		}
 		out = got
 
+		if err := outbox.Insert(ctx, tx, outbox.Event{AggregateType: "lineage_edge", AggregateID: got.EdgeID,
+			EventType: "DATA.LineageRecorded", TenantID: &tenantID, Payload: got}); err != nil {
+			return err
+		}
+		// The spec's own event (ZS-SVC-Z-001 section 12): run, input and output node IDs, and the code and
+		// configuration digest, which the edge-only DATA.LineageRecorded payload does not carry.
 		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "lineage_edge", AggregateID: got.EdgeID,
-			EventType: "DATA.LineageRecorded", TenantID: &tenantID, Payload: got})
+			EventType: "dqc.lineage.recorded", TenantID: &tenantID, Payload: map[string]any{
+				"edge_id": got.EdgeID, "activity_id": activityID, "activity_type": req.ActivityType,
+				"run_id": req.RunID, "input_node_id": source.EntityID, "output_node_id": derived.EntityID,
+				"input_version": req.SourceVersion, "output_version": req.DerivedVersion,
+				"build_version": req.BuildVersion, "config_digest": req.ConfigDigest, "transformation_version": versionName,
+				"environment": req.Environment, "region": req.Region, "recorded_by": actor, "recorded_at": got.CreatedAt,
+			}})
 	})
 	return out, err
 }
@@ -271,7 +301,11 @@ func (s *PgStore) RecordDerivation(ctx context.Context, tenantID string, req dom
 // findCurrentMatchingEdge looks for a non-superseded edge between the
 // given source/derived entities whose activity matches activityType and
 // transformationVersion exactly.
-func findCurrentMatchingEdge(ctx context.Context, tx pgx.Tx, tenantID, sourceEntityID, derivedEntityID, activityType string, transformationVersion *string) (*domain.LineageEdge, error) {
+func findCurrentMatchingEdge(ctx context.Context, tx pgx.Tx, tenantID, sourceEntityID, derivedEntityID, activityType string, transformationVersion *string, p domain.ProvenanceFields) (*domain.LineageEdge, error) {
+	// run_id and the two version pins are part of the identity of a derivation:
+	// the same transformation run again is a NEW run (and a new edge), and the
+	// same pair at a different version is a different fact. Legacy callers that
+	// send none of them still match each other exactly as before (NULL = NULL).
 	row := tx.QueryRow(ctx, `
 		SELECT `+prefixed("e", edgeColumns)+`
 		FROM lineage_edges e
@@ -279,9 +313,13 @@ func findCurrentMatchingEdge(ctx context.Context, tx pgx.Tx, tenantID, sourceEnt
 		WHERE e.tenant_id = $1 AND e.source_entity_id = $2 AND e.derived_entity_id = $3
 		  AND a.activity_type = $4
 		  AND a.transformation_version IS NOT DISTINCT FROM $5
+		  AND a.run_id IS NOT DISTINCT FROM $6
+		  AND e.source_version IS NOT DISTINCT FROM $7
+		  AND e.derived_version IS NOT DISTINCT FROM $8
 		  AND NOT EXISTS (SELECT 1 FROM lineage_edges s WHERE s.supersedes_edge_id = e.edge_id)
 		LIMIT 1`,
-		tenantID, sourceEntityID, derivedEntityID, activityType, transformationVersion)
+		tenantID, sourceEntityID, derivedEntityID, activityType, transformationVersion,
+		p.RunID, p.SourceVersion, p.DerivedVersion)
 	edge, err := scanEdge(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -314,8 +352,10 @@ func (s *PgStore) SupersedeLineage(ctx context.Context, tenantID string, req dom
 	var out *domain.LineageEdge
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		var oldSource, oldActivity, oldDerived string
-		err := tx.QueryRow(ctx, `SELECT source_entity_id, activity_id, derived_entity_id
-			FROM lineage_edges WHERE edge_id = $1 FOR UPDATE`, req.EdgeID).Scan(&oldSource, &oldActivity, &oldDerived)
+		var oldSourceVersion, oldDerivedVersion *string
+		err := tx.QueryRow(ctx, `SELECT source_entity_id, activity_id, derived_entity_id, source_version, derived_version
+			FROM lineage_edges WHERE edge_id = $1 FOR UPDATE`, req.EdgeID).Scan(&oldSource, &oldActivity, &oldDerived,
+			&oldSourceVersion, &oldDerivedVersion)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrLineageEdgeNotFound
 		}
@@ -337,12 +377,65 @@ func (s *PgStore) SupersedeLineage(ctx context.Context, tenantID string, req dom
 			return err
 		}
 
+		// By default the superseding edge reuses the old activity and pins. When
+		// the caller supplies corrected provenance, a NEW activity is written
+		// from the old one overlaid with the corrections — the old activity row
+		// is never edited (it is immutable), so history stays intact and the
+		// correction is itself a recorded fact (NP-39).
+		activityID := oldActivity
+		sourceVersion, derivedVersion := oldSourceVersion, oldDerivedVersion
+		if req.SourceVersion != nil {
+			sourceVersion = req.SourceVersion
+		}
+		if req.DerivedVersion != nil {
+			derivedVersion = req.DerivedVersion
+		}
+		if req.HasReplacement() {
+			prev, err := scanActivity(tx.QueryRow(ctx, `SELECT `+activityColumns+` FROM lineage_activities WHERE activity_id = $1`, oldActivity))
+			if err != nil {
+				return fmt.Errorf("load activity being corrected: %w", err)
+			}
+			next := *prev
+			if req.TransformationVersion != nil {
+				v, err := findOrCreateTransformationVersion(ctx, tx, tenantID, *req.TransformationVersion, actor)
+				if err != nil {
+					return fmt.Errorf("transformation version: %w", err)
+				}
+				next.TransformationVersion = &v.Name
+			}
+			if req.RunID != nil {
+				next.RunID = req.RunID
+			}
+			if req.BuildVersion != nil {
+				next.BuildVersion = req.BuildVersion
+			}
+			if req.ConfigDigest != nil {
+				next.ConfigDigest = req.ConfigDigest
+			}
+			if req.Environment != nil {
+				next.Environment = req.Environment
+			}
+			if req.Region != nil {
+				next.Region = req.Region
+			}
+			activityID = newID(domain.PrefixLineageActivity)
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO lineage_activities (activity_id, tenant_id, activity_type, transformation_version, agent, occurred_at,
+					run_id, build_version, config_digest, environment, region)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+				activityID, tenantID, next.ActivityType, next.TransformationVersion, next.Agent, time.Now().UTC(),
+				next.RunID, next.BuildVersion, next.ConfigDigest, next.Environment, next.Region); err != nil {
+				return fmt.Errorf("insert replacement activity: %w", err)
+			}
+		}
+
 		got, err := scanEdge(tx.QueryRow(ctx, `
 			INSERT INTO lineage_edges (edge_id, tenant_id, source_entity_id, activity_id, derived_entity_id,
-				supersedes_edge_id, reason, created_by)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+				supersedes_edge_id, reason, created_by, source_version, derived_version)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 			RETURNING `+edgeColumns,
-			newEdgeID, tenantID, oldSource, oldActivity, oldDerived, req.EdgeID, req.Reason, actor))
+			newEdgeID, tenantID, oldSource, activityID, oldDerived, req.EdgeID, req.Reason, actor,
+			sourceVersion, derivedVersion))
 		if err != nil {
 			return fmt.Errorf("insert superseding edge: %w", err)
 		}
@@ -606,6 +699,66 @@ func (s *PgStore) GetSourceToReportPath(ctx context.Context, tenantID, entityID 
 
 const manifestColumns = `manifest_id, tenant_id, entity_id, manifest, manifest_sha256, sealed_at, sealed_by`
 
+func sameStrPtr(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+func blank(s *string) bool { return s == nil || strings.TrimSpace(*s) == "" }
+
+// requireSealableGraph is the certification gate. Recording accepts partial
+// evidence; a SEALED manifest must not paper over a gap in the evidence it
+// certifies (ZS-SVC-Z-001 DQC-04, TC-09, NP-31..NP-34):
+//
+//   - an entity with no upstream edges has no lineage to certify — the manifest
+//     would be a hash of nothing, indistinguishable from "never recorded";
+//   - every activity must name its transformation, run, build and config digest;
+//   - every edge must pin the exact source and derived versions.
+//
+// Order matters only for which error a caller sees first; the transformation
+// version check keeps its original precedence.
+func requireSealableGraph(snap *domain.LineageGraphSnapshot) error {
+	// The gaps are enumerated once, in domain.LineageGaps, so what a reader is TOLD is missing and what
+	// sealing REFUSES for can never diverge. Sealing reports the first gap by precedence.
+	gaps := domain.LineageGaps(snap)
+	if len(gaps) == 0 {
+		return nil
+	}
+	has := func(kind string) bool {
+		for _, g := range gaps {
+			if g.Kind == kind {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case has(domain.GapNoInputLineage):
+		return domain.ErrNoInputLineage
+	case has(domain.GapMissingTransformationVer):
+		return domain.ErrMissingTransformationVersion
+	}
+	field := map[string]string{
+		domain.GapMissingRunID: "run_id", domain.GapMissingBuildVersion: "build_version", domain.GapMissingConfigDigest: "config_digest",
+	}
+	for _, g := range gaps {
+		if f, ok := field[g.Kind]; ok {
+			return fmt.Errorf("%w: activity %s has no %s", domain.ErrMissingRunProvenance, g.ActivityID, f)
+		}
+	}
+	for _, g := range gaps {
+		switch g.Kind {
+		case domain.GapMissingSourceVersion:
+			return fmt.Errorf("%w: edge %s has no source_version", domain.ErrMissingVersionPin, g.EdgeID)
+		case domain.GapMissingDerivedVersion:
+			return fmt.Errorf("%w: edge %s has no derived_version", domain.ErrMissingVersionPin, g.EdgeID)
+		}
+	}
+	return nil
+}
+
 // SealManifest walks entityID's upstream graph and writes an immutable
 // snapshot. Refuses (ErrMissingTransformationVersion) if any activity in
 // that graph has no transformation_version recorded — the doc's own named
@@ -628,10 +781,8 @@ func (s *PgStore) SealManifest(ctx context.Context, tenantID, entityID, actor st
 		if err != nil {
 			return err
 		}
-		for _, a := range snap.Activities {
-			if a.TransformationVersion == nil || *a.TransformationVersion == "" {
-				return domain.ErrMissingTransformationVersion
-			}
+		if err := requireSealableGraph(snap); err != nil {
+			return err
 		}
 
 		manifestID := newID(domain.PrefixProvenanceManifest)

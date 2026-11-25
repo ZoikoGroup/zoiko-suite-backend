@@ -7,6 +7,7 @@ package domain
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -90,6 +91,14 @@ type LineageActivity struct {
 	TransformationVersion *string   `json:"transformation_version,omitempty"`
 	Agent                 string    `json:"agent"`
 	OccurredAt            time.Time `json:"occurred_at"`
+
+	// Run and code/config provenance (ZS-SVC-Z-001 DQC-04, TC-09). All nullable:
+	// recording accepts partial evidence, SealManifest refuses it.
+	RunID        *string `json:"run_id,omitempty"`
+	BuildVersion *string `json:"build_version,omitempty"`
+	ConfigDigest *string `json:"config_digest,omitempty"`
+	Environment  *string `json:"environment,omitempty"`
+	Region       *string `json:"region,omitempty"`
 }
 
 // LineageEdge is a directed edge connecting a source entity to a derived
@@ -108,6 +117,11 @@ type LineageEdge struct {
 	Reason           *string   `json:"reason,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
 	CreatedBy        string    `json:"created_by"`
+
+	// Exact input/output versions this edge is about (watermark, snapshot id,
+	// content hash). Never a moving pointer such as "latest" (NP-32).
+	SourceVersion  *string `json:"source_version,omitempty"`
+	DerivedVersion *string `json:"derived_version,omitempty"`
 }
 
 // ProvenanceManifest is a sealed, immutable snapshot of the full upstream
@@ -170,6 +184,7 @@ type RecordDerivationRequest struct {
 	TransformationVersion *string   `json:"transformation_version,omitempty"`
 	Agent                 string    `json:"agent"`
 	DerivedEntity         EntityRef `json:"derived_entity"`
+	ProvenanceFields
 }
 
 func (r RecordDerivationRequest) Validate() error {
@@ -188,12 +203,24 @@ func (r RecordDerivationRequest) Validate() error {
 	if r.TransformationVersion != nil && *r.TransformationVersion == "" {
 		return fmt.Errorf("transformation_version, if given, must not be empty")
 	}
-	return nil
+	return r.ProvenanceFields.Validate()
 }
 
 type SupersedeLineageRequest struct {
 	EdgeID string `json:"edge_id"`
 	Reason string `json:"reason"`
+
+	// Replacement provenance. Without any of these the superseding edge reuses
+	// the old activity and pins, so it inherits every gap the old edge had and
+	// could never become sealable. With any of them, a NEW activity is written
+	// (the old one is never edited, NP-39); fields not given are inherited.
+	TransformationVersion *string `json:"transformation_version,omitempty"`
+	ProvenanceFields
+}
+
+// HasReplacement reports whether the caller supplied corrected provenance.
+func (r SupersedeLineageRequest) HasReplacement() bool {
+	return r.TransformationVersion != nil || !r.ProvenanceFields.IsZero()
 }
 
 func (r SupersedeLineageRequest) Validate() error {
@@ -203,7 +230,10 @@ func (r SupersedeLineageRequest) Validate() error {
 	if r.Reason == "" {
 		return fmt.Errorf("reason is required")
 	}
-	return nil
+	if r.TransformationVersion != nil && *r.TransformationVersion == "" {
+		return fmt.Errorf("transformation_version, if given, must not be empty")
+	}
+	return r.ProvenanceFields.Validate()
 }
 
 type AttachEvidenceRequest struct {
@@ -228,4 +258,98 @@ var (
 	ErrProvenanceManifestNotFound   = errorString("provenance manifest not found")
 	ErrMissingTransformationVersion = errorString("upstream lineage has an activity with no transformation_version recorded; cannot seal a certified manifest")
 	ErrIdempotencyKeyReused         = errorString("idempotency key was already used for a different request")
+
+	// ZS-SVC-Z-001 DQC-04 / TC-09 / NP-31..NP-34.
+	ErrNoInputLineage        = errorString("entity has no upstream lineage; a manifest of an empty graph certifies nothing")
+	ErrMissingRunProvenance  = errorString("upstream lineage has an activity with no run_id, build_version or config_digest recorded; cannot seal a certified manifest")
+	ErrMissingVersionPin     = errorString("upstream lineage has an edge with no source_version or derived_version pinned; cannot seal a certified manifest")
+	ErrRunProvenanceConflict = errorString("this run_id was already recorded for the same derivation with a different build_version or config_digest")
 )
+
+// ── Run provenance (ZS-SVC-Z-001 DQC-04) ─────────────────────────────────────
+
+// ProvenanceFields is the run, code/config and version-pin evidence that turns
+// "A fed B" into "run R of build X with configuration C read A@v1 and wrote
+// B@v2". Every field is optional on write — SealManifest is what refuses to
+// certify a graph with gaps.
+type ProvenanceFields struct {
+	RunID          *string `json:"run_id,omitempty"`
+	BuildVersion   *string `json:"build_version,omitempty"`
+	ConfigDigest   *string `json:"config_digest,omitempty"`
+	Environment    *string `json:"environment,omitempty"`
+	Region         *string `json:"region,omitempty"`
+	SourceVersion  *string `json:"source_version,omitempty"`
+	DerivedVersion *string `json:"derived_version,omitempty"`
+}
+
+// IsZero reports whether no provenance field was supplied.
+func (p ProvenanceFields) IsZero() bool {
+	return p.RunID == nil && p.BuildVersion == nil && p.ConfigDigest == nil &&
+		p.Environment == nil && p.Region == nil && p.SourceVersion == nil && p.DerivedVersion == nil
+}
+
+// mutablePointers are version labels that name a moving target. An edge pinned
+// to one proves nothing, because the thing it names changes underneath it.
+var mutablePointers = map[string]bool{
+	"latest": true, "head": true, "current": true, "main": true, "master": true,
+	"tip": true, "trunk": true, "@latest": true, "live": true, "default": true,
+}
+
+// IsMutablePointer reports whether v is a moving-target label rather than an
+// exact version (NP-32).
+func IsMutablePointer(v string) bool {
+	return mutablePointers[strings.ToLower(strings.TrimSpace(v))]
+}
+
+func isLowerHex64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// Validate checks only what is present: absence is allowed here (and refused at
+// seal time), but a value that IS supplied must be well-formed.
+func (p ProvenanceFields) Validate() error {
+	nonEmpty := func(name string, v *string, max int) error {
+		if v == nil {
+			return nil
+		}
+		if strings.TrimSpace(*v) == "" {
+			return fmt.Errorf("%s, if given, must not be empty", name)
+		}
+		if len(*v) > max {
+			return fmt.Errorf("%s must be at most %d characters", name, max)
+		}
+		return nil
+	}
+	for _, c := range []struct {
+		name string
+		v    *string
+		max  int
+	}{
+		{"run_id", p.RunID, 128}, {"build_version", p.BuildVersion, 256}, {"environment", p.Environment, 64},
+		{"region", p.Region, 64}, {"source_version", p.SourceVersion, 256}, {"derived_version", p.DerivedVersion, 256},
+	} {
+		if err := nonEmpty(c.name, c.v, c.max); err != nil {
+			return err
+		}
+	}
+	if p.ConfigDigest != nil && !isLowerHex64(*p.ConfigDigest) {
+		return fmt.Errorf("config_digest must be a lowercase sha256 hex digest (64 characters)")
+	}
+	if p.BuildVersion != nil && IsMutablePointer(*p.BuildVersion) {
+		return fmt.Errorf("build_version %q names a moving target; pin an exact build or commit", *p.BuildVersion)
+	}
+	for name, v := range map[string]*string{"source_version": p.SourceVersion, "derived_version": p.DerivedVersion} {
+		if v != nil && IsMutablePointer(*v) {
+			return fmt.Errorf("%s %q names a moving target; pin an exact version, watermark or snapshot id", name, *v)
+		}
+	}
+	return nil
+}

@@ -63,6 +63,7 @@ func NewRouter(h *Handler) http.Handler {
 		r.Get("/entities/{entityID}/downstream", h.GetDownstreamImpact)
 		r.Get("/entities/{entityID}/as-of", h.GetAsOfLineage)
 		r.Get("/entities/{entityID}/source-path", h.GetSourceToReportPath)
+		r.Get("/dqc/lineage", h.DQCLineage)
 	})
 
 	return r
@@ -344,7 +345,9 @@ func (h *Handler) respondFromError(w http.ResponseWriter, err error) {
 		errors.Is(err, domain.ErrProvenanceManifestNotFound):
 		h.respondError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, domain.ErrLineageEdgeAlreadySuperseded), errors.Is(err, domain.ErrMissingTransformationVersion),
-		errors.Is(err, domain.ErrIdempotencyKeyReused):
+		errors.Is(err, domain.ErrIdempotencyKeyReused), errors.Is(err, domain.ErrNoInputLineage),
+		errors.Is(err, domain.ErrMissingRunProvenance), errors.Is(err, domain.ErrMissingVersionPin),
+		errors.Is(err, domain.ErrRunProvenanceConflict):
 		h.respondError(w, http.StatusConflict, err.Error())
 	default:
 		h.logger.Error("data-lineage-svc request failed", zap.Error(err))
