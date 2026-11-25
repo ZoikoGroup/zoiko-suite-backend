@@ -20,6 +20,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/identity-envelope/decisionledger"
+
 	"zoiko.io/authorization-svc/internal/domain"
 	"zoiko.io/authorization-svc/internal/retention"
 )
@@ -182,6 +184,17 @@ type Store interface {
 type PgStore struct {
 	pool *pgxpool.Pool
 	log  *zap.Logger
+	// ledger, when set, builds the governance-ledger record of a decision
+	// (nil = nothing to relay); see SetDecisionLedger.
+	ledger func(domain.AccessDecisionLog) (*decisionledger.Record, error)
+}
+
+// SetDecisionLedger makes RecordAccessDecision write the governance-ledger
+// record build returns into decision_log_outbox (000047), in the decision's
+// own transaction, so the two commit together or not at all (DL-3). build
+// answers nil for a decision that is not relayed (D-DL-1: PERMIT, STEP_UP).
+func (s *PgStore) SetDecisionLedger(build func(domain.AccessDecisionLog) (*decisionledger.Record, error)) {
+	s.ledger = build
 }
 
 // New returns an open PgStore. Caller must call pool.Close() when done.
@@ -2630,8 +2643,24 @@ func (s *PgStore) RecordAccessDecision(ctx context.Context, params domain.Record
 			nullIfEmpty(params.ResourceType), nullIfEmpty(params.ResourceID), nullIfEmpty(params.ResourceVersion),
 			nullIfEmpty(params.AttributesDigest), nullIfEmpty(params.SessionAssurance), nullIfEmpty(params.OnBehalfOf),
 			nullIfEmpty(params.DelegationID), params.ExpiresAt, nullIfEmpty(params.SessionKind), params.SessionID))
-		if scanErr != nil || params.Events == nil {
+		if scanErr != nil {
 			return scanErr
+		}
+		// DL-3: a DENY or REQUIRE_APPROVAL is also queued for the governance
+		// ledger, in this transaction.
+		if s.ledger != nil {
+			rec, buildErr := s.ledger(*d)
+			if buildErr != nil {
+				return buildErr
+			}
+			if rec != nil {
+				if err := decisionledger.Enqueue(ctx, tx, *rec); err != nil {
+					return err
+				}
+			}
+		}
+		if params.Events == nil {
+			return nil
 		}
 		// Same transaction: the decision and its events commit together or
 		// not at all.

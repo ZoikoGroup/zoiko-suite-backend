@@ -147,7 +147,8 @@ func TestAC2_PlatformServiceIdentitiesProvisionedWithATenantsFirstRole(t *testin
 
 // OB-S8 / OB-S11: migration 000044 provisions obligations-svc's clock worker
 // identity: it may ask jurisdiction-rules-svc for a calculation and open an
-// escalation case, nothing more.
+// escalation case. Since 000046 (DL-1) it also appends its own decisions to
+// the governance ledger; nothing more.
 func TestOBS8_ObligationsServiceIdentityProvisionedWithATenantsFirstRole(t *testing.T) {
 	f := newFixture(t)
 	entity := uuid.NewString()
@@ -155,14 +156,52 @@ func TestOBS8_ObligationsServiceIdentityProvisionedWithATenantsFirstRole(t *test
 		t.Fatal("precondition: svc-obligations holds a grant in a tenant that has no role yet")
 	}
 	f.role(t)
-	for _, a := range []string{"OBLIGATION_CALCULATION_CALCULATE", "CASE_OPEN"} {
+	for _, a := range []string{"OBLIGATION_CALCULATION_CALCULATE", "CASE_OPEN", actionDecisionRecord} {
 		if !f.granted(t, "svc-obligations", entity, a) {
 			t.Fatalf("svc-obligations must hold %s on any entity of the tenant", a)
 		}
 	}
-	for _, a := range []string{actionDecisionRecord, actionDecisionRead, "OBLIGATION_CLOCK_WAIVE", "CASE_CLOSE"} {
+	for _, a := range []string{actionDecisionRead, "OBLIGATION_CLOCK_WAIVE", "CASE_CLOSE"} {
 		if f.granted(t, "svc-obligations", entity, a) {
 			t.Fatalf("svc-obligations must not hold %s", a)
 		}
+	}
+}
+
+// DL-1 (25 Nov 2026): migration 000046 provisions the four new decision-log
+// writers with GOVERNANCE_DECISION_RECORD only, in a tenant from its first
+// role on, and an administrator's revocation stands.
+func TestDL1_DecisionLogWritersProvisionedWithATenantsFirstRole(t *testing.T) {
+	writers := []string{"svc-authorization", "svc-jurisdiction-rules", "svc-obligations", "svc-evidence-requirements"}
+	f := newFixture(t)
+	entity := uuid.NewString()
+	for _, p := range writers {
+		if f.granted(t, p, entity, actionDecisionRecord) {
+			t.Fatalf("precondition: %s holds RECORD in a tenant that has no role yet", p)
+		}
+	}
+	f.role(t)
+	for _, p := range writers {
+		if !f.granted(t, p, entity, actionDecisionRecord) {
+			t.Fatalf("%s must hold %s on any entity of a provisioned tenant", p, actionDecisionRecord)
+		}
+		if f.granted(t, p, entity, actionDecisionRead) {
+			t.Fatalf("%s is a writer: it must not read the ledger", p)
+		}
+	}
+	if f.granted(t, "someone-else", entity, actionDecisionRecord) {
+		t.Fatal("only service identities are provisioned")
+	}
+
+	assignments, err := f.s.ListRoleAssignments(f.ctx, f.tenant, "svc-evidence-requirements", "", true)
+	if err != nil || len(assignments) != 1 {
+		t.Fatalf("svc-evidence-requirements assignments: %d %v", len(assignments), err)
+	}
+	if _, err := f.s.RevokeRoleAssignment(f.ctx, assignments[0].PrincipalRoleAssignmentID, f.tenant); err != nil {
+		t.Fatal(err)
+	}
+	f.role(t)
+	if f.granted(t, "svc-evidence-requirements", entity, actionDecisionRecord) {
+		t.Fatal("creating another role re-granted a writer an administrator had revoked")
 	}
 }

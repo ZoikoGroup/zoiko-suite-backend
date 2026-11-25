@@ -43,6 +43,22 @@ type Config struct {
 	// fail, since this service has no principal at startup) — MTLSEnabled
 	// should not be turned on without this also being set.
 	MTLSBootstrapTokenPath string
+
+	// Decision capture (DL-3, 25 Nov 2026; D-DL-1). Every DENY and
+	// REQUIRE_APPROVAL is queued in decision_log_outbox with its decision
+	// and relayed to governance-decision-log-svc's mTLS listener
+	// (GOVERNANCE_DECISION_LOG_MTLS_URL) as LedgerPrincipalID with this
+	// service's own workload certificate. An empty URL leaves the records
+	// waiting in the outbox (evidence fails safe, never lost); an empty
+	// LEDGER_PRINCIPAL_ID queues nothing.
+	DecisionLogMTLSURL  string
+	LedgerPrincipalID   string
+	LedgerRelayInterval time.Duration
+	// LedgerRelayMaxPerSecond caps deliveries (decisionledger.SetMaxPerSecond).
+	LedgerRelayMaxPerSecond int
+	// LedgerRetention: delivered outbox rows older than this are purged
+	// (the ledger holds them); 0 keeps them.
+	LedgerRetention time.Duration
 	// MTLSRevocationCheck is "require" (default) or "off": whether the mTLS
 	// listener refuses client certificates on mtls-management-svc's CRL, and
 	// refuses every client certificate while it holds no current CRL
@@ -532,6 +548,11 @@ func Load() (*Config, error) {
 		MTLSPort:                 envInt("MTLS_PORT", 8449),
 		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 		MTLSBootstrapTokenPath:   env("MTLS_BOOTSTRAP_TOKEN_PATH", ""),
+		DecisionLogMTLSURL:       env("GOVERNANCE_DECISION_LOG_MTLS_URL", ""),
+		LedgerPrincipalID:        env("LEDGER_PRINCIPAL_ID", "svc-authorization"),
+		LedgerRelayInterval:      time.Duration(envInt("LEDGER_RELAY_INTERVAL_MS", 2000)) * time.Millisecond,
+		LedgerRelayMaxPerSecond:  envInt("LEDGER_RELAY_MAX_PER_SECOND", 20),
+		LedgerRetention:          time.Duration(envInt("LEDGER_RETENTION_HOURS", 168)) * time.Hour,
 		MTLSRevocationCheck:      strings.ToLower(env("MTLS_REVOCATION_CHECK", "require")),
 		MTLSCRLURL:               env("MTLS_CRL_URL", strings.TrimRight(env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"), "/")+"/v1/mtls/crl"),
 		MTLSCRLRefreshSeconds:    envInt("MTLS_CRL_REFRESH_SECONDS", 30),

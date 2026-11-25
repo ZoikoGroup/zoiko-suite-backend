@@ -2650,3 +2650,25 @@ together (If-Match is now required by one and sent by the other); apply access-c
   `internal/mtls` client requests a certificate with no bootstrap token; compose never sets
   `AUTHZ_MTLS_ENABLED`), as do the dev seed (synthetic seed administrator) and the persona
   harness. Compose stays `warn`; SPEC_DEVIATIONS records the blockers.
+
+## Decision capture (DL-3, 25 Nov 2026)
+
+Doc 01 §7 / Doc 03 §8.3, decision D-DL-1: every `DENY` and `REQUIRE_APPROVAL` (and a denied admin-gate check)
+is relayed to governance-decision-log-svc as `svc-authorization` (`GOVERNANCE_DECISION_RECORD`, migration 000046).
+`PERMIT` and `STEP_UP` stay only in `access_decision_log`. Not relayed either: a decision with no tenant (the
+ledger is tenant-scoped) and a decision about `svc-authorization` itself (the ledger's own append check; relaying
+its denial would loop). Tenant-scope and platform-scope checks are filed under the ledger's `PLATFORM` scope.
+
+- Record: `internal/ledger` (`decision_id` = access decision id, `action_type` `ACCESS_<action>`, domain
+  `ORGANIZATION_ACCESS`, `rule_basis` `<policy_set_version> reasons:<codes> basis:<basis>`, the attributes digest
+  only, the evaluated principal in `evaluation_context.on_behalf_of`).
+- Store: `PgStore.SetDecisionLedger`, migration 000047 `decision_log_outbox` (RLS: own tenant or the relay marker).
+- Metrics: `authz_decision_log_outbox_pending`, `_parked`, `_oldest_pending_seconds`,
+  `authz_decision_log_relay_deliveries_total{result}`, `authz_decision_log_outbox_purged_total`.
+- Tests: `TestBuilder_*`, `TestRecord_CarriesBasisActorAndNoAttributeValues` (unit);
+  `TestDL3_OnlyDenyAndRequireApprovalAreQueuedForTheLedger`, `TestDL3_TheLedgerRecordCommitsWithTheDecision`,
+  `TestDL1_DecisionLogWritersProvisionedWithATenantsFirstRole` (AUTHZ_IT_DSN, NOBYPASSRLS).
+- Load (c=50, 30 s, DENY ≈ 40 % of the mix): the in-transaction enqueue alone adds ~7 % to p95; unpaced delivery
+  during the run added 16–29 %, hence the delivery cap.
+
+The record is written to `decision_log_outbox` in the transaction of the decision it records and delivered by `identity-envelope/decisionledger`'s relay (lease-based claim, backoff to 10 minutes, a 409 parks the row for an operator, delivered rows purged after `LEDGER_RETENTION_HOURS`, default 168) to `GOVERNANCE_DECISION_LOG_MTLS_URL` with this service's own workload certificate (`mtlsclient`, bootstrap token `MTLS_BOOTSTRAP_TOKEN_PATH`). Deliveries are capped at `LEDGER_RELAY_MAX_PER_SECOND` (default 20): a ledger outage or a burst delays the evidence, it never fails or slows the decision. Status: 🔵 built, not verified (tracker "Assignment 25 Nov 2026").

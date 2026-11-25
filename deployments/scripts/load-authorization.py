@@ -61,33 +61,34 @@ def get_envelope(principal):
 
     email, password = CREDS[principal]
 
-    # Authenticate with identity-context-svc.
-    auth_body = json.dumps({
-        "client_id": "zoiko-console",
-        "client_secret": "local-dev-console-client-secret",
-        "username": email,
-        "password": password
-    }).encode()
+    # Authenticate with identity-context-svc (console client, since 3 Nov
+    # IDP_CLIENT_AUTH=required), then resolve the signed envelope for the demo
+    # entity. 25 Nov 2026: this sent `username` and read `identity_token`,
+    # which identity-context-svc never answered, so every run fell back to
+    # bare headers.
+    def post(url, body, extra=None):
+        h = {"Content-Type": "application/json", "X-Tenant-Id": TENANT, "X-Legal-Entity-Id": ENTITY,
+             "X-Request-Id": str(uuid.uuid4()), "X-Correlation-ID": str(uuid.uuid4()),
+             "Idempotency-Key": str(uuid.uuid4()), "X-Source-Channel": "api"}
+        h.update(extra or {})
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST", headers=h)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
 
     try:
-        req = urllib.request.Request(f"{IDENTITY}/v1/authenticate", data=auth_body, method="POST",
-                                     headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            auth_result = json.loads(r.read())
+        auth_result = post(f"{IDENTITY}/v1/authenticate", {
+            "tenant_id": TENANT, "email": email, "password": password,
+            "client_id": "zoiko-console", "client_secret": "local-dev-console-client-secret"})
         access_token = auth_result["access_token"]
     except Exception as e:
         print(f"WARN: Failed to authenticate {email}: {e}", flush=True)
         print("WARN: Falling back to headers-only mode (works under warn)", flush=True)
         return None
 
-    # Resolve context for the demo legal entity.
-    resolve_body = json.dumps({"entity_id": ENTITY}).encode()
     try:
-        req = urllib.request.Request(f"{IDENTITY}/v1/context/resolve", data=resolve_body, method="POST",
-                                     headers={"Content-Type": "application/json", "Authorization": f"Bearer {access_token}"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            resolve_result = json.loads(r.read())
-        identity_token = resolve_result["identity_token"]
+        resolve_result = post(f"{IDENTITY}/v1/context/resolve",
+                              {"bearer_token": access_token, "legal_entity_id": ENTITY})
+        identity_token = resolve_result["envelope_jwt"]
     except Exception as e:
         print(f"WARN: Failed to resolve context for {email}: {e}", flush=True)
         print("WARN: Falling back to headers-only mode (works under warn)", flush=True)
