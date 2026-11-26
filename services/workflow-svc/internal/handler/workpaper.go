@@ -8,6 +8,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"zoiko.io/workflow-svc/internal/domain"
+	"zoiko.io/workflow-svc/internal/evidence"
 )
 
 const (
@@ -201,6 +202,10 @@ func (h *Handler) LinkEvidence(w http.ResponseWriter, r *http.Request) {
 	contradictionFlag := false
 	if h.evidence != nil {
 		flag, err := h.evidence.GetContradictionFlag(r.Context(), wp.TenantID, req.EvidenceID, actor, r.Header.Get("X-Correlation-ID"))
+		if errors.Is(err, evidence.ErrEvidenceNotFound) {
+			writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "evidence_not_found"})
+			return
+		}
 		if err != nil {
 			writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "evidence_service_unavailable"})
 			return

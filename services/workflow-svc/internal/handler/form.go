@@ -669,30 +669,67 @@ func (h *Handler) writeFormAuthzErr(w http.ResponseWriter, r *http.Request, err 
 
 type createCaseRequest struct {
 	WorkflowInstanceID    *string `json:"workflow_instance_id,omitempty"`
-	CaseFamily            string  `json:"case_family"` // FINANCIAL, PAYROLL_HR, LEGAL_COMPLIANCE, SECURITY_PRIVACY, OPERATIONAL
-	CaseType              string  `json:"case_type"`   // INVESTIGATION, DISPUTE, EXCEPTION, etc.
+	LegalEntityID         string  `json:"legal_entity_id,omitempty"` // required for a case not linked to a workflow
+	CaseFamily            string  `json:"case_family"`               // FINANCIAL, PAYROLL_HR, LEGAL_COMPLIANCE, SECURITY_PRIVACY, OPERATIONAL
+	CaseType              string  `json:"case_type"`                 // INVESTIGATION, DISPUTE, EXCEPTION, etc.
 	Title                 string  `json:"title"`
 	Description           string  `json:"description"`
-	Severity              string  `json:"severity,omitempty"`        // LOW, MEDIUM, HIGH, CRITICAL
-	Confidentiality       string  `json:"confidentiality,omitempty"` // INTERNAL, RESTRICTED, PRIVILEGED
+	Severity              string  `json:"severity,omitempty"`        // LOW, MEDIUM (default), HIGH, CRITICAL
+	Confidentiality       string  `json:"confidentiality,omitempty"` // INTERNAL (default), RESTRICTED, PRIVILEGED
 	AssignedToPrincipalID *string `json:"assigned_to_principal_id,omitempty"`
+	// What opened the case (R-001 §6.3), e.g. obligations-svc's escalation
+	// relay: OBLIGATION_CLOCK / clock id / milestone. One source milestone
+	// opens one case; a retry answers 200 with it.
+	SourceType string `json:"source_type,omitempty"`
+	SourceID   string `json:"source_id,omitempty"`
+	Milestone  string `json:"milestone,omitempty"`
 }
 
-func (req createCaseRequest) missingField() string {
+var (
+	caseFamilies        = map[string]bool{"FINANCIAL": true, "PAYROLL_HR": true, "LEGAL_COMPLIANCE": true, "SECURITY_PRIVACY": true, "OPERATIONAL": true}
+	caseSeverities      = map[string]bool{"LOW": true, "MEDIUM": true, "HIGH": true, "CRITICAL": true}
+	caseConfidentiality = map[string]bool{"INTERNAL": true, "RESTRICTED": true, "PRIVILEGED": true}
+)
+
+// actionCaseOpen is the action a case open is authorized with, on the case's
+// legal entity (WF-S2; svc-obligations holds it for its escalation relay,
+// authorization-svc 000044).
+const actionCaseOpen = "CASE_OPEN"
+
+// normalise fills the defaults and returns the first missing or invalid field.
+// A case opened from a source milestone with no case_type takes
+// <SOURCE_TYPE>_ESCALATION (OBLIGATION_CLOCK_ESCALATION for obligations-svc).
+func (req *createCaseRequest) normalise() (field, problem string) {
+	if (req.SourceType == "") != (req.SourceID == "") || (req.Milestone != "" && req.SourceType == "") {
+		return "source_type", "source_type and source_id go together (milestone needs both)"
+	}
+	if req.CaseType == "" && req.SourceType != "" && req.Milestone != "" {
+		req.CaseType = strings.ToUpper(req.SourceType) + "_ESCALATION"
+	}
 	switch {
 	case req.CaseFamily == "":
-		return "case_family"
+		return "case_family", "missing"
+	case !caseFamilies[req.CaseFamily]:
+		return "case_family", "must be FINANCIAL, PAYROLL_HR, LEGAL_COMPLIANCE, SECURITY_PRIVACY or OPERATIONAL"
 	case req.CaseType == "":
-		return "case_type"
+		return "case_type", "missing"
 	case req.Title == "":
-		return "title"
-	default:
-		return ""
+		return "title", "missing"
+	case req.Severity != "" && !caseSeverities[req.Severity]:
+		return "severity", "must be LOW, MEDIUM, HIGH or CRITICAL"
+	case req.Confidentiality != "" && !caseConfidentiality[req.Confidentiality]:
+		return "confidentiality", "must be INTERNAL, RESTRICTED or PRIVILEGED"
 	}
+	return "", ""
 }
 
 // CreateCase handles POST /v1/cases.
-// Creates a new case (optionally linked to a workflow instance).
+//
+// A case is linked to a workflow (its legal entity is the workflow's) or
+// stands alone with legal_entity_id, which tenant-entity-registry-svc must
+// confirm in the caller's tenant. Opening one needs CASE_OPEN on that entity
+// (it used to need only WORKFLOW_READ, on no entity). 201 opened; 200 the case
+// this source milestone already opened.
 func (h *Handler) CreateCase(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
@@ -710,74 +747,92 @@ func (h *Handler) CreateCase(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "bad_request", "invalid JSON body", correlationID, nil)
 		return
 	}
-	if missing := req.missingField(); missing != "" {
-		writeJSON(w, r, http.StatusBadRequest, map[string]string{
-			"error": "missing_field",
-			"field": missing,
-		})
-		return
-	}
-
-	// Verify workflow exists if provided
-	if req.WorkflowInstanceID != nil {
-		_, err := h.store.FindWorkflowByID(r.Context(), *req.WorkflowInstanceID)
-		if err != nil {
-			writeStoreErr(w, r, h.log, err, correlationID, "CreateCase")
-			return
+	if field, problem := req.normalise(); field != "" {
+		code := "invalid_field"
+		if problem == "missing" {
+			code = "missing_field"
 		}
-	}
-
-	// Authorize against legal entity (need to get from workflow or create with tenant scope)
-	// For now, require AUDIT_ENGAGEMENT_MANAGE or similar
-	// TODO: Add specific CASE_CREATE action
-	if !h.authorizeRead(w, r, nil, principalID, correlationID, "CreateCase") {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": code, "field": field, "detail": problem})
 		return
 	}
 
-	params := domain.CreateCaseParams{
-		TenantID:             tenantID,
-		LegalEntityID:        "", // will be set from workflow or require in request
-		WorkflowInstanceID:   req.WorkflowInstanceID,
-		CaseFamily:           domain.CaseFamily(req.CaseFamily),
-		CaseType:             req.CaseType,
-		Title:                req.Title,
-		Description:          req.Description,
-		AssignedToPrincipal:  req.AssignedToPrincipalID,
-		CreatedByPrincipalID: principalID,
-		CorrelationID:        correlationID,
-	}
-
-	// If linked to workflow, get legal entity from workflow
+	legalEntityID := strings.ToLower(strings.TrimSpace(req.LegalEntityID))
 	if req.WorkflowInstanceID != nil {
 		wf, err := h.store.FindWorkflowByID(r.Context(), *req.WorkflowInstanceID)
 		if err != nil {
 			writeStoreErr(w, r, h.log, err, correlationID, "CreateCase")
 			return
 		}
-		params.LegalEntityID = wf.LegalEntityID
+		if legalEntityID != "" && !strings.EqualFold(legalEntityID, wf.LegalEntityID) {
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "legal_entity_mismatch",
+				"detail": "legal_entity_id differs from the linked workflow's legal entity"})
+			return
+		}
+		legalEntityID = wf.LegalEntityID
 	} else {
-		// Need legal entity in request for standalone case
-		writeJSON(w, r, http.StatusBadRequest, map[string]string{
-			"error":  "missing_field",
-			"field":  "legal_entity_id",
-			"detail": "required when not linking to a workflow",
-		})
+		if legalEntityID == "" {
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "legal_entity_id",
+				"detail": "required when the case is not linked to a workflow"})
+			return
+		}
+		if !isValidUUID(legalEntityID) {
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "legal_entity_id"})
+			return
+		}
+		if h.registry != nil {
+			if err := h.registry.CheckEntity(r.Context(), tenantID, legalEntityID); err != nil {
+				writeStoreErr(w, r, h.log, err, correlationID, "CreateCase")
+				return
+			}
+		}
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionCaseOpen, principalID); err != nil {
+		if errors.Is(err, domain.ErrAuthorizationDenied) {
+			writeError(w, r, http.StatusForbidden, "authorization_denied", "principal is not authorized for "+actionCaseOpen+" on this legal entity",
+				correlationID, map[string]any{"action_type": actionCaseOpen})
+			return
+		}
+		h.log.Error("CreateCase: authorization-svc unavailable — failing closed", zap.String("correlation_id", correlationID), zap.Error(err))
+		writeError(w, r, http.StatusServiceUnavailable, "authorization_service_unavailable", "authorization service unavailable", correlationID,
+			map[string]any{"retryable": true})
 		return
 	}
 
-	c, err := h.store.CreateCase(r.Context(), params)
+	c, created, err := h.store.CreateCase(r.Context(), domain.CreateCaseParams{
+		TenantID:             tenantID,
+		LegalEntityID:        legalEntityID,
+		WorkflowInstanceID:   req.WorkflowInstanceID,
+		CaseFamily:           domain.CaseFamily(req.CaseFamily),
+		CaseType:             req.CaseType,
+		Severity:             domain.CaseSeverity(req.Severity),
+		Confidentiality:      domain.CaseConfidentiality(req.Confidentiality),
+		Title:                req.Title,
+		Description:          req.Description,
+		AssignedToPrincipal:  req.AssignedToPrincipalID,
+		CreatedByPrincipalID: principalID,
+		CorrelationID:        correlationID,
+		SourceType:           req.SourceType,
+		SourceID:             req.SourceID,
+		Milestone:            req.Milestone,
+	})
 	if err != nil {
 		writeStoreErr(w, r, h.log, err, correlationID, "CreateCase")
 		return
 	}
 
-	h.log.Info("case created",
+	h.log.Info("case opened",
 		zap.String("case_id", c.CaseID),
 		zap.String("case_type", c.CaseType),
+		zap.Bool("created", created),
 		zap.String("correlation_id", correlationID),
 	)
 	w.Header().Set("Location", "/v1/cases/"+c.CaseID)
-	writeJSON(w, r, http.StatusCreated, c)
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSONWithETag(w, r, status, c, c.RowVersion)
 }
 
 // GetCase handles GET /v1/cases/{case_id}.
@@ -1253,7 +1308,7 @@ func (h *Handler) CreateWorkItem(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	_, ok = h.requireTenant(w, r)
+	tenantID, ok := h.requireTenant(w, r)
 	if !ok {
 		return
 	}
@@ -1272,7 +1327,10 @@ func (h *Handler) CreateWorkItem(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
 		return
 	}
-	if h.refuseForeignTenant(w, r, req.TenantID, principalID) {
+	// The body's tenant is compared with the caller's verified tenant. Until
+	// 26 Nov 2026 it was compared with the principal id, so every create was
+	// 403 tenant_scope_mismatch.
+	if h.refuseForeignTenant(w, r, req.TenantID, tenantID) {
 		return
 	}
 
@@ -1312,7 +1370,7 @@ func (h *Handler) ListWorkItems(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	_, ok = h.requireTenant(w, r)
+	tenantID, ok := h.requireTenant(w, r)
 	if !ok {
 		return
 	}
@@ -1340,8 +1398,10 @@ func (h *Handler) ListWorkItems(w http.ResponseWriter, r *http.Request) {
 		cursor = c
 	}
 
+	// The list is scoped to the caller's verified tenant. It used to pass the
+	// principal id here, which the uuid column refused (503).
 	filter := domain.ListWorkItemsFilter{
-		TenantID:            principalID, // Using principalID as tenant scope for now
+		TenantID:            tenantID,
 		LegalEntityID:       r.URL.Query().Get("legal_entity_id"),
 		CaseID:              nilIfEmpty(r.URL.Query().Get("case_id")),
 		WorkflowInstanceID:  nilIfEmpty(r.URL.Query().Get("workflow_instance_id")),
@@ -1353,7 +1413,7 @@ func (h *Handler) ListWorkItems(w http.ResponseWriter, r *http.Request) {
 		Cursor:              cursor,
 	}
 
-	items, nextCursor, err := h.store.ListWorkItems(r.Context(), principalID, filter)
+	items, nextCursor, err := h.store.ListWorkItems(r.Context(), tenantID, filter)
 	if err != nil {
 		writeStoreErr(w, r, h.log, err, correlationID, "ListWorkItems")
 		return
@@ -1639,7 +1699,7 @@ func (h *Handler) BulkCompleteWorkItems(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	_, ok = h.requireTenant(w, r)
+	tenantID, ok := h.requireTenant(w, r)
 	if !ok {
 		return
 	}
@@ -1660,7 +1720,7 @@ func (h *Handler) BulkCompleteWorkItems(w http.ResponseWriter, r *http.Request) 
 	}
 
 	items, results, err := h.store.BulkCompleteWorkItems(r.Context(), domain.BulkCompleteWorkItemsParams{
-		TenantID:         principalID,
+		TenantID:         tenantID,
 		WorkItemIDs:      req.WorkItemIDs,
 		ActorPrincipalID: principalID,
 		CorrelationID:    correlationID,

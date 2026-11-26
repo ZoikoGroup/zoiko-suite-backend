@@ -229,3 +229,42 @@ tables that do not exist (`authorization_svc_role_holders`, `workflow_stages.ten
 touched (scanInstance read 33 targets for 32 columns; the instance INSERT passed 19 arguments for 18 placeholders;
 migration 000025 did not parse). Store suite on a scratch DB: 33 pass / 35 fail, every failure in `CreateWorkflow`.
 The user chose (25 Nov) to repair WF-S separately. The running image (18 Nov) predates WF-S and DL-2.
+
+## Approver and requester notices (26 Nov 2026)
+
+The person who must decide is now told a request waits on them, and the requester is told how it was decided,
+with the reason (Doc 03 §9.7). No frontend change: the approver still decides on Workflows & Approvals → "My
+Approvals"; the notice reaches the topbar bell and the mailbox.
+
+- **Where.** Every transition writes its notices to `outbox_events` (destination `notification`) in its own
+  transaction (`internal/store/notices.go`, called from `CreateWorkflow`, `advanceTx`, `transitionInstanceStatus`,
+  `EscalateToWorkflow`, `RequestChanges`, `InvalidateWorkflow`, so the timers are covered too). A rolled-back or
+  replayed command writes none. A third relay (`internal/notifyclient`) sends each to notification-svc
+  `POST /v1/notifications` as `svc-workflow` with `Idempotency-Key: workflow-notice:<outbox id>` (a redelivery is a
+  replay). Only 409 parks a notice; anything else retries with the outbox backoff. A notice never touches the
+  decision.
+- **Who hears what** (`internal/notify`, table-tested): started → stage-1 approvers; stage approved → the next
+  stage's approvers and the requester (with the comment); approved / rejected → the requester (with the reason);
+  reopened → stage-1 approvers and the requester; escalated → the target and the requester; expired → the requester;
+  cancelled / invalidated → whoever was due to decide and the requester. Never the actor, never a `svc-*` or
+  `system:` principal. SINGLE stage: its approver; QUORUM: the pool; ROLE: nobody (no named holder here; logged).
+- **Channels.** Each recipient gets IN_APP (the bell, plain text) and EMAIL. notification-svc sends a free-text body
+  as `text/html` as given, so the EMAIL copy is escaped HTML with the request linked (`notify.HTMLBody`): an
+  approver's reason can never become markup in the requester's mailbox.
+- **Config.** `NOTIFICATION_SERVICE_URL` (empty = off, no rows written), `WORKFLOW_NOTIFY_PRINCIPAL_ID` (default
+  `svc-workflow`), `CONSOLE_BASE_URL` (link prefix). Compose sets all three.
+- **Grant.** authorization-svc `000048_workflow_notifier`: role `SVC_WORKFLOW_NOTIFIER` for `svc-workflow` with
+  `NOTIFICATION_SEND` and `IDENTITY_PRINCIPAL_READ` in every tenant (notification-svc resolves an email recipient
+  from identity-context-svc as the sender; without the read every email waited RECIPIENT_UNRESOLVED, seen live).
+  Same in `deployments/supabase/seed-rbac.sql` section 5.
+- **Evidence.** `go test ./...` with the store suite on a scratch DB: 362 pass / 0 fail, including
+  `TestPgStore_Notices_*` (10) and `TestPgStore_RLS_NoticesAsTheRuntimeRole` (NOBYPASSRLS); a mutant dropping the
+  approver lookup failed 3 of them. authorization `TestWN_WorkflowNotifierProvisionedWithATenantsFirstRole` and the
+  four grant tests beside it pass; 000048 up/down/up clean. Live (image from host binaries, old kept as
+  `deployments-workflow-svc:pre-26nov`; notification-svc at HEAD on a scratch DB): a scratchpad e2e signed in as
+  cfo@ (requester), legal.counsel@ and admin@ (approvers): 20/20, covering each bell, the reason, IN_APP+EMAIL
+  delivered, the escaped email in Mailpit, a redelivered row answered as a replay, and notification-svc down → the
+  workflow still starts and the notice arrives once it is back. The bell showed the items with no frontend change.
+- **Open** (tracker D1-7.F25 / F26 / F27, NT-9 / NT-10): ROLE-stage holders; a link on the bell item; notification-svc's
+  retry worker resolves recipients without the legal entity, so an email whose first attempt failed never succeeds;
+  under `IDENTITY_VERIFY=require` notification-svc needs an mTLS peer path for `svc-workflow`.

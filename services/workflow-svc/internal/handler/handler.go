@@ -39,6 +39,7 @@ type WorkflowStore interface {
 	IsCurrentStageApprover(ctx context.Context, workflowInstanceID, principalID string) (bool, error)
 	SubmitAction(ctx context.Context, params domain.SubmitActionParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error)
 	SubmitQuorumVote(ctx context.Context, params domain.SubmitQuorumVoteParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error)
+	FindCommandReplay(ctx context.Context, workflowInstanceID string, meta domain.CommandMeta) (*domain.CommandReplay, error)
 	EscalateWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string, cmd ...domain.LifecycleCommand) (*domain.WorkflowInstance, bool, error)
 	CancelWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string, cmd ...domain.LifecycleCommand) (*domain.WorkflowInstance, bool, error)
 	ExpireWorkflow(ctx context.Context, workflowInstanceID string, cmd ...domain.LifecycleCommand) (*domain.WorkflowInstance, bool, error)
@@ -52,7 +53,7 @@ type WorkflowStore interface {
 	GetInstanceSummary(ctx context.Context, workflowInstanceID string) (*domain.InstanceSummary, error)
 
 	// WFC-04: Cases (WF-2)
-	CreateCase(ctx context.Context, params domain.CreateCaseParams) (*domain.Case, error)
+	CreateCase(ctx context.Context, params domain.CreateCaseParams) (*domain.Case, bool, error)
 	FindCaseByID(ctx context.Context, caseID string) (*domain.Case, error)
 	ListCases(ctx context.Context, filter domain.ListCasesFilter) ([]*domain.Case, error)
 	TransitionCase(ctx context.Context, params domain.TransitionCaseParams) (*domain.Case, bool, error)
@@ -97,6 +98,7 @@ type WorkflowStore interface {
 	DesignAuditResponse(ctx context.Context, params domain.DesignAuditResponseParams) error
 	AssessRisk(ctx context.Context, params domain.AssessRiskParams) (*domain.RiskAssessment, bool, error)
 	MarkSignificantRisk(ctx context.Context, params domain.MarkSignificantRiskParams) (*domain.RiskAssessment, error)
+	RecordRiskCoverage(ctx context.Context, params domain.RecordRiskCoverageParams) (*domain.RiskAssessment, bool, error)
 	ApprovePlan(ctx context.Context, params domain.ApprovePlanParams) (*domain.AuditPlan, bool, error)
 	GetAuditEngagementFieldworkGates(ctx context.Context, tenantID, engagementID string) (planApproved bool, noUnresolvedHighRisk bool, err error)
 
@@ -298,6 +300,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{engagement_id}/mark-fieldwork-complete", h.MarkFieldworkComplete)
 		r.Post("/{engagement_id}/enter-completion-review", h.EnterCompletionReview)
 		r.Post("/{engagement_id}/mark-report-ready", h.MarkReportReady)
+		r.Post("/{engagement_id}/release", h.ReleaseEngagement)
 		r.Post("/{engagement_id}/close", h.CloseEngagement)
 		r.Post("/{engagement_id}/plan", h.CreateAuditPlan)
 		r.Get("/{engagement_id}/plan", h.GetAuditPlan)
@@ -313,6 +316,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{risk_id}/response", h.DesignAuditResponse)
 		r.Post("/{risk_id}/assess", h.AssessRisk)
 		r.Post("/{risk_id}/mark-significant", h.MarkSignificantRisk)
+		r.Post("/{risk_id}/coverage", h.RecordRiskCoverage)
 	})
 	r.Route("/v1/audit/engagements/{engagement_id}/workpapers", func(r chi.Router) {
 		r.Post("/", h.CreateWorkpaper)
@@ -1142,6 +1146,14 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A retry of a decision that already committed replays its result. It
+	// carries the If-Match of its first attempt, stale by now, so the replay
+	// is recognised before the version check.
+	meta := h.commandMeta(r, correlationID, req.Action, derefString(req.Rationale), derefString(req.CausationID), workflowInstanceID)
+	if h.replayDecision(w, r, instanceForAuthzCheck, principalID, meta, correlationID, "SubmitAction") {
+		return
+	}
+
 	// API-3: optimistic concurrency via If-Match header
 	if !requireIfMatch(w, r, instanceForAuthzCheck.RowVersion) {
 		return
@@ -1236,7 +1248,6 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	meta := h.commandMeta(r, correlationID, req.Action, derefString(req.Rationale), derefString(req.CausationID), workflowInstanceID)
 	instance, stage, transitioned, err := h.store.SubmitAction(r.Context(), domain.SubmitActionParams{
 		WorkflowInstanceID: workflowInstanceID, ActorPrincipalID: principalID, AssignedApproverID: assignedApproverID,
 		Action: req.Action, Rationale: req.Rationale, CausationID: req.CausationID,
@@ -1270,6 +1281,40 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 		zap.String("correlation_id", correlationID),
 	)
 	writeJSONWithETag(w, r, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: []*domain.WorkflowStage{stage}, DecisionID: decisionIDFor(meta, transitioned)}, instance.RowVersion)
+}
+
+// replayDecision answers a retried decision from what it committed the first
+// time: 200 with the instance as it is now, the stage that was decided and the
+// original ledger decision id, marked Idempotent-Replayed. The key used with
+// another body, or by another principal, is 409 idempotency_mismatch. It
+// returns false when the key committed nothing yet (the caller goes on).
+func (h *Handler) replayDecision(w http.ResponseWriter, r *http.Request, instance *domain.WorkflowInstance, principalID string, meta domain.CommandMeta, correlationID, op string) bool {
+	replay, err := h.store.FindCommandReplay(r.Context(), instance.WorkflowInstanceID, meta)
+	if err != nil {
+		writeStoreErr(w, r, h.log, err, correlationID, op)
+		return true
+	}
+	if replay == nil {
+		return false
+	}
+	if replay.ActedBy != principalID {
+		writeStoreErr(w, r, h.log, domain.ErrIdempotencyMismatch, correlationID, op)
+		return true
+	}
+	stages, err := h.store.FindStagesByWorkflowID(r.Context(), instance.WorkflowInstanceID)
+	if err != nil {
+		writeStoreErr(w, r, h.log, err, correlationID, op)
+		return true
+	}
+	decided := []*domain.WorkflowStage{}
+	for _, st := range stages {
+		if replay.StageOrder != nil && st.StageOrder == *replay.StageOrder {
+			decided = append(decided, st)
+		}
+	}
+	w.Header().Set("Idempotent-Replayed", "true")
+	writeJSONWithETag(w, r, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: decided, DecisionID: derefString(replay.DecisionID)}, instance.RowVersion)
+	return true
 }
 
 // ── POST /v1/workflows/{id}/quorum-votes ─────────────────────────────────────
@@ -1313,6 +1358,12 @@ func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
 	instanceForAuthzCheck, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
 	if err != nil {
 		writeStoreErr(w, r, h.log, err, correlationID, "SubmitQuorumVote")
+		return
+	}
+
+	// A retried vote that already committed replays (see SubmitAction).
+	meta := h.commandMeta(r, correlationID, req.Action, derefString(req.Rationale), derefString(req.CausationID), workflowInstanceID)
+	if h.replayDecision(w, r, instanceForAuthzCheck, principalID, meta, correlationID, "SubmitQuorumVote") {
 		return
 	}
 
@@ -1382,7 +1433,6 @@ func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	meta := h.commandMeta(r, correlationID, req.Action, derefString(req.Rationale), derefString(req.CausationID), workflowInstanceID)
 	instance, stage, transitioned, err := h.store.SubmitQuorumVote(r.Context(), domain.SubmitQuorumVoteParams{
 		WorkflowInstanceID: workflowInstanceID, ActorPrincipalID: principalID, Action: req.Action,
 		Rationale: req.Rationale, CausationID: req.CausationID, Authority: authority, Meta: meta,
@@ -1920,28 +1970,33 @@ func (h *Handler) VerifyRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Release verification is an approval authority, not an unauthenticated
-	// status check. Resolve the workflow first so authorization is evaluated
-	// against its legal entity and initiator.
+	// Resolve the workflow first so authorization is evaluated against its
+	// legal entity and initiator.
 	instanceForAuthz, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
 	if err != nil {
 		writeStoreErr(w, r, h.log, err, correlationID, "VerifyRelease")
 		return
 	}
 
-	// API-3: optimistic concurrency via If-Match header
-	if !requireIfMatch(w, r, instanceForAuthz.RowVersion) {
+	// verify-release evaluates; it changes nothing, so If-Match (API-3, for
+	// mutations) is optional here. A caller that sends one binds the answer to
+	// the version it read, and a stale one is still 412. Requiring it (428)
+	// broke every caller that only asks the question: obligations-svc's
+	// waiver and exemption checks (workflowclient.VerifyApproval) send none,
+	// so each one failed closed (found by the live test of 26 Nov 2026).
+	if r.Header.Get("If-Match") != "" && !requireIfMatch(w, r, instanceForAuthz.RowVersion) {
 		return
 	}
 
-	if _, err := h.authz.CheckApprovalAllowed(r.Context(), principalID, instanceForAuthz.LegalEntityID, instanceForAuthz.InitiatedBy,
-		map[string]string{authz.AttrWorkflowType: instanceForAuthz.WorkflowType}); err != nil {
-		switch {
-		case errors.Is(err, domain.ErrAuthorizationDenied):
-			writeJSON(w, r, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
-		default:
-			writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "authorization_service_unavailable"})
-		}
+	// Who may ask is who may read the workflow: its requester, its current
+	// approver, or a WORKFLOW_READ holder on its legal entity (authorizeRead,
+	// fail closed). The answer tells them nothing a GET of the workflow does
+	// not (status, bound subject fingerprint). It used to need the APPROVAL
+	// authority, which the requester never holds over their own request (the
+	// own-object rule), so obligations-svc — which asks as the person waiving
+	// a clock, normally the one who requested the waiver — was refused 403 on
+	// every waiver (found by the live test of 26 Nov 2026).
+	if !h.authorizeRead(w, r, instanceForAuthz, principalID, correlationID, "VerifyRelease") {
 		return
 	}
 
@@ -3164,6 +3219,20 @@ func writeStoreErr(w http.ResponseWriter, r *http.Request, log *zap.Logger, err 
 		writeError(w, r, http.StatusNotFound, "legal_entity_not_found", "legal entity not found in the caller's tenant", correlationID, nil)
 	case errors.Is(err, domain.ErrRegistryUnavailable):
 		writeError(w, r, http.StatusServiceUnavailable, "registry_unavailable", "tenant-entity-registry-svc unavailable", correlationID, map[string]any{"retryable": true})
+	case errors.Is(err, domain.ErrDefinitionInvalid):
+		writeError(w, r, http.StatusUnprocessableEntity, "definition_invalid", err.Error(), correlationID, nil)
+	// Until 26 Nov 2026 these fell through to 503 store_unavailable (with
+	// retryable=true), so a client retried a mistake that can never succeed.
+	case errors.Is(err, domain.ErrCaseNotFound):
+		writeError(w, r, http.StatusNotFound, "case_not_found", "case not found", correlationID, nil)
+	case errors.Is(err, domain.ErrWorkItemNotFound):
+		writeError(w, r, http.StatusNotFound, "work_item_not_found", "work item not found", correlationID, nil)
+	case errors.Is(err, domain.ErrInvalidCaseTransition), errors.Is(err, domain.ErrInvalidWorkItemTransition):
+		writeError(w, r, http.StatusConflict, "invalid_transition", err.Error(), correlationID, nil)
+	case errors.Is(err, domain.ErrInvalidIdentifier):
+		writeError(w, r, http.StatusBadRequest, "invalid_identifier", "an identifier in the request is not a valid UUID", correlationID, nil)
+	case errors.Is(err, domain.ErrTenantMissing):
+		writeError(w, r, http.StatusForbidden, "tenant_scope_mismatch", "the request names another tenant than the caller's", correlationID, nil)
 	default:
 		log.Error(op+": store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
 		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "workflow store temporarily unavailable", correlationID, map[string]any{

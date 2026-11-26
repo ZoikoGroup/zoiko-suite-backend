@@ -35,6 +35,22 @@ type Client struct {
 	baseURL string
 	http    *http.Client
 	log     *zap.Logger
+	// peerURL / peer: the registry's mTLS listener and this service's own
+	// certificate, used when the request carries no caller identity to
+	// forward (a service relay, e.g. obligations-svc opening an escalation
+	// case). The registry's identity gate admits such a call only as a
+	// registered mTLS peer.
+	peerURL string
+	peer    *http.Client
+}
+
+// WithPeer sends checks that have no caller identity to peerURL through
+// client (this service's certificate). A person's request still forwards
+// their envelope to baseURL.
+func (c *Client) WithPeer(peerURL string, client *http.Client) *Client {
+	c.peerURL = strings.TrimRight(peerURL, "/")
+	c.peer = client
+	return c
 }
 
 // New builds a Client. An empty baseURL disables the check (Noop), which is
@@ -54,8 +70,14 @@ type entityStatus struct {
 // tenant), and domain.ErrRegistryUnavailable when the registry cannot answer —
 // "cannot answer" is never treated as "yes".
 func (c *Client) CheckEntity(ctx context.Context, tenantID, legalEntityID string) error {
+	// No envelope to forward (no identity, or one only asserted by headers):
+	// ask as this service, over mTLS.
+	base, client := c.baseURL, c.http
+	if id, ok := idenv.FromContext(ctx); (!ok || id.Token == "") && c.peer != nil {
+		base, client = c.peerURL, c.peer
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		c.baseURL+"/v1/entities/"+url.PathEscape(legalEntityID)+"/status", nil)
+		base+"/v1/entities/"+url.PathEscape(legalEntityID)+"/status", nil)
 	if err != nil {
 		return domain.ErrRegistryUnavailable
 	}
@@ -64,7 +86,7 @@ func (c *Client) CheckEntity(ctx context.Context, tenantID, legalEntityID string
 	svcenvelope.ForwardTo(ctx, req)
 	idenv.Forward(ctx, req)
 
-	resp, err := c.http.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		c.log.Error("tenant-entity-registry-svc unreachable — failing closed", zap.String("legal_entity_id", legalEntityID), zap.Error(err))
 		return domain.ErrRegistryUnavailable

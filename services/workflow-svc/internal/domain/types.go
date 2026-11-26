@@ -527,6 +527,10 @@ type StageSummary struct {
 
 var ErrWorkflowNotFound = errorString("workflow not found")
 var ErrNoStages = errorString("workflow must have at least one stage")
+
+// ErrDefinitionInvalid is a workflow definition that fails its validation
+// gates (R-001 §3.3); the message names the failing stage.
+var ErrDefinitionInvalid = errorString("workflow definition failed validation")
 var ErrInvalidTransition = errorString("invalid workflow status transition")
 var ErrWrongApprover = errorString("actor is not the approver for the current stage")
 var ErrStoreUnavailable = errorString("workflow store unavailable")
@@ -700,13 +704,18 @@ type Case struct {
 	CreatedByPrincipalID string              `json:"created_by_principal_id"`
 	CanonicalCaseID      *string             `json:"canonical_case_id,omitempty"`  // for merge lineage
 	SplitFromCaseID      *string             `json:"split_from_case_id,omitempty"` // for split lineage
-	OpenedAt             time.Time           `json:"opened_at"`
-	TriagedAt            *time.Time          `json:"triaged_at,omitempty"`
-	ResolvedAt           *time.Time          `json:"resolved_at,omitempty"`
-	ClosedAt             *time.Time          `json:"closed_at,omitempty"`
-	CreatedAt            time.Time           `json:"created_at"`
-	UpdatedAt            time.Time           `json:"updated_at"`
-	RowVersion           int                 `json:"row_version"`
+	// SourceType / SourceID / Milestone: what opened the case (000032), e.g.
+	// OBLIGATION_CLOCK / <clock id> / <escalation milestone>.
+	SourceType *string    `json:"source_type,omitempty"`
+	SourceID   *string    `json:"source_id,omitempty"`
+	Milestone  *string    `json:"milestone,omitempty"`
+	OpenedAt   time.Time  `json:"opened_at"`
+	TriagedAt  *time.Time `json:"triaged_at,omitempty"`
+	ResolvedAt *time.Time `json:"resolved_at,omitempty"`
+	ClosedAt   *time.Time `json:"closed_at,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
+	RowVersion int        `json:"row_version"`
 }
 
 type CreateCaseParams struct {
@@ -715,11 +724,15 @@ type CreateCaseParams struct {
 	WorkflowInstanceID   *string
 	CaseFamily           CaseFamily
 	CaseType             string
+	Severity             CaseSeverity
+	Confidentiality      CaseConfidentiality
 	Title                string
 	Description          string
 	AssignedToPrincipal  *string
 	CreatedByPrincipalID string
 	CorrelationID        string
+	// Source reference (000032). One source milestone opens one case.
+	SourceType, SourceID, Milestone string
 }
 
 type TransitionCaseParams struct {
@@ -747,6 +760,8 @@ type ListCasesFilter struct {
 }
 
 var ErrCaseNotFound = errorString("case not found")
+var ErrWorkItemNotFound = errorString("work item not found")
+var ErrInvalidWorkItemTransition = errorString("invalid work item state transition")
 var ErrInvalidCaseTransition = errorString("invalid case state transition")
 
 // Case state transitions per R-001 §6.3

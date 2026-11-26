@@ -218,6 +218,13 @@ func (c *HTTPClient) OpenCase(ctx context.Context, req CaseRequest) (string, err
 		hdr["X-Principal-Id"] = ServicePrincipal
 		hdr["X-Tenant-Id"] = req.TenantID
 		hdr["X-Correlation-ID"] = req.IdempotencyKey
+		// workflow-svc's input contract (§4) requires both on every write:
+		// the case's legal entity (INV-02) and the channel, here a system
+		// relay. Without them every escalation case was refused 400
+		// envelope_incomplete (found by the live test of 26 Nov 2026).
+		hdr["X-Legal-Entity-Id"] = req.LegalEntityID
+		hdr["X-Source-Channel"] = "system"
+		hdr["X-Source-System"] = "obligations-svc"
 	}
 	status, raw, err := c.do(ctx, http.MethodPost, "/v1/cases", req, hdr)
 	if err != nil {

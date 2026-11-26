@@ -18,6 +18,10 @@ import (
 // closed, never treat this as "no contradiction."
 var ErrEvidenceServiceUnavailable = errors.New("document-vault-svc evidence lookup unavailable")
 
+// ErrEvidenceNotFound is document-vault-svc answering 404: no such evidence
+// record in the tenant. It is the caller's mistake, not an outage.
+var ErrEvidenceNotFound = errors.New("audit evidence not found")
+
 // Client is the narrow interface the handler depends on.
 type Client interface {
 	// GetContradictionFlag returns whether evidenceID currently carries a
@@ -61,6 +65,9 @@ func (c *HTTPClient) GetContradictionFlag(ctx context.Context, tenantID, evidenc
 		return false, ErrEvidenceServiceUnavailable
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return false, ErrEvidenceNotFound
+	}
 	if resp.StatusCode != http.StatusOK {
 		c.log.Error("document-vault-svc refused evidence lookup", zap.String("evidence_id", evidenceID), zap.Int("status", resp.StatusCode))
 		return false, ErrEvidenceServiceUnavailable

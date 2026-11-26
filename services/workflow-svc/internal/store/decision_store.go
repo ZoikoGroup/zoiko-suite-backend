@@ -27,6 +27,7 @@ import (
 
 	"zoiko.io/workflow-svc/internal/domain"
 	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
+	"zoiko.io/workflow-svc/internal/notify"
 	"zoiko.io/workflow-svc/internal/outbox"
 )
 
@@ -547,6 +548,21 @@ func (s *PgStore) advanceTx(ctx context.Context, tx pgx.Tx, o decisionOutcome) (
 			}}); err != nil {
 			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
+	}
+
+	// Notices: the requester hears the outcome (with the decider's comment),
+	// and when the route goes on, the next stage's approvers hear it waits on
+	// them. A quorum vote's synthetic tally is not a comment and is not sent.
+	moment, approverStage := notify.StageApproved, nextStage
+	switch newStatus {
+	case domain.WorkflowStatusRejected:
+		moment, approverStage = notify.Rejected, 0
+	case domain.WorkflowStatusApproved:
+		moment, approverStage = notify.Approved, 0
+	}
+	if err := s.enqueueNoticesTx(ctx, tx, updated, notify.Input{Moment: moment, Actor: o.actor,
+		Rationale: personReason(o.rationale), StageOrder: o.stage.StageOrder}, approverStage, corr); err != nil {
+		return nil, err
 	}
 
 	actionType := "WORKFLOW_STAGE_APPROVE"

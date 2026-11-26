@@ -336,6 +336,16 @@ func (h *Handler) MarkReportReady(w http.ResponseWriter, r *http.Request) {
 	h.transitionWithGate(w, r, "REPORT", []string{domain.AuditEngagementCompletionReview}, domain.AuditEngagementReportReady, "audit.engagement.report_ready")
 }
 
+// ReleaseEngagement handles POST /v1/audit/engagements/{id}/release:
+// REPORT_READY → RELEASED once the release gates hold (every review scope
+// signed off, no unresolved mandatory note — AUD-CTRL-031, the gates
+// EvaluateReleaseGates reports). The spec's lifecycle is ReportReady →
+// Released → Closed; until 26 Nov 2026 no command reached RELEASED, so no
+// engagement could ever be closed.
+func (h *Handler) ReleaseEngagement(w http.ResponseWriter, r *http.Request) {
+	h.transitionWithGate(w, r, "REPORT", []string{domain.AuditEngagementReportReady}, domain.AuditEngagementReleased, "audit.engagement.released")
+}
+
 func (h *Handler) CloseEngagement(w http.ResponseWriter, r *http.Request) {
 	h.transitionAuditEngagement(w, r, actionAuditEngagementManage, []string{domain.AuditEngagementReleased}, domain.AuditEngagementClosed, false)
 }
@@ -422,6 +432,10 @@ func (h *Handler) transitionAuditEngagement(w http.ResponseWriter, r *http.Reque
 			domain.AuditEngagementAccepted:  "audit.engagement.accepted",
 			domain.AuditEngagementActive:    "audit.engagement.activated",
 			domain.AuditEngagementWithdrawn: "audit.engagement.withdrawn",
+			// EngagementCompletionReviewStarted and EngagementClosed are
+			// AUD-01 events too; both commands committed and published nothing.
+			domain.AuditEngagementCompletionReview: "audit.engagement.completion_review_entered",
+			domain.AuditEngagementClosed:           "audit.engagement.closed",
 		}[next]
 		if next == domain.AuditEngagementWithdrawn && len(expected) == 1 && expected[0] == domain.AuditEngagementAcceptanceReview {
 			eventType = "audit.engagement.rejected"

@@ -44,6 +44,7 @@ import (
 	"zoiko.io/workflow-svc/internal/handler"
 	"zoiko.io/workflow-svc/internal/health"
 	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
+	"zoiko.io/workflow-svc/internal/notifyclient"
 	"zoiko.io/workflow-svc/internal/outbox"
 	"zoiko.io/workflow-svc/internal/registry"
 	"zoiko.io/workflow-svc/internal/signatory"
@@ -119,6 +120,12 @@ func main() {
 	log.Info("db pool connected")
 
 	pgStore := store.New(pool, log)
+	// Approver and requester notices (Doc 03 §9.7): written to the outbox in
+	// each transition's own transaction, only when there is a notification-svc
+	// to deliver them (the relay is started below).
+	if cfg.NotificationServiceURL != "" {
+		pgStore = pgStore.WithNotices(cfg.ConsoleBaseURL)
+	}
 
 	// AllowAutoTopicCreation is required even though the broker itself has
 	// auto.create.topics.enable=true: segmentio/kafka-go's Writer defaults
@@ -172,7 +179,17 @@ func main() {
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	h := handler.New(pgStore, publisher, authzClient, documentVaultClient, log)
-	h = h.WithRegistryChecker(registry.New(cfg.RegistryServiceURL, log))
+	registryChecker := registry.New(cfg.RegistryServiceURL, log)
+	if cfg.RegistryMTLSURL != "" {
+		registryIdentity := mtlsclient.Start(context.Background(), mtlsclient.Options{
+			ServiceName:        "workflow-svc",
+			ManagementURL:      cfg.MTLSManagementServiceURL,
+			BootstrapTokenPath: cfg.MTLSBootstrapTokenPath,
+		}, log)
+		registryChecker.WithPeer(cfg.RegistryMTLSURL, registryIdentity.HTTPClient(3*time.Second))
+		log.Info("legal-entity checks without a caller identity: tenant registry over mTLS", zap.String("url", cfg.RegistryMTLSURL))
+	}
+	h = h.WithRegistryChecker(registryChecker)
 	h = h.WithReadAuthz(cfg.ReadAuthzMode)
 	// AUD-07's contradiction check reads document-vault-svc's own AUD-06
 	// evidence state; without this wiring the check was skipped silently and
@@ -218,6 +235,20 @@ func main() {
 	ledgerRelay := outbox.NewRelay(pool, ledgerDeliverer,
 		outbox.DestinationDecisionLog, 1500*time.Millisecond, 50, log)
 	go ledgerRelay.Start(relayCtx)
+
+	// Notices to approvers and requesters, delivered to notification-svc as
+	// workflow-svc's own principal. A notice that cannot be delivered retries
+	// with backoff and never touches the decision that caused it.
+	if cfg.NotificationServiceURL != "" {
+		noticeRelay := outbox.NewRelay(pool, notifyclient.New(cfg.NotificationServiceURL, cfg.NotifyPrincipalID),
+			outbox.DestinationNotification, 2*time.Second, 50, log)
+		go noticeRelay.Start(relayCtx)
+		log.Info("notice relay: approver and requester notices on",
+			zap.String("notification_service_url", cfg.NotificationServiceURL),
+			zap.String("principal", cfg.NotifyPrincipalID), zap.String("console_base_url", cfg.ConsoleBaseURL))
+	} else {
+		log.Info("notice relay: off (NOTIFICATION_SERVICE_URL unset); no approver or requester notices are written")
+	}
 
 	// Deadline expiry, escalation and authority re-check (000020).
 	sweeper := timers.New(pgStore, authzClient, cfg.TimerSweepInterval, cfg.TimerSweepBatch, log, prometheus.DefaultRegisterer)

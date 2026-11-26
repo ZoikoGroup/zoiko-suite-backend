@@ -20,6 +20,7 @@ import (
 	"zoiko.io/workflow-svc/internal/domain"
 	svcenvelope "zoiko.io/workflow-svc/internal/envelope"
 	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
+	"zoiko.io/workflow-svc/internal/notify"
 	"zoiko.io/workflow-svc/internal/outbox"
 )
 
@@ -126,6 +127,9 @@ type Store interface {
 type PgStore struct {
 	pool *pgxpool.Pool
 	log  *zap.Logger
+	// notices, when set (WithNotices), makes each transition write its
+	// approver and requester notices to the outbox (notices.go).
+	notices *noticeSettings
 }
 
 // Pool returns the underlying connection pool for direct queries.
@@ -209,10 +213,12 @@ func insertOutboxEventTx(ctx context.Context, tx pgx.Tx, tenantID, eventType, ag
 		return fmt.Errorf("marshal outbox payload: %w", err)
 	}
 
+	// A tenant-wide aggregate (a definition, an operator action) has no legal
+	// entity: '' is written as NULL (000030), not cast to uuid and refused.
 	const query = `
 		INSERT INTO outbox_events (outbox_event_id, aggregate_type, aggregate_id, event_type,
 			tenant_id, legal_entity_id, actor_id, correlation_id, headers, payload, destination, created_at)
-		VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, '{}'::jsonb, $8, 'kafka', NOW());`
+		VALUES (gen_random_uuid(), $1, $2, $3, $4, NULLIF($5, '')::uuid, $6, $7, '{}'::jsonb, $8, 'kafka', NOW());`
 
 	_, err = tx.Exec(ctx, query, aggregateType, aggregateID, eventType, tenantID, legalEntityID, actorID, correlationID, payloadBytes)
 	if err != nil {
@@ -315,6 +321,11 @@ func scanDefinition(row pgx.Row) (*domain.WorkflowDefinition, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The raw stage list is what a start from this definition expands
+	// (DefinitionStages) and what the published checksum covers. Until 26 Nov
+	// 2026 it was parsed into d.Stages only and StagesJSON stayed empty, so
+	// every start from a definition was 400 invalid_definition_stages.
+	d.StagesJSON = stagesJSON
 	_ = json.Unmarshal(stagesJSON, &d.Stages)
 	if expiryHours != nil {
 		if h, err := strconv.Atoi(*expiryHours); err == nil {
@@ -394,6 +405,43 @@ func isUniqueViolation(err error, constraint string) bool {
 // replayedCommand looks for a transition already recorded under this
 // command's Idempotency-Key. found=false when there is none; a stored request
 // hash that differs is domain.ErrIdempotencyMismatch.
+// FindCommandReplay returns the decision an Idempotency-Key already committed
+// on this instance (nil when it committed none), or ErrIdempotencyMismatch
+// when the key was used with another body. Handlers ask it before checking
+// If-Match: a retried decision carries the version it was first sent with,
+// which is stale once that first attempt committed, so a genuine retry was
+// refused 412 instead of replaying (found by the live test of 26 Nov 2026).
+func (s *PgStore) FindCommandReplay(ctx context.Context, instanceID string, meta domain.CommandMeta) (*domain.CommandReplay, error) {
+	if meta.IdempotencyKey == "" {
+		return nil, nil
+	}
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	var replay domain.CommandReplay
+	var hash *string
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT t.acted_by, t.request_hash, t.stage_order, t.decision_id::text
+			  FROM workflow_transitions t
+			  JOIN workflow_instances i ON i.workflow_instance_id = t.workflow_instance_id
+			 WHERE t.workflow_instance_id = $1 AND t.idempotency_key = $2
+			   AND i.tenant_id = NULLIF($3, '')::uuid`,
+			instanceID, meta.IdempotencyKey, tenantID).Scan(&replay.ActedBy, &hash, &replay.StageOrder, &replay.DecisionID)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
+			return nil, domain.ErrWorkflowNotFound
+		}
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	if hash != nil && meta.RequestHash != "" && *hash != meta.RequestHash {
+		return nil, domain.ErrIdempotencyMismatch
+	}
+	return &replay, nil
+}
+
 func replayedCommand(ctx context.Context, tx pgx.Tx, instanceID string, meta domain.CommandMeta) (bool, error) {
 	if meta.IdempotencyKey == "" {
 		return false, nil
@@ -695,6 +743,11 @@ func (s *PgStore) CreateWorkflow(ctx context.Context, params domain.CreateWorkfl
 		Payload:       startedPayload,
 	}); err != nil {
 		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	// Stage 1's approvers are told a request waits on them.
+	if err := s.enqueueNoticesTx(ctx, tx, instance, notify.Input{Moment: notify.Started, Actor: instance.InitiatedBy},
+		1, correlationID); err != nil {
+		return nil, nil, false, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -1352,6 +1405,16 @@ func (s *PgStore) InvalidateWorkflow(ctx context.Context, params domain.Invalida
 	}); err != nil {
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
+	// The requester, and whoever was due to decide, are told the approval no
+	// longer applies. The reason is the narrative, else the reason code.
+	invalidReason := personReason(params.Narrative)
+	if invalidReason == "" {
+		invalidReason = notify.Humanize(params.ReasonCode)
+	}
+	if err := s.enqueueNoticesTx(ctx, tx, updated, notify.Input{Moment: notify.Invalidated, Actor: params.ActorPrincipalID,
+		Rationale: invalidReason}, current.CurrentStage, instanceCorrelationID); err != nil {
+		return nil, false, err
+	}
 
 	if err := tx.Commit(ctx); err != nil {
 		s.log.Error("pg InvalidateWorkflow: commit failed", zap.Error(err))
@@ -1661,173 +1724,237 @@ func (s *PgStore) GetInstanceSummary(ctx context.Context, workflowInstanceID str
 // WFC-01: Definition Publication Lifecycle (WF-S22)
 // =============================================================================
 
+// The definition lifecycle follows R-001 §3.2:
+//
+//	DRAFT → (validate) → VALIDATED → (submit-approval) → APPROVAL_PENDING
+//	      → (approve, by a checker other than the author) → APPROVAL_PENDING + approved_by
+//	      → (publish) → PUBLISHED; (reject) → REJECTED → DRAFT
+//
+// VALIDATION_PENDING is the state while validation runs; validation here is
+// synchronous, so validate passes through it and records VALIDATED (or refuses
+// with ErrDefinitionInvalid and leaves the row as it was). Until 26 Nov 2026
+// validate stopped at VALIDATION_PENDING and approve moved the row to
+// VALIDATED, so submit-approval → approve → publish could never reach
+// PUBLISHED; and every command's event was written with legal_entity_id ''
+// and refused (503).
+
 func (s *PgStore) ValidateDefinition(ctx context.Context, params domain.ValidateDefinitionParams) (*domain.WorkflowDefinition, error) {
-	return s.transitionDefinitionStatus(ctx, params.WorkflowDefinitionID, "VALIDATION_PENDING", params.ActorPrincipalID, params.CorrelationID, nil, nil, "", nil, nil, params.Meta)
+	return s.changeDefinition(ctx, definitionCommand{
+		definitionID: params.WorkflowDefinitionID, actor: params.ActorPrincipalID, correlationID: params.CorrelationID,
+		from: []string{"DRAFT", "VALIDATION_PENDING"}, to: "VALIDATED", event: "workflow.definition.validated",
+		check: func(def *domain.WorkflowDefinition) error { return validateDefinitionGates(def) },
+	})
 }
 
 func (s *PgStore) SubmitDefinitionApproval(ctx context.Context, params domain.SubmitDefinitionApprovalParams) (*domain.WorkflowDefinition, error) {
-	return s.transitionDefinitionStatus(ctx, params.WorkflowDefinitionID, "APPROVAL_PENDING", params.ActorPrincipalID, params.CorrelationID, nil, nil, "", nil, nil, params.Meta)
+	return s.changeDefinition(ctx, definitionCommand{
+		definitionID: params.WorkflowDefinitionID, actor: params.ActorPrincipalID, correlationID: params.CorrelationID,
+		from: []string{"VALIDATED"}, to: "APPROVAL_PENDING", event: "workflow.definition.approval_requested",
+	})
 }
 
+// ApproveDefinition records the checker's approval. The row stays
+// APPROVAL_PENDING (R-001 has no APPROVED state); publish needs it.
 func (s *PgStore) ApproveDefinition(ctx context.Context, params domain.ApproveDefinitionParams) (*domain.WorkflowDefinition, error) {
-	now := time.Now().UTC().Format(time.RFC3339)
-	return s.transitionDefinitionStatus(ctx, params.WorkflowDefinitionID, "VALIDATED", params.ActorPrincipalID, params.CorrelationID, &params.ActorPrincipalID, &now, "", nil, nil, params.Meta)
+	return s.changeDefinition(ctx, definitionCommand{
+		definitionID: params.WorkflowDefinitionID, actor: params.ActorPrincipalID, correlationID: params.CorrelationID,
+		from: []string{"APPROVAL_PENDING"}, to: "APPROVAL_PENDING", event: "workflow.definition.approved", approve: true,
+		reasonCode: params.ReasonCode,
+		check: func(def *domain.WorkflowDefinition) error {
+			if def.CreatedBy == params.ActorPrincipalID {
+				return fmt.Errorf("%w: the author of a definition cannot approve it", domain.ErrSelfApprovalNotAllowed)
+			}
+			return nil
+		},
+	})
 }
 
 func (s *PgStore) RejectDefinition(ctx context.Context, params domain.RejectDefinitionParams) (*domain.WorkflowDefinition, error) {
-	return s.transitionDefinitionStatus(ctx, params.WorkflowDefinitionID, "REJECTED", params.ActorPrincipalID, params.CorrelationID, nil, nil, "", nil, nil, params.Meta)
+	return s.changeDefinition(ctx, definitionCommand{
+		definitionID: params.WorkflowDefinitionID, actor: params.ActorPrincipalID, correlationID: params.CorrelationID,
+		from: []string{"APPROVAL_PENDING"}, to: "REJECTED", event: "workflow.definition.rejected", reasonCode: params.ReasonCode,
+		check: func(def *domain.WorkflowDefinition) error {
+			if def.CreatedBy == params.ActorPrincipalID {
+				return fmt.Errorf("%w: the author of a definition cannot decide it", domain.ErrSelfApprovalNotAllowed)
+			}
+			return nil
+		},
+	})
 }
 
+// PublishDefinition publishes an approved definition, or resumes a suspended
+// one (SUSPENDED → PUBLISHED, R-001 §3.2).
 func (s *PgStore) PublishDefinition(ctx context.Context, params domain.PublishDefinitionParams) (*domain.WorkflowDefinition, error) {
-	now := time.Now().UTC().Format(time.RFC3339)
-	return s.transitionDefinitionStatus(ctx, params.WorkflowDefinitionID, "PUBLISHED", params.ActorPrincipalID, params.CorrelationID, nil, &now, params.ActorPrincipalID, params.EffectiveFrom, params.EffectiveTo, params.Meta)
+	return s.changeDefinition(ctx, definitionCommand{
+		definitionID: params.WorkflowDefinitionID, actor: params.ActorPrincipalID, correlationID: params.CorrelationID,
+		from: []string{"APPROVAL_PENDING", "SUSPENDED"}, to: "PUBLISHED", event: "workflow.definition.published", publish: true,
+		effectiveFrom: params.EffectiveFrom, effectiveTo: params.EffectiveTo,
+		check: func(def *domain.WorkflowDefinition) error {
+			if def.Status != nil && *def.Status == "APPROVAL_PENDING" && def.ApprovedBy == nil {
+				return fmt.Errorf("%w: the definition has not been approved", domain.ErrInvalidTransition)
+			}
+			return nil
+		},
+	})
 }
 
 func (s *PgStore) SuspendDefinition(ctx context.Context, params domain.SuspendDefinitionParams) (*domain.WorkflowDefinition, error) {
-	return s.transitionDefinitionStatus(ctx, params.WorkflowDefinitionID, "SUSPENDED", params.ActorPrincipalID, params.CorrelationID, nil, nil, "", nil, nil, params.Meta)
+	return s.changeDefinition(ctx, definitionCommand{
+		definitionID: params.WorkflowDefinitionID, actor: params.ActorPrincipalID, correlationID: params.CorrelationID,
+		from: []string{"PUBLISHED"}, to: "SUSPENDED", event: "workflow.definition.suspended",
+	})
 }
 
 func (s *PgStore) RetireDefinition(ctx context.Context, params domain.RetireDefinitionParams) (*domain.WorkflowDefinition, error) {
-	return s.transitionDefinitionStatus(ctx, params.WorkflowDefinitionID, "RETIRED", params.ActorPrincipalID, params.CorrelationID, nil, nil, "", nil, nil, params.Meta)
+	return s.changeDefinition(ctx, definitionCommand{
+		definitionID: params.WorkflowDefinitionID, actor: params.ActorPrincipalID, correlationID: params.CorrelationID,
+		from: []string{"DRAFT", "PUBLISHED", "SUSPENDED", "SUPERSEDED"}, to: "RETIRED", event: "workflow.definition.retired",
+	})
 }
 
-// transitionDefinitionStatus is the internal helper for definition status transitions.
-func (s *PgStore) transitionDefinitionStatus(ctx context.Context, definitionID, newStatus, actorPrincipalID, correlationID string, validatedBy, validatedAt *string, publishedBy string, effectiveFrom, effectiveTo *time.Time, meta domain.CommandMeta) (*domain.WorkflowDefinition, error) {
+// validateDefinitionGates are the static checks of R-001 §3.3 that a
+// definition must pass before it can be submitted for approval: a stage list
+// that parses, every stage with someone to decide it, a quorum no larger than
+// its pool, and no negative deadline.
+func validateDefinitionGates(def *domain.WorkflowDefinition) error {
+	stages, err := DefinitionStages(def)
+	if err != nil {
+		return fmt.Errorf("%w: %v", domain.ErrDefinitionInvalid, err)
+	}
+	for i, st := range stages {
+		switch st.StageType {
+		case domain.StageTypeSingle:
+			if st.ApproverPrincipalID == "" {
+				return fmt.Errorf("%w: stage %d has no approver_principal_id", domain.ErrDefinitionInvalid, i+1)
+			}
+		case domain.StageTypeQuorum:
+			if len(st.QuorumApprovers) == 0 || st.RequiredApprovals < 1 || st.RequiredApprovals > len(st.QuorumApprovers) {
+				return fmt.Errorf("%w: stage %d needs 1..%d required_approvals from its quorum_approvers", domain.ErrDefinitionInvalid, i+1, len(st.QuorumApprovers))
+			}
+		}
+		if st.DueAtHours < 0 {
+			return fmt.Errorf("%w: stage %d has a negative due_at_hours", domain.ErrDefinitionInvalid, i+1)
+		}
+	}
+	return nil
+}
+
+// definitionCommand is one lifecycle command on a definition.
+type definitionCommand struct {
+	definitionID, actor, correlationID string
+	from                               []string
+	to, event, reasonCode              string
+	approve, publish                   bool
+	effectiveFrom, effectiveTo         *time.Time
+	// check runs on the locked row before the change; its error refuses it.
+	check func(*domain.WorkflowDefinition) error
+}
+
+// changeDefinition applies cmd under a row lock and writes its event in the
+// same transaction. A definition already where the command would leave it is
+// an idempotent no-op (no second event).
+func (s *PgStore) changeDefinition(ctx context.Context, cmd definitionCommand) (*domain.WorkflowDefinition, error) {
 	var updated *domain.WorkflowDefinition
 
 	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
-		// Lock the definition row
 		const lockQuery = `SELECT ` + definitionColumns + ` FROM workflow_definitions WHERE workflow_definition_id = $1 AND tenant_id = $2 FOR UPDATE;`
-		current, err := scanDefinition(tx.QueryRow(ctx, lockQuery, definitionID, tenantID))
+		current, err := scanDefinition(tx.QueryRow(ctx, lockQuery, cmd.definitionID, tenantID))
 		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return domain.ErrWorkflowNotFound
-			}
-			if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
+			if errors.Is(err, pgx.ErrNoRows) || errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
 				return domain.ErrWorkflowNotFound
 			}
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
-
 		currentStatus := ""
 		if current.Status != nil {
 			currentStatus = *current.Status
 		}
 
-		// Check if transition is allowed
-		allowedTransitions := map[string][]string{
-			"DRAFT":              {"VALIDATION_PENDING", "RETIRED"},
-			"VALIDATION_PENDING": {"VALIDATED", "REJECTED", "DRAFT"},
-			"VALIDATED":          {"APPROVAL_PENDING", "DRAFT"},
-			"APPROVAL_PENDING":   {"PUBLISHED", "REJECTED", "VALIDATED"},
-			"PUBLISHED":          {"SUSPENDED", "SUPERSEDED", "RETIRED"},
-			"SUSPENDED":          {"PUBLISHED", "RETIRED"},
-			"REJECTED":           {"DRAFT"},
-			"SUPERSEDED":         {"RETIRED"},
-			"RETIRED":            {},
-		}
-
-		allowed, ok := allowedTransitions[currentStatus]
-		if !ok {
-			return fmt.Errorf("%w: unknown current status %s", domain.ErrInvalidTransition, currentStatus)
-		}
-		transitionAllowed := false
-		for _, s := range allowed {
-			if s == newStatus {
-				transitionAllowed = true
-				break
+		// Idempotent replays: already approved by this checker, or already in
+		// the target state of a state-changing command.
+		if cmd.approve && current.ApprovedBy != nil && currentStatus == "APPROVAL_PENDING" {
+			if *current.ApprovedBy == cmd.actor {
+				updated = current
+				return nil
 			}
+			return fmt.Errorf("%w: the definition was already approved by another checker", domain.ErrInvalidTransition)
 		}
-		if !transitionAllowed {
-			return fmt.Errorf("%w: cannot transition from %s to %s", domain.ErrInvalidTransition, currentStatus, newStatus)
-		}
-
-		// Idempotent: already in target status
-		if currentStatus == newStatus {
+		if !cmd.approve && currentStatus == cmd.to {
 			updated = current
 			return nil
 		}
-
-		// Maker-checker: approver cannot be the same as creator/validator
-		if newStatus == "VALIDATED" && validatedBy != nil && *validatedBy == current.CreatedBy {
-			return fmt.Errorf("%w: approver cannot be the creator", domain.ErrAuthorizationDenied)
+		allowed := false
+		for _, f := range cmd.from {
+			if f == currentStatus {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return fmt.Errorf("%w: cannot move a definition from %s to %s", domain.ErrInvalidTransition, currentStatus, cmd.to)
+		}
+		if cmd.check != nil {
+			if err := cmd.check(current); err != nil {
+				return err
+			}
 		}
 
-		// Compute checksum for PUBLISHED
-		var checksum string
-		if newStatus == "PUBLISHED" {
-			h := sha256.New()
-			h.Write([]byte(current.WorkflowType))
-			h.Write([]byte(strconv.Itoa(current.Version)))
-			h.Write(current.StagesJSON)
-			checksum = hex.EncodeToString(h.Sum(nil))
-		}
-
-		// Build update query
+		now := time.Now().UTC()
 		setClauses := []string{"definition_status = $1", "updated_at = NOW()", "row_version = row_version + 1"}
-		args := []any{newStatus}
-		argIdx := 2
-
-		switch newStatus {
-		case "VALIDATED":
-			setClauses = append(setClauses, "validated_by = $"+strconv.Itoa(argIdx), "validated_at = $"+strconv.Itoa(argIdx+1))
-			args = append(args, *validatedBy, *validatedAt)
-			argIdx += 2
-		case "PUBLISHED":
-			setClauses = append(setClauses,
-				"published_by = $"+strconv.Itoa(argIdx),
-				"published_at = $"+strconv.Itoa(argIdx+1),
-				"effective_from = $"+strconv.Itoa(argIdx+2),
-				"effective_to = $"+strconv.Itoa(argIdx+3),
-				"checksum = $"+strconv.Itoa(argIdx+4))
-			args = append(args, publishedBy, time.Now().UTC())
-			if effectiveFrom != nil {
-				args = append(args, *effectiveFrom)
-			} else {
-				args = append(args, time.Now().UTC())
-			}
-			if effectiveTo != nil {
-				args = append(args, *effectiveTo)
-			} else {
-				args = append(args, nil)
-			}
-			args = append(args, checksum)
-			argIdx += 5
+		args := []any{cmd.to}
+		add := func(column string, value any) {
+			args = append(args, value)
+			setClauses = append(setClauses, column+" = $"+strconv.Itoa(len(args)))
 		}
-
-		args = append(args, definitionID, tenantID)
+		switch {
+		case cmd.to == "VALIDATED":
+			add("validated_by", cmd.actor)
+			add("validated_at", now)
+		case cmd.approve:
+			add("approved_by", cmd.actor)
+			add("approved_at", now)
+		case cmd.to == "REJECTED":
+			// A rejected definition goes back through validation and approval.
+			setClauses = append(setClauses, "approved_by = NULL", "approved_at = NULL")
+		case cmd.publish && currentStatus == "APPROVAL_PENDING":
+			from := now
+			if cmd.effectiveFrom != nil {
+				from = cmd.effectiveFrom.UTC()
+			}
+			add("published_by", cmd.actor)
+			add("published_at", now)
+			add("effective_from", from)
+			add("effective_to", cmd.effectiveTo)
+			add("checksum", computeChecksum(current.WorkflowType, current.Version, current.StagesJSON))
+		}
+		args = append(args, cmd.definitionID, tenantID)
 		updateQuery := `
 			UPDATE workflow_definitions
 			SET ` + strings.Join(setClauses, ", ") + `
 			WHERE workflow_definition_id = $` + strconv.Itoa(len(args)-1) + ` AND tenant_id = $` + strconv.Itoa(len(args)) + `
 			RETURNING ` + definitionColumns + `;`
-
 		updated, err = scanDefinition(tx.QueryRow(ctx, updateQuery, args...))
 		if err != nil {
-			if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
-				return domain.ErrWorkflowNotFound
-			}
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
 
-		// Write definition event
-		eventType := "workflow.definition." + strings.ToLower(newStatus)
 		payload := map[string]any{
 			"workflow_definition_id": updated.WorkflowDefinitionID,
 			"workflow_type":          updated.WorkflowType,
 			"version":                updated.Version,
-			"previous_status":        current.Status,
-			"new_status":             updated.Status,
-			"actor_principal_id":     actorPrincipalID,
+			"previous_status":        currentStatus,
+			"new_status":             cmd.to,
+			"actor_principal_id":     cmd.actor,
 		}
-		if validatedBy != nil {
-			payload["validated_by"] = *validatedBy
+		if cmd.reasonCode != "" {
+			payload["reason_code"] = cmd.reasonCode
 		}
-		if publishedBy != "" {
-			payload["published_by"] = publishedBy
+		if updated.Checksum != nil {
+			payload["checksum"] = *updated.Checksum
 		}
-
-		return s.outboxInsertTx(ctx, tx, eventType, "workflow_definition", updated.WorkflowDefinitionID, correlationID, payload, tenantID, "", actorPrincipalID)
+		// A definition belongs to the tenant, not to one legal entity: its
+		// event carries no entity (NULL, 000030).
+		return s.outboxInsertTx(ctx, tx, cmd.event, "workflow_definition", updated.WorkflowDefinitionID, cmd.correlationID, payload, tenantID, "", cmd.actor)
 	})
 	if err != nil {
 		return nil, err
@@ -1855,6 +1982,9 @@ const caseColumns = `
 	created_by_principal_id,
 	canonical_case_id,
 	split_from_case_id,
+	source_type,
+	source_id,
+	milestone,
 	opened_at,
 	triaged_at,
 	resolved_at,
@@ -1881,6 +2011,9 @@ func scanCase(row pgx.Row) (*domain.Case, error) {
 		&c.CreatedByPrincipalID,
 		&c.CanonicalCaseID,
 		&c.SplitFromCaseID,
+		&c.SourceType,
+		&c.SourceID,
+		&c.Milestone,
 		&c.OpenedAt,
 		&c.TriagedAt,
 		&c.ResolvedAt,
@@ -1893,23 +2026,37 @@ func scanCase(row pgx.Row) (*domain.Case, error) {
 }
 
 // CreateCase creates a new case.
-func (s *PgStore) CreateCase(ctx context.Context, params domain.CreateCaseParams) (*domain.Case, error) {
+func (s *PgStore) CreateCase(ctx context.Context, params domain.CreateCaseParams) (*domain.Case, bool, error) {
 	if params.WorkflowInstanceID != nil {
 		_, err := s.FindWorkflowByID(ctx, *params.WorkflowInstanceID)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
+	if params.Severity == "" {
+		params.Severity = domain.CaseSeverityMedium
+	}
+	if params.Confidentiality == "" {
+		params.Confidentiality = domain.CaseConfidentialityInternal
+	}
 
+	// A case opened from a source milestone is opened once: a retry (the
+	// obligations-svc relay is at-least-once) finds the case it opened.
 	const query = `
 		INSERT INTO cases (
 			case_id, tenant_id, legal_entity_id, workflow_instance_id,
 			case_family, case_type, case_state, severity, confidentiality,
-			title, description, assigned_to_principal_id, created_by_principal_id
-		) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 'OPEN', 'MEDIUM', 'INTERNAL', $6, $7, $8, $9)
+			title, description, assigned_to_principal_id, created_by_principal_id,
+			source_type, source_id, milestone
+		) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 'OPEN', $6, $7, $8, $9, $10, $11,
+			NULLIF($12, ''), NULLIF($13, ''), NULLIF($14, ''))
+		ON CONFLICT (tenant_id, source_type, source_id, (COALESCE(milestone, ''))) WHERE source_type IS NOT NULL DO NOTHING
 		RETURNING ` + caseColumns + `;`
+	const existing = `SELECT ` + caseColumns + ` FROM cases
+		WHERE tenant_id = $1 AND source_type = $2 AND source_id = $3 AND COALESCE(milestone, '') = $4;`
 
 	var c *domain.Case
+	created := false
 	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
 		if params.TenantID != tenantID {
 			return domain.ErrTenantMissing
@@ -1918,14 +2065,20 @@ func (s *PgStore) CreateCase(ctx context.Context, params domain.CreateCaseParams
 		var scanErr error
 		c, scanErr = scanCase(tx.QueryRow(ctx, query,
 			tenantID, params.LegalEntityID, params.WorkflowInstanceID,
-			params.CaseFamily, params.CaseType, params.Title, params.Description,
-			params.AssignedToPrincipal, params.CreatedByPrincipalID))
+			params.CaseFamily, params.CaseType, params.Severity, params.Confidentiality, params.Title, params.Description,
+			params.AssignedToPrincipal, params.CreatedByPrincipalID,
+			params.SourceType, params.SourceID, params.Milestone))
+		if errors.Is(scanErr, pgx.ErrNoRows) && params.SourceType != "" {
+			c, scanErr = scanCase(tx.QueryRow(ctx, existing, tenantID, params.SourceType, params.SourceID, params.Milestone))
+			return scanErr
+		}
 		if scanErr != nil {
 			if errors.Is(mapPgError(scanErr), domain.ErrInvalidIdentifier) {
 				return domain.ErrInvalidIdentifier
 			}
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
 		}
+		created = true
 
 		return insertOutboxEventTx(ctx, tx, tenantID, "case.created", "case", c.CaseID, params.CorrelationID,
 			params.LegalEntityID, "", params.CreatedByPrincipalID, map[string]any{
@@ -1936,13 +2089,19 @@ func (s *PgStore) CreateCase(ctx context.Context, params domain.CreateCaseParams
 				"severity":             c.Severity,
 				"confidentiality":      c.Confidentiality,
 				"workflow_instance_id": c.WorkflowInstanceID,
+				"source_type":          c.SourceType,
+				"source_id":            c.SourceID,
+				"milestone":            c.Milestone,
 				"row_version":          c.RowVersion,
 			})
 	})
 	if err != nil {
-		return nil, err
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, false, fmt.Errorf("%w: source case vanished between insert and read", domain.ErrStoreUnavailable)
+		}
+		return nil, false, err
 	}
-	return c, nil
+	return c, created, nil
 }
 
 // FindCaseByID returns the Case with the given case_id.
@@ -2753,7 +2912,7 @@ func (s *PgStore) GetWorkItem(ctx context.Context, workItemID string) (*domain.W
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, domain.ErrCaseNotFound
+			return nil, domain.ErrWorkItemNotFound
 		}
 		if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
 			return nil, domain.ErrInvalidIdentifier
@@ -2776,6 +2935,9 @@ func (s *PgStore) ListWorkItems(ctx context.Context, tenantID string, filter dom
 		query += fmt.Sprintf(" AND %s $%d", clause, len(args))
 	}
 
+	if filter.LegalEntityID != "" {
+		addFilter("legal_entity_id =", filter.LegalEntityID)
+	}
 	if filter.CaseID != nil {
 		addFilter("case_id =", *filter.CaseID)
 	}
@@ -2798,17 +2960,18 @@ func (s *PgStore) ListWorkItems(ctx context.Context, tenantID string, filter dom
 		addFilter("mandatory =", *filter.Mandatory)
 	}
 
-	query += " ORDER BY created_at DESC, work_item_id DESC"
-
 	limit := filter.Limit
 	if limit <= 0 {
 		limit = 50
 	}
+	// The cursor is a WHERE predicate, so it goes before ORDER BY; appended
+	// after it, every second page was a syntax error.
 	if filter.Cursor != nil {
 		args = append(args, filter.Cursor.StartedAt)
-		query += fmt.Sprintf(" AND (created_at, work_item_id) < ($%d, $%d)", len(args), len(args)+1)
+		query += fmt.Sprintf(" AND (created_at, work_item_id) < ($%d::timestamptz, $%d::uuid)", len(args), len(args)+1)
 		args = append(args, filter.Cursor.InstanceID)
 	}
+	query += " ORDER BY created_at DESC, work_item_id DESC"
 	args = append(args, limit+1)
 	query += fmt.Sprintf(" LIMIT $%d;", len(args))
 
@@ -2859,7 +3022,7 @@ func (s *PgStore) SatisfyWorkItem(ctx context.Context, params domain.SatisfyWork
 		current, err := scanWorkItem(tx.QueryRow(ctx, lockQuery, params.WorkItemID, tenantID))
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				return domain.ErrCaseNotFound
+				return domain.ErrWorkItemNotFound
 			}
 			if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
 				return domain.ErrInvalidIdentifier
@@ -2872,7 +3035,7 @@ func (s *PgStore) SatisfyWorkItem(ctx context.Context, params domain.SatisfyWork
 		}
 
 		if current.State != "CLAIMED" && current.State != "UNASSIGNED" {
-			return fmt.Errorf("%w: work item not in claimable state", domain.ErrInvalidCaseTransition)
+			return fmt.Errorf("%w: work item not in claimable state", domain.ErrInvalidWorkItemTransition)
 		}
 
 		var completionData []byte
@@ -2918,7 +3081,7 @@ func (s *PgStore) WaiveWorkItem(ctx context.Context, params domain.WaiveWorkItem
 		current, err := scanWorkItem(tx.QueryRow(ctx, lockQuery, params.WorkItemID, tenantID))
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				return domain.ErrCaseNotFound
+				return domain.ErrWorkItemNotFound
 			}
 			if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
 				return domain.ErrInvalidIdentifier
@@ -2931,7 +3094,7 @@ func (s *PgStore) WaiveWorkItem(ctx context.Context, params domain.WaiveWorkItem
 		}
 
 		if !current.Mandatory {
-			return fmt.Errorf("%w: work item is not mandatory", domain.ErrInvalidCaseTransition)
+			return fmt.Errorf("%w: work item is not mandatory", domain.ErrInvalidWorkItemTransition)
 		}
 
 		const update = `
@@ -2968,7 +3131,7 @@ func (s *PgStore) TransferWorkItem(ctx context.Context, params domain.TransferWo
 		current, err := scanWorkItem(tx.QueryRow(ctx, lockQuery, params.WorkItemID, tenantID))
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				return domain.ErrCaseNotFound
+				return domain.ErrWorkItemNotFound
 			}
 			if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
 				return domain.ErrInvalidIdentifier
@@ -3029,7 +3192,7 @@ func (s *PgStore) ClaimWorkItem(ctx context.Context, workItemID string, expected
 		current, err := scanWorkItem(tx.QueryRow(ctx, lockQuery, workItemID, tenantID))
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				return domain.ErrCaseNotFound
+				return domain.ErrWorkItemNotFound
 			}
 			if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
 				return domain.ErrInvalidIdentifier
@@ -3042,7 +3205,7 @@ func (s *PgStore) ClaimWorkItem(ctx context.Context, workItemID string, expected
 		}
 
 		if current.State != "UNASSIGNED" {
-			return fmt.Errorf("%w: work item not unassigned", domain.ErrInvalidCaseTransition)
+			return fmt.Errorf("%w: work item not unassigned", domain.ErrInvalidWorkItemTransition)
 		}
 
 		const update = `
@@ -3087,7 +3250,7 @@ func (s *PgStore) ReleaseWorkItem(ctx context.Context, workItemID string, expect
 		current, err := scanWorkItem(tx.QueryRow(ctx, lockQuery, workItemID, tenantID))
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				return domain.ErrCaseNotFound
+				return domain.ErrWorkItemNotFound
 			}
 			if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
 				return domain.ErrInvalidIdentifier
@@ -3100,7 +3263,7 @@ func (s *PgStore) ReleaseWorkItem(ctx context.Context, workItemID string, expect
 		}
 
 		if current.State != "CLAIMED" {
-			return fmt.Errorf("%w: work item not claimed", domain.ErrInvalidCaseTransition)
+			return fmt.Errorf("%w: work item not claimed", domain.ErrInvalidWorkItemTransition)
 		}
 
 		const update = `
@@ -3145,7 +3308,7 @@ func (s *PgStore) CancelWorkItem(ctx context.Context, workItemID string, expecte
 		current, err := scanWorkItem(tx.QueryRow(ctx, lockQuery, workItemID, tenantID))
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				return domain.ErrCaseNotFound
+				return domain.ErrWorkItemNotFound
 			}
 			if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
 				return domain.ErrInvalidIdentifier
@@ -3158,7 +3321,7 @@ func (s *PgStore) CancelWorkItem(ctx context.Context, workItemID string, expecte
 		}
 
 		if current.State == "COMPLETED" || current.State == "CANCELLED" {
-			return fmt.Errorf("%w: work item already terminal", domain.ErrInvalidCaseTransition)
+			return fmt.Errorf("%w: work item already terminal", domain.ErrInvalidWorkItemTransition)
 		}
 
 		const update = `
@@ -3195,7 +3358,7 @@ func (s *PgStore) EscalateWorkItem(ctx context.Context, workItemID string, expec
 		current, err := scanWorkItem(tx.QueryRow(ctx, lockQuery, workItemID, tenantID))
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				return domain.ErrCaseNotFound
+				return domain.ErrWorkItemNotFound
 			}
 			if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
 				return domain.ErrInvalidIdentifier
@@ -3240,7 +3403,7 @@ func (s *PgStore) ReassignWorkItem(ctx context.Context, workItemID string, expec
 		current, err := scanWorkItem(tx.QueryRow(ctx, lockQuery, workItemID, tenantID))
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				return domain.ErrCaseNotFound
+				return domain.ErrWorkItemNotFound
 			}
 			if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
 				return domain.ErrInvalidIdentifier
@@ -3253,7 +3416,7 @@ func (s *PgStore) ReassignWorkItem(ctx context.Context, workItemID string, expec
 		}
 
 		if current.State != "CLAIMED" {
-			return fmt.Errorf("%w: work item not claimed", domain.ErrInvalidCaseTransition)
+			return fmt.Errorf("%w: work item not claimed", domain.ErrInvalidWorkItemTransition)
 		}
 
 		const update = `

@@ -32,6 +32,10 @@ const (
 // ── stub store ────────────────────────────────────────────────────────────────
 
 type stubStore struct {
+	// commandReplay is what FindCommandReplay answers (nil: no replay).
+	commandReplay    *domain.CommandReplay
+	commandReplayErr error
+
 	// createdParams / submitParams record what the handler passed the store.
 	createdParams domain.CreateWorkflowParams
 	submitParams  domain.SubmitActionParams
@@ -467,8 +471,8 @@ func (s *stubStore) GetWorkflowDefinition(_ context.Context, p domain.GetWorkflo
 	return s.workflowDefinition, s.definitionErr
 }
 
-func (s *stubStore) CreateCase(_ context.Context, _ domain.CreateCaseParams) (*domain.Case, error) {
-	return s.caseCreated, s.caseFindErr
+func (s *stubStore) CreateCase(_ context.Context, _ domain.CreateCaseParams) (*domain.Case, bool, error) {
+	return s.caseCreated, s.caseCreated != nil, s.caseFindErr
 }
 func (s *stubStore) FindCaseByID(_ context.Context, _ string) (*domain.Case, error) {
 	return s.caseCreated, s.caseFindErr
@@ -505,6 +509,9 @@ func (s *stubStore) IsCurrentStageApprover(_ context.Context, _, _ string) (bool
 }
 func (s *stubStore) IsQuorumApprover(_ context.Context, _, _ string) (bool, error) {
 	return s.currentStageApprover, s.currentStageApproverErr
+}
+func (s *stubStore) FindCommandReplay(_ context.Context, _ string, _ domain.CommandMeta) (*domain.CommandReplay, error) {
+	return s.commandReplay, s.commandReplayErr
 }
 func (s *stubStore) SubmitAction(_ context.Context, p domain.SubmitActionParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error) {
 	s.submitParams = p
@@ -605,6 +612,9 @@ func (s *stubStore) AssessRisk(_ context.Context, _ domain.AssessRiskParams) (*d
 }
 func (s *stubStore) MarkSignificantRisk(_ context.Context, _ domain.MarkSignificantRiskParams) (*domain.RiskAssessment, error) {
 	return s.riskAssessment, s.markSigErr
+}
+func (s *stubStore) RecordRiskCoverage(_ context.Context, _ domain.RecordRiskCoverageParams) (*domain.RiskAssessment, bool, error) {
+	return s.riskAssessment, true, nil
 }
 func (s *stubStore) ApprovePlan(_ context.Context, _ domain.ApprovePlanParams) (*domain.AuditPlan, bool, error) {
 	return s.auditPlan, s.approveChanged, s.approvePlanErr

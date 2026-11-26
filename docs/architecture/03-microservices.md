@@ -957,6 +957,8 @@ Errors carry the GCP §16 stable class in `code`. A conflict between two equally
 **Critical Constraint**
  Notification failure must not collapse source operational workflows.
 
+*Workflow notices (added 26 Nov 2026): workflow-svc tells approvers a request waits on them and requesters how it was decided. Each transition writes its notices to workflow-svc's `outbox_events` (destination `notification`) in its own transaction; a relay sends them to `POST /v1/notifications` (IN_APP and EMAIL) as `svc-workflow` (`NOTIFICATION_SEND`, `IDENTITY_PRINCIPAL_READ`, authorization-svc 000048), keyed `workflow-notice:<outbox id>`. A notice that cannot be delivered waits and retries; the decision is never affected. Physical surface: `services/workflow-svc/internal/notify`, `internal/notifyclient`.*
+
 ## **9.8 Search Index Service**
 
 **Purpose**

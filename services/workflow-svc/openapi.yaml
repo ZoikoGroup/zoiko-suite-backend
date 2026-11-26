@@ -312,7 +312,7 @@ paths:
     post:
       tags: [lifecycle]
       operationId: verifyRelease
-      description: Critical Release Rule (ZS-STATE-001 §6.1). 409 with can_release=false when the approval does not cover the current subject.
+      description: Critical Release Rule (ZS-STATE-001 §6.1). 409 with can_release=false when the approval does not cover the current subject. It changes nothing, so If-Match is optional; when sent, a stale version is 412.
       parameters: [{$ref: '#/components/parameters/WorkflowInstanceID'}]
       requestBody:
         required: true
@@ -332,6 +332,7 @@ paths:
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
   /v1/workflows/{workflow_instance_id}/summary:
     get:

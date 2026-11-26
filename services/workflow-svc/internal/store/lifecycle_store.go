@@ -15,6 +15,7 @@ import (
 
 	"zoiko.io/workflow-svc/internal/domain"
 	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
+	"zoiko.io/workflow-svc/internal/notify"
 	"zoiko.io/workflow-svc/internal/outbox"
 )
 
@@ -166,6 +167,28 @@ func (s *PgStore) transitionInstanceStatus(ctx context.Context, current *domain.
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 
+	// Notices. Only a reason a person typed is quoted; the default rationale
+	// above is bookkeeping.
+	notice := notify.Input{Actor: actorPrincipalID, Rationale: personReason(cmd.Rationale)}
+	approverStage := 0
+	switch toState {
+	case domain.WorkflowStatusEscalated:
+		notice.Moment = notify.Escalated
+		if updated.EscalationTarget != nil {
+			notice.Approvers = []string{*updated.EscalationTarget}
+		}
+	case domain.WorkflowStatusCancelled:
+		// Whoever was due to decide is told nothing waits on them any more.
+		notice.Moment, approverStage = notify.Cancelled, current.CurrentStage
+	case domain.WorkflowStatusExpired:
+		notice.Moment = notify.Expired
+	}
+	if notice.Moment != "" {
+		if err := s.enqueueNoticesTx(ctx, tx, updated, notice, approverStage, corr); err != nil {
+			return nil, false, err
+		}
+	}
+
 	actionType := "WORKFLOW_" + strings.ToUpper(toState)
 	switch toState {
 	case domain.WorkflowStatusEscalated:
@@ -262,6 +285,12 @@ func (s *PgStore) EscalateToWorkflow(ctx context.Context, params domain.Escalate
 			"current_stage": updated.CurrentStage, "reason_code": reason}}); err != nil {
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
+	// The target hears the request is now theirs to decide; the requester
+	// hears it was escalated.
+	if err := s.enqueueNoticesTx(ctx, tx, updated, notify.Input{Moment: notify.Escalated, Actor: params.ActorPrincipalID,
+		Rationale: personReason(params.Narrative), Approvers: []string{params.EscalationTarget}}, 0, corr); err != nil {
+		return nil, false, err
+	}
 	if err := writeLedgerTx(ctx, tx, updated, params.ActorPrincipalID, "WORKFLOW_ESCALATE", domain.WorkflowStatusEscalated, nil,
 		params.Authority, meta, map[string]any{"escalation_target": params.EscalationTarget, "reason_code": reason,
 			"from_status": current.WorkflowStatus, "rationale": rationale}); err != nil {
@@ -349,6 +378,12 @@ func (s *PgStore) RequestChanges(ctx context.Context, workflowInstanceID, actorP
 		Payload: map[string]any{"workflow_instance_id": workflowInstanceID, "from_status": cur.WorkflowStatus,
 			"review_cycle": cycle, "rationale": rationale}}); err != nil {
 		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	// Stage 1's approvers hear the request is back; the requester hears
+	// changes were requested, with the reason.
+	if err := s.enqueueNoticesTx(ctx, tx, updated, notify.Input{Moment: notify.Reopened, Actor: actorPrincipalID,
+		Rationale: rationale}, 1, corr); err != nil {
+		return err
 	}
 	if err := writeLedgerTx(ctx, tx, updated, actorPrincipalID, "WORKFLOW_REQUEST_CHANGES", "REOPENED", causationID, c.Authority, c.Meta,
 		map[string]any{"from_status": cur.WorkflowStatus, "review_cycle": cycle, "rationale": rationale}); err != nil {

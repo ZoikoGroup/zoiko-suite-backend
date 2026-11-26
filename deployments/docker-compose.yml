@@ -961,11 +961,13 @@ services:
       # admitted, and X-Workload-Id is set to the verified one.
       # identity-context-svc reads tenants and entities here while it resolves
       # a sign-in, before any envelope exists, so it must be a peer.
+      # workflow-svc checks the legal entity of a case opened by a service
+      # relay (obligations-svc's escalations), which carries no envelope.
       MTLS_ENABLED: "true"
       MTLS_PORT: "8449"
       MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
       MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
-      MTLS_ALLOWED_CLIENTS: "gateway-auth-svc,authorization-svc,identity-context-svc"
+      MTLS_ALLOWED_CLIENTS: "gateway-auth-svc,authorization-svc,identity-context-svc,workflow-svc"
     volumes:
       # Only this service's own bootstrap token (register M-01): the
       # sub-directory tenant-entity-registry-svc/ of the keygen volume, so /bootstrap/token
@@ -1857,6 +1859,15 @@ services:
       # Without the grant every decision still commits, and its ledger record
       # waits durably in the outbox.
       WORKFLOW_LEDGER_PRINCIPAL_ID: "${WORKFLOW_LEDGER_PRINCIPAL_ID:-svc-workflow}"
+      # Approver and requester notices (26 Nov 2026): every transition writes
+      # them to the outbox in its own transaction, and a relay sends them to
+      # notification-svc's POST /v1/notifications (bell + email) as
+      # svc-workflow, which holds NOTIFICATION_SEND (WORKFLOW_NOTIFIER in
+      # deployments/supabase/seed-rbac.sql). Unset NOTIFICATION_SERVICE_URL
+      # turns notices off. CONSOLE_BASE_URL prefixes the link in each notice.
+      NOTIFICATION_SERVICE_URL: "${WORKFLOW_NOTIFICATION_SERVICE_URL:-http://notification-svc:8133}"
+      WORKFLOW_NOTIFY_PRINCIPAL_ID: "${WORKFLOW_NOTIFY_PRINCIPAL_ID:-svc-workflow}"
+      CONSOLE_BASE_URL: "${CONSOLE_BASE_URL:-http://localhost:3000}"
       # Signature workflows (ZS-GOV-INT-002 §4.2) are created only from a
       # policy-svc SIGNATORY_MATRIX decision, read from policy-svc's :8449 peer
       # listener with this service's certificate and verified against
@@ -1871,6 +1882,10 @@ services:
       # CreateWorkflow validates the legal entity against the registry
       # (cross-domain fact) rather than trusting a caller-supplied UUID.
       TENANT_ENTITY_REGISTRY_SERVICE_URL: "http://tenant-entity-registry-svc:8081"
+      # A check with no caller envelope to forward (a case opened by
+      # obligations-svc's escalation relay) goes to the registry's mTLS peer
+      # listener with this service's certificate.
+      TENANT_REGISTRY_MTLS_URL: "${WORKFLOW_TENANT_REGISTRY_MTLS_URL:-https://tenant-entity-registry-svc:8449}"
       # Identity gate (X5 / X-R3): verify a presented signed envelope against
       # identity-context-svc and derive the trusted principal/tenant from it.
       # Warn locally while the console does not forward the envelope on every
