@@ -182,6 +182,10 @@ var registeredActionMigrations = []struct {
 	{"000062_register_dqc_certification_revoke_action", "data-quality-svc", map[string]string{
 		"DQC_CERTIFICATION_REVOKE": "HIGH",
 	}},
+	{"000063_register_dqc_risk_actions", "data-quality-svc", map[string]string{
+		"DQC_RISK_REQUEST": "STANDARD",
+		"DQC_RISK_APPROVE": "CRITICAL",
+	}},
 }
 
 // templatePublishers are the migrations, in this list, that publish role
