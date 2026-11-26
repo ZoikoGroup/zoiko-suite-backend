@@ -12,4 +12,5 @@ WORKDIR /app
 COPY --from=builder /server /app/server
 COPY --from=builder /healthcheck /app/healthcheck
 EXPOSE 8149
+HEALTHCHECK --interval=20s --timeout=5s --retries=3 CMD ["/app/healthcheck"]
 ENTRYPOINT ["/app/server"]

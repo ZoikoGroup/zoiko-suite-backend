@@ -9,9 +9,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
+
 	"zoiko.io/reporting-orchestration-svc/internal/archivestore"
 	"zoiko.io/reporting-orchestration-svc/internal/authz"
 	"zoiko.io/reporting-orchestration-svc/internal/config"
@@ -35,78 +35,45 @@ func main() {
 		panic(err)
 	}
 	defer logger.Sync()
-
 	logger.Info("Starting reporting-orchestration-svc", zap.String("port", cfg.Port))
 
-	var dataStore store.Store
-	// pgStore is kept separately (not just as the store.Store interface
-	// value above) because AUD-10's export routes need the concrete
-	// *store.PgStore's ExportStore methods — MemoryStore is a
-	// DB-unavailable fallback that exists only for the pre-existing report
-	// endpoints; approval/seal/deliver correctness genuinely depends on
-	// real transactional CAS predicates, so there is no in-memory
-	// equivalent to fall back to. When the DB is unavailable, AUD-10's
-	// routes are simply not registered (see below) rather than silently
-	// running against a fake store.
-	var pgStore *store.PgStore
+	// Step 1: Postgres is mandatory. This service used to fall back to an
+	// in-memory store when the database was down, silently accepting
+	// regulated report definitions and runs it would lose on restart and
+	// skipping RLS, idempotency and the outbox. It now refuses to start.
+	startupCtx, cancelStartup := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelStartup()
+	pool := connectPostgres(startupCtx, cfg.DatabaseURL, logger)
+	defer pool.Close()
+	pgStore := store.NewPgStore(pool)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
-	if err != nil {
-		logger.Fatal("failed to parse db pool config", zap.Error(err))
-	}
-	poolCfg.MaxConns = 20
-	poolCfg.MinConns = 2
-	poolCfg.MaxConnLifetime = 30 * time.Minute
-	poolCfg.MaxConnIdleTime = 5 * time.Minute
-	poolCfg.HealthCheckPeriod = 1 * time.Minute
-	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
-	if err != nil || pool.Ping(ctx) != nil {
-		logger.Warn("Database unavailable, using MemoryStore")
-		dataStore = store.NewMemoryStore()
-	} else {
-		logger.Info("Connected to PostgreSQL")
-		pgStore = store.NewPgStore(pool)
-		dataStore = pgStore
-	}
-
-	brokers := strings.Split(cfg.KafkaBrokers, ",")
-	publisher := events.NewPublisher(brokers, cfg.KafkaTopic, logger)
+	// Step 2: Kafka publisher + transactional-outbox relay.
+	publisher := events.NewPublisher(strings.Split(cfg.KafkaBrokers, ","), cfg.KafkaTopic, logger)
 	defer publisher.Close()
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	go events.NewRelay(pgStore, publisher, logger).Run(relayCtx)
 
-	var authzClient *authz.Client
-	if cfg.AuthzMTLSEnabled {
-		mtlsHTTPClient, err := mtls.NewClientHTTPClient(ctx, cfg.MTLSManagementServiceURL, "reporting-orchestration-svc", platformScopeID)
-		if err != nil {
-			logger.Fatal("mtls: failed to provision client identity", zap.Error(err))
-		}
-		logger.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
-		authzClient = authz.NewClientWithHTTPClient(cfg.AuthzMTLSURL, mtlsHTTPClient, logger)
-	} else {
-		authzClient = authz.NewClient(cfg.AuthzURL, logger)
-	}
-	h := handler.NewHandler(dataStore, publisher, authzClient, logger)
-	router := handler.NewRouter(h)
+	// Step 3: upstream clients (all fail closed).
+	authzClient := newAuthzClient(startupCtx, cfg, logger)
+	archiveClient := archivestore.NewHTTPClient(cfg.AuditEventStoreURL, logger)
+	retentionClient := retention.NewHTTPClient(cfg.RetentionRegistryURL, logger)
 
-	// AUD-10 export/redact/deliver routes — only mounted when a real
-	// Postgres connection is available (see pgStore's own comment above).
-	if pgStore != nil {
-		archiveClient := archivestore.NewHTTPClient(cfg.AuditEventStoreURL, logger)
-		retentionClient := retention.NewHTTPClient(cfg.RetentionRegistryURL, logger)
-		if chiRouter, ok := router.(chi.Router); ok {
-			handler.RegisterExportRoutes(chiRouter, h, pgStore, archiveClient, retentionClient)
-		} else {
-			logger.Error("router does not implement chi.Router — AUD-10 export routes not mounted")
-		}
-	} else {
-		logger.Warn("Database unavailable — AUD-10 export routes not mounted")
-	}
-
+	// Step 4: HTTP handler and router.
+	h := handler.NewHandler(handler.Dependencies{
+		Definitions: pgStore,
+		Runs:        pgStore,
+		Exports:     pgStore,
+		Idempotency: pgStore,
+		Archives:    archiveClient,
+		Retentions:  retentionClient,
+		Authz:       authzClient,
+		Ready:       pool,
+		Logger:      logger,
+	})
 	srv := &http.Server{
-		Addr:         ":" + cfg.Port,
-		Handler:      router,
+		Addr:         cfg.ListenHost + ":" + cfg.Port,
+		Handler:      handler.NewRouter(h),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -117,15 +84,52 @@ func main() {
 			logger.Fatal("server error", zap.Error(err))
 		}
 	}()
+	logger.Info("Server listening", zap.String("addr", srv.Addr))
 
-	logger.Info("Server listening on :" + cfg.Port)
-
+	// Step 5: graceful shutdown.
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer shutCancel()
-	_ = srv.Shutdown(shutCtx)
+	stopRelay()
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelShutdown()
+	_ = srv.Shutdown(shutdownCtx)
 	logger.Info("Server exited")
+}
+
+// connectPostgres opens the pool and verifies connectivity, or exits.
+func connectPostgres(ctx context.Context, databaseURL string, logger *zap.Logger) *pgxpool.Pool {
+	poolCfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		logger.Fatal("failed to parse db pool config", zap.Error(err))
+	}
+	poolCfg.MaxConns = 20
+	poolCfg.MinConns = 2
+	poolCfg.MaxConnLifetime = 30 * time.Minute
+	poolCfg.MaxConnIdleTime = 5 * time.Minute
+	poolCfg.HealthCheckPeriod = 1 * time.Minute
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	if err != nil {
+		logger.Fatal("failed to create db pool", zap.Error(err))
+	}
+	if err := pool.Ping(ctx); err != nil {
+		logger.Fatal("database unavailable — refusing to start without Postgres", zap.Error(err))
+	}
+	logger.Info("Connected to PostgreSQL")
+	return pool
+}
+
+// newAuthzClient builds the authorization-svc client (mTLS when enabled).
+func newAuthzClient(ctx context.Context, cfg *config.Config, logger *zap.Logger) *authz.Client {
+	if !cfg.AuthzMTLSEnabled {
+		return authz.NewClient(cfg.AuthzURL, logger)
+	}
+	mtlsHTTPClient, err := mtls.NewClientHTTPClient(ctx, cfg.MTLSManagementServiceURL, "reporting-orchestration-svc", platformScopeID)
+	if err != nil {
+		logger.Fatal("mtls: failed to provision client identity", zap.Error(err))
+	}
+	logger.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+	return authz.NewClientWithHTTPClient(cfg.AuthzMTLSURL, mtlsHTTPClient, logger)
 }

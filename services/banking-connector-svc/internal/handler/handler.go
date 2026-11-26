@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -19,6 +20,12 @@ const (
 	BANKING_CONNECTION_CREATE = "BANKING_CONNECTION_CREATE"
 	BANKING_STATEMENT_INGEST  = "BANKING_STATEMENT_INGEST"
 
+	// Read actions. A connection, its statements and its canonical
+	// transactions are authorized for the connection's legal entity; a list
+	// for the requested legal entity, else the caller's tenant.
+	BANKING_CONNECTION_READ  = "BANKING_CONNECTION_READ"
+	BANKING_STATEMENT_READ   = "BANKING_STATEMENT_READ"
+	BANKING_TRANSACTION_READ = "BANKING_TRANSACTION_READ"
 	// TOKEN_DETOKENIZE gates the full, unmasked account number. It is the
 	// same grant key-management-svc checks before detokenizing (SEC-T15's
 	// "additional scoped approval"), checked here too so that a legacy row —
@@ -52,20 +59,22 @@ func (h *Handler) WithTokenizer(t tokenization.Tokenizer) *Handler {
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
-	r.Route("/v1/banking", func(r chi.Router) {
-		r.Post("/connections", h.CreateConnection)
-		r.Get("/connections", h.ListConnections)
-		r.Get("/connections/{id}", h.GetConnectionByID)
-		r.Get("/connections/{id}/account-number", h.GetConnectionAccountNumber)
-		r.Post("/statements", h.IngestStatement)
-		r.Get("/connections/{id}/statements", h.ListStatements)
+	// Full paths on the shared router, not r.Route("/v1/banking", ...): the
+	// BNK-02/03/04 registrations add routes under the same prefix, and a
+	// mounted subrouter here plus their routes there made one of the two
+	// unreachable (route shadowing -> 404). routes_contract_test.go pins it.
+	r.Post("/v1/banking/connections", h.CreateConnection)
+	r.Get("/v1/banking/connections", h.ListConnections)
+	r.Get("/v1/banking/connections/{id}", h.GetConnectionByID)
+	r.Post("/v1/banking/statements", h.IngestStatement)
+	r.Get("/v1/banking/connections/{id}/statements", h.ListStatements)
 
-		// Postman compatibility aliases
-		r.Post("/accounts", h.CreateConnection)
-		r.Get("/accounts", h.ListConnections)
-		r.Get("/accounts/{id}", h.GetConnectionByID)
-		r.Get("/accounts/{id}/account-number", h.GetConnectionAccountNumber)
-	})
+	// Postman compatibility aliases
+	r.Post("/v1/banking/accounts", h.CreateConnection)
+	r.Get("/v1/banking/accounts", h.ListConnections)
+	r.Get("/v1/banking/accounts/{id}", h.GetConnectionByID)
+	r.Get("/v1/banking/connections/{id}/account-number", h.GetConnectionAccountNumber)
+	r.Get("/v1/banking/accounts/{id}/account-number", h.GetConnectionAccountNumber)
 }
 
 func populateAliases(conn *domain.BankConnection) {
@@ -154,6 +163,11 @@ func (h *Handler) CreateConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// No bank has been contacted and no consent exists: the connection is a
+	// request, not a working link. It starts REQUESTED, the BNK-02 initial
+	// state, and becomes ACTIVE only through the consent lifecycle
+	// (complete-authorization -> activate). It used to be stored CONNECTED,
+	// asserting a connection that was never made.
 	conn := &domain.BankConnection{
 		TenantID:      tenantID,
 		LegalEntityID: req.LegalEntityID,
@@ -164,7 +178,7 @@ func (h *Handler) CreateConnection(w http.ResponseWriter, r *http.Request) {
 		IBAN:          accNum,
 		Currency:      req.Currency,
 		AccountType:   req.AccountType,
-		Status:        domain.StatusConnected,
+		Status:        domain.ConnStatusRequested,
 	}
 
 	if err := h.store.CreateConnection(r.Context(), conn, principalID, r.Header.Get("X-Correlation-ID")); err != nil {
@@ -255,15 +269,35 @@ func (h *Handler) GetConnectionAccountNumber(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-func (h *Handler) GetConnectionByID(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	conn, err := h.store.GetConnectionByID(r.Context(), id)
+// loadConnectionForRead requires a principal, resolves {id} within the
+// caller's tenant (404 for a missing or foreign connection, before any
+// authorization is asked) and authorizes action for the connection's legal
+// entity.
+func (h *Handler) loadConnectionForRead(w http.ResponseWriter, r *http.Request, action string) (*domain.BankConnection, bool) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return nil, false
+	}
+	conn, err := h.store.GetConnectionByID(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		if errors.Is(err, domain.ErrConnectionNotFound) {
 			writeError(w, http.StatusNotFound, "bank connection not found")
-			return
+			return nil, false
 		}
+		h.logger.Error("failed to get bank connection", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to get bank connection")
+		return nil, false
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, conn.LegalEntityID, action); err != nil {
+		h.writeAuthzErr(w, err)
+		return nil, false
+	}
+	return conn, true
+}
+
+func (h *Handler) GetConnectionByID(w http.ResponseWriter, r *http.Request) {
+	conn, ok := h.loadConnectionForRead(w, r, BANKING_CONNECTION_READ)
+	if !ok {
 		return
 	}
 	populateAliases(conn)
@@ -273,6 +307,13 @@ func (h *Handler) GetConnectionByID(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) ListConnections(w http.ResponseWriter, r *http.Request) {
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	scope := legalEntityID
+	if scope == "" {
+		scope = middleware.GetTenantID(r.Context())
+	}
+	if !h.authorizeRead(w, r, scope, BANKING_CONNECTION_READ) {
+		return
+	}
 	conns, err := h.store.ListConnections(r.Context(), legalEntityID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list bank connections")
@@ -340,8 +381,11 @@ func (h *Handler) IngestStatement(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListStatements(w http.ResponseWriter, r *http.Request) {
-	connectionID := chi.URLParam(r, "id")
-	stmts, err := h.store.ListStatements(r.Context(), connectionID)
+	conn, ok := h.loadConnectionForRead(w, r, BANKING_STATEMENT_READ)
+	if !ok {
+		return
+	}
+	stmts, err := h.store.ListStatements(r.Context(), conn.ConnectionID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list statements")
 		return
@@ -369,6 +413,29 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 		return "", false
 	}
 	return principalID, true
+}
+
+// authorizeRead authorizes a list read scoped to legalEntityID
+// (purchase-request-svc pattern). A request with no principal is served only
+// when it declares itself an internal service call (X-Source-Channel: system;
+// treasury-svc's BNK-01 connection-option lookup is such a caller); it is
+// still tenant-scoped by RLS. Anything else needs a principal holding action:
+// 401 without one, 403 on denial, 503 when authorization-svc gives no
+// decision.
+func (h *Handler) authorizeRead(w http.ResponseWriter, r *http.Request, legalEntityID, action string) bool {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		if strings.EqualFold(r.Header.Get("X-Source-Channel"), "system") {
+			return true
+		}
+		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		return false
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, action); err != nil {
+		h.writeAuthzErr(w, err)
+		return false
+	}
+	return true
 }
 
 // writeAuthzErr maps an authz.CheckAllowed error to the appropriate HTTP

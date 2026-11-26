@@ -137,12 +137,14 @@ type errorString string
 func (e errorString) Error() string { return string(e) }
 
 var (
-	ErrCheckNotFound          = errorString("vendor due diligence check not found")
-	ErrVendorProfileNotFound  = errorString("vendor profile not found")
-	ErrAuthorizationDenied    = errorString("authorization denied for vendor due diligence action")
-	ErrAuthzServiceUnavailabe = errorString("authorization-svc unavailable")
-	ErrIdentityMissing        = errorString("caller identity missing")
-	ErrStoreUnavailable       = errorString("store unavailable")
+	ErrCheckNotFound         = errorString("vendor due diligence check not found")
+	ErrVendorProfileNotFound = errorString("vendor profile not found")
+	// ErrVendorProfileAlreadyApproved is a profile that already carries an approval.
+	ErrVendorProfileAlreadyApproved = errorString("vendor profile is already approved")
+	ErrAuthorizationDenied          = errorString("authorization denied for vendor due diligence action")
+	ErrAuthzServiceUnavailabe       = errorString("authorization-svc unavailable")
+	ErrIdentityMissing              = errorString("caller identity missing")
+	ErrStoreUnavailable             = errorString("store unavailable")
 
 	// ErrTenantMissing is returned by every store method when no tenant scope
 	// reached it. Distinct from ErrStoreUnavailable because the handler used to

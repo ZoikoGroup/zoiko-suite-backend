@@ -230,10 +230,14 @@ func (r *Relay) RelayOnce(ctx context.Context) {
 	for rows.Next() {
 		var e StoredEvent
 		var actorID *string
+		// A tenant-level aggregate (a legal hold, an export package) is stored with a
+		// NULL legal_entity_id (see Insert); scanning that into a plain string failed
+		// the whole poll, and with ORDER BY created_at it blocked every later event.
+		var legalEntityID *string
 		var headersJSON []byte
 		if scanErr := rows.Scan(
 			&e.OutboxEventID, &e.AggregateType, &e.AggregateID, &e.EventType,
-			&e.TenantID, &e.LegalEntityID, &actorID, &e.CorrelationID, &headersJSON,
+			&e.TenantID, &legalEntityID, &actorID, &e.CorrelationID, &headersJSON,
 			&e.Payload, &e.Attempts,
 		); scanErr != nil {
 			r.log.Error("outbox relay: scan failed", zap.Error(scanErr))
@@ -241,6 +245,9 @@ func (r *Relay) RelayOnce(ctx context.Context) {
 			return
 		}
 		e.ActorID = actorID
+		if legalEntityID != nil {
+			e.LegalEntityID = *legalEntityID
+		}
 		if len(headersJSON) > 0 {
 			_ = json.Unmarshal(headersJSON, &e.Headers)
 		}

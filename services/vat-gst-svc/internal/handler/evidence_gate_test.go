@@ -50,12 +50,12 @@ func evidenceStore() *stubStore {
 func evidenceRouter(st *stubStore, e EvidenceChecker) chi.Router {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContextMiddleware)
-	RegisterRoutes(r, New(st, &stubPublisher{}, &stubAuthz{}, zap.NewNop()).WithEvidenceGate(e))
+	RegisterRoutes(r, New(st, &stubAuthz{}, zap.NewNop()).WithEvidenceGate(e))
 	return r
 }
 
 func fileRequest() *http.Request {
-	req := buildRequest(http.MethodPost, "/v1/vat-returns/v1/file", domain.FileVATReturnRequest{FiledBy: "tax-director"})
+	req := buildRequest(http.MethodPost, "/v1/vat-returns/v1/file", domain.FileVATReturnRequest{FiledBy: "principal-test-01"})
 	req.Header.Set("X-Correlation-ID", "corr-1")
 	req.Header.Set("X-Evidence-Refs", "doc-1, doc-2")
 	return req

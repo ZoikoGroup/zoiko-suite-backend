@@ -127,6 +127,18 @@ func (s *stubStore) UpdateObligationStatus(_ context.Context, _, _ string, _ int
 	return s.updated, s.transitioned, s.updateErr
 }
 
+func (s *stubStore) ValidateExtractedObligation(_ context.Context, _, validatedBy, correlationID string) (*domain.Obligation, error) {
+	s.statusActorID = validatedBy
+	s.statusCorrelationID = correlationID
+	return s.updated, s.updateErr
+}
+
+func (s *stubStore) TransitionExtended(_ context.Context, _, _ string, _ int, actorID, correlationID string, _ domain.ExtendedTransitionEvidence) (*domain.Obligation, bool, error) {
+	s.statusActorID = actorID
+	s.statusCorrelationID = correlationID
+	return s.updated, s.transitioned, s.updateErr
+}
+
 func (s *stubStore) UpdateObligationWorkflow(_ context.Context, obligationID, workflowID, actorID, correlationID string) (*domain.Obligation, error) {
 	s.workflowObligationID = obligationID
 	s.workflowLinkedID = workflowID
@@ -157,6 +169,22 @@ func (s *stubStore) FindFilingRequirement(_ context.Context, _, _ string) (*doma
 
 func (s *stubStore) UpdateFilingStatus(_ context.Context, p domain.UpdateFilingStatusParams) (*domain.FilingRequirement, bool, error) {
 	s.filingStatusParams = p
+	return s.filingReq, true, s.filingErr
+}
+
+func (s *stubStore) SubmitFiling(_ context.Context, p domain.SubmitFilingParams) (*domain.FilingRequirement, bool, error) {
+	s.filingStatusParams = domain.UpdateFilingStatusParams{
+		ObligationID: p.ObligationID, FilingRequirementID: p.FilingRequirementID,
+		ExpectedVersion: p.ExpectedVersion, ActorPrincipalID: p.ActorPrincipalID, CorrelationID: p.CorrelationID,
+	}
+	return s.filingReq, true, s.filingErr
+}
+
+func (s *stubStore) ConfirmFiling(_ context.Context, p domain.ConfirmFilingParams) (*domain.FilingRequirement, bool, error) {
+	s.filingStatusParams = domain.UpdateFilingStatusParams{
+		ObligationID: p.ObligationID, FilingRequirementID: p.FilingRequirementID,
+		ExpectedVersion: p.ExpectedVersion, ActorPrincipalID: p.ActorPrincipalID, CorrelationID: p.CorrelationID,
+	}
 	return s.filingReq, true, s.filingErr
 }
 

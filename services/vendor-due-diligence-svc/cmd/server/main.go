@@ -29,6 +29,7 @@ import (
 	"zoiko.io/vendor-due-diligence-svc/internal/events"
 	"zoiko.io/vendor-due-diligence-svc/internal/handler"
 	"zoiko.io/vendor-due-diligence-svc/internal/health"
+	"zoiko.io/vendor-due-diligence-svc/internal/idempotency"
 	svcmiddleware "zoiko.io/vendor-due-diligence-svc/internal/middleware"
 	"zoiko.io/vendor-due-diligence-svc/internal/mtls"
 	"zoiko.io/vendor-due-diligence-svc/internal/store"
@@ -335,6 +336,11 @@ func main() {
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+
+	// Replay protection for material writes: a retried POST/PUT with the same
+	// Idempotency-Key gets the first answer instead of running twice. Placed after
+	// the envelope middleware, which guarantees the key and tenant are present.
+	r.Use(idempotency.Middleware(idempotency.NewPgStore(pool), log))
 
 	h := handler.New(pgStore, publisher, authzClient, counterpartyClient, log)
 	handler.RegisterRoutes(r, h)

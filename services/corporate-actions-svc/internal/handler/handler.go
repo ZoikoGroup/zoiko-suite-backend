@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/corporate-actions-svc/internal/authz"
+	"zoiko.io/corporate-actions-svc/internal/boardresolutions"
 	"zoiko.io/corporate-actions-svc/internal/domain"
 	"zoiko.io/corporate-actions-svc/internal/events"
 	"zoiko.io/corporate-actions-svc/internal/evidencereq"
@@ -42,11 +43,46 @@ type Handler struct {
 	publisher   events.Publisher
 	authz       AuthZClient
 	evidenceReq EvidenceReqClient
+	resolutions ResolutionVerifier
 	logger      *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthZClient, er EvidenceReqClient, logger *zap.Logger) *Handler {
-	return &Handler{store: st, publisher: pub, authz: az, evidenceReq: er, logger: logger}
+// ResolutionVerifier checks a resolution_id against board-resolutions-svc.
+// Implemented by boardresolutions.Client; stubbed in tests.
+type ResolutionVerifier interface {
+	VerifyPassedResolution(ctx context.Context, caller boardresolutions.Caller, resolutionID, legalEntityID string) error
+}
+
+func New(st store.Store, pub events.Publisher, az AuthZClient, er EvidenceReqClient, rv ResolutionVerifier, logger *zap.Logger) *Handler {
+	return &Handler{store: st, publisher: pub, authz: az, evidenceReq: er, resolutions: rv, logger: logger}
+}
+
+// verifyResolution refuses a resolution_id that board-resolutions-svc cannot
+// confirm as an existing, PASSED resolution of the same legal entity. It
+// writes the error response itself and returns false when the write must stop:
+//   - unknown id, other legal entity, or not PASSED -> 422 (the caller's input is wrong)
+//   - board-resolutions-svc unreachable              -> 503 (fail closed)
+func (h *Handler) verifyResolution(w http.ResponseWriter, r *http.Request, principalID, resolutionID, legalEntityID string) bool {
+	caller := boardresolutions.Caller{
+		TenantID:      middleware.GetTenantID(r.Context()),
+		PrincipalID:   principalID,
+		LegalEntityID: legalEntityID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
+	}
+	err := h.resolutions.VerifyPassedResolution(r.Context(), caller, resolutionID, legalEntityID)
+	if err == nil {
+		return true
+	}
+	switch {
+	case errors.Is(err, boardresolutions.ErrResolutionNotFound),
+		errors.Is(err, boardresolutions.ErrResolutionEntityMismatch),
+		errors.Is(err, boardresolutions.ErrResolutionNotPassed):
+		writeError(w, http.StatusUnprocessableEntity, err.Error())
+	default:
+		h.logger.Warn("board resolution could not be verified — failing closed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, boardresolutions.ErrServiceUnavailable.Error())
+	}
+	return false
 }
 
 // requirePrincipal extracts the calling principal from the X-Principal-Id
@@ -120,6 +156,12 @@ func (h *Handler) CreateAction(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionCorporateActionCreate); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+
+	// A resolution_id is a claim of board authority: it must name a real,
+	// PASSED resolution of this legal entity, verified upstream.
+	if req.ResolutionID != "" && !h.verifyResolution(w, r, principalID, req.ResolutionID, req.LegalEntityID) {
 		return
 	}
 
@@ -236,6 +278,9 @@ func (h *Handler) UpdateAction(w http.ResponseWriter, r *http.Request) {
 		existing.Description = req.Description
 	}
 	if req.ResolutionID != "" {
+		if !h.verifyResolution(w, r, principalID, req.ResolutionID, existing.LegalEntityID) {
+			return
+		}
 		existing.ResolutionID = req.ResolutionID
 	}
 	if req.EffectiveDate != "" {

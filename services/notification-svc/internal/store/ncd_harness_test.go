@@ -159,7 +159,7 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	app, admin := ncdPools(t)
-	st := store.NewNCD(store.New(app))
+	st := store.NewNCD(store.New(app, store.WithEventRegion("local")))
 	em := &fakeEmail{}
 	rs := &fakeResolver{emails: map[string]string{}}
 	svc := ncd.NewService(st, rs, ncd.RouterTransport{Email: em, Inbox: st}, ncd.DefaultLimits(), nil)

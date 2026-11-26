@@ -143,7 +143,12 @@ func (h *Handler) submitViaAuthority(w http.ResponseWriter, r *http.Request, ifa
 
 func (h *Handler) noAuthority(w http.ResponseWriter) bool {
 	if h.engine == nil {
-		writeError(w, http.StatusNotFound, "the authority adapter is not enabled on this service")
+		// 503, not 404: the route exists, the live adapter is simply not
+		// configured (AUTHORITY_ADAPTER_ENABLED unset — the fail-closed default).
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error":   "tax_authority_adapter_not_configured",
+			"message": "the live tax-authority adapter is not enabled on this deployment (AUTHORITY_ADAPTER_ENABLED)",
+		})
 		return true
 	}
 	return false
@@ -314,7 +319,11 @@ func (h *Handler) GetAuthorityHealth(w http.ResponseWriter, r *http.Request) {
 // AuthorityCallback is POST /v1/tax-authority/callbacks/{provider}/{tenantID}.
 func (h *Handler) AuthorityCallback(w http.ResponseWriter, r *http.Request) {
 	if h.callbacks == nil {
-		writeError(w, http.StatusNotFound, "authority callbacks are not enabled on this service")
+		// Nothing can verify a callback signature, so nothing is accepted.
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error":   "tax_authority_callbacks_not_configured",
+			"message": "authority callbacks are not enabled on this deployment (AUTHORITY_ADAPTER_ENABLED / AUTHORITY_CALLBACKS_JSON)",
+		})
 		return
 	}
 	res := h.callbacks.Handle(r.Context(), chi.URLParam(r, "provider"), chi.URLParam(r, "tenantID"), r.Header, http.MaxBytesReader(w, r.Body, 256<<10))

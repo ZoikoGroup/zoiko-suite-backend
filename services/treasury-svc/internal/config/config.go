@@ -65,8 +65,53 @@ type Config struct {
 	// service has never owned, and doesn't start owning now.
 	BankingConnectorServiceURL string
 
+	// CurrencyRegistryURL is currency-registry-svc's (REF-02) base URL —
+	// the platform's one real currency-reference service. BNK-09's
+	// CreateTreasuryTransfer/AmendTreasuryTransfer resolve each currency's
+	// real minor-unit count from it rather than applying a single
+	// hardcoded decimal-places rule to every currency. Empty disables the
+	// check (internal/handler.CurrencyClient is nil-safe), same convention
+	// as BankingConnectorServiceURL above.
+	CurrencyRegistryURL string
+
 	// OTELExporterEndpoint is where telemetry sends trace data.
 	OTELExporterEndpoint string
+
+	// TokenizationEnforced turns on real server-side tokenization (via
+	// key-management-svc) of bank account numbers at write time (Security
+	// Standard §14, S3 Restricted; internal/tokenization) — BNK-01's own
+	// "Security/KMS/Tokenization" dependency and RotateAccountIdentifierToken
+	// command. Disabled by default: while false, RegisterBankAccount and
+	// RotateAccountIdentifierToken behave EXACTLY as before — the caller's
+	// own MaskedAccountNumber/NewMaskedAccountNumber string is stored as
+	// given, a documented known gap (SPEC_DEVIATIONS), not a fix. Same
+	// migration-state-with-an-end convention as banking-connector-svc's and
+	// payee-banking-identity-svc's identical flag.
+	TokenizationEnforced   bool
+	TokenizationServiceURL string
+
+	tokenizationEnforcedRaw string
+}
+
+// Validate reports configuration the service must not start with.
+//
+// TOKENIZATION_ENFORCED is parsed strictly, the same way
+// banking-connector-svc's and payee-banking-identity-svc's identical flag
+// is: AUTHZ_MTLS_ENABLED-style parsing (== "true") would read a typo such as
+// "True" or "yes" as false and silently store raw account numbers on a
+// deployment that asked for tokenization; for a protection flag that is
+// fail-open, so anything other than "true", "false" or unset refuses to
+// start.
+func (c *Config) Validate() error {
+	switch c.tokenizationEnforcedRaw {
+	case "", "false", "true":
+	default:
+		return fmt.Errorf("TOKENIZATION_ENFORCED must be \"true\" or \"false\", got %q", c.tokenizationEnforcedRaw)
+	}
+	if c.TokenizationEnforced && c.TokenizationServiceURL == "" {
+		return fmt.Errorf("TOKENIZATION_ENFORCED is true but TOKENIZATION_SERVICE_URL is empty")
+	}
+	return nil
 }
 
 // DBConfig holds PostgreSQL connection parameters.
@@ -96,6 +141,14 @@ type KafkaConfig struct {
 	Brokers []string
 	GroupID string
 	Topic   string
+
+	// BankStatementEventsTopic and BankStatementConsumerGroupID are
+	// treasury-svc's first event CONSUMER (BNK-08's BankStatementAccepted
+	// listener) — mirrors bank-reconciliation-svc's own
+	// PaymentStatusEventsTopic/ConflictConsumerGroupID split from its
+	// outbox-producer Topic above.
+	BankStatementEventsTopic    string
+	BankStatementConsumerGroupID string
 }
 
 // Load reads configuration from environment variables.
@@ -117,9 +170,11 @@ func Load() (*Config, error) {
 			SSLMode:  env("DB_SSLMODE", "require"),
 		},
 		Kafka: KafkaConfig{
-			Brokers: strings.Split(env("KAFKA_BROKERS", "localhost:9092"), ","),
-			GroupID: env("KAFKA_GROUP_ID", "treasury-svc"),
-			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.treasury.events"),
+			Brokers:                      strings.Split(env("KAFKA_BROKERS", "localhost:9092"), ","),
+			GroupID:                      env("KAFKA_GROUP_ID", "treasury-svc"),
+			Topic:                        env("KAFKA_EVENTS_TOPIC", "zoiko.treasury.events"),
+			BankStatementEventsTopic:     env("BANK_STATEMENT_EVENTS_TOPIC", "zoiko.banking.connector.events"),
+			BankStatementConsumerGroupID: env("BANK_STATEMENT_CONSUMER_GROUP_ID", "treasury-svc-cash-position"),
 		},
 		AuthZServiceURL:          env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
@@ -132,7 +187,11 @@ func Load() (*Config, error) {
 		PaymentAdapterServiceURL: env("PAYMENT_ADAPTER_SERVICE_URL", "http://payment-initiation-adapter-svc:8162"),
 		IntercompanyServiceURL:   env("INTERCOMPANY_SERVICE_URL", "http://intercompany-accounting-svc:8105"),
 		BankingConnectorServiceURL: env("BANKING_CONNECTOR_SERVICE_URL", "http://banking-connector-svc:8145"),
+		CurrencyRegistryURL:        env("CURRENCY_REGISTRY_URL", "http://currency-registry-svc:8172"),
 		OTELExporterEndpoint:     env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		TokenizationEnforced:    os.Getenv("TOKENIZATION_ENFORCED") == "true",
+		TokenizationServiceURL:  env("TOKENIZATION_SERVICE_URL", "http://key-management-svc:8143"),
+		tokenizationEnforcedRaw: os.Getenv("TOKENIZATION_ENFORCED"),
 	}, nil
 }
 

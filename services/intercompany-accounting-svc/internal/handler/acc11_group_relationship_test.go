@@ -23,7 +23,9 @@ import (
 func validMatchedJournal(entry *domain.IntercompanyEntry, targetLegalEntityID string) *ledger.JournalDetail {
 	return &ledger.JournalDetail{
 		JournalID: "journal-1", LegalEntityID: targetLegalEntityID, Status: "FINALIZED", CurrencyCode: entry.CounterpartyCurrencyCode,
-		Lines: []ledger.JournalLine{{AccountCode: "1300-Intercompany", DebitAmount: entry.CounterpartyAmount}},
+		// IsIntercompanyAccount: true — SPEC_DEVIATIONS A5 now compares only
+		// a journal's intercompany-designated line(s) against the pair.
+		Lines: []ledger.JournalLine{{AccountCode: "1300-Intercompany", DebitAmount: entry.CounterpartyAmount, IsIntercompanyAccount: true}},
 	}
 }
 

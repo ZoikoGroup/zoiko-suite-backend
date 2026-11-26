@@ -1692,6 +1692,11 @@ func (h *Handler) handleTemplateError(w http.ResponseWriter, r *http.Request, er
 			writeError(w, r, http.StatusBadRequest, "missing_variables", missing.Error())
 			return
 		}
+		var undeclared domain.ErrTemplateVariablesUndeclared
+		if errors.As(err, &undeclared) {
+			writeError(w, r, http.StatusBadRequest, "template_variable_invalid", undeclared.Error())
+			return
+		}
 		var unexpected domain.ErrTemplateVariablesUnexpected
 		if errors.As(err, &unexpected) {
 			writeError(w, r, http.StatusBadRequest, "unexpected_variables", unexpected.Error())
@@ -1877,11 +1882,14 @@ func (h *Handler) IngestEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Authorization check
-	if h.authz != nil {
-		if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionSend); err != nil {
-			h.writeAuthzErr(w, r, err)
-			return
-		}
+	// Fail closed: an unset authorizer must refuse, never skip the check.
+	if h.authz == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "service_unavailable", "authorization not configured")
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionSend); err != nil {
+		h.writeAuthzErr(w, r, err)
+		return
 	}
 
 	res, err := h.orchestrator.IngestEvent(r.Context(), req, principalID)
@@ -1956,11 +1964,21 @@ func (h *Handler) GetIntent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.authz != nil && intent.LegalEntityID != "" {
-		if err := h.authz.CheckAllowed(r.Context(), principalID, intent.LegalEntityID, actionView); err != nil {
-			h.writeAuthzErr(w, r, err)
-			return
-		}
+	// Fail closed. This check used to be skipped when the authorizer was unset or the
+	// intent carried no legal entity, so such an intent (and its render) was readable by any
+	// principal in the tenant. An intent with no legal entity cannot be authorized against
+	// anything, so it is refused rather than served.
+	if h.authz == nil {
+		writeError(w, r, http.StatusServiceUnavailable, "service_unavailable", "authorization not configured")
+		return
+	}
+	if intent.LegalEntityID == "" {
+		writeError(w, r, http.StatusForbidden, "forbidden", "the intent has no legal entity to authorize against")
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, intent.LegalEntityID, actionView); err != nil {
+		h.writeAuthzErr(w, r, err)
+		return
 	}
 
 	render, rErr := h.ledgerStore.GetRenderByIntent(r.Context(), tenantID, id)

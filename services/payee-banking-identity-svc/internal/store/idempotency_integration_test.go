@@ -192,7 +192,7 @@ func TestCommandIdempotency_RefusedCommandDoesNotBurnKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("find after refused approve: %v", err)
 	}
-	if current.Status != domain.StatusCandidate {
+	if current.Status != domain.StatusVerificationPending {
 		t.Fatalf("refused approve changed status to %s", current.Status)
 	}
 
@@ -223,7 +223,7 @@ func TestCommandIdempotency_KeyReuseAcrossCommandsIsConflict(t *testing.T) {
 	if err != nil {
 		t.Fatalf("find: %v", err)
 	}
-	if current.Status != domain.StatusCandidate {
+	if current.Status != domain.StatusVerificationPending {
 		t.Fatalf("conflicting command changed status to %s", current.Status)
 	}
 }
@@ -245,7 +245,7 @@ func TestCommandIdempotency_KeyReuseAcrossDestinationsIsConflict(t *testing.T) {
 	if err != nil {
 		t.Fatalf("find second: %v", err)
 	}
-	if current.Status != domain.StatusCandidate {
+	if current.Status != domain.StatusVerificationPending {
 		t.Fatalf("conflicting destination changed status to %s", current.Status)
 	}
 }

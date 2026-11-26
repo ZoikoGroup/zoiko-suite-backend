@@ -14,8 +14,12 @@ import (
 	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/key-management-svc/internal/authz"
+	"zoiko.io/key-management-svc/internal/config"
 	kmscrypto "zoiko.io/key-management-svc/internal/crypto"
+	"zoiko.io/key-management-svc/internal/events"
 	"zoiko.io/key-management-svc/internal/handler"
+	"zoiko.io/key-management-svc/internal/idempotency"
+	"zoiko.io/key-management-svc/internal/outbox"
 	"zoiko.io/key-management-svc/internal/siem"
 	"zoiko.io/key-management-svc/internal/store"
 )
@@ -23,22 +27,21 @@ import (
 func main() {
 	logger, _ := zap.NewProduction()
 	defer logger.Sync()
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8143"
+	// Config fails on a missing DATABASE_URL or AUTHZ_SERVICE_URL: key
+	// metadata and version history are authoritative and live only in
+	// Postgres, so there is no in-memory fallback to start with.
+	cfg, err := config.Load()
+	if err != nil {
+		logger.Fatal("invalid configuration", zap.Error(err))
 	}
+	port := cfg.Port
 
-	// Durable storage, for the first time in this service. It used to run on
-	// store.NewMemoryStore(), which forgot every key registration — and would
-	// now forget every tokenized bank account number — on each restart.
-	// Required, and fatal when absent, for the same reason AUTHZ_SERVICE_URL
-	// is: there is no safe default, and silently falling back to memory would
-	// turn a missing variable into data loss.
-	databaseURL := os.Getenv("DATABASE_URL")
-	if databaseURL == "" {
-		logger.Fatal("DATABASE_URL is required: key metadata and the token vault are stored in Postgres")
-	}
-	poolCfg, err := pgxpool.ParseConfig(databaseURL)
+	// Durable storage: key metadata, version history and the token vault are
+	// stored in Postgres only. config.Load already refused a missing
+	// DATABASE_URL; a database that is unreachable at boot is fatal too, for
+	// the same reason: silently starting without it would turn a deployment
+	// mistake into lost tokenized bank account numbers.
+	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
 		logger.Fatal("DATABASE_URL is not a valid Postgres connection string", zap.Error(err))
 	}
@@ -48,16 +51,16 @@ func main() {
 	poolCfg.MaxConnIdleTime = 5 * time.Minute
 	poolCfg.HealthCheckPeriod = time.Minute
 	connectCtx, cancelConnect := context.WithTimeout(context.Background(), 10*time.Second)
-	dbpool, err := pgxpool.NewWithConfig(connectCtx, poolCfg)
+	pool, err := pgxpool.NewWithConfig(connectCtx, poolCfg)
 	if err == nil {
-		err = dbpool.Ping(connectCtx)
+		err = pool.Ping(connectCtx)
 	}
 	cancelConnect()
 	if err != nil {
 		logger.Fatal("cannot connect to Postgres", zap.Error(err))
 	}
-	defer dbpool.Close()
-	s := store.NewPgStore(dbpool)
+	defer pool.Close()
+	s := store.NewPgStore(pool)
 
 	// The vault's encryption key. Fatal when missing or malformed: a vault
 	// that started without one could only refuse every tokenize, or worse.
@@ -78,13 +81,26 @@ func main() {
 	// rejects all authorized traffic hides a deployment mistake until a user
 	// finds it. This dependency was added in Priority 2b and was missing from
 	// docker-compose.yml for two services, which is exactly how that happens.
-	authzURL := os.Getenv("AUTHZ_SERVICE_URL")
-	if authzURL == "" {
-		logger.Fatal("AUTHZ_SERVICE_URL is required: every authorized route would return 503 without it")
-	}
-	authzClient := authz.NewClient(authzURL)
-	h := handler.New(s, siemClient, authzClient, logger).WithVault(s, vaultCipher)
+	// (config.Load enforces it.)
+	authzClient := authz.NewClient(cfg.AuthzServiceURL)
+	h := handler.New(s, siemClient, authzClient, logger).
+		WithVault(s, vaultCipher).
+		WithIdempotency(idempotency.NewPgStore(pool)).
+		WithReadiness(pool)
 	router := handler.NewRouter(h)
+
+	// Transactional outbox relay: lifecycle events are written with the
+	// change in one transaction; the relay delivers them to Kafka.
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	if cfg.KafkaBrokers != "" {
+		publisher, closeKafka := events.NewKafkaPublisher(cfg.KafkaBrokers, cfg.KafkaTopic)
+		defer func() { _ = closeKafka() }()
+		go outbox.NewRelay(pool, publisher, 2*time.Second, 50, logger).Start(relayCtx)
+	} else {
+		logger.Warn("KAFKA_BROKERS is not set: the outbox relay is not running; events are kept in outbox_events and delivered once it is configured",
+			zap.String("topic", cfg.KafkaTopic))
+	}
 
 	// Wrap router with apicontract middleware
 	r := chi.NewRouter()

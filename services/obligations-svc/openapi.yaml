@@ -162,6 +162,59 @@ paths:
         '409': {$ref: '#/components/responses/Problem'}
         '412': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}/validate:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}]
+    post:
+      tags: [obligations]
+      operationId: validateExtractedObligation
+      description: >-
+        WFC-05 consolidation (Doc 04 §2.1): moves an EXTENDED obligation from
+        CANDIDATE to PLANNED. The only path out of CANDIDATE for an
+        AI-extracted obligation (LEG-07 §9.1).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ValidateObligationRequest'}
+      responses:
+        '200':
+          description: Moved CANDIDATE -> PLANNED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Obligation'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}/transition:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}]
+    post:
+      tags: [obligations]
+      operationId: transitionExtendedObligation
+      description: >-
+        WFC-05 consolidation (Doc 04 §2.1): the generic EXTENDED-lifecycle
+        transition endpoint. Only legal on an obligation created with
+        lifecycle_model=EXTENDED; a LEGACY obligation must use
+        /status instead.
+      parameters: [{$ref: '#/components/parameters/IfMatchOptional'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TransitionExtendedRequest'}
+      responses:
+        '200':
+          description: Transitioned, or already in that status
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Obligation'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
   /v1/obligations/{obligation_id}/workflow:
     parameters: [{$ref: '#/components/parameters/ObligationID'}]
     post:
@@ -209,6 +262,9 @@ paths:
                 filing_type: {type: string}
                 filing_authority: {type: string}
                 submission_channel: {type: string}
+                jurisdiction_id: {type: string}
+                period_key: {type: string}
+                due_date: {type: string, format: date-time}
       responses:
         '201':
           description: Created (or the existing identical requirement)
@@ -258,6 +314,56 @@ paths:
                 expected_version: {type: integer}
       responses:
         '200': {description: Moved (or already in that status), content: {application/json: {schema: {$ref: '#/components/schemas/FilingRequirement'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}/filing-requirements/{filing_requirement_id}/submit:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}, {$ref: '#/components/parameters/FilingRequirementID'}]
+    post:
+      tags: [filing]
+      operationId: submitFiling
+      summary: 'Record filing submission evidence and move to SUBMITTED (filing-tracker-svc parity)'
+      parameters: [{$ref: '#/components/parameters/IfMatchOptional'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [submission_reference]
+              additionalProperties: false
+              properties:
+                submission_reference: {type: string}
+                expected_version: {type: integer}
+      responses:
+        '200': {description: Submitted (or already SUBMITTED), content: {application/json: {schema: {$ref: '#/components/schemas/FilingRequirement'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/Problem'}
+  /v1/obligations/{obligation_id}/filing-requirements/{filing_requirement_id}/confirm:
+    parameters: [{$ref: '#/components/parameters/ObligationID'}, {$ref: '#/components/parameters/FilingRequirementID'}]
+    post:
+      tags: [filing]
+      operationId: confirmFiling
+      summary: 'Record confirmation evidence and move to CONFIRMED (filing-tracker-svc parity)'
+      parameters: [{$ref: '#/components/parameters/IfMatchOptional'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [confirmation_reference]
+              additionalProperties: false
+              properties:
+                confirmation_reference: {type: string}
+                expected_version: {type: integer}
+      responses:
+        '200': {description: Confirmed (or already CONFIRMED), content: {application/json: {schema: {$ref: '#/components/schemas/FilingRequirement'}}}}
         '400': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
@@ -843,7 +949,32 @@ components:
         correlation_id: {type: string}
       additionalProperties: true
     ObligationStatus: {type: string, enum: [OPEN, IN_PROGRESS, OVERDUE, CLOSED]}
-    FilingStatus: {type: string, enum: [PENDING, IN_PREPARATION, SUBMITTED, ACCEPTED, REJECTED, WITHDRAWN]}
+    ExtendedObligationStatus:
+      type: string
+      enum: [CANDIDATE, PLANNED, ACTIVE, DUE_SOON, DUE, OVERDUE, FULFILLED, WAIVED, NOT_APPLICABLE, SUPERSEDED, IN_PROGRESS, BREACHED, DISPUTED]
+    ValidateObligationRequest:
+      type: object
+      required: [validated_by]
+      additionalProperties: false
+      properties:
+        validated_by: {type: string}
+    TransitionExtendedRequest:
+      type: object
+      required: [obligation_status]
+      additionalProperties: false
+      properties:
+        obligation_status: {$ref: '#/components/schemas/ExtendedObligationStatus'}
+        trigger_description: {type: string}
+        calculation_method: {type: string}
+        source_clause_id: {type: string}
+        fulfillment_evidence_ref: {type: string}
+        waiver_authority_reference: {type: string}
+        waiver_reason_code: {type: string}
+        not_applicable_reason: {type: string}
+        breach_note: {type: string}
+        dispute_reason: {type: string}
+        superseded_by_obligation_id: {type: string, format: uuid}
+    FilingStatus: {type: string, enum: [PENDING, IN_PREPARATION, SCHEDULED, DRAFT_READY, OVERDUE, SUBMITTED, ACCEPTED, REJECTED, CONFIRMED, WITHDRAWN]}
     Obligation:
       type: object
       properties:
@@ -913,6 +1044,16 @@ components:
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
         row_version: {type: integer}
+        jurisdiction_id: {type: [string, 'null']}
+        period_key: {type: [string, 'null']}
+        due_date: {type: [string, 'null'], format: date-time}
+        submission_reference: {type: [string, 'null']}
+        submitted_at: {type: [string, 'null'], format: date-time}
+        submitted_by: {type: [string, 'null']}
+        confirmation_reference: {type: [string, 'null']}
+        confirmed_at: {type: [string, 'null'], format: date-time}
+        rejection_reason: {type: [string, 'null']}
+        notes: {type: [string, 'null']}
     CreateApplicabilityDecision:
       type: object
       required: [jurisdiction_code, entity_ref, decision, source_rule_ref, source_rule_version, effective_from, created_by_principal_id]

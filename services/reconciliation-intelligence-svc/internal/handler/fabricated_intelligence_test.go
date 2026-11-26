@@ -52,10 +52,24 @@ func TestApplyResolution_EmptyHumanNote_PreservesMachineRationale(t *testing.T) 
 		t.Fatalf("expected machine rationale on generation, got %q", job.UnmatchedItems[0].ResolutionNotes)
 	}
 
-	// Approve with NO note — the common case, and the one that used to erase
-	// the rationale.
+	// ZS-SVC-Z-001 INV-18: a manual decision carries its reason, so an empty
+	// note is now refused outright (it used to be accepted and, before that,
+	// to erase the rationale). The rationale must still survive a decision.
+	emptyBody, _ := json.Marshal(domain.ApplyResolutionRequest{SuggestionStatus: domain.StatusApproved, ResolutionNotes: ""})
+	emptyReq := httptest.NewRequest(http.MethodPost,
+		"/v1/reconciliations/"+job.ID+"/resolutions/"+itemID+"/apply", bytes.NewReader(emptyBody))
+	emptyReq.Header.Set("Content-Type", "application/json")
+	emptyReq.Header.Set("X-Tenant-ID", "tenant-rec-fab")
+	emptyReq.Header.Set("X-Principal-Id", "principal-02")
+	emptyReq = withEnvelope(emptyReq)
+	emptyRec := httptest.NewRecorder()
+	router.ServeHTTP(emptyRec, emptyReq)
+	if emptyRec.Code != http.StatusBadRequest {
+		t.Fatalf("a decision without a reason must be refused (INV-18), got %d: %s", emptyRec.Code, emptyRec.Body.String())
+	}
+
 	applyBody, _ := json.Marshal(domain.ApplyResolutionRequest{
-		SuggestionStatus: domain.StatusApproved, ResolutionNotes: "",
+		SuggestionStatus: domain.StatusApproved, ResolutionNotes: "ok",
 	})
 	applyReq := httptest.NewRequest(http.MethodPost,
 		"/v1/reconciliations/"+job.ID+"/resolutions/"+itemID+"/apply", bytes.NewReader(applyBody))
@@ -77,7 +91,7 @@ func TestApplyResolution_EmptyHumanNote_PreservesMachineRationale(t *testing.T) 
 		t.Fatalf("expected APPROVED, got %s", applied.SuggestionStatus)
 	}
 	if !strings.Contains(applied.ResolutionNotes, "heuristic rule") {
-		t.Fatalf("REGRESSION: an empty-note approval erased the machine's rationale, got %q", applied.ResolutionNotes)
+		t.Fatalf("REGRESSION: a decision erased the machine's rationale, got %q", applied.ResolutionNotes)
 	}
 }
 

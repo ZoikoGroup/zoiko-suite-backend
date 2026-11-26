@@ -30,6 +30,8 @@ var migrations = []string{
 	"000007_match_attempts.up.sql",
 	"000008_source_journal_checks.up.sql",
 	"000009_command_idempotency.up.sql",
+	"000010_intercompany_line_match_rule.up.sql",
+	"000011_tolerance_policy_versions.up.sql",
 }
 
 // resetTables is every table the migrations create, children first.
@@ -37,6 +39,7 @@ var migrations = []string{
 // child table, so each is dropped by name.
 var resetTables = []string{
 	"command_idempotency",
+	"intercompany_tolerance_policy_versions",
 	"intercompany_match_attempts",
 	"intercompany_pair_transitions",
 	"intercompany_entries",

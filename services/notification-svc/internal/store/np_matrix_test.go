@@ -56,7 +56,7 @@ func skipNP(t *testing.T, name, why string) {
 
 func TestNP_Matrix(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := context.Background()
 
 	// ── NCD-01 intent, template and content ────────────────────────────────────────────
@@ -223,7 +223,7 @@ func TestNP_Matrix(t *testing.T) {
 	})
 
 	t.Run("NP-51 a rate limit never silently drops work and a backlog keeps its priority", func(t *testing.T) {
-		qs := store.New(pool).WithQuota(quota.Limits{TenantPerMinute: 1})
+		qs := store.New(pool, store.WithEventRegion("local")).WithQuota(quota.Limits{TenantPerMinute: 1})
 		require.NoError(t, send(qs, "np-51", "corr-np-51-a", "p1", "A1"))
 		err := send(qs, "np-51", "corr-np-51-b", "p2", "A1")
 		ex := exceeded(t, err)
@@ -233,7 +233,7 @@ func TestNP_Matrix(t *testing.T) {
 	})
 
 	t.Run("NP-53 a security alert is not starved by a routine blast", func(t *testing.T) {
-		qs := store.New(pool).WithQuota(quota.Limits{TenantPerMinute: 2, TenantS0PerMinute: 3})
+		qs := store.New(pool, store.WithEventRegion("local")).WithQuota(quota.Limits{TenantPerMinute: 2, TenantS0PerMinute: 3})
 		for i := 0; i < 2; i++ {
 			require.NoError(t, send(qs, "np-53", fmt.Sprintf("blast-%d", i), fmt.Sprintf("b%d", i), "A1"))
 		}

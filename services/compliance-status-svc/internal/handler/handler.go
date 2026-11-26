@@ -132,6 +132,12 @@ func (h *Handler) CreateComplianceStatus(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
+	// The actor is the authenticated principal: an absent created_by is
+	// filled from it, a different one is refused.
+	if req.CreatedByPrincipalID != principalID {
+		writeError(w, http.StatusForbidden, "created_by_principal_id must be the authenticated principal")
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionComplianceStatusCreate); err != nil {
 		h.writeAuthzErr(w, err)
 		return
@@ -216,6 +222,22 @@ func (h *Handler) ListComplianceStatuses(w http.ResponseWriter, r *http.Request)
 		StatusCode:    domain.ComplianceStatusCode(statusCode),
 		Limit:         limit,
 		Offset:        offset,
+	}
+
+	// A list used to be served to any caller in the tenant without an
+	// authorization decision. It needs COMPLIANCE_STATUS_READ on the entity,
+	// or on the tenant when it spans entities.
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	scope := legalEntityID
+	if scope == "" {
+		scope = middleware.GetTenantID(r.Context())
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, scope, actionComplianceStatusRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
 	}
 
 	records, err := h.store.ListComplianceStatuses(r.Context(), filter)

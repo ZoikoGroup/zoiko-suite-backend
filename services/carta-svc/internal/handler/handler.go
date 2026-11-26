@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
@@ -12,6 +13,8 @@ import (
 	authzpkg "zoiko.io/carta-svc/internal/authz"
 	"zoiko.io/carta-svc/internal/domain"
 	svcenvelope "zoiko.io/carta-svc/internal/envelope"
+	"zoiko.io/carta-svc/internal/health"
+	"zoiko.io/carta-svc/internal/idempotency"
 	"zoiko.io/carta-svc/internal/store"
 	apicontract "zoiko.io/identity-envelope/apicontract"
 )
@@ -57,7 +60,11 @@ func requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
 
 // Action constants passed to authorization-svc as action_type.
 const (
-	CartaAssessmentRead = "CARTA_ASSESSMENT_READ"
+	CartaAssessmentRead       = "CARTA_ASSESSMENT_READ"
+	CartaAssessmentReevaluate = "CARTA_ASSESSMENT_REEVALUATE"
+	// CartaEvaluate is checked on POST /v1/carta/evaluate whenever the caller
+	// presents a principal (see EvaluateAccess).
+	CartaEvaluate = "CARTA_EVALUATE"
 )
 
 // AuthzChecker is the authorization-svc contract this handler depends on.
@@ -69,10 +76,29 @@ type Handler struct {
 	store  store.Store
 	authz  AuthzChecker
 	logger *zap.Logger
+
+	// idem answers a retried material write from its first response. nil
+	// disables replay protection — unit tests only; cmd/server always sets
+	// the Postgres-backed store.
+	idem idempotency.Store
+	// db is what /readyz pings. nil reports not-ready.
+	db health.Pinger
 }
 
 func New(s store.Store, az AuthzChecker, l *zap.Logger) *Handler {
 	return &Handler{store: s, authz: az, logger: l}
+}
+
+// WithIdempotency installs Idempotency-Key replay for material writes.
+func (h *Handler) WithIdempotency(s idempotency.Store) *Handler {
+	h.idem = s
+	return h
+}
+
+// WithReadiness sets the dependency /readyz checks.
+func (h *Handler) WithReadiness(db health.Pinger) *Handler {
+	h.db = db
+	return h
 }
 
 // ── Why POST /v1/carta/evaluate has NO principal guard ──────────────────
@@ -158,18 +184,40 @@ func NewRouter(h *Handler) http.Handler {
 	// Refusals rendered as RFC 9457 problem+json, like every other error here.
 	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(envelopePolicy, svcenvelope.DefaultReporter()))
-	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "carta-svc"})
-	})
+	// Replay protection (INV-08). A write without an Idempotency-Key passes
+	// straight through — which is how gateway-auth-svc's /evaluate calls
+	// arrive — so this deduplicates retries without refusing anything the
+	// envelope policy admits.
+	if h.idem != nil {
+		r.Use(idempotency.Middleware(h.idem, h.logger))
+	}
+	// Probes are public: the envelope policy exempts them and the tenant
+	// check lives in the handlers below, not on the router.
+	r.Get("/healthz", health.HealthzHandler("carta-svc"))
+	r.Get("/readyz", health.ReadyzHandler(h.db))
 	r.Route("/v1/carta", func(r chi.Router) {
 		r.Post("/evaluate", h.EvaluateAccess)
 		r.Get("/assessments", h.ListAssessments)
 		r.Get("/assessments/{id}", h.GetAssessment)
+		r.Post("/assessments/{id}/reevaluate", h.ReevaluateAssessment)
 	})
 	return r
 }
 
+// EvaluateAccess scores one access request and records the decision.
+//
+// Principal handling (2026-11-04 hardening). A caller that presents
+// X-Principal-Id is a principal acting on this tenant: it is authorized
+// CARTA_EVALUATE on the body's legal_entity_id (403 on deny, 503 when
+// authorization-svc is unreachable) and recorded as evaluated_by. A caller
+// that presents none is still admitted, because gateway-auth-svc — the
+// route's production caller, on every gated request — sends X-Tenant-ID
+// only, and refusing it would make every material write on the platform 503
+// (gateway AU-23 fails closed when carta-svc does not answer). Closing that
+// path needs a service identity for gateway-auth-svc (mTLS or a workload
+// principal) and is a platform decision, not something this service can
+// impose alone; such assessments are stored with evaluated_by NULL, not a
+// guessed actor.
 func (h *Handler) EvaluateAccess(w http.ResponseWriter, r *http.Request) {
 	tenantID, ok := requireTenant(w, r)
 	if !ok {
@@ -184,12 +232,72 @@ func (h *Handler) EvaluateAccess(w http.ResponseWriter, r *http.Request) {
 		h.errJSON(w, r, 400, err.Error())
 		return
 	}
+	// The route is envelope-exempt, so the middleware installed no envelope.
+	// Install the header one here so the authorization call (and its cache
+	// key) and the outbox event carry this request's tenant and correlation.
+	if _, present := svcenvelope.FromContext(r.Context()); !present {
+		r = r.WithContext(svcenvelope.WithEnvelope(r.Context(), svcenvelope.Parse(r)))
+	}
+	principalID := strings.TrimSpace(r.Header.Get("X-Principal-Id"))
+	if principalID != "" && !h.authorize(w, r, principalID, req.LegalEntityID, CartaEvaluate) {
+		return
+	}
 	asm := domain.EvaluateAccess(&req, tenantID)
+	asm.EvaluatedBy = principalID
 	if err := h.store.SaveAssessment(r.Context(), tenantID, asm); err != nil {
+		h.logger.Error("save assessment failed", zap.Error(err))
 		h.errJSON(w, r, 500, "failed to save assessment")
 		return
 	}
 	h.okJSON(w, r, 201, asm)
+}
+
+// ReevaluateAssessment scores an assessment's recorded access context again
+// with the current model and records the result as a new assessment. The
+// original is never changed: assessments are the evidence of a decision taken
+// at a point in time. The caller must be authorized on the assessment's own
+// legal entity.
+func (h *Handler) ReevaluateAssessment(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	prev, err := h.store.GetAssessmentByID(r.Context(), tenantID, chi.URLParam(r, "id"))
+	if errors.Is(err, store.ErrNotFound) {
+		h.errJSON(w, r, 404, "assessment not found")
+		return
+	}
+	if err != nil {
+		h.logger.Error("get assessment failed", zap.Error(err))
+		h.errJSON(w, r, http.StatusInternalServerError, "failed to read assessment")
+		return
+	}
+	if !h.authorize(w, r, principalID, prev.LegalEntityID, CartaAssessmentReevaluate) {
+		return
+	}
+	req := domain.EvaluateRequest{LegalEntityID: prev.LegalEntityID, Context: prev.Context}
+	if err := req.Validate(); err != nil {
+		h.errJSON(w, r, http.StatusUnprocessableEntity, "the recorded context can no longer be evaluated: "+err.Error())
+		return
+	}
+	asm := domain.EvaluateAccess(&req, tenantID)
+	if err := h.store.SaveAssessment(r.Context(), tenantID, asm); err != nil {
+		h.logger.Error("save assessment failed", zap.Error(err))
+		h.errJSON(w, r, 500, "failed to save assessment")
+		return
+	}
+	h.logger.Info("carta assessment re-evaluated",
+		zap.String("previous_assessment_id", prev.ID), zap.String("assessment_id", asm.ID),
+		zap.String("principal_id", principalID), zap.String("decision", string(asm.Decision)))
+	h.okJSON(w, r, 201, map[string]interface{}{
+		"assessment":             asm,
+		"previous_assessment_id": prev.ID,
+		"previous_decision":      prev.Decision,
+	})
 }
 
 func (h *Handler) GetAssessment(w http.ResponseWriter, r *http.Request) {
@@ -202,8 +310,13 @@ func (h *Handler) GetAssessment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	asm, err := h.store.GetAssessmentByID(r.Context(), tenantID, chi.URLParam(r, "id"))
-	if err != nil {
+	if errors.Is(err, store.ErrNotFound) {
 		h.errJSON(w, r, 404, "assessment not found")
+		return
+	}
+	if err != nil {
+		h.logger.Error("get assessment failed", zap.Error(err))
+		h.errJSON(w, r, http.StatusInternalServerError, "failed to read assessment")
 		return
 	}
 	// Authorized against the assessment row's own legal entity, never a
@@ -236,7 +349,12 @@ func (h *Handler) ListAssessments(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principalID, legalEntityID, CartaAssessmentRead) {
 		return
 	}
-	asms, _ := h.store.ListAssessments(r.Context(), tenantID, legalEntityID, r.URL.Query().Get("subject_id"))
+	asms, err := h.store.ListAssessments(r.Context(), tenantID, legalEntityID, r.URL.Query().Get("subject_id"))
+	if err != nil {
+		h.logger.Error("list assessments failed", zap.Error(err))
+		h.errJSON(w, r, http.StatusInternalServerError, "failed to list assessments")
+		return
+	}
 	if asms == nil {
 		asms = []domain.CartaAssessment{}
 	}

@@ -1,9 +1,11 @@
 package handler_test
 
 // ZS-SVC-B-001 first survey (SPEC_DEVIATIONS.md B1-B8): maker-checker on
-// ACC-07/08/09/10/17, command idempotency on the four aggregate creates, one
-// reversal per FX run, ACC-17's source-to-target reconciliation, one chart
-// read per command, and ACC-18's permission and rebuild corrections.
+// ACC-07/08/09/10, command idempotency on the four aggregate creates, one
+// reversal per FX run, and ACC-18's permission and rebuild corrections.
+// ACC-17's migration-batch maker-checker, source-to-target reconciliation and
+// one-chart-read-per-command coverage were retired along with its code —
+// see SPEC_DEVIATIONS.md A9.
 
 import (
 	"encoding/json"
@@ -59,7 +61,7 @@ func TestApproveAccrual_PreparerOrSubmitterCannotApprove(t *testing.T) {
 	}
 }
 
-func TestApprove_PreparerCannotApproveOwnItem_ACC08_09_10_17(t *testing.T) {
+func TestApprove_PreparerCannotApproveOwnItem_ACC08_09_10(t *testing.T) {
 	s := newStubStore()
 	cl := &stubClients{accountStatuses: map[string]string{"6100-Sales": "ACTIVE"}}
 	r := newRouter(s, &stubAuthZ{}, cl)
@@ -70,33 +72,16 @@ func TestApprove_PreparerCannotApproveOwnItem_ACC08_09_10_17(t *testing.T) {
 		Drivers: []domain.AllocationDriver{{RecipientAccountCode: "6100-Sales", WeightPercentage: 100}}}
 	s.fxRuns["run-1"] = &domain.FXRevaluationRun{CurrencyCode: testCurrency, RunID: "run-1", LegalEntityID: "le-1",
 		Status: domain.FXRevaluationStatusReview, CreatedByPrincipalID: "preparer-1"}
-	s.migrationBatches["batch-1"] = &domain.MigrationBatch{BatchID: "batch-1", LegalEntityID: "le-1",
-		Status: domain.MigrationBatchStatusValidated, CreatedByPrincipalID: "preparer-1"}
 
 	for _, path := range []string{
 		"/v1/prepayments/ppy-1/approve",
 		"/v1/allocation-rules/rule-1/approve",
 		"/v1/fx-revaluations/run-1/approve",
-		"/v1/migration-batches/batch-1/approve",
 	} {
 		requireSelfApprovalRefused(t, doReq(r, http.MethodPost, path, nil, "preparer-1"), path)
 		if rr := doReq(r, http.MethodPost, path, nil, "approver-1"); rr.Code != http.StatusOK {
 			t.Fatalf("%s by an independent approver: want 200, got %d %s", path, rr.Code, rr.Body.String())
 		}
-	}
-}
-
-func TestCertifyMigration_PreparerCannotCertifyOwnCutover(t *testing.T) {
-	s := newStubStore()
-	r := newRouter(s, &stubAuthZ{}, &stubClients{})
-	s.migrationBatches["batch-1"] = &domain.MigrationBatch{BatchID: "batch-1", LegalEntityID: "le-1",
-		Status: domain.MigrationBatchStatusReconciled, CreatedByPrincipalID: "preparer-1"}
-
-	requireSelfApprovalRefused(t, doReq(r, http.MethodPost, "/v1/migration-batches/batch-1/certify",
-		domain.CertifyMigrationBatchRequest{Reason: "cutover signed"}, "preparer-1"), "self-certification")
-	if rr := doReq(r, http.MethodPost, "/v1/migration-batches/batch-1/certify",
-		domain.CertifyMigrationBatchRequest{Reason: "cutover signed"}, "certifier-1"); rr.Code != http.StatusOK {
-		t.Fatalf("independent certification: want 200, got %d %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -218,126 +203,6 @@ func TestReversePriorRevaluation_SecondCallReturnsTheExistingReversal(t *testing
 	mustDecode(t, second.Body.Bytes(), &b)
 	if a.RunID != b.RunID || len(s.fxRuns) != 2 {
 		t.Fatalf("want one reversal run; got %s then %s, %d runs in total", a.RunID, b.RunID, len(s.fxRuns))
-	}
-}
-
-// ── ACC-17 source-to-target reconciliation ───────────────────────────────────
-
-func approvedMigrationBatch(t *testing.T, s *stubStore, cl *stubClients, r chi.Router) string {
-	t.Helper()
-	batchID := createValidatedMigrationBatch(t, s, cl, r)
-	if rr := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/approve", nil, "approver-1"); rr.Code != http.StatusOK {
-		t.Fatalf("approve failed: %d %s", rr.Code, rr.Body.String())
-	}
-	return batchID
-}
-
-func TestCommitOpeningPosting_ReconcilesTheLedgerJournalAgainstTheCrosswalk(t *testing.T) {
-	s := newStubStore()
-	cl := &stubClients{}
-	r := newRouter(s, &stubAuthZ{}, cl)
-	batchID := approvedMigrationBatch(t, s, cl, r)
-
-	rr := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/commit", nil, "preparer-1")
-	if rr.Code != http.StatusOK {
-		t.Fatalf("commit: want 200, got %d %s", rr.Code, rr.Body.String())
-	}
-	if cl.getJournalCalls != 1 {
-		t.Fatalf("reconciliation must read the posted journal back from GL; read it %d times", cl.getJournalCalls)
-	}
-	if got := s.migrationBatches[batchID].Status; got != domain.MigrationBatchStatusReconciled {
-		t.Fatalf("matching journal: want RECONCILED, got %s", got)
-	}
-}
-
-func TestCommitOpeningPosting_LedgerDisagrees_QuarantinesAndCannotBeCertified(t *testing.T) {
-	s := newStubStore()
-	cl := &stubClients{}
-	r := newRouter(s, &stubAuthZ{}, cl)
-	batchID := approvedMigrationBatch(t, s, cl, r)
-
-	// The ledger holds a journal whose equity side was booked short: the
-	// kind of drift a status flag alone would have certified.
-	cl.postedJournal = &domain.PostedJournal{JournalID: "journal-fx-001", Status: domain.GLJournalStatusFinalized, LegalEntityID: "le-1", FiscalPeriod: "2026-01",
-		Lines: []domain.JournalLineInput{
-			{AccountCode: "1000-Cash", DebitAmount: 10000},
-			{AccountCode: "3000-OpeningEquity", CreditAmount: 9000},
-			{AccountCode: "9999-Plug", CreditAmount: 1000},
-		}}
-	rr := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/commit", nil, "preparer-1")
-	if rr.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("mismatched journal: want 422, got %d %s", rr.Code, rr.Body.String())
-	}
-	var body map[string]string
-	mustDecode(t, rr.Body.Bytes(), &body)
-	if body["error_code"] != "migration_reconciliation_failed" {
-		t.Fatalf("want migration_reconciliation_failed, got %v", body)
-	}
-	b := s.migrationBatches[batchID]
-	if b.Status != domain.MigrationBatchStatusQuarantined || b.QuarantineReason == nil {
-		t.Fatalf("want QUARANTINED with a reason, got %s / %v", b.Status, b.QuarantineReason)
-	}
-	if rr := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/certify",
-		domain.CertifyMigrationBatchRequest{Reason: "signed"}, "certifier-1"); rr.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("certifying an unreconciled batch: want 422, got %d %s", rr.Code, rr.Body.String())
-	}
-}
-
-func TestCommitOpeningPosting_ReadBackUnavailable_StaysPostedAndRetryReconcilesWithoutReposting(t *testing.T) {
-	s := newStubStore()
-	cl := &stubClients{getJournalErr: domain.ErrGLServiceUnavailable}
-	r := newRouter(s, &stubAuthZ{}, cl)
-	batchID := approvedMigrationBatch(t, s, cl, r)
-
-	rr := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/commit", nil, "preparer-1")
-	if rr.Code != http.StatusServiceUnavailable {
-		t.Fatalf("read-back failure: want 503, got %d %s", rr.Code, rr.Body.String())
-	}
-	if got := s.migrationBatches[batchID].Status; got != domain.MigrationBatchStatusPosted {
-		t.Fatalf("an unproven batch must stay POSTED, got %s", got)
-	}
-
-	cl.getJournalErr = nil
-	retry := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/commit", nil, "preparer-1")
-	if retry.Code != http.StatusOK || s.migrationBatches[batchID].Status != domain.MigrationBatchStatusReconciled {
-		t.Fatalf("retry: want 200 RECONCILED, got %d %s / %s", retry.Code, retry.Body.String(), s.migrationBatches[batchID].Status)
-	}
-	if cl.postMultiLineCalls != 1 {
-		t.Fatalf("the retry must reconcile, not post again: %d journal posts", cl.postMultiLineCalls)
-	}
-}
-
-// ── One chart read per command ───────────────────────────────────────────────
-
-func TestValidateOpeningBalances_ReadsTheChartOnceForTheWholeBatch(t *testing.T) {
-	s := newStubStore()
-	cl := &stubClients{}
-	r := newRouter(s, &stubAuthZ{}, cl)
-	createValidatedMigrationBatch(t, s, cl, r) // two entries, two accounts
-	if cl.chartCalls != 1 {
-		t.Fatalf("want one chart listing for the batch, got %d", cl.chartCalls)
-	}
-}
-
-func TestValidateOpeningBalances_ChartUnavailable_Returns503WithoutQuarantine(t *testing.T) {
-	s := newStubStore()
-	cl := &stubClients{}
-	r := newRouter(s, &stubAuthZ{}, cl)
-	req := domain.CreateMigrationBatchRequest{
-		CurrencyCode:  testCurrency,
-		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:abc",
-		ExpectedRowCount: 2, ExpectedTotalDebits: 10000, ExpectedTotalCredits: 10000, Entries: balancedMigrationEntries(),
-	}
-	rr := doReq(r, http.MethodPost, "/v1/migration-batches/", req, "preparer-1")
-	var batch domain.MigrationBatch
-	mustDecode(t, rr.Body.Bytes(), &batch)
-
-	cl.chartOfAccountsErr = domain.ErrGLServiceUnavailable
-	if rr := doReq(r, http.MethodPost, "/v1/migration-batches/"+batch.BatchID+"/validate", nil, "preparer-1"); rr.Code != http.StatusServiceUnavailable {
-		t.Fatalf("want 503, got %d %s", rr.Code, rr.Body.String())
-	}
-	if got := s.migrationBatches[batch.BatchID].Status; got != domain.MigrationBatchStatusLoaded {
-		t.Fatalf("an outage is not a validation failure: want LOADED, got %s", got)
 	}
 }
 

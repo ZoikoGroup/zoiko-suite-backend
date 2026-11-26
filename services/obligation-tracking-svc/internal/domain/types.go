@@ -29,6 +29,11 @@ var (
 	// authority reference. LEG-07 §9.1: "Waiver is distinct from
 	// satisfaction and requires documented authority."
 	ErrWaiverAuthorityRequired = errors.New("waiver_authority_reference is required")
+
+	// ErrSegregationOfDuties means the principal deciding a waive/validate
+	// step is the one who created the obligation. Maker-checker: the
+	// decision must come from a different principal.
+	ErrSegregationOfDuties = errors.New("the deciding principal may not be the obligation's creator")
 )
 
 // ObligationType is deliberately narrow: this service owns contract-derived

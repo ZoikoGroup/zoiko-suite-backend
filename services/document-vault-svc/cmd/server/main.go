@@ -28,6 +28,8 @@ import (
 	"zoiko.io/document-vault-svc/internal/scan"
 	"zoiko.io/document-vault-svc/internal/storage"
 	"zoiko.io/document-vault-svc/internal/store"
+	"zoiko.io/eventing/kafkaout"
+	eventingoutbox "zoiko.io/eventing/outbox"
 )
 
 func main() {
@@ -70,7 +72,13 @@ func main() {
 		log.Fatal("failed to initialise storage backend", zap.Error(err))
 	}
 
-	pgStore := store.New(pool, log)
+	// The eventing outbox table must exist before the first write tries to enqueue
+	// into it; fail here, at deploy time, not on a request.
+	if err := eventingoutbox.VerifySchema(pingCtx, pool); err != nil {
+		log.Fatal("eventing outbox schema missing", zap.Error(err))
+	}
+
+	pgStore := store.New(pool, log, store.WithEventRegion(cfg.EventResidencyRegion))
 	residencyValidator := residency.NewHTTPValidator(cfg.TenantRegistryURL, log)
 	authzClient := authz.NewHTTPClient(cfg.AuthZServiceURL, log)
 	var scanner scan.Scanner
@@ -112,6 +120,34 @@ func main() {
 	defer cancelRelay()
 	relay := outbox.NewRelay(pool, outboxPub, 500*time.Millisecond, 50, log)
 	go relay.Start(relayCtx)
+
+	// Second relay, for the BIZ-01/BIZ-02 events on the shared eventing outbox. The
+	// older relay above keeps delivering the events still written to outbox_events.
+	// With no brokers configured (local log-only run) the eventing relay is not
+	// started: its events stay queued in eventing_outbox, none are lost.
+	eventingRelayDone := make(chan struct{}, 1)
+	if len(cfg.Kafka.Brokers) == 0 {
+		log.Warn("no KAFKA_BROKERS configured: the eventing outbox relay is not running; BIZ-01/BIZ-02 events will queue in eventing_outbox")
+		eventingRelayDone <- struct{}{}
+	} else {
+		eventingWriter, err := kafkaout.New(kafkaout.Config{
+			Brokers:                cfg.Kafka.Brokers,
+			Topic:                  cfg.Kafka.Topic,
+			AllowAutoTopicCreation: cfg.Env == "local",
+		})
+		if err != nil {
+			log.Fatal("eventing outbox kafka writer", zap.Error(err))
+		}
+		defer func() { _ = eventingWriter.Close() }()
+		eventingRelay, err := eventingoutbox.NewRelay(pool, eventingWriter, eventingoutbox.DefaultConfig(), log)
+		if err != nil {
+			log.Fatal("eventing outbox relay", zap.Error(err))
+		}
+		go func() {
+			eventingRelay.Run(relayCtx)
+			eventingRelayDone <- struct{}{}
+		}()
+	}
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -168,5 +204,13 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed", zap.Error(err))
+	}
+	// Stop the relays after the server: requests finishing during Shutdown may still
+	// commit events. Anything not delivered stays in the outbox for the next process.
+	cancelRelay()
+	select {
+	case <-eventingRelayDone:
+	case <-shutdownCtx.Done():
+		log.Warn("eventing outbox relay did not stop before the shutdown deadline")
 	}
 }

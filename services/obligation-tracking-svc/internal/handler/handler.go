@@ -11,7 +11,6 @@ import (
 
 	"zoiko.io/obligation-tracking-svc/internal/authz"
 	"zoiko.io/obligation-tracking-svc/internal/domain"
-	"zoiko.io/obligation-tracking-svc/internal/events"
 	"zoiko.io/obligation-tracking-svc/internal/middleware"
 	"zoiko.io/obligation-tracking-svc/internal/store"
 )
@@ -36,14 +35,16 @@ type AuthZClient interface {
 }
 
 type Handler struct {
-	store     store.Store
-	publisher events.Publisher
-	authz     AuthZClient
-	logger    *zap.Logger
+	store  store.Store
+	authz  AuthZClient
+	logger *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthZClient, logger *zap.Logger) *Handler {
-	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+// Events are not published from here: every store write emits its event into
+// the transactional outbox in the same transaction, and the outbox relay
+// (cmd/server) delivers it.
+func New(st store.Store, az AuthZClient, logger *zap.Logger) *Handler {
+	return &Handler{store: st, authz: az, logger: logger}
 }
 
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -67,6 +68,8 @@ func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
 // by every command in this handler.
 func (h *Handler) writeLifecycleErr(w http.ResponseWriter, what string, err error) {
 	switch {
+	case errors.Is(err, domain.ErrSegregationOfDuties):
+		writeCoded(w, http.StatusForbidden, "segregation_of_duties", domain.ErrSegregationOfDuties.Error())
 	case errors.Is(err, domain.ErrTenantMissing):
 		writeError(w, http.StatusUnauthorized, "tenant scope missing")
 	case errors.Is(err, domain.ErrObligationNotFound):
@@ -126,6 +129,9 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !requireActor(w, principalID, req.CreatedBy) {
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionObligationCreate); err != nil {
 		h.writeAuthzErr(w, err)
 		return
@@ -145,18 +151,14 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 		ExtractedByAI:  req.ExtractedByAI,
 		EffectiveFrom:  req.EffectiveFrom,
 		EffectiveTo:    req.EffectiveTo,
-		CreatedBy:      req.CreatedBy,
+		CreatedBy:      principalID,
 	}
 
-	if err := h.store.CreateObligation(r.Context(), o); err != nil {
+	if err := h.store.CreateObligation(auditCtx(r, principalID), o); err != nil {
 		h.writeLifecycleErr(w, "failed to create obligation", err)
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "obligation.created", ObligationID: o.ObligationID, TenantID: tenantID,
-		LegalEntityID: o.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: o,
-	})
 	writeJSON(w, http.StatusCreated, o)
 }
 
@@ -195,7 +197,6 @@ func (h *Handler) ListObligations(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) UpdateObligation(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	existing, err := h.store.GetObligation(r.Context(), id)
 	if err != nil {
@@ -239,20 +240,19 @@ func (h *Handler) UpdateObligation(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !requireActor(w, principalID, req.UpdatedBy) {
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionObligationUpdate); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
 
-	if err := h.store.UpdateObligation(r.Context(), existing); err != nil {
+	if err := h.store.UpdateObligation(auditCtx(r, principalID), existing); err != nil {
 		h.writeLifecycleErr(w, "failed to update obligation", err)
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "obligation.updated", ObligationID: id, TenantID: tenantID,
-		LegalEntityID: existing.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: existing,
-	})
 	writeJSON(w, http.StatusOK, existing)
 }
 
@@ -261,7 +261,6 @@ func (h *Handler) UpdateObligation(w http.ResponseWriter, r *http.Request) {
 // gate.
 func (h *Handler) ValidateExtractedObligation(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	existing, err := h.store.GetObligation(r.Context(), id)
 	if err != nil {
@@ -276,16 +275,18 @@ func (h *Handler) ValidateExtractedObligation(w http.ResponseWriter, r *http.Req
 		h.writeAuthzErr(w, err)
 		return
 	}
+	// Segregation of duties: the deciding principal may not be the one who
+	// created the obligation (re-checked by the store on the locked row).
+	if existing.CreatedBy != "" && existing.CreatedBy == principalID {
+		writeCoded(w, http.StatusForbidden, "segregation_of_duties", domain.ErrSegregationOfDuties.Error())
+		return
+	}
 
-	o, err := h.store.ValidateExtractedObligation(r.Context(), id, principalID)
+	o, err := h.store.ValidateExtractedObligation(auditCtx(r, principalID), id, principalID)
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to validate obligation", err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "obligation.validated", ObligationID: id, TenantID: tenantID,
-		LegalEntityID: o.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: o,
-	})
 	writeJSON(w, http.StatusOK, o)
 }
 
@@ -293,7 +294,6 @@ func (h *Handler) ValidateExtractedObligation(w http.ResponseWriter, r *http.Req
 // (source clause, trigger, calculation method — LEG-07 §9.1).
 func (h *Handler) Schedule(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	var req domain.ScheduleObligationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -310,26 +310,24 @@ func (h *Handler) Schedule(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !requireActor(w, principalID, req.ScheduledBy) {
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionObligationSchedule); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
 
-	o, err := h.store.Schedule(r.Context(), id, &req)
+	o, err := h.store.Schedule(auditCtx(r, principalID), id, &req)
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to schedule obligation", err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "obligation.activated", ObligationID: id, TenantID: tenantID,
-		LegalEntityID: o.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: o,
-	})
 	writeJSON(w, http.StatusOK, o)
 }
 
 func (h *Handler) MarkDue(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	existing, err := h.store.GetObligation(r.Context(), id)
 	if err != nil {
@@ -345,21 +343,16 @@ func (h *Handler) MarkDue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	o, err := h.store.MarkDue(r.Context(), id, principalID)
+	o, err := h.store.MarkDue(auditCtx(r, principalID), id, principalID)
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to mark obligation due", err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "obligation.due", ObligationID: id, TenantID: tenantID,
-		LegalEntityID: o.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: o,
-	})
 	writeJSON(w, http.StatusOK, o)
 }
 
 func (h *Handler) MarkInProgress(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	existing, err := h.store.GetObligation(r.Context(), id)
 	if err != nil {
@@ -375,21 +368,16 @@ func (h *Handler) MarkInProgress(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	o, err := h.store.MarkInProgress(r.Context(), id, principalID)
+	o, err := h.store.MarkInProgress(auditCtx(r, principalID), id, principalID)
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to mark obligation in progress", err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "obligation.in_progress", ObligationID: id, TenantID: tenantID,
-		LegalEntityID: o.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: o,
-	})
 	writeJSON(w, http.StatusOK, o)
 }
 
 func (h *Handler) Complete(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	existing, err := h.store.GetObligation(r.Context(), id)
 	if err != nil {
@@ -405,15 +393,11 @@ func (h *Handler) Complete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	o, err := h.store.Complete(r.Context(), id, principalID)
+	o, err := h.store.Complete(auditCtx(r, principalID), id, principalID)
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to complete obligation", err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "obligation.satisfied", ObligationID: id, TenantID: tenantID,
-		LegalEntityID: o.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: o,
-	})
 	writeJSON(w, http.StatusOK, o)
 }
 
@@ -421,7 +405,6 @@ func (h *Handler) Complete(w http.ResponseWriter, r *http.Request) {
 // (LEG-07 §9.1).
 func (h *Handler) Waive(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	var req domain.WaiveObligationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -438,20 +421,25 @@ func (h *Handler) Waive(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !requireActor(w, principalID, req.WaivedBy) {
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionObligationWaive); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
+	// Segregation of duties: the deciding principal may not be the one who
+	// created the obligation (re-checked by the store on the locked row).
+	if existing.CreatedBy != "" && existing.CreatedBy == principalID {
+		writeCoded(w, http.StatusForbidden, "segregation_of_duties", domain.ErrSegregationOfDuties.Error())
+		return
+	}
 
-	o, err := h.store.Waive(r.Context(), id, &req)
+	o, err := h.store.Waive(auditCtx(r, principalID), id, &req)
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to waive obligation", err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "obligation.waived", ObligationID: id, TenantID: tenantID,
-		LegalEntityID: o.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: o,
-	})
 	writeJSON(w, http.StatusOK, o)
 }
 
@@ -459,7 +447,6 @@ func (h *Handler) Waive(w http.ResponseWriter, r *http.Request) {
 // financial accrual, payment or legal remedy.
 func (h *Handler) RecordBreach(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	var req domain.RecordBreachRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -476,26 +463,24 @@ func (h *Handler) RecordBreach(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !requireActor(w, principalID, req.BreachedBy) {
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionObligationBreach); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
 
-	o, err := h.store.RecordBreach(r.Context(), id, &req)
+	o, err := h.store.RecordBreach(auditCtx(r, principalID), id, &req)
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to record breach", err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "obligation.breached", ObligationID: id, TenantID: tenantID,
-		LegalEntityID: o.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: o,
-	})
 	writeJSON(w, http.StatusOK, o)
 }
 
 func (h *Handler) Dispute(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	var req domain.DisputeObligationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -512,26 +497,24 @@ func (h *Handler) Dispute(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !requireActor(w, principalID, req.DisputedBy) {
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionObligationDispute); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
 
-	o, err := h.store.Dispute(r.Context(), id, &req)
+	o, err := h.store.Dispute(auditCtx(r, principalID), id, &req)
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to dispute obligation", err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "obligation.disputed", ObligationID: id, TenantID: tenantID,
-		LegalEntityID: o.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: o,
-	})
 	writeJSON(w, http.StatusOK, o)
 }
 
 func (h *Handler) Supersede(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	var req domain.SupersedeObligationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -557,15 +540,11 @@ func (h *Handler) Supersede(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	o, err := h.store.Supersede(r.Context(), id, req.SupersededBy)
+	o, err := h.store.Supersede(auditCtx(r, principalID), id, req.SupersededBy)
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to supersede obligation", err)
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "obligation.superseded", ObligationID: id, TenantID: tenantID,
-		LegalEntityID: o.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: o,
-	})
 	writeJSON(w, http.StatusOK, o)
 }
 
@@ -577,4 +556,28 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// requireActor applies the platform actor rule to a request-body actor field
+// (created_by, updated_by, …): the actor of a write is the authenticated
+// X-Principal-Id. An absent body value is filled from the principal by the
+// caller; a present value naming someone else is refused 403 actor_mismatch
+// rather than silently recorded or silently overridden.
+func requireActor(w http.ResponseWriter, principalID, bodyActor string) bool {
+	if bodyActor != "" && bodyActor != principalID {
+		writeCoded(w, http.StatusForbidden, "actor_mismatch", "request body actor does not match the authenticated principal")
+		return false
+	}
+	return true
+}
+
+// auditCtx attaches the write attribution (principal + correlation id) that
+// the store stamps on the outbox event it writes in the same transaction.
+func auditCtx(r *http.Request, principalID string) context.Context {
+	return store.WithAudit(r.Context(), store.Audit{ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID")})
+}
+
+// writeCoded is writeError plus a stable machine-readable code.
+func writeCoded(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg, "code": code})
 }

@@ -335,6 +335,7 @@ func main() {
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	r.Get("/healthz", health.Handler())
+	r.Get("/readyz", health.ReadyHandler(dbpool))
 	handler.RegisterRoutes(r, h)
 	handler.RegisterRegistryRoutes(r, rh)
 	handler.RegisterConnectionRoutes(r, ch)

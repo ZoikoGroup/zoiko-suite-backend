@@ -144,7 +144,7 @@ func TestAnalyze_SourceFailures_RefusedNoJob(t *testing.T) {
 			if rec.Code != tc.want {
 				t.Fatalf("expected %d, got %d: %s", tc.want, rec.Code, rec.Body.String())
 			}
-			if jobs, _ := memStore.ListJobs(t.Context(), "tenant-test", "le-1", "", ""); len(jobs) != 0 {
+			if jobs, _ := memStore.ListJobs(t.Context(), "tenant-test", "le-1", "", "", 0, 0); len(jobs) != 0 {
 				t.Fatalf("a refused analysis created %d job(s)", len(jobs))
 			}
 		})

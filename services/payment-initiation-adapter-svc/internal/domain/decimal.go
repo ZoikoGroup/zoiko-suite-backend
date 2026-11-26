@@ -111,21 +111,34 @@ func (d *Decimal) Scan(src any) error {
 	return nil
 }
 
-const amountPlaces = 2
+// amountPlaces is NUMERIC(18,4)'s scale (migration 000009 widened it from
+// NUMERIC(18,2)): the column's own storage CEILING, applied uniformly to
+// every currency, same as treasury-svc's MoneyScale — not a per-currency
+// rule. No real ISO 4217 currency needs more than 4 decimal places. The
+// actual per-currency rule (JPY=0, USD/GBP=2, BHD=3, ...) is
+// ValidateCurrencyPrecision below, which needs the currency's real
+// minor-unit count from currency-registry-svc and so cannot live here.
+const amountPlaces = 4
 
 var (
-	// amountScale is NUMERIC(18,2)'s scale: amounts with more fractional
+	// amountScale is NUMERIC(18,4)'s scale: amounts with more fractional
 	// digits would be silently rounded by Postgres on insert.
-	amountScale = big.NewRat(100, 1)
-	// amountLimit is NUMERIC(18,2)'s bound: 16 integer digits.
-	amountLimit = new(big.Rat).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(16), nil))
+	amountScale = new(big.Rat).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(amountPlaces)), nil))
+	// amountLimit is NUMERIC(18,4)'s bound: 14 integer digits.
+	amountLimit = new(big.Rat).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(18-int64(amountPlaces)), nil))
 )
 
 // ValidatePositiveAmount checks that d is a positive amount the
-// NUMERIC(18,2) amount column stores exactly, with no rounding and no
+// NUMERIC(18,4) amount column stores exactly, with no rounding and no
 // overflow. A value that would be rounded is refused rather than quietly
 // changed, so the stored amount, the amount sent to the provider and the
 // amount the caller authorized are one number (invariant 13).
+//
+// This is a column-capacity check only — it says nothing about whether a
+// SPECIFIC currency actually allows that many decimal places (a 3-decimal
+// amount fits this column for every currency, but is only valid for a
+// 3-decimal currency like BHD). Callers that know the currency must also
+// call ValidateCurrencyPrecision.
 func ValidatePositiveAmount(d Decimal) (*big.Rat, error) {
 	r, err := d.Rat()
 	if err != nil {
@@ -141,6 +154,78 @@ func ValidatePositiveAmount(d Decimal) (*big.Rat, error) {
 }
 
 // ColumnText renders a validated amount the way the amount column holds it
-// and amount::text reads it back ("10.50"), so a check made before the row
-// exists sees the same text the provider-bound path later hashes and sends.
+// and amount::text reads it back ("10.5000"), so a check made before the
+// row exists sees the same text the provider-bound path later hashes and
+// sends.
 func ColumnText(r *big.Rat) string { return r.FloatString(amountPlaces) }
+
+// ErrAmountExceedsCurrencyPrecision is returned when an amount's actual
+// decimal places exceed its currency's real ISO 4217 minor-unit count (e.g.
+// a JPY amount with any fractional part, or a USD amount with 3+ decimal
+// places). Distinct from ErrAmountPrecision above, which only guards this
+// column's own storage ceiling (4), identical for every currency.
+var ErrAmountExceedsCurrencyPrecision = sentinel("amount has more decimal places than this currency's minor-unit precision allows")
+
+// terminatingScale returns the number of fractional digits needed to write
+// denom's reciprocal as a terminating decimal, and whether it terminates.
+// Decimal inputs reduce to 2^a * 5^b, so this is exact for every value
+// ParseAmount admits and for sums/products of such values.
+func terminatingScale(denom *big.Int) (int, bool) {
+	n := new(big.Int).Set(denom)
+	twos, fives := 0, 0
+	two := big.NewInt(2)
+	five := big.NewInt(5)
+	mod := new(big.Int)
+	div := new(big.Int)
+	for n.Cmp(big.NewInt(1)) > 0 {
+		div.QuoRem(n, two, mod)
+		if mod.Sign() == 0 {
+			n.Set(div)
+			twos++
+			continue
+		}
+		div.QuoRem(n, five, mod)
+		if mod.Sign() == 0 {
+			n.Set(div)
+			fives++
+			continue
+		}
+		break
+	}
+	if n.Cmp(big.NewInt(1)) != 0 {
+		return 0, false
+	}
+	if twos > fives {
+		return twos, true
+	}
+	return fives, true
+}
+
+// DecimalPlaces returns the minimal number of fractional digits needed to
+// render r exactly as a terminating decimal (0 for an integer). It is the
+// actual precision the caller used, not the column's capacity — "7.50" is
+// 2 places by column scale but only needs 1 to be written exactly.
+func DecimalPlaces(r *big.Rat) int {
+	if r.IsInt() {
+		return 0
+	}
+	scale, exact := terminatingScale(r.Denom())
+	if !exact {
+		// ParseAmount/jsonNumberRe refuse non-terminating fractions, so this
+		// is unreachable for any value this package itself parsed.
+		return amountPlaces
+	}
+	return scale
+}
+
+// ValidateCurrencyPrecision refuses r if it uses more decimal places than
+// minorUnit allows for its real currency (e.g. minorUnit=0 for JPY, 2 for
+// USD/GBP, 3 for BHD). r is assumed already validated by
+// ValidatePositiveAmount — this only adds the currency-specific precision
+// rule on top.
+func ValidateCurrencyPrecision(r *big.Rat, minorUnit int) error {
+	if DecimalPlaces(r) > minorUnit {
+		return ErrAmountExceedsCurrencyPrecision
+	}
+	return nil
+}

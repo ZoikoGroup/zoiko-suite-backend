@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/corporate-actions-svc/internal/boardresolutions"
 	"zoiko.io/corporate-actions-svc/internal/domain"
 	"zoiko.io/corporate-actions-svc/internal/events"
 	"zoiko.io/corporate-actions-svc/internal/evidencereq"
@@ -95,9 +96,23 @@ func (s *stubEvidenceReq) EvaluateSufficient(_ context.Context, _, _, _, _, _, _
 	return s.err
 }
 
+// stubResolutions records the resolution lookups it was asked to make and
+// answers with err (nil = a PASSED resolution of the same legal entity).
+type stubResolutions struct {
+	err    error
+	called []string
+	caller boardresolutions.Caller
+}
+
+func (s *stubResolutions) VerifyPassedResolution(_ context.Context, caller boardresolutions.Caller, resolutionID, _ string) error {
+	s.called = append(s.called, resolutionID)
+	s.caller = caller
+	return s.err
+}
+
 func newTestHandler() *Handler {
 	logger, _ := zap.NewDevelopment()
-	return New(newStubStore(), &stubPublisher{}, &stubAuthzClient{}, &stubEvidenceReq{}, logger)
+	return New(newStubStore(), &stubPublisher{}, &stubAuthzClient{}, &stubEvidenceReq{}, &stubResolutions{}, logger)
 }
 
 func buildRequest(method, path string, body interface{}) *http.Request {
@@ -239,7 +254,7 @@ func TestExecuteAction(t *testing.T) {
 
 func TestExecuteAction_EvidenceMissing_Returns422(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
-	h := New(newStubStore(), &stubPublisher{}, &stubAuthzClient{}, &stubEvidenceReq{err: evidencereq.ErrEvidenceMissing}, logger)
+	h := New(newStubStore(), &stubPublisher{}, &stubAuthzClient{}, &stubEvidenceReq{err: evidencereq.ErrEvidenceMissing}, &stubResolutions{}, logger)
 	r := chi.NewRouter()
 	RegisterRoutes(r, h)
 
@@ -267,7 +282,7 @@ func TestExecuteAction_EvidenceMissing_Returns422(t *testing.T) {
 
 func TestExecuteAction_EvidenceServiceUnavailable_Returns503(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
-	h := New(newStubStore(), &stubPublisher{}, &stubAuthzClient{}, &stubEvidenceReq{err: evidencereq.ErrServiceUnavailable}, logger)
+	h := New(newStubStore(), &stubPublisher{}, &stubAuthzClient{}, &stubEvidenceReq{err: evidencereq.ErrServiceUnavailable}, &stubResolutions{}, logger)
 	r := chi.NewRouter()
 	RegisterRoutes(r, h)
 
@@ -359,5 +374,73 @@ func TestUpdateAction_StatusGuard(t *testing.T) {
 
 	if wUpd.Code != http.StatusConflict {
 		t.Fatalf("expected 409 Conflict for EXECUTED record update, got %d — %s", wUpd.Code, wUpd.Body.String())
+	}
+}
+
+// --- resolution_id verification (regression for "accepted a resolution_id that
+// does not exist in board-resolutions-svc", 2026-10-27 live e2e) ---------------
+
+func createWithResolution(t *testing.T, rv *stubResolutions) *httptest.ResponseRecorder {
+	t.Helper()
+	logger := zap.NewNop()
+	h := New(newStubStore(), &stubPublisher{}, &stubAuthzClient{}, &stubEvidenceReq{}, rv, logger)
+	body := domain.CreateCorporateActionRequest{
+		LegalEntityID: "le-001",
+		Title:         "Dividend declaration",
+		ActionType:    domain.ActionTypeMerger,
+		EffectiveDate: "2026-06-01",
+		ResolutionID:  "res-123",
+	}
+	w := httptest.NewRecorder()
+	h.CreateAction(w, buildRequest(http.MethodPost, "/v1/corporate-actions", body))
+	return w
+}
+
+func TestCreateAction_PassedResolutionIsAccepted(t *testing.T) {
+	rv := &stubResolutions{}
+	w := createWithResolution(t, rv)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for a verified PASSED resolution, got %d — %s", w.Code, w.Body.String())
+	}
+	if len(rv.called) != 1 || rv.called[0] != "res-123" {
+		t.Fatalf("expected one lookup of res-123, got %v", rv.called)
+	}
+	if rv.caller.PrincipalID != "principal-test-01" {
+		t.Errorf("lookup must carry the caller's principal, got %q", rv.caller.PrincipalID)
+	}
+}
+
+func TestCreateAction_UnverifiableResolutionIsRefused(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"resolution does not exist", boardresolutions.ErrResolutionNotFound, http.StatusUnprocessableEntity},
+		{"resolution of another legal entity", boardresolutions.ErrResolutionEntityMismatch, http.StatusUnprocessableEntity},
+		{"resolution not passed", boardresolutions.ErrResolutionNotPassed, http.StatusUnprocessableEntity},
+		{"board-resolutions-svc unreachable fails closed", boardresolutions.ErrServiceUnavailable, http.StatusServiceUnavailable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := createWithResolution(t, &stubResolutions{err: tc.err})
+			if w.Code != tc.want {
+				t.Fatalf("expected %d, got %d — %s", tc.want, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestCreateAction_WithoutResolutionDoesNotCallBoardResolutions(t *testing.T) {
+	rv := &stubResolutions{err: boardresolutions.ErrServiceUnavailable}
+	logger := zap.NewNop()
+	h := New(newStubStore(), &stubPublisher{}, &stubAuthzClient{}, &stubEvidenceReq{}, rv, logger)
+	body := domain.CreateCorporateActionRequest{
+		LegalEntityID: "le-001", Title: "No resolution", ActionType: domain.ActionTypeMerger, EffectiveDate: "2026-06-01",
+	}
+	w := httptest.NewRecorder()
+	h.CreateAction(w, buildRequest(http.MethodPost, "/v1/corporate-actions", body))
+	if w.Code != http.StatusCreated || len(rv.called) != 0 {
+		t.Fatalf("resolution_id is optional: expected 201 and no lookup, got %d and %v", w.Code, rv.called)
 	}
 }

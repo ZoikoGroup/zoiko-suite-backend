@@ -20,7 +20,7 @@ import (
 // the same (tenant_id, deduplication_key) succeeds idempotently and returns the existing record.
 func TestLedger_CreateMessageIntent_Idempotent(t *testing.T) {
 	pool, admin := openTestPools(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := context.Background()
 
 	tenantID := "tenant-" + uuid.NewString()
@@ -104,7 +104,7 @@ func TestLedger_CreateMessageIntent_Idempotent(t *testing.T) {
 // on the same deduplication key safely resolve to exactly one inserted record.
 func TestLedger_ConcurrentInsert_NoDuplicates(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := context.Background()
 
 	tenantID := "tenant-" + uuid.NewString()
@@ -174,7 +174,7 @@ func TestLedger_ConcurrentInsert_NoDuplicates(t *testing.T) {
 // Tenant B must never see Tenant A's intents, renders, attempts, or events.
 func TestLedger_RLS_TenantIsolation(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := context.Background()
 
 	tenantA := "tenant-alpha-" + uuid.NewString()
@@ -341,7 +341,7 @@ func TestLedger_RLS_TenantIsolation(t *testing.T) {
 // records form an unbroken, queryable audit trail.
 func TestLedger_Traceability_IntentToRenderToAttemptToEvent(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := context.Background()
 
 	tenantID := "tenant-" + uuid.NewString()
@@ -504,7 +504,7 @@ func TestLedger_TransactionRollback(t *testing.T) {
 // and their status/reason are correctly persisted.
 func TestLedger_KillSwitch_Persistence(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := context.Background()
 
 	tenantID := "tenant-" + uuid.NewString()
@@ -617,7 +617,7 @@ func TestLedger_Constraints_Validation(t *testing.T) {
 // TestLedger_Context_TenantMissing verifies that operations without tenant scope fail.
 func TestLedger_Context_TenantMissing(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := context.Background() // No tenant context installed
 
 	intent := &ledger.MessageIntent{

@@ -54,7 +54,7 @@ apply_migrations() {
     # migrate.py, so a fresh volume is "tracked" from its first boot.
     psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$db" -q -c         "CREATE TABLE IF NOT EXISTS schema_migrations (filename TEXT PRIMARY KEY, checksum TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now(), method TEXT NOT NULL);"
 
-    for f in $(LC_ALL=C ls "$path"/*.up.sql 2>/dev/null | LC_ALL=C sort); do
+    for f in $(LC_ALL=C ls "$path"/*.sql 2>/dev/null | grep -v ".down.sql$" | LC_ALL=C sort); do
         echo "    $db <- $(basename "$f")"
         psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$db" -f "$f"
         sum=$(tr -d '\r' < "$f" | sha256sum | cut -d' ' -f1)
@@ -162,6 +162,27 @@ tax_determination:tax-determination
 vat_gst:vat-gst
 corporate_tax:corporate-tax
 evidence_requirements:evidence-requirements
+anomaly_detection:anomaly-detection
+forecasting:forecasting
+compliance_risk_scoring:compliance-risk-scoring
+reconciliation_intelligence:reconciliation-intelligence
+reporting_orchestration:reporting-orchestration
+migration_integrity:migration-integrity
+siem_integration:siem-integration
+carta:carta
+key_management:key-management
+connectivity_api_bridge:connectivity-api-bridge
+banking_connector:banking-connector
+hris_connector:hris-connector
+tax_authority_interface:tax-authority-interface
+esignature_integration:esignature-integration
+external_data_feed:external-data-feed
+withholding_tax:withholding-tax
+filing_preparation:filing-preparation
+filing_tracker:filing-tracker
+compliance_status:compliance-status
+exception_escalation:exception-escalation
+mtls_management:mtls-management
 "
 
 echo "Creating databases..."

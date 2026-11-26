@@ -283,7 +283,41 @@ const obligationColumns = `
 	closed_at,
 	version,
 	obligation_definition_id,
-	definition_version`
+	definition_version,
+	lifecycle_model,
+	clock_class,
+	extracted_by_ai,
+	validated_at,
+	validated_by,
+	source_clause_id,
+	trigger_description,
+	calculation_method,
+	scheduled_at,
+	scheduled_by,
+	due_soon_marked_at,
+	due_marked_at,
+	due_marked_by,
+	in_progress_at,
+	in_progress_by,
+	fulfilled_at,
+	fulfilled_by,
+	fulfillment_evidence_ref,
+	waived_at,
+	waived_by,
+	waiver_authority_reference,
+	waiver_reason_code,
+	not_applicable_at,
+	not_applicable_by,
+	not_applicable_reason,
+	breached_at,
+	breached_by,
+	breach_note,
+	disputed_at,
+	disputed_by,
+	dispute_reason,
+	superseded_by_obligation_id,
+	effective_from,
+	effective_to`
 
 // scanObligation scans one row produced by an obligationColumns SELECT.
 func scanObligation(row pgx.Row) (*domain.Obligation, error) {
@@ -309,6 +343,40 @@ func scanObligation(row pgx.Row) (*domain.Obligation, error) {
 		&o.Version,
 		&o.ObligationDefinitionID,
 		&o.DefinitionVersion,
+		&o.LifecycleModel,
+		&o.ClockClass,
+		&o.ExtractedByAI,
+		&o.ValidatedAt,
+		&o.ValidatedBy,
+		&o.SourceClauseID,
+		&o.TriggerDescription,
+		&o.CalculationMethod,
+		&o.ScheduledAt,
+		&o.ScheduledBy,
+		&o.DueSoonMarkedAt,
+		&o.DueMarkedAt,
+		&o.DueMarkedBy,
+		&o.InProgressAt,
+		&o.InProgressBy,
+		&o.FulfilledAt,
+		&o.FulfilledBy,
+		&o.FulfillmentEvidenceRef,
+		&o.WaivedAt,
+		&o.WaivedBy,
+		&o.WaiverAuthorityReference,
+		&o.WaiverReasonCode,
+		&o.NotApplicableAt,
+		&o.NotApplicableBy,
+		&o.NotApplicableReason,
+		&o.BreachedAt,
+		&o.BreachedBy,
+		&o.BreachNote,
+		&o.DisputedAt,
+		&o.DisputedBy,
+		&o.DisputeReason,
+		&o.SupersededByObligationID,
+		&o.EffectiveFrom,
+		&o.EffectiveTo,
 	)
 	return o, err
 }
@@ -360,14 +428,35 @@ func (s *PgStore) CreateObligation(ctx context.Context, params domain.CreateObli
 	// tenant's legal entity, due date and source reference, as a 200. One
 	// tenant's compliance register answering with another's record, straight
 	// down the documented happy path.
+	// lifecycle_model/clock_class default via COALESCE against the column's
+	// own DEFAULT when the caller leaves them empty, so every existing
+	// caller (which never sets these two params) gets exactly the same row
+	// it got before this field existed — LEGACY / REGULATORY, as before.
+	// obligation_status's initial value depends on the lifecycle: LEGACY
+	// keeps the pre-existing literal 'OPEN'; EXTENDED starts at CANDIDATE
+	// when AI-extracted (LEG-07 §9.1: AI extraction cannot activate without
+	// validation) or PLANNED otherwise.
 	const query = `
 		INSERT INTO obligations (
 			obligation_id, tenant_id, legal_entity_id, jurisdiction_id, workflow_id, obligation_source_type,
 			obligation_source_id, obligation_code, obligation_type, due_date,
 			severity_level, responsible_function, source_reference, created_by_principal_id,
-			obligation_definition_id, definition_version
+			obligation_definition_id, definition_version,
+			lifecycle_model, clock_class, extracted_by_ai, source_clause_id,
+			trigger_description, calculation_method, effective_from, effective_to,
+			obligation_status
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+		VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+			COALESCE(NULLIF($17, ''), 'LEGACY'),
+			COALESCE(NULLIF($18, ''), 'REGULATORY'),
+			$19, NULLIF($20, ''), NULLIF($21, ''), NULLIF($22, ''), $23, $24,
+			CASE
+				WHEN COALESCE(NULLIF($17, ''), 'LEGACY') <> 'EXTENDED' THEN 'OPEN'
+				WHEN $19 THEN 'CANDIDATE'
+				ELSE 'PLANNED'
+			END
+		)
 		ON CONFLICT (tenant_id, obligation_code)
 		DO NOTHING
 		RETURNING ` + obligationColumns + `;`
@@ -414,6 +503,8 @@ func (s *PgStore) CreateObligation(ctx context.Context, params domain.CreateObli
 			params.ObligationSourceID, params.ObligationCode, params.ObligationType, params.DueDate,
 			params.SeverityLevel, params.ResponsibleFunction, params.SourceReference, params.CreatedByPrincipalID,
 			definitionID, definitionVersion,
+			params.LifecycleModel, params.ClockClass, params.ExtractedByAI, params.SourceClauseID,
+			params.TriggerDescription, params.CalculationMethod, params.EffectiveFrom, params.EffectiveTo,
 		))
 		if scanErr == nil {
 			created = true
@@ -702,6 +793,245 @@ func (s *PgStore) UpdateObligationStatus(ctx context.Context, obligationID, newS
 	return updated, transitioned, nil
 }
 
+// extendedTransitions enumerates the WFC-05 (spec §7.2) obligation_status
+// state machine, used only when the obligation's lifecycle_model is
+// EXTENDED. Entirely separate from legalTransitions/UpdateObligationStatus
+// above, which remains the LEGACY machine, unchanged.
+//
+// FULFILLED, WAIVED, NOT_APPLICABLE and SUPERSEDED are terminal — none is a
+// key here, mirroring legalTransitions' treatment of CLOSED. BREACHED and
+// DISPUTED (carried over from obligation-tracking-svc, not named in spec
+// §7.2) are not terminal: a breach can still be disputed, and a dispute
+// resolved back into the live clock.
+var extendedTransitions = map[string][]string{
+	domain.ExtendedStatusCandidate: {domain.ExtendedStatusPlanned, domain.ExtendedStatusSuperseded},
+	domain.ExtendedStatusPlanned:   {domain.ExtendedStatusActive, domain.ExtendedStatusSuperseded, domain.ExtendedStatusNotApplicable},
+	domain.ExtendedStatusActive: {
+		domain.ExtendedStatusDueSoon, domain.ExtendedStatusDue, domain.ExtendedStatusOverdue,
+		domain.ExtendedStatusInProgress, domain.ExtendedStatusFulfilled, domain.ExtendedStatusWaived,
+		domain.ExtendedStatusNotApplicable, domain.ExtendedStatusSuperseded,
+	},
+	domain.ExtendedStatusDueSoon: {
+		domain.ExtendedStatusDue, domain.ExtendedStatusOverdue, domain.ExtendedStatusInProgress,
+		domain.ExtendedStatusFulfilled, domain.ExtendedStatusWaived, domain.ExtendedStatusNotApplicable,
+	},
+	domain.ExtendedStatusDue: {
+		domain.ExtendedStatusOverdue, domain.ExtendedStatusInProgress, domain.ExtendedStatusFulfilled,
+		domain.ExtendedStatusWaived, domain.ExtendedStatusNotApplicable,
+	},
+	domain.ExtendedStatusOverdue: {
+		domain.ExtendedStatusInProgress, domain.ExtendedStatusFulfilled, domain.ExtendedStatusWaived,
+		domain.ExtendedStatusBreached,
+	},
+	domain.ExtendedStatusInProgress: {
+		domain.ExtendedStatusFulfilled, domain.ExtendedStatusWaived, domain.ExtendedStatusBreached,
+		domain.ExtendedStatusDisputed,
+	},
+	domain.ExtendedStatusBreached: {domain.ExtendedStatusDisputed, domain.ExtendedStatusFulfilled, domain.ExtendedStatusWaived},
+	domain.ExtendedStatusDisputed: {domain.ExtendedStatusInProgress, domain.ExtendedStatusFulfilled, domain.ExtendedStatusWaived},
+}
+
+// ValidateExtractedObligation moves a CANDIDATE obligation (one created with
+// ExtractedByAI=true) to PLANNED, recording who validated it. LEG-07 §9.1:
+// "AI extraction cannot activate obligation without validation" — this is
+// the only path out of CANDIDATE for an AI-extracted obligation.
+func (s *PgStore) ValidateExtractedObligation(ctx context.Context, obligationID, validatedBy, correlationID string) (*domain.Obligation, error) {
+	var updated *domain.Obligation
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		const lockQuery = `SELECT ` + obligationColumns + ` FROM obligations WHERE obligation_id = $1 AND tenant_id = $2 FOR UPDATE;`
+		current, err := scanObligation(tx.QueryRow(ctx, lockQuery, obligationID, tenantID))
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) || errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
+				return domain.ErrObligationNotFound
+			}
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		if current.LifecycleModel != domain.LifecycleModelExtended {
+			return domain.ErrWrongLifecycleModel
+		}
+		if current.ObligationStatus != domain.ExtendedStatusCandidate {
+			return domain.ErrNotCandidate
+		}
+
+		const updateQuery = `
+			UPDATE obligations
+			SET obligation_status = '` + domain.ExtendedStatusPlanned + `',
+			    validated_at = NOW(),
+			    validated_by = $1,
+			    updated_at = NOW(),
+			    version = version + 1
+			WHERE obligation_id = $2 AND tenant_id = $3
+			RETURNING ` + obligationColumns + `;`
+		updated, err = scanObligation(tx.QueryRow(ctx, updateQuery, validatedBy, obligationID, tenantID))
+		if err != nil {
+			s.log.Error("pg ValidateExtractedObligation failed", zap.String("obligation_id", obligationID), zap.Error(err))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		return insertOutboxEventTx(ctx, tx, tenantID, "obligation.validated", correlationID,
+			updated.LegalEntityID, updated.JurisdictionID, validatedBy, map[string]any{
+				"obligation_id": updated.ObligationID,
+				"validated_by":  validatedBy,
+				"validated_at":  updated.ValidatedAt,
+			})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return updated, nil
+}
+
+// extendedTerminalEvents names the outbox event emitted for each terminal
+// (or otherwise notable) EXTENDED status, beyond the always-written
+// "obligation.updated". Deliberately a separate, finer-grained vocabulary
+// from the LEGACY machine's obligation.overdue/obligation.closed — nothing
+// consumes these yet (this is a new lifecycle, not a reinterpretation of an
+// existing one), so adding them is purely additive.
+var extendedTerminalEvents = map[string]string{
+	domain.ExtendedStatusDueSoon:       "obligation.due_soon",
+	domain.ExtendedStatusOverdue:       "obligation.overdue",
+	domain.ExtendedStatusFulfilled:     "obligation.fulfilled",
+	domain.ExtendedStatusWaived:        "obligation.waived",
+	domain.ExtendedStatusNotApplicable: "obligation.not_applicable",
+	domain.ExtendedStatusSuperseded:    "obligation.superseded",
+	domain.ExtendedStatusBreached:      "obligation.breached",
+	domain.ExtendedStatusDisputed:      "obligation.disputed",
+}
+
+// TransitionExtended moves an EXTENDED obligation through the WFC-05 state
+// machine. Idempotent (requesting the current status is a no-op), optimistic
+// locking via expectedVersion (0 skips the check), and fails closed on an
+// illegal transition or missing required evidence for the target status —
+// see domain.ExtendedTransitionEvidence's doc comment for which fields each
+// target status requires.
+func (s *PgStore) TransitionExtended(ctx context.Context, obligationID, newStatus string, expectedVersion int, actorID, correlationID string, evidence domain.ExtendedTransitionEvidence) (*domain.Obligation, bool, error) {
+	var updated *domain.Obligation
+	transitioned := false
+
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		const lockQuery = `SELECT ` + obligationColumns + ` FROM obligations WHERE obligation_id = $1 AND tenant_id = $2 FOR UPDATE;`
+		current, err := scanObligation(tx.QueryRow(ctx, lockQuery, obligationID, tenantID))
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) || errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
+				return domain.ErrObligationNotFound
+			}
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		if current.LifecycleModel != domain.LifecycleModelExtended {
+			return domain.ErrWrongLifecycleModel
+		}
+		if expectedVersion > 0 && current.Version != expectedVersion {
+			return domain.ErrVersionMismatch
+		}
+		if current.ObligationStatus == newStatus {
+			updated = current
+			return nil
+		}
+
+		legal := false
+		for _, candidate := range extendedTransitions[current.ObligationStatus] {
+			if candidate == newStatus {
+				legal = true
+				break
+			}
+		}
+		if !legal {
+			return domain.ErrInvalidTransition
+		}
+
+		// Per-target-status evidence requirements (spec §7.1/§9).
+		switch newStatus {
+		case domain.ExtendedStatusActive:
+			if evidence.TriggerDescription == "" || evidence.CalculationMethod == "" {
+				return domain.ErrAmbiguousDueDateBasis
+			}
+		case domain.ExtendedStatusWaived:
+			if evidence.WaiverAuthorityReference == "" || evidence.WaiverReasonCode == "" {
+				return domain.ErrWaiverEvidenceRequired
+			}
+		case domain.ExtendedStatusNotApplicable:
+			if evidence.NotApplicableReason == "" {
+				return domain.ErrNotApplicableEvidenceRequired
+			}
+		}
+
+		const updateQuery = `
+			UPDATE obligations
+			SET obligation_status = $1,
+			    updated_at = NOW(),
+			    version = version + 1,
+			    trigger_description   = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusActive + `' THEN $4 ELSE trigger_description END,
+			    calculation_method    = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusActive + `' THEN $5 ELSE calculation_method END,
+			    scheduled_at          = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusActive + `' THEN NOW() ELSE scheduled_at END,
+			    scheduled_by          = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusActive + `' THEN $3 ELSE scheduled_by END,
+			    due_soon_marked_at    = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusDueSoon + `' THEN NOW() ELSE due_soon_marked_at END,
+			    due_marked_at         = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusDue + `' THEN NOW() ELSE due_marked_at END,
+			    due_marked_by         = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusDue + `' THEN $3 ELSE due_marked_by END,
+			    in_progress_at        = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusInProgress + `' THEN NOW() ELSE in_progress_at END,
+			    in_progress_by        = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusInProgress + `' THEN $3 ELSE in_progress_by END,
+			    fulfilled_at          = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusFulfilled + `' THEN NOW() ELSE fulfilled_at END,
+			    fulfilled_by          = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusFulfilled + `' THEN $3 ELSE fulfilled_by END,
+			    fulfillment_evidence_ref = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusFulfilled + `' THEN NULLIF($6, '') ELSE fulfillment_evidence_ref END,
+			    waived_at                  = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusWaived + `' THEN NOW() ELSE waived_at END,
+			    waived_by                  = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusWaived + `' THEN $3 ELSE waived_by END,
+			    waiver_authority_reference = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusWaived + `' THEN NULLIF($7, '') ELSE waiver_authority_reference END,
+			    waiver_reason_code         = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusWaived + `' THEN NULLIF($8, '') ELSE waiver_reason_code END,
+			    not_applicable_at     = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusNotApplicable + `' THEN NOW() ELSE not_applicable_at END,
+			    not_applicable_by     = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusNotApplicable + `' THEN $3 ELSE not_applicable_by END,
+			    not_applicable_reason = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusNotApplicable + `' THEN NULLIF($9, '') ELSE not_applicable_reason END,
+			    breached_at  = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusBreached + `' THEN NOW() ELSE breached_at END,
+			    breached_by  = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusBreached + `' THEN $3 ELSE breached_by END,
+			    breach_note  = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusBreached + `' THEN NULLIF($10, '') ELSE breach_note END,
+			    disputed_at    = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusDisputed + `' THEN NOW() ELSE disputed_at END,
+			    disputed_by    = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusDisputed + `' THEN $3 ELSE disputed_by END,
+			    dispute_reason = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusDisputed + `' THEN NULLIF($11, '') ELSE dispute_reason END,
+			    superseded_by_obligation_id = CASE WHEN $1::VARCHAR = '` + domain.ExtendedStatusSuperseded + `' THEN NULLIF($12, '')::uuid ELSE superseded_by_obligation_id END
+			WHERE obligation_id = $2 AND tenant_id = $13
+			RETURNING ` + obligationColumns + `;`
+
+		updated, err = scanObligation(tx.QueryRow(ctx, updateQuery,
+			newStatus, obligationID, actorID,
+			evidence.TriggerDescription, evidence.CalculationMethod,
+			evidence.FulfillmentEvidenceRef,
+			evidence.WaiverAuthorityReference, evidence.WaiverReasonCode,
+			evidence.NotApplicableReason,
+			evidence.BreachNote,
+			evidence.DisputeReason,
+			evidence.SupersededByObligationID,
+			tenantID,
+		))
+		if err != nil {
+			s.log.Error("pg TransitionExtended failed",
+				zap.String("obligation_id", obligationID), zap.String("new_status", newStatus), zap.Error(err))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		transitioned = true
+
+		if err := insertOutboxEventTx(ctx, tx, tenantID, "obligation.updated", correlationID,
+			updated.LegalEntityID, updated.JurisdictionID, actorID, map[string]any{
+				"obligation_id":     updated.ObligationID,
+				"obligation_status": updated.ObligationStatus,
+				"previous_status":   current.ObligationStatus,
+				"version":           updated.Version,
+				"updated_at":        updated.UpdatedAt,
+			}); err != nil {
+			return err
+		}
+		if eventType, ok := extendedTerminalEvents[newStatus]; ok {
+			if err := insertOutboxEventTx(ctx, tx, tenantID, eventType, correlationID,
+				updated.LegalEntityID, updated.JurisdictionID, actorID, map[string]any{
+					"obligation_id": updated.ObligationID,
+				}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return updated, transitioned, nil
+}
+
 // UpdateObligationWorkflow links or unlinks an obligation to/from a workflow instance.
 // An empty workflowID unlinks the obligation. The obligation.updated event is
 // written to the outbox in the same transaction as the link change.
@@ -760,7 +1090,17 @@ const filingRequirementColumns = `
 	filing_status,
 	created_at,
 	updated_at,
-	row_version`
+	row_version,
+	jurisdiction_id,
+	period_key,
+	due_date,
+	submission_reference,
+	submitted_at,
+	submitted_by,
+	confirmation_reference,
+	confirmed_at,
+	rejection_reason,
+	notes`
 
 func scanFilingRequirement(row pgx.Row) (*domain.FilingRequirement, error) {
 	f := &domain.FilingRequirement{}
@@ -774,6 +1114,16 @@ func scanFilingRequirement(row pgx.Row) (*domain.FilingRequirement, error) {
 		&f.CreatedAt,
 		&f.UpdatedAt,
 		&f.RowVersion,
+		&f.JurisdictionID,
+		&f.PeriodKey,
+		&f.DueDate,
+		&f.SubmissionReference,
+		&f.SubmittedAt,
+		&f.SubmittedBy,
+		&f.ConfirmationReference,
+		&f.ConfirmedAt,
+		&f.RejectionReason,
+		&f.Notes,
 	)
 	return f, err
 }
@@ -799,8 +1149,8 @@ func (s *PgStore) CreateFilingRequirement(ctx context.Context, params domain.Cre
 	const query = `
 		INSERT INTO filing_requirements (
 			filing_requirement_id, tenant_id, obligation_id, filing_type, filing_authority,
-			submission_channel, filing_status
-		) VALUES ($1, $2, $3, $4, $5, $6, 'PENDING')
+			submission_channel, filing_status, jurisdiction_id, period_key, due_date
+		) VALUES ($1, $2, $3, $4, $5, $6, 'PENDING', NULLIF($7, '')::UUID, NULLIF($8, ''), $9)
 		ON CONFLICT (tenant_id, obligation_id, filing_type, filing_authority, submission_channel)
 		DO NOTHING
 		RETURNING ` + filingRequirementColumns + `;`
@@ -817,6 +1167,7 @@ func (s *PgStore) CreateFilingRequirement(ctx context.Context, params domain.Cre
 		f, scanErr = scanFilingRequirement(tx.QueryRow(ctx, query,
 			params.FilingRequirementID, tenantID, params.ObligationID, params.FilingType,
 			params.FilingAuthority, params.SubmissionChannel,
+			params.JurisdictionID, params.PeriodKey, params.DueDate,
 		))
 		if scanErr == nil {
 			return nil

@@ -35,7 +35,7 @@ import (
 // USING-only, with no WITH CHECK and no FORCE.
 
 func TestMissingTenantHeader_Refused(t *testing.T) {
-	router := newRouter(t)
+	router := newRouterNoDB(t)
 
 	for _, tc := range []struct {
 		name, method, path string
@@ -78,7 +78,7 @@ func TestMissingTenantHeader_Refused(t *testing.T) {
 // rather than in production. Note it must assert on a request with NO
 // tenant header: with one, it would pass either way and prove nothing.
 func TestHealthzDoesNotRequireTenant(t *testing.T) {
-	router := newRouter(t)
+	router := newRouterNoDB(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	// Deliberately NO X-Tenant-ID — exactly how a probe arrives.

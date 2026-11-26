@@ -81,11 +81,21 @@ type InvoiceLineKind string
 const (
 	LineRecurring InvoiceLineKind = "RECURRING"
 	LineUsage     InvoiceLineKind = "USAGE"
+	// LineOneTime is one ONE_TIME component's flat charge. Rated at most
+	// once ever per (price_version_id, component_key) on one subscription
+	// (see billedOneTime on RateInvoiceBasis).
+	LineOneTime InvoiceLineKind = "ONE_TIME"
+	// LineDiscount is a negative-amount line reducing the invoice's
+	// subtotal, rated only against an APPROVED DiscountApplication (see
+	// approvedDiscounts on RateInvoiceBasis). DiscountApplicationID carries
+	// which application authorized it (COM-CTRL-019 lineage).
+	LineDiscount InvoiceLineKind = "DISCOUNT"
 )
 
 // InvoiceLine is one rated line, carrying the evidence it was rated from
 // (COM-CTRL-019). StatementTotalQuantityAtGenerate is only set for a USAGE
 // line and is the usage basis IssueInvoice re-checks for drift.
+// DiscountApplicationID is only set for a DISCOUNT line.
 type InvoiceLine struct {
 	LineNo                           int             `json:"line_no"`
 	Kind                             InvoiceLineKind `json:"kind"`
@@ -98,6 +108,7 @@ type InvoiceLine struct {
 	Quantity                         *string         `json:"quantity,omitempty"`
 	UnitAmount                       *string         `json:"unit_amount,omitempty"`
 	Amount                           string          `json:"amount"`
+	DiscountApplicationID            *string         `json:"discount_application_id,omitempty"`
 }
 
 // ── Invoice candidate ────────────────────────────────────────────────────────
@@ -199,14 +210,65 @@ type UsageBasis struct {
 	TotalQuantity string
 }
 
-// RateInvoiceBasis computes one line per RECURRING_FIXED/PER_UNIT/METERED
-// component of every item's bound price version. A METERED component with no
-// entry in usage is refused (ErrUsageBasisNotCertified): this service never
-// bills from an uncertified or absent usage window. ONE_TIME and DISCOUNT
-// components are not rated here (out of scope for this part of COM-05).
-func RateInvoiceBasis(items []SubscriptionItem, pvs map[string]*PriceVersion, usage map[string]UsageBasis) ([]InvoiceLine, error) {
+// ApprovedDiscount is the frozen fact RateInvoiceBasis needs to rate one
+// DISCOUNT component: that a DiscountApplication for it reached APPROVED
+// (either by a second approver, or by catalogue policy for a component that
+// does not require approval — see ProposeDiscount/DecideDiscount, COM-02
+// part 2c), and the first term number it is eligible from (the term in which
+// it was approved, never recomputed on a later rating so a subscription with
+// no new approval never drifts). A DISCOUNT component with no entry here is
+// not applied: COM-CTRL-005 forbids applying an unapproved discount, and
+// "no application" is indistinguishable from "proposed but not yet decided"
+// — both must be refused, never silently skipped as if approved.
+type ApprovedDiscount struct {
+	DiscountApplicationID string
+	FirstEligibleTermNo   int
+}
+
+// LineComponentKey is the identity RateInvoiceBasis's billedOneTime and
+// approvedDiscounts maps are keyed by: one price component of one immutable
+// price version. Never just ComponentKey alone — a plan change that moves a
+// subscription to a new PriceVersionID binds a component the author of that
+// new version chose to define (or not), and COM-CTRL-002/-003's immutable
+// published-price-version doctrine treats it as a distinct fact from the
+// identically-named component on the old version.
+func LineComponentKey(priceVersionID, componentKey string) string {
+	return priceVersionID + "/" + componentKey
+}
+
+// RateInvoiceBasis computes one line per chargeable component of every
+// item's bound price version:
+//
+//   - RECURRING_FIXED/PER_UNIT/METERED as before.
+//   - ONE_TIME: billed exactly once ever for a given component on this
+//     subscription. billedOneTime (keyed by LineComponentKey) is this
+//     subscription's own already-issued-invoice history; a component already
+//     present there is skipped, never re-billed and never an error — a fee
+//     that already fired is not a basis failure, it is simply done.
+//   - DISCOUNT: rated as a single negative-amount line against the sum of
+//     every other rated line on this same invoice (§5 doctrine: discount
+//     policy versions are a rating input alongside price and quantity), only
+//     when approvedDiscounts (keyed by LineComponentKey) carries an approved
+//     application for it and the term being rated (termNo) still falls
+//     inside that application's duration_intervals counted from the term it
+//     was first approved in. Multiple independent discounts on one invoice
+//     each apply against that same pre-discount base, not against each
+//     other's result — order among them is therefore immaterial.
+//
+// A METERED component with no entry in usage is refused
+// (ErrUsageBasisNotCertified): this service never bills from an uncertified
+// or absent usage window.
+func RateInvoiceBasis(items []SubscriptionItem, pvs map[string]*PriceVersion, usage map[string]UsageBasis,
+	billedOneTime map[string]bool, approvedDiscounts map[string]ApprovedDiscount, termNo int) ([]InvoiceLine, error) {
 	var lines []InvoiceLine
 	lineNo := 1
+	base := new(big.Rat)
+	type discountCandidate struct {
+		pv *PriceVersion
+		c  PriceComponent
+	}
+	var discounts []discountCandidate
+
 	for _, it := range items {
 		pv, ok := pvs[it.PriceVersionID]
 		if !ok {
@@ -219,10 +281,12 @@ func RateInvoiceBasis(items []SubscriptionItem, pvs map[string]*PriceVersion, us
 		for _, c := range pv.Components {
 			switch c.ComponentType {
 			case ComponentRecurringFixed:
+				amt := dec(*c.Amount)
+				base.Add(base, amt)
 				lines = append(lines, InvoiceLine{
 					LineNo: lineNo, Kind: LineRecurring, Description: pv.DisplayName + " / " + c.ComponentKey,
 					PriceVersionID: pv.PriceVersionID, ComponentKey: c.ComponentKey,
-					Amount: EvidenceAmount(dec(*c.Amount)),
+					Amount: EvidenceAmount(amt),
 				})
 				lineNo++
 			case ComponentPerUnit:
@@ -232,6 +296,7 @@ func RateInvoiceBasis(items []SubscriptionItem, pvs map[string]*PriceVersion, us
 				}
 				billable := billableQuantity(dec(raw), c.IncludedQuantity)
 				amt, unit := rateComponent(billable, c)
+				base.Add(base, amt)
 				qCopy := raw
 				lines = append(lines, InvoiceLine{
 					LineNo: lineNo, Kind: LineRecurring, Description: pv.DisplayName + " / " + c.ComponentKey,
@@ -249,6 +314,7 @@ func RateInvoiceBasis(items []SubscriptionItem, pvs map[string]*PriceVersion, us
 				}
 				billable := billableQuantity(dec(ub.TotalQuantity), c.IncludedQuantity)
 				amt, unit := rateComponent(billable, c)
+				base.Add(base, amt)
 				qCopy, sidCopy := ub.TotalQuantity, ub.StatementID
 				lines = append(lines, InvoiceLine{
 					LineNo: lineNo, Kind: LineUsage, Description: pv.DisplayName + " / " + c.ComponentKey,
@@ -257,9 +323,68 @@ func RateInvoiceBasis(items []SubscriptionItem, pvs map[string]*PriceVersion, us
 					Quantity: &qCopy, UnitAmount: unit, Amount: EvidenceAmount(amt),
 				})
 				lineNo++
+			case ComponentOneTime:
+				if billedOneTime[LineComponentKey(pv.PriceVersionID, c.ComponentKey)] {
+					continue
+				}
+				amt := dec(*c.Amount)
+				base.Add(base, amt)
+				lines = append(lines, InvoiceLine{
+					LineNo: lineNo, Kind: LineOneTime, Description: pv.DisplayName + " / " + c.ComponentKey,
+					PriceVersionID: pv.PriceVersionID, ComponentKey: c.ComponentKey,
+					Amount: EvidenceAmount(amt),
+				})
+				lineNo++
+			case ComponentDiscount:
+				// Deferred to the second pass below: a discount is rated
+				// against the full base of every other line on this
+				// invoice, which is not known until every item has been
+				// walked.
+				discounts = append(discounts, discountCandidate{pv: pv, c: c})
 			}
 		}
 	}
+
+	for _, d := range discounts {
+		pv, c := d.pv, d.c
+		ad, ok := approvedDiscounts[LineComponentKey(pv.PriceVersionID, c.ComponentKey)]
+		if !ok {
+			continue
+		}
+		if termNo < ad.FirstEligibleTermNo {
+			continue
+		}
+		if termNo > ad.FirstEligibleTermNo+*c.DurationIntervals-1 {
+			continue
+		}
+		var amt *big.Rat
+		if *c.DiscountType == "PERCENT" {
+			amt = new(big.Rat).Mul(base, new(big.Rat).Quo(dec(*c.DiscountValue), big.NewRat(100, 1)))
+		} else {
+			amt = dec(*c.DiscountValue)
+		}
+		if c.DiscountCapAmount != nil {
+			if cap := dec(*c.DiscountCapAmount); amt.Cmp(cap) > 0 {
+				amt = cap
+			}
+		}
+		// A discount never makes the invoice's subtotal negative: it
+		// reduces what is owed, it does not itself become a credit.
+		if amt.Cmp(base) > 0 {
+			amt = base
+		}
+		if amt.Sign() <= 0 {
+			continue
+		}
+		applicationID := ad.DiscountApplicationID
+		lines = append(lines, InvoiceLine{
+			LineNo: lineNo, Kind: LineDiscount, Description: pv.DisplayName + " / " + c.ComponentKey + " (discount)",
+			PriceVersionID: pv.PriceVersionID, ComponentKey: c.ComponentKey,
+			Amount: EvidenceAmount(new(big.Rat).Neg(amt)), DiscountApplicationID: &applicationID,
+		})
+		lineNo++
+	}
+
 	return lines, nil
 }
 

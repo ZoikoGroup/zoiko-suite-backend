@@ -271,7 +271,7 @@ func newWhEnv(t *testing.T, o ...whOpts) *whEnv {
 		opt = o[0]
 	}
 	e := &whEnv{
-		t: t, app: app, admin: admin, st: store.New(app),
+		t: t, app: app, admin: admin, st: store.New(app, store.WithEventRegion("local")),
 		keys:   &whKeys{known: map[string]bool{"kv/webhooks/erp": true, "kv/webhooks/erp-2": true}},
 		vault:  &whVault{keys: map[string][]byte{"kv/webhooks/erp": whKey1, "kv/webhooks/erp-2": whKey2}},
 		dns:    &whDNS{m: map[string][]string{whHost: {"93.184.216.34"}}},

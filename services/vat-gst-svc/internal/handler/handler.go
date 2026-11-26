@@ -12,7 +12,6 @@ import (
 
 	authzpkg "zoiko.io/vat-gst-svc/internal/authz"
 	"zoiko.io/vat-gst-svc/internal/domain"
-	"zoiko.io/vat-gst-svc/internal/events"
 	"zoiko.io/vat-gst-svc/internal/evidencereq"
 	"zoiko.io/vat-gst-svc/internal/middleware"
 	"zoiko.io/vat-gst-svc/internal/store"
@@ -25,7 +24,11 @@ const (
 	VATReturnCreate = "VAT_RETURN_CREATE"
 	VATReturnUpdate = "VAT_RETURN_UPDATE"
 	VATReturnFile   = "VAT_RETURN_FILE"
+	VATReturnRead   = "VAT_RETURN_READ"
 )
+
+// Stable error codes for refusals a client must be able to tell apart.
+const codeActorMismatch = "actor_mismatch"
 
 // AuthzChecker is the authorization-svc contract this handler depends on.
 // authz.Client satisfies it; tests can substitute a stub.
@@ -41,15 +44,17 @@ type EvidenceChecker interface {
 }
 
 type Handler struct {
-	store     store.Store
-	publisher events.Publisher
-	authz     AuthzChecker
-	evidence  EvidenceChecker
-	logger    *zap.Logger
+	store    store.Store
+	authz    AuthzChecker
+	evidence EvidenceChecker
+	logger   *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthzChecker, logger *zap.Logger) *Handler {
-	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+// New builds the handler. Domain events are not published from here: the
+// store writes them to the transactional outbox inside the business
+// transaction and internal/outbox.Relay delivers them.
+func New(st store.Store, az AuthzChecker, logger *zap.Logger) *Handler {
+	return &Handler{store: st, authz: az, logger: logger}
 }
 
 // WithEvidenceGate wires the evidence-requirements gate into return filing.
@@ -150,7 +155,7 @@ func (h *Handler) CreateVATReturn(w http.ResponseWriter, r *http.Request) {
 		CreatedBy:             principalID,
 	}
 
-	if err := h.store.CreateVATReturn(r.Context(), vret); err != nil {
+	if err := h.store.CreateVATReturn(r.Context(), vret, eventMeta(r, principalID)); err != nil {
 		if errors.Is(err, domain.ErrVATReturnConflict) {
 			writeError(w, http.StatusConflict, "vat return for this period already exists")
 			return
@@ -160,15 +165,23 @@ func (h *Handler) CreateVATReturn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "vat_return.created", ReturnID: vret.ReturnID, TenantID: tenantID,
-		LegalEntityID: vret.LegalEntityID, Jurisdiction: vret.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: vret,
-	})
 	writeJSON(w, http.StatusCreated, vret)
 }
 
+// authorizeRead authorizes a read in scope (the return's legal entity, the
+// list's legal_entity_id filter, or the tenant for a tenant-wide list). Reads
+// used to need nothing beyond X-Tenant-Id. Now: no principal is 401, a denied
+// principal is 403, an unreachable authorization-svc is 503.
+func (h *Handler) authorizeRead(w http.ResponseWriter, r *http.Request, scope string) bool {
+	_, ok := h.authorize(w, r, scope, VATReturnRead)
+	return ok
+}
+
 func (h *Handler) GetVATReturn(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("X-Principal-Id") == "" {
+		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		return
+	}
 	id := chi.URLParam(r, "id")
 	vret, err := h.store.GetVATReturn(r.Context(), id)
 	if err != nil {
@@ -180,11 +193,21 @@ func (h *Handler) GetVATReturn(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to get vat return")
 		return
 	}
+	if !h.authorizeRead(w, r, vret.LegalEntityID) {
+		return
+	}
 	writeJSON(w, http.StatusOK, vret)
 }
 
 func (h *Handler) ListVATReturns(w http.ResponseWriter, r *http.Request) {
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	scope := legalEntityID
+	if scope == "" {
+		scope = middleware.GetTenantID(r.Context())
+	}
+	if !h.authorizeRead(w, r, scope) {
+		return
+	}
 	jurisdictionID := r.URL.Query().Get("jurisdiction_id")
 	status := r.URL.Query().Get("status")
 	returns, err := h.store.ListVATReturns(r.Context(), legalEntityID, jurisdictionID, status)
@@ -201,7 +224,6 @@ func (h *Handler) ListVATReturns(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) UpdateVATReturn(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	existing, err := h.store.GetVATReturn(r.Context(), id)
 	if err != nil {
@@ -236,17 +258,20 @@ func (h *Handler) UpdateVATReturn(w http.ResponseWriter, r *http.Request) {
 	existing.OutputTaxAmount = req.OutputTaxAmount
 	existing.InputTaxAmount = req.InputTaxAmount
 
-	if err := h.store.UpdateVATReturn(r.Context(), existing); err != nil {
+	if err := h.store.UpdateVATReturn(r.Context(), existing, eventMeta(r, principalID)); err != nil {
+		switch {
+		case errors.Is(err, domain.ErrVATReturnNotFound):
+			writeError(w, http.StatusNotFound, "vat return not found")
+			return
+		case errors.Is(err, domain.ErrAlreadyFiled):
+			writeError(w, http.StatusConflict, "filed vat return cannot be updated")
+			return
+		}
 		h.logger.Error("failed to update vat return", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to update vat return")
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "vat_return.updated", ReturnID: id, TenantID: tenantID,
-		LegalEntityID: existing.LegalEntityID, Jurisdiction: existing.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: existing,
-	})
 	writeJSON(w, http.StatusOK, existing)
 }
 
@@ -257,10 +282,6 @@ func (h *Handler) FileVATReturn(w http.ResponseWriter, r *http.Request) {
 	var req domain.FileVATReturnRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if req.FiledBy == "" {
-		writeError(w, http.StatusBadRequest, "filed_by is required")
 		return
 	}
 
@@ -279,11 +300,16 @@ func (h *Handler) FileVATReturn(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// The filer is the authenticated principal. filed_by is still accepted
+	// for backward compatibility, but only when it names the caller.
+	if !actorMatches(w, req.FiledBy, principalID, "filed_by") {
+		return
+	}
 	if !h.checkEvidence(w, r, tenantID, existing.LegalEntityID, principalID) {
 		return
 	}
 
-	vret, err := h.store.FileVATReturn(r.Context(), id, req.FiledBy)
+	vret, err := h.store.FileVATReturn(r.Context(), id, principalID, eventMeta(r, principalID))
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrVATReturnNotFound):
@@ -296,11 +322,6 @@ func (h *Handler) FileVATReturn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "vat_return.filed", ReturnID: id, TenantID: tenantID,
-		LegalEntityID: vret.LegalEntityID, Jurisdiction: vret.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: vret,
-	})
 	writeJSON(w, http.StatusOK, vret)
 }
 
@@ -312,4 +333,27 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// eventMeta is what the outbox event of a write records about the request.
+func eventMeta(r *http.Request, principalID string) store.EventMeta {
+	return store.EventMeta{ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID")}
+}
+
+// writeCodedError is writeError plus a stable machine-readable code.
+func writeCodedError(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg, "code": code})
+}
+
+// actorMatches enforces the actor rule for a body field naming who acted: the
+// actor is the authenticated principal. An absent field is filled by the
+// caller from the principal; a present one that names someone else is refused
+// 403 actor_mismatch. It reports whether the request may proceed.
+func actorMatches(w http.ResponseWriter, claimed, principalID, field string) bool {
+	if claimed != "" && claimed != principalID {
+		writeCodedError(w, http.StatusForbidden, codeActorMismatch,
+			field+" must be the authenticated principal (X-Principal-Id)")
+		return false
+	}
+	return true
 }

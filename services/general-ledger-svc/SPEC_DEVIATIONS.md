@@ -20,36 +20,53 @@ B14.
 Overall: all nine named commands/queries now exist with real guards (cycles,
 optimistic version checks, append-only version history, half-open effective
 intervals) and tests. Lifecycle events (A5), maker-checker (A4), mandatory
-reason for material control-account/hierarchy changes, and an optional
-source_policy_ref (A8) are closed; what remains missing is structural: the
-account has no legal-entity/book dimension (A1), no Draft→Approved state (A3)
-outside the gated path, and evidence_refs is still optional everywhere.
+reason for material control-account/hierarchy changes, an optional
+source_policy_ref (A8), and the legal-entity/book dimension (A1, closed via
+B13's scope-versions design rather than re-keying the chart) are closed; what
+remains missing is structural: no Draft→Approved state (A3) outside the gated
+path, and evidence_refs is still optional everywhere.
 Those and the rest are A1–A15, recorded rather than guessed. The deliberate design
 decisions a reviewer may want to reverse are B1–B19.
 
 ## A. Not implemented / weaker than the spec
 
-- **A1. The account has no legal-entity/book dimension. — Scoped, not built
-  (2026-11-07).** The spec's purpose ("Maintain the versioned posting-account
+- **A1. The account has no legal-entity/book dimension. — Closed (B13,
+  migration `000026_account_scope_versions`, commit `7728f0c6`,
+  2026-10-26).** The spec's purpose ("Maintain the versioned posting-account
   master and hierarchy **for each legal entity and accounting book**"), its
   required inputs (`entity_id; book_id`) and §24's AccountMaster/AccountVersion
   ("entity, book, code…") all make the entity/book pair part of an account's
-  identity. This service keys accounts by `tenant_id + account_code` only; no
-  `entity_id`/`book_id` column exists anywhere in ACC-01, and nothing in
-  posting/eligibility evaluates an entity/book constraint. Consequence: two
-  entities in one tenant cannot hold different versions of the same account
-  code, and `GetAccountAsOf` answers for the tenant, not a book.
-  A written migration plan is at
-  `docs/ACC01_A1_entity_book_migration_plan.md` — not executed here, since
-  re-keying account identity is a multi-service decision, not a single-file
-  fix. Its headline finding: at least 8 other services' own schemas carry
-  `account_code` (financial-close-svc, consolidation-svc,
-  inventory-management-svc, asset-management-svc, financial-statements-svc,
-  financial-control-svc, project-accounting-svc, bank-reconciliation-svc),
-  but every one checked already carries `legal_entity_id` on the same rows —
-  so the plan's shape is additive (nullable entity/book columns here, a
-  relaxed uniqueness constraint, existing-caller behavior unchanged) rather
-  than a hard re-key of 8 services' databases.
+  identity. Answered without re-keying the chart: `account_scope_versions`
+  gives each account append-only, entity- and book-scoped versions of what can
+  legitimately differ by scope (name, hierarchy parent, ACTIVE/INACTIVE
+  status), most-specific-wins (book, then entity, then tenant) — see B13 for
+  the full shape, the `.../as-of` and `.../posting-eligibility` read surface,
+  and where scoped status is enforced (kernel posting engine, legacy journal
+  path). `ResolvePostingEligibility` already threads a caller's
+  `legal_entity_id` through to account resolution (`scopedAccountStatus`
+  overlay before eligibility is evaluated), so there is no second, unaddressed
+  gap on the ACC-02/ACC-04 side. What stays tenant-level, deliberately, per
+  B13: account type, control type, direct-posting restriction and book
+  applicability — a code still means the same *kind* of account everywhere in
+  a tenant, because every journal line, ledger entry and mapping in this
+  service, and every other service's unFK'd `account_code` column (see below),
+  keeps pointing at that one row. So A1's literal consequence ("two entities
+  cannot hold different versions of the same account code") no longer holds
+  for name/hierarchy/status; it still holds, by design, for the account's
+  type/classification.
+  A superseded migration plan had sketched a different, more literal answer
+  (nullable `entity_id`/`book_id` columns and a relaxed uniqueness constraint
+  letting two entities hold fully independent account rows, including
+  different account types) — see
+  `docs/ACC01_A1_entity_book_migration_plan.md`, now marked superseded in
+  favor of the scope-versions design actually shipped. That plan's one
+  reusable finding stands regardless of which design closed A1: at least 8
+  other services' own schemas carry `account_code` (financial-close-svc,
+  consolidation-svc, inventory-management-svc, asset-management-svc,
+  financial-statements-svc, financial-control-svc, project-accounting-svc,
+  bank-reconciliation-svc) as a plain column, not a cross-service foreign key,
+  so each of them independently decides whether and how to thread its own
+  `legal_entity_id` through to this service's scope-aware reads.
 - **A2. `normal_balance` is not implemented. — Closed (B11).** Every
   account response now carries a read-only `normal_balance`, derived from
   `account_type` by `AccountType.NormalBalance()`: ASSET and EXPENSE are

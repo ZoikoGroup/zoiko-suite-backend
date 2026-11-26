@@ -51,7 +51,7 @@ func TestAddComment_Classification_InvalidIs400_AndNeverReachesTheStore(t *testi
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("%q: want 400, got %d", bad, w.Code)
 		}
-		if st.calls != 0 || pub.calls != 0 {
+		if st.calls != 0 || pub.n() != 0 {
 			t.Fatalf("%q: an invalid classification must write nothing and publish nothing", bad)
 		}
 	}
@@ -69,8 +69,8 @@ func TestAddComment_Classification_StoreRefusalsMapToStatus(t *testing.T) {
 		st.addCommentErr = tc.err
 		r, pub := routerWith(st, &recordingAuthZ{})
 		w := do(r, http.MethodPost, "/v1/threads/comments", addBody("INTERNAL"), "p", nil)
-		if w.Code != tc.want || pub.calls != 0 {
-			t.Fatalf("%s: want %d and no event, got %d (%d events)", name, tc.want, w.Code, pub.calls)
+		if w.Code != tc.want || pub.n() != 0 {
+			t.Fatalf("%s: want %d and no event, got %d (%d events)", name, tc.want, w.Code, pub.n())
 		}
 	}
 }

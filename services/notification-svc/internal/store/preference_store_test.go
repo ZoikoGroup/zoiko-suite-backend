@@ -14,7 +14,7 @@ import (
 )
 
 func TestPreferences_SetReadReplaceAndVersion(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-pref")
 
 	_, err := s.GetPreferences(ctx, "alice")
@@ -42,7 +42,7 @@ func TestPreferences_SetReadReplaceAndVersion(t *testing.T) {
 }
 
 func TestPreferences_InvalidProfilesNeverReachTheDatabase(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	_, err := s.SetPreferences(tenantCtx("tenant-pref-bad"), domain.SetPreferencesParams{PrincipalID: "a", TimeZone: "Mars/Olympus", UpdatedBy: "a"})
 	assert.ErrorIs(t, err, domain.ErrPreferencesInvalid)
 }
@@ -67,7 +67,7 @@ func TestPreferences_DatabaseRefusesWhatTheServiceShouldHaveCaught(t *testing.T)
 }
 
 func TestPreferences_TenantIsolated(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	_, err := s.SetPreferences(tenantCtx("tenant-pref-a"), domain.SetPreferencesParams{PrincipalID: "alice", TimeZone: "UTC", UpdatedBy: "alice"})
 	require.NoError(t, err)
 	_, err = s.GetPreferences(tenantCtx("tenant-pref-b"), "alice")
@@ -75,7 +75,7 @@ func TestPreferences_TenantIsolated(t *testing.T) {
 }
 
 func TestScheduleRetry_ADeferralIsStoredAsTheNextAttemptTime(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-pref-defer")
 	n := seedNotification(t, s, "tenant-pref-defer", "corr-pref-defer")
 	until := time.Now().UTC().Add(7 * time.Hour).Truncate(time.Second)

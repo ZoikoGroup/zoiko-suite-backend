@@ -152,15 +152,17 @@ func (s *PgStore) GetBillingAccount(ctx context.Context, organizationID string) 
 // frozen usage-basis evidence IssueInvoice re-checks for drift);
 // invoice_lines, the immutable issued copy, does not.
 const candidateLineColumns = `line_no, kind, description, price_version_id, component_key, meter_key,
-	statement_id, statement_total_quantity_at_generate::text, quantity::text, unit_amount::text, amount::text`
+	statement_id, statement_total_quantity_at_generate::text, quantity::text, unit_amount::text, amount::text,
+	discount_application_id`
 
 const issuedLineColumns = `line_no, kind, description, price_version_id, component_key, meter_key,
-	statement_id, quantity::text, unit_amount::text, amount::text`
+	statement_id, quantity::text, unit_amount::text, amount::text, discount_application_id`
 
 func scanCandidateLine(row pgx.Row) (*domain.InvoiceLine, error) {
 	var l domain.InvoiceLine
 	if err := row.Scan(&l.LineNo, &l.Kind, &l.Description, &l.PriceVersionID, &l.ComponentKey, &l.MeterKey,
-		&l.StatementID, &l.StatementTotalQuantityAtGenerate, &l.Quantity, &l.UnitAmount, &l.Amount); err != nil {
+		&l.StatementID, &l.StatementTotalQuantityAtGenerate, &l.Quantity, &l.UnitAmount, &l.Amount,
+		&l.DiscountApplicationID); err != nil {
 		return nil, err
 	}
 	return &l, nil
@@ -169,7 +171,7 @@ func scanCandidateLine(row pgx.Row) (*domain.InvoiceLine, error) {
 func scanIssuedLine(row pgx.Row) (*domain.InvoiceLine, error) {
 	var l domain.InvoiceLine
 	if err := row.Scan(&l.LineNo, &l.Kind, &l.Description, &l.PriceVersionID, &l.ComponentKey, &l.MeterKey,
-		&l.StatementID, &l.Quantity, &l.UnitAmount, &l.Amount); err != nil {
+		&l.StatementID, &l.Quantity, &l.UnitAmount, &l.Amount, &l.DiscountApplicationID); err != nil {
 		return nil, err
 	}
 	return &l, nil
@@ -290,6 +292,65 @@ func loadUsageBasis(ctx context.Context, tx pgx.Tx, subscriptionID string, termN
 	return out, rows.Err()
 }
 
+// loadBilledOneTime answers, for every ONE_TIME component bound by the
+// subscription's items, whether it has already appeared on an issued
+// invoice for this subscription — the one immutable, authoritative record
+// of "has this already been billed" (no separate mutable flag to drift from
+// it). Keyed by domain.LineComponentKey.
+func loadBilledOneTime(ctx context.Context, tx pgx.Tx, subscriptionID string) (map[string]bool, error) {
+	out := map[string]bool{}
+	rows, err := tx.Query(ctx, `
+		SELECT il.price_version_id, il.component_key FROM invoice_lines il
+		JOIN platform_commercial_invoices i ON i.invoice_id = il.invoice_id
+		WHERE i.subscription_id = $1 AND il.kind = 'ONE_TIME'`, subscriptionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var priceVersionID, componentKey string
+		if err := rows.Scan(&priceVersionID, &componentKey); err != nil {
+			return nil, err
+		}
+		out[domain.LineComponentKey(priceVersionID, componentKey)] = true
+	}
+	return out, rows.Err()
+}
+
+// loadApprovedDiscounts answers, for every live subscription_discounts
+// application on this subscription that reached APPROVED (by a second
+// approver, or by catalogue policy — ProposeDiscount/DecideDiscount, COM-02
+// part 2c), the term it first became eligible from: the term already
+// underway (or the next one to start) at the moment it was approved. That
+// term number is fixed by the approval itself and never recomputed from a
+// later rating, so a discount's duration_intervals window does not drift if
+// this is rated late or re-rated. Keyed by domain.LineComponentKey.
+func loadApprovedDiscounts(ctx context.Context, tx pgx.Tx, subscriptionID string) (map[string]domain.ApprovedDiscount, error) {
+	out := map[string]domain.ApprovedDiscount{}
+	rows, err := tx.Query(ctx, `
+		SELECT d.discount_application_id, d.price_version_id, d.component_key,
+		       COALESCE((SELECT t.term_no FROM subscription_terms t
+		                  WHERE t.subscription_id = d.subscription_id AND t.starts_at <= d.approved_at
+		                  ORDER BY t.term_no DESC LIMIT 1), 1) AS first_eligible_term_no
+		FROM subscription_discounts d
+		WHERE d.subscription_id = $1 AND d.status = 'APPROVED'`, subscriptionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var applicationID, priceVersionID, componentKey string
+		var firstEligibleTermNo int
+		if err := rows.Scan(&applicationID, &priceVersionID, &componentKey, &firstEligibleTermNo); err != nil {
+			return nil, err
+		}
+		out[domain.LineComponentKey(priceVersionID, componentKey)] = domain.ApprovedDiscount{
+			DiscountApplicationID: applicationID, FirstEligibleTermNo: firstEligibleTermNo,
+		}
+	}
+	return out, rows.Err()
+}
+
 func (s *PgStore) GenerateInvoiceCandidate(ctx context.Context, req domain.GenerateInvoiceCandidateRequest, claim domain.IdempotencyClaim) (*domain.InvoiceCandidate, error) {
 	var out *domain.InvoiceCandidate
 	err := s.billingSellerTx(ctx, req.OrganizationID, func(tx pgx.Tx) error {
@@ -348,7 +409,15 @@ func (s *PgStore) GenerateInvoiceCandidate(ctx context.Context, req domain.Gener
 		if err != nil {
 			return err
 		}
-		lines, err := domain.RateInvoiceBasis(version.Items, agg.pvs, usage)
+		billedOneTime, err := loadBilledOneTime(ctx, tx, req.SubscriptionID)
+		if err != nil {
+			return err
+		}
+		approvedDiscounts, err := loadApprovedDiscounts(ctx, tx, req.SubscriptionID)
+		if err != nil {
+			return err
+		}
+		lines, err := domain.RateInvoiceBasis(version.Items, agg.pvs, usage, billedOneTime, approvedDiscounts, req.TermNo)
 		if err != nil {
 			return err
 		}
@@ -391,10 +460,11 @@ func (s *PgStore) GenerateInvoiceCandidate(ctx context.Context, req domain.Gener
 		for _, l := range lines {
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO invoice_candidate_lines (candidate_id, line_no, kind, description, price_version_id,
-					component_key, meter_key, statement_id, statement_total_quantity_at_generate, quantity, unit_amount, amount)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::numeric, $10::numeric, $11::numeric, $12::numeric)`,
+					component_key, meter_key, statement_id, statement_total_quantity_at_generate, quantity, unit_amount, amount,
+					discount_application_id)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::numeric, $10::numeric, $11::numeric, $12::numeric, $13)`,
 				id, l.LineNo, l.Kind, l.Description, l.PriceVersionID, l.ComponentKey, l.MeterKey, l.StatementID,
-				l.StatementTotalQuantityAtGenerate, l.Quantity, l.UnitAmount, l.Amount); err != nil {
+				l.StatementTotalQuantityAtGenerate, l.Quantity, l.UnitAmount, l.Amount, l.DiscountApplicationID); err != nil {
 				return err
 			}
 		}
@@ -530,9 +600,9 @@ func (s *PgStore) IssueInvoice(ctx context.Context, candidateID, actor string, n
 		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO invoice_lines (invoice_id, line_no, kind, description, price_version_id, component_key,
-				meter_key, statement_id, quantity, unit_amount, amount)
+				meter_key, statement_id, quantity, unit_amount, amount, discount_application_id)
 			SELECT $1, line_no, kind, description, price_version_id, component_key, meter_key, statement_id,
-				quantity, unit_amount, amount FROM invoice_candidate_lines WHERE candidate_id = $2`,
+				quantity, unit_amount, amount, discount_application_id FROM invoice_candidate_lines WHERE candidate_id = $2`,
 			invoiceID, candidateID); err != nil {
 			return err
 		}

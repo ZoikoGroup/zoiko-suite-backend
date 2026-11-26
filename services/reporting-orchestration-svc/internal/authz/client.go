@@ -84,6 +84,7 @@ func (c *Client) Authorize(ctx context.Context, tenantID, userID, action, resour
 }
 
 type authorizeRequest struct {
+	TenantID      string `json:"tenant_id"`
 	PrincipalID   string `json:"principal_id"`
 	LegalEntityID string `json:"legal_entity_id"`
 	ActionType    string `json:"action_type"`
@@ -94,17 +95,19 @@ type authorizeResponse struct {
 }
 
 // CheckAllowed asks authorization-svc whether principalID may perform
-// actionType within legalEntityID. It fails closed: any transport error,
+// actionType within legalEntityID in tenantID. The tenant is part of the
+// decision-cache key: without it a decision cached for one tenant would be
+// reused for a same-named principal and entity in another tenant. It fails closed: any transport error,
 // non-200 status, or undecodable body is treated as
 // ErrAuthzServiceUnavailable, never as an implicit grant.
-func (c *Client) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	key := principalID + "|" + legalEntityID + "|" + actionType
+func (c *Client) CheckAllowed(ctx context.Context, tenantID, principalID, legalEntityID, actionType string) error {
+	key := tenantID + "|" + principalID + "|" + legalEntityID + "|" + actionType
 
 	if decision, hit := c.lookupCache(key); hit {
 		return decision
 	}
 
-	err := c.checkAllowedLive(ctx, principalID, legalEntityID, actionType)
+	err := c.checkAllowedLive(ctx, tenantID, principalID, legalEntityID, actionType)
 
 	// Cache the decision itself (GRANTED or DENIED), never an unavailable
 	// outcome — see the doc comment on decisionCacheTTL.
@@ -154,8 +157,9 @@ func (c *Client) storeCache(key string, decision error) {
 }
 
 // checkAllowedLive is the real, uncached call to authorization-svc.
-func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType string) error {
+func (c *Client) checkAllowedLive(ctx context.Context, tenantID, principalID, legalEntityID, actionType string) error {
 	body, err := json.Marshal(authorizeRequest{
+		TenantID:      tenantID,
 		PrincipalID:   principalID,
 		LegalEntityID: legalEntityID,
 		ActionType:    actionType,
@@ -169,6 +173,8 @@ func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityI
 		return ErrAuthzServiceUnavailable
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

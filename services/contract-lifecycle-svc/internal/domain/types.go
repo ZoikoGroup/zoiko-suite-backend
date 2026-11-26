@@ -32,6 +32,11 @@ var (
 	// ErrTenantMissing means the request carried no X-Tenant-Id. It is an
 	// unauthenticated request, not an empty tenant named "default".
 	ErrTenantMissing = errors.New("tenant scope missing")
+
+	// ErrActorMismatch means a request body named an actor (created_by,
+	// amended_by, …) other than the authenticated principal. The actor of a
+	// write is always X-Principal-Id; a body value may only repeat it.
+	ErrActorMismatch = errors.New("request body actor does not match the authenticated principal")
 )
 
 // ContractType enumerates the kinds of legal agreements supported.
@@ -76,54 +81,57 @@ func (s ContractStatus) IsFinal() bool {
 type SignatureStatus string
 
 const (
-	SignatureStatusNotRequested  SignatureStatus = "NOT_REQUESTED"
-	SignatureStatusSent          SignatureStatus = "SENT"
+	SignatureStatusNotRequested    SignatureStatus = "NOT_REQUESTED"
+	SignatureStatusSent            SignatureStatus = "SENT"
 	SignatureStatusPartiallySigned SignatureStatus = "PARTIALLY_SIGNED"
-	SignatureStatusCompleted     SignatureStatus = "COMPLETED"
-	SignatureStatusDeclined      SignatureStatus = "DECLINED"
-	SignatureStatusExpired       SignatureStatus = "EXPIRED"
-	SignatureStatusPendingUnknown SignatureStatus = "PENDING_UNKNOWN"
-	SignatureStatusVoided        SignatureStatus = "VOIDED"
+	SignatureStatusCompleted       SignatureStatus = "COMPLETED"
+	SignatureStatusDeclined        SignatureStatus = "DECLINED"
+	SignatureStatusExpired         SignatureStatus = "EXPIRED"
+	SignatureStatusPendingUnknown  SignatureStatus = "PENDING_UNKNOWN"
+	SignatureStatusVoided          SignatureStatus = "VOIDED"
 )
 
 // Contract is the core domain entity representing a legal agreement.
 // All material records carry tenant_id, legal_entity_id, and effective dates.
 type Contract struct {
-	ContractID           string         `json:"contract_id"`
-	TenantID             string         `json:"tenant_id"`
-	LegalEntityID        string         `json:"legal_entity_id"`
-	ContractType         ContractType   `json:"contract_type"`
-	Title                string         `json:"title"`
-	Description          string         `json:"description,omitempty"`
-	CounterpartyID       string          `json:"counterparty_id"`
-	CounterpartyName     string          `json:"counterparty_name"`
-	Status               ContractStatus  `json:"status"`
-	SignatureStatus      SignatureStatus `json:"signature_status"`
-	Version              int             `json:"version"`
-	EffectiveFrom        string          `json:"effective_from"`
-	EffectiveTo          *string         `json:"effective_to,omitempty"`
-	SubmittedAt          *time.Time      `json:"submitted_at,omitempty"`
-	SubmittedBy          *string         `json:"submitted_by,omitempty"`
-	ApprovedAt           *time.Time      `json:"approved_at,omitempty"`
-	ApprovedBy           *string         `json:"approved_by,omitempty"`
-	SignatureSentAt      *time.Time      `json:"signature_sent_at,omitempty"`
-	ExecutedAt           *time.Time      `json:"executed_at,omitempty"`
-	SignedBy             *string         `json:"signed_by,omitempty"`
-	EffectiveAt          *time.Time      `json:"effective_at,omitempty"`
-	AmendedAt            *time.Time      `json:"amended_at,omitempty"`
-	AmendedBy            *string         `json:"amended_by,omitempty"`
-	RenewedAt            *time.Time      `json:"renewed_at,omitempty"`
-	RenewedBy            *string         `json:"renewed_by,omitempty"`
-	TerminatedAt         *time.Time      `json:"terminated_at,omitempty"`
-	TerminatedBy         *string         `json:"terminated_by,omitempty"`
-	TerminationNote      *string         `json:"termination_note,omitempty"`
-	Currency             string          `json:"currency"`
-	TotalValue           float64         `json:"total_value"`
-	DocumentVaultID      *string         `json:"document_vault_id,omitempty"`
-	GovernanceDecisionID *string         `json:"governance_decision_id,omitempty"`
-	CreatedBy            string          `json:"created_by"`
-	CreatedAt            time.Time       `json:"created_at"`
-	UpdatedAt            time.Time       `json:"updated_at"`
+	ContractID       string          `json:"contract_id"`
+	TenantID         string          `json:"tenant_id"`
+	LegalEntityID    string          `json:"legal_entity_id"`
+	ContractType     ContractType    `json:"contract_type"`
+	Title            string          `json:"title"`
+	Description      string          `json:"description,omitempty"`
+	CounterpartyID   string          `json:"counterparty_id"`
+	CounterpartyName string          `json:"counterparty_name"`
+	Status           ContractStatus  `json:"status"`
+	SignatureStatus  SignatureStatus `json:"signature_status"`
+	Version          int             `json:"version"`
+	EffectiveFrom    string          `json:"effective_from"`
+	EffectiveTo      *string         `json:"effective_to,omitempty"`
+	SubmittedAt      *time.Time      `json:"submitted_at,omitempty"`
+	SubmittedBy      *string         `json:"submitted_by,omitempty"`
+	ApprovedAt       *time.Time      `json:"approved_at,omitempty"`
+	ApprovedBy       *string         `json:"approved_by,omitempty"`
+	SignatureSentAt  *time.Time      `json:"signature_sent_at,omitempty"`
+	ExecutedAt       *time.Time      `json:"executed_at,omitempty"`
+	SignedBy         *string         `json:"signed_by,omitempty"`
+	// ExecutionRecordedBy is the authenticated principal that recorded the
+	// execution; SignedBy is the signatory named in the signing evidence.
+	ExecutionRecordedBy  *string    `json:"execution_recorded_by,omitempty"`
+	EffectiveAt          *time.Time `json:"effective_at,omitempty"`
+	AmendedAt            *time.Time `json:"amended_at,omitempty"`
+	AmendedBy            *string    `json:"amended_by,omitempty"`
+	RenewedAt            *time.Time `json:"renewed_at,omitempty"`
+	RenewedBy            *string    `json:"renewed_by,omitempty"`
+	TerminatedAt         *time.Time `json:"terminated_at,omitempty"`
+	TerminatedBy         *string    `json:"terminated_by,omitempty"`
+	TerminationNote      *string    `json:"termination_note,omitempty"`
+	Currency             string     `json:"currency"`
+	TotalValue           float64    `json:"total_value"`
+	DocumentVaultID      *string    `json:"document_vault_id,omitempty"`
+	GovernanceDecisionID *string    `json:"governance_decision_id,omitempty"`
+	CreatedBy            string     `json:"created_by"`
+	CreatedAt            time.Time  `json:"created_at"`
+	UpdatedAt            time.Time  `json:"updated_at"`
 }
 
 // ContractVersion is an immutable snapshot of a contract at a point in time.
@@ -206,9 +214,9 @@ type AmendContractRequest struct {
 }
 
 type RenewContractRequest struct {
-	RenewedBy     string `json:"renewed_by"`
+	RenewedBy      string `json:"renewed_by"`
 	NewEffectiveTo string `json:"new_effective_to"`
-	ChangeSummary string `json:"change_summary"`
+	ChangeSummary  string `json:"change_summary"`
 }
 
 type TerminateContractRequest struct {

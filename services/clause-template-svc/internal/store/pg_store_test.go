@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 
@@ -35,18 +36,21 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS clause_deviation_rules, clause_versions, contract_templates, clauses CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS clause_deviation_rules, clause_versions, contract_templates, clauses, outbox_events, idempotency_keys CASCADE;`)
 
-	for _, name := range []string{
-		"000001_initial_schema.up.sql",
-		"000002_approval_workflow_and_tenant_isolation.up.sql",
-	} {
-		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", name))
+	// Every forward migration, in order — the same set init-db.sh applies.
+	ups, err := filepath.Glob(filepath.Join(base, "../../deployments/migrations", "*.up.sql"))
+	if err != nil || len(ups) == 0 {
+		t.Fatalf("no migrations found: %v", err)
+	}
+	sort.Strings(ups)
+	for _, m := range ups {
+		sql, err := os.ReadFile(m)
 		if err != nil {
-			t.Fatalf("failed to read migration %s: %v", name, err)
+			t.Fatalf("failed to read migration %s: %v", m, err)
 		}
 		if _, err := pool.Exec(ctx, string(sql)); err != nil {
-			t.Fatalf("failed to apply migration %s: %v", name, err)
+			t.Fatalf("failed to apply migration %s: %v", filepath.Base(m), err)
 		}
 	}
 
@@ -66,8 +70,10 @@ func requireThrowawayDatabase(t *testing.T, dsn string) {
 	}
 }
 
+// tenantCtx is a request context: tenant plus the write attribution every
+// store write needs for its outbox event.
 func tenantCtx(tenantID string) context.Context {
-	return middleware.WithTenant(context.Background(), tenantID)
+	return store.WithAudit(middleware.WithTenant(context.Background(), tenantID), store.Audit{ActorID: "test-actor", CorrelationID: "corr-test"})
 }
 
 func newClause(legalEntityID, createdBy string) *domain.Clause {

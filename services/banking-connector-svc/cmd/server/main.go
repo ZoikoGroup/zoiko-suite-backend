@@ -17,9 +17,11 @@ import (
 	"zoiko.io/banking-connector-svc/internal/authz"
 	"zoiko.io/banking-connector-svc/internal/clients"
 	"zoiko.io/banking-connector-svc/internal/config"
+	"zoiko.io/banking-connector-svc/internal/documentvault"
 	svcenvelope "zoiko.io/banking-connector-svc/internal/envelope"
 	"zoiko.io/banking-connector-svc/internal/handler"
 	"zoiko.io/banking-connector-svc/internal/health"
+	"zoiko.io/banking-connector-svc/internal/idempotency"
 	"zoiko.io/banking-connector-svc/internal/middleware"
 	"zoiko.io/banking-connector-svc/internal/mtls"
 	"zoiko.io/banking-connector-svc/internal/store"
@@ -142,26 +144,48 @@ func main() {
 	// validation). pgStore already satisfies store.BNK02Store.
 	bankAcctClient := clients.NewBankAccountHTTPClient(cfg.TreasuryServiceURL)
 	vaultClient := clients.NewVaultHTTPClient(cfg.VaultServiceURL)
+	documentVaultClient := documentvault.NewHTTPClient(cfg.DocumentVaultServiceURL, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
 	r.Use(chimiddleware.Logger)
 	r.Use(chimiddleware.Recoverer)
-	r.Use(middleware.TenantContext)
 
-	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
-	// Recoverer and telemetry so a refusal is still traced, and ahead of every
-	// handler so no request reaches business logic without a resolved tenant,
-	// actor, correlation and — on material writes — an idempotency key.
-	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
-	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
-
+	// /healthz is registered OUTSIDE the tenant/envelope-gated group below.
+	// It used to sit on the same router after r.Use(middleware.TenantContext),
+	// which chi applies to every route on that router regardless of
+	// registration order -- so Docker's own HEALTHCHECK probe (a plain
+	// http.Get with no headers, cmd/healthcheck/main.go) got 401
+	// missing_tenant_scope on every single check and the container could
+	// never report healthy. Found running this stack for real under
+	// docker-compose.phase7.yml; invisible in the native-process run, which
+	// polled the port directly rather than through Docker's HEALTHCHECK.
+	// A liveness probe must not require a verified tenant identity; nor does
+	// the readiness probe.
 	r.Get("/healthz", health.Handler())
-	handler.RegisterRoutes(r, h)
-	handler.RegisterBNK02Routes(r, h, st, bankAcctClient, vaultClient)
-	handler.RegisterBNK0304Routes(r, h, st)
-	handler.RegisterControlPopulationRoutes(r, h, st)
+	r.Get("/readyz", health.ReadyHandler(dbpool))
+
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.TenantContext)
+
+		// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
+		// Recoverer and telemetry so a refusal is still traced, and ahead of every
+		// handler so no request reaches business logic without a resolved tenant,
+		// actor, correlation and — on material writes — an idempotency key.
+		// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+		r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+
+		// Idempotency-Key replay for material writes (INV-08): a retried write
+		// with the same key is answered from its first response, not re-run.
+		r.Use(idempotency.Middleware(idempotency.NewPgStore(dbpool), logger))
+
+		handler.RegisterAll(r, h, st, bankAcctClient, vaultClient)
+		handler.RegisterRoutes(r, h)
+		handler.RegisterBNK02Routes(r, h, st, bankAcctClient, vaultClient)
+		handler.RegisterBNK0304Routes(r, h, st, documentVaultClient)
+		handler.RegisterControlPopulationRoutes(r, h, st)
+	})
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,

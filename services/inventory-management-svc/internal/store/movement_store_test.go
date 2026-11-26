@@ -64,7 +64,7 @@ func newDraftReceiptForEntity(legalEntityID, itemID, destLocationID, idemKey str
 
 func TestPgStore_CreateMovement_DuplicateIdempotencyKey_ReturnsOriginal(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -89,7 +89,7 @@ func TestPgStore_CreateMovement_DuplicateIdempotencyKey_ReturnsOriginal(t *testi
 
 func TestPgStore_FullReceiptLifecycle_UpdatesOnHand(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -124,7 +124,7 @@ func TestPgStore_FullReceiptLifecycle_UpdatesOnHand(t *testing.T) {
 // single item, and that a fully-consumed item (net zero) drops out.
 func TestPgStore_GetLocationInventorySummary_NetsAcrossItems(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -195,7 +195,7 @@ func TestPgStore_GetLocationInventorySummary_NetsAcrossItems(t *testing.T) {
 // start from.
 func TestPgStore_MovementLineageAndChain_CorrectionOfACorrection(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -253,7 +253,7 @@ func TestPgStore_MovementLineageAndChain_CorrectionOfACorrection(t *testing.T) {
 // the state model's own claim, "committed movement immutable."
 func TestPgStore_CommitMovement_CommittedRowImmutable(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -292,7 +292,7 @@ func TestPgStore_CommitMovement_CommittedRowImmutable(t *testing.T) {
 // negative path #3.
 func TestPgStore_CommitMovement_NegativeStockRefused(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -324,7 +324,7 @@ func TestPgStore_CommitMovement_NegativeStockRefused(t *testing.T) {
 // carries ALLOWED forward instead of silently resetting to PROHIBITED.
 func TestPgStore_NegativeStockPolicy_AllowedCommitsAndCarriesForward(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -385,7 +385,7 @@ func TestPgStore_NegativeStockPolicy_AllowedCommitsAndCarriesForward(t *testing.
 // narrow to hit reliably, so the concurrent test below is only a smoke test.)
 func TestPgStore_CommitMovement_BlocksOnItemLocationLock(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -445,7 +445,7 @@ func TestPgStore_CommitMovement_BlocksOnItemLocationLock(t *testing.T) {
 // exactly one may commit, the other must get ErrNegativeStockNotAllowed.
 func TestPgStore_CommitMovement_ConcurrentIssues_OnlyOneSucceeds(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -509,7 +509,7 @@ func TestPgStore_CommitMovement_ConcurrentIssues_OnlyOneSucceeds(t *testing.T) {
 // of negative path #2.
 func TestPgStore_SerialResidency_DuplicateReceiptRefused(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -546,7 +546,7 @@ func TestPgStore_SerialResidency_DuplicateReceiptRefused(t *testing.T) {
 // to end against real Postgres.
 func TestPgStore_CreateCorrectionMovement_ReversalRevertsOnHand(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -591,7 +591,7 @@ func TestPgStore_CreateCorrectionMovement_ReversalRevertsOnHand(t *testing.T) {
 // exactly the scenario this check exists to catch.
 func TestPgStore_GetNegativeOnHandCount_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()

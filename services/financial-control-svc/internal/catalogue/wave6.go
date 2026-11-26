@@ -71,7 +71,13 @@ func Wave6(effectiveFrom string) ([]domain.CreateControlDefinitionRequest, error
 			ControlCode: "FIN-CTRL-038", Name: "Opening balance migration tie-out", Domain: "Migration",
 			ControlType: "BALANCE", Assertions: []string{"COMPLETENESS", "ACCURACY"}, RiskTier: "KEY",
 			Frequency: "ON_DEMAND", OwnerRole: "MIGRATION_OWNER", ReviewerRole: "SENIOR_ACCOUNTANT", CertifierRole: "CONTROLLER",
-			SourceSpec: pop(SysFinancialClose, "migration-batch-tieout", map[string]string{"batch_id": "${scope.batch_id}"}),
+			// Sourced from general-ledger-svc, not financial-close-svc: migration-integrity-svc now drives
+			// general-ledger-svc's own kernel migration batches (internal/kernel/migration.go in
+			// general-ledger-svc) as the real posting path, and financial-close-svc's older migration-batch
+			// write side has no real callers left and is slated for retirement. general-ledger-svc exposes the
+			// same migration-batch-tieout population (same record/attribute shape) so the ARITHMETIC equations
+			// below are unchanged -- only where the population is read from changes.
+			SourceSpec: pop(SysGL, "migration-batch-tieout", map[string]string{"batch_id": "${scope.batch_id}"}),
 			InitialLogic: j(map[string]any{
 				"kind": "ARITHMETIC",
 				"equations": []map[string]any{

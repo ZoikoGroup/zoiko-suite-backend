@@ -10,8 +10,9 @@ package domain
 import "time"
 
 const (
-	PrefixRestriction         = "crst_"
-	PrefixEntitlementSnapshot = "cesn_"
+	PrefixRestriction              = "crst_"
+	PrefixEntitlementSnapshot      = "cesn_"
+	PrefixEntitlementSnapshotBatch = "cesb_"
 )
 
 // Outcome is the decision COM-03 returns. Ranked from least to most severe;

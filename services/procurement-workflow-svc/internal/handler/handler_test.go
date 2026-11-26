@@ -24,6 +24,10 @@ import (
 type stubStore struct {
 	byID          map[string]*domain.ProcurementCase
 	byCorrelation map[string]*domain.ProcurementCase
+	// outbox stands in for the real store's outbox writes (DB-tested in
+	// internal/store): the events of a fresh create / a completion.
+	outbox          *stubPublisher
+	completionActor string
 }
 
 func newStubStore() *stubStore {
@@ -38,7 +42,22 @@ func (s *stubStore) CreateCase(_ context.Context, c *domain.ProcurementCase) (bo
 	cp := *c
 	s.byID[c.CaseID] = &cp
 	s.byCorrelation[c.CorrelationID] = &cp
+	if s.outbox != nil {
+		s.outbox.requested++
+		if c.Status == domain.CaseStatusApprovalPending {
+			s.outbox.approvalStarted++
+		}
+	}
 	return true, nil
+}
+
+func (s *stubStore) GetCaseByCorrelation(_ context.Context, correlationID string) (*domain.ProcurementCase, error) {
+	c, ok := s.byCorrelation[correlationID]
+	if !ok {
+		return nil, domain.ErrCaseNotFound
+	}
+	cp := *c
+	return &cp, nil
 }
 
 func (s *stubStore) GetCase(_ context.Context, caseID string) (*domain.ProcurementCase, error) {
@@ -99,7 +118,7 @@ func (s *stubStore) UpdateRejected(_ context.Context, caseID, principalID, reaso
 	return &cp, nil
 }
 
-func (s *stubStore) UpdateOrderIssued(_ context.Context, caseID, purchaseOrderID string) (*domain.ProcurementCase, error) {
+func (s *stubStore) UpdateOrderIssued(_ context.Context, caseID, purchaseOrderID, actorID string) (*domain.ProcurementCase, error) {
 	c, ok := s.byID[caseID]
 	if !ok {
 		return nil, domain.ErrCaseNotFound
@@ -112,20 +131,17 @@ func (s *stubStore) UpdateOrderIssued(_ context.Context, caseID, purchaseOrderID
 	c.PurchaseOrderID = &purchaseOrderID
 	c.CompletedAt = &now
 	c.UpdatedAt = now
+	s.completionActor = actorID
+	if s.outbox != nil {
+		s.outbox.completed++
+	}
 	cp := *c
 	return &cp, nil
 }
 
+// stubPublisher counts the outbox events the stub store wrote.
 type stubPublisher struct {
 	requested, approvalStarted, completed int
-}
-
-func (p *stubPublisher) PublishRequested(_ context.Context, _ domain.ProcurementCase) { p.requested++ }
-func (p *stubPublisher) PublishApprovalStarted(_ context.Context, _ domain.ProcurementCase) {
-	p.approvalStarted++
-}
-func (p *stubPublisher) PublishCompleted(_ context.Context, _ string, _ domain.ProcurementCase) {
-	p.completed++
 }
 
 type stubAuthZ struct{ err error }
@@ -136,9 +152,11 @@ type stubSpendChecker struct {
 	decision string
 	basis    string
 	err      error
+	calls    int
 }
 
 func (s *stubSpendChecker) SubmitCheck(_ context.Context, _, _, _, _, _, _, _ string, _ float64) (*clients.SpendCheckResult, error) {
+	s.calls++
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -167,7 +185,10 @@ func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ, spend *stubSp
 			next.ServeHTTP(w, req)
 		})
 	})
-	h := handler.New(s, pub, authz, spend, order, zap.NewNop())
+	if s.outbox == nil {
+		s.outbox = pub
+	}
+	h := handler.New(s, authz, spend, order, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -385,5 +406,33 @@ func TestIssueOrder_PurchaseOrderServiceUnavailable(t *testing.T) {
 	rr := doReq(r, http.MethodPost, "/v1/procurement-cases/"+c.CaseID+"/issue-order", nil, "principal-1")
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// Regression: a retried create (same correlation_id) re-ran the spend check
+// with a new source_reference, which spend-controls-svc refuses (409) under
+// the same Idempotency-Key and procurement-workflow surfaced as 503.
+func TestCreateCase_ReplayDoesNotRerunSpendCheck(t *testing.T) {
+	spend := &stubSpendChecker{decision: "ALLOWED", basis: "within_threshold"}
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, spend, &stubOrderIssuer{})
+	correlationID := uuid.NewString()
+
+	first := doReq(r, http.MethodPost, "/v1/procurement-cases/", createCaseBody(correlationID), "principal-1")
+	second := doReq(r, http.MethodPost, "/v1/procurement-cases/", createCaseBody(correlationID), "principal-1")
+
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first create: expected 201, got %d: %s", first.Code, first.Body.String())
+	}
+	if second.Code != http.StatusOK {
+		t.Fatalf("replay: expected 200 with the stored case, got %d: %s", second.Code, second.Body.String())
+	}
+	if spend.calls != 1 {
+		t.Fatalf("spend check must run once for one logical create, ran %d times", spend.calls)
+	}
+	var a, b domain.ProcurementCase
+	_ = json.Unmarshal(first.Body.Bytes(), &a)
+	_ = json.Unmarshal(second.Body.Bytes(), &b)
+	if a.CaseID == "" || a.CaseID != b.CaseID {
+		t.Fatalf("replay must return the original case: %q vs %q", a.CaseID, b.CaseID)
 	}
 }

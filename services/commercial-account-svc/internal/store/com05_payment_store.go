@@ -250,10 +250,22 @@ func (s *PgStore) GetPaymentAttempts(ctx context.Context, invoiceID string) ([]d
 	return out, err
 }
 
+// GetCollectionState is a read model: it does not compute a new state
+// machine, it summarizes the invoice's own payment attempts (this file),
+// dunning case (com05_dunning_store.go) and write-offs (com05_credit_store.go)
+// — each already a real, independently recorded fact elsewhere in COM-05.
 func (s *PgStore) GetCollectionState(ctx context.Context, invoiceID string) (domain.CollectionState, error) {
 	attempts, err := s.GetPaymentAttempts(ctx, invoiceID)
 	if err != nil {
 		return "", err
 	}
-	return domain.CollectionStateOf(attempts), nil
+	dunning, err := s.GetDunningStateForInvoice(ctx, invoiceID)
+	if err != nil {
+		return "", err
+	}
+	writeOffs, err := s.GetWriteOffs(ctx, invoiceID)
+	if err != nil {
+		return "", err
+	}
+	return domain.CollectionStateOf(attempts, dunning, len(writeOffs) > 0), nil
 }

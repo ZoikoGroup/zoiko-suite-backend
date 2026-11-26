@@ -2,13 +2,19 @@ package store
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"sync"
 
 	"github.com/google/uuid"
 	"zoiko.io/carta-svc/internal/domain"
 )
 
+// ErrNotFound: no assessment with that id in the caller's tenant. Another
+// tenant's assessment is indistinguishable from a missing one on purpose.
+var ErrNotFound = errors.New("assessment not found")
+
+// Store persists CARTA assessments — the authoritative decision records.
+// PgStore is the production implementation; MemoryStore is for unit tests.
 type Store interface {
 	SaveAssessment(ctx context.Context, tenantID string, asm *domain.CartaAssessment) error
 	GetAssessmentByID(ctx context.Context, tenantID, id string) (*domain.CartaAssessment, error)
@@ -17,6 +23,8 @@ type Store interface {
 	ListAssessments(ctx context.Context, tenantID, legalEntityID, subjectID string) ([]domain.CartaAssessment, error)
 }
 
+// MemoryStore keeps assessments in process memory. Unit tests only: it loses
+// every decision record on restart, so cmd/server never uses it.
 type MemoryStore struct {
 	mu          sync.RWMutex
 	assessments map[string]*domain.CartaAssessment
@@ -31,6 +39,9 @@ func (m *MemoryStore) SaveAssessment(ctx context.Context, tenantID string, asm *
 	defer m.mu.Unlock()
 	asm.ID = uuid.New().String()
 	asm.TenantID = tenantID
+	if asm.RiskFactors == nil {
+		asm.RiskFactors = []string{} // as PgStore returns it
+	}
 	m.assessments[asm.ID] = asm
 	return nil
 }
@@ -40,7 +51,7 @@ func (m *MemoryStore) GetAssessmentByID(ctx context.Context, tenantID, id string
 	defer m.mu.RUnlock()
 	asm, ok := m.assessments[id]
 	if !ok || asm.TenantID != tenantID {
-		return nil, fmt.Errorf("assessment not found")
+		return nil, ErrNotFound
 	}
 	return asm, nil
 }

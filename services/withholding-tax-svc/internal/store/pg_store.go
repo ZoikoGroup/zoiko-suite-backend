@@ -102,7 +102,7 @@ func (s *PgStore) GetByID(ctx context.Context, id string) (*domain.WithholdingTa
 		       payment_reference, payment_type, gross_payment_amount, taxable_base_amount,
 		       withholding_rate_percent, withheld_amount, currency, tax_rule_id,
 		       tax_treaty_exemption, exemption_certificate_ref, status, remittance_reference,
-		       remitted_at, remitted_by, notes, effective_from, effective_to,
+		       remitted_at, remitted_by, notes, effective_from::text, effective_to::text,
 		       created_by, created_at, updated_at
 		FROM withholding_tax_obligations WHERE obligation_id = $1 AND tenant_id = $2`, id, tenantID,
 	).Scan(
@@ -140,7 +140,7 @@ func (s *PgStore) List(ctx context.Context, legalEntityID, jurisdictionID, count
 		       payment_reference, payment_type, gross_payment_amount, taxable_base_amount,
 		       withholding_rate_percent, withheld_amount, currency, tax_rule_id,
 		       tax_treaty_exemption, exemption_certificate_ref, status, remittance_reference,
-		       remitted_at, remitted_by, notes, effective_from, effective_to,
+		       remitted_at, remitted_by, notes, effective_from::text, effective_to::text,
 		       created_by, created_at, updated_at
 		FROM withholding_tax_obligations
 		WHERE tenant_id = $5
@@ -186,9 +186,25 @@ func (s *PgStore) Update(ctx context.Context, o *domain.WithholdingTaxObligation
 	if err := s.setRLS(ctx, tx); err != nil {
 		return err
 	}
+	tenantID := middleware.GetTenantID(ctx)
+	// A remitted or cancelled obligation is a closed record: its amounts are
+	// what was paid (or never owed) and must not be recomputed afterwards.
+	var current string
+	if err := tx.QueryRow(ctx, `SELECT status FROM withholding_tax_obligations
+		WHERE obligation_id=$1 AND tenant_id=$2 FOR UPDATE`, o.ObligationID, tenantID).Scan(&current); err != nil {
+		if err == pgx.ErrNoRows {
+			return domain.ErrObligationNotFound
+		}
+		return err
+	}
+	switch domain.ObligationStatus(current) {
+	case domain.StatusRemitted:
+		return domain.ErrAlreadyRemitted
+	case domain.StatusCancelled:
+		return domain.ErrAlreadyCancelled
+	}
 	o.Compute()
 	o.UpdatedAt = time.Now().UTC()
-	tenantID := middleware.GetTenantID(ctx)
 
 	cmdTag, err := tx.Exec(ctx, `
 		UPDATE withholding_tax_obligations

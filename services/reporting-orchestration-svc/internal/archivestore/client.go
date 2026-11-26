@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"time"
 
 	"go.uber.org/zap"
@@ -49,7 +50,7 @@ func NewHTTPClient(baseURL string, log *zap.Logger) *HTTPClient {
 }
 
 func (c *HTTPClient) GetArchive(ctx context.Context, archiveID, actorID, correlationID string) (*Archive, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/archives/"+archiveID, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/archives/"+url.PathEscape(archiveID), nil)
 	if err != nil {
 		return nil, err
 	}

@@ -47,6 +47,8 @@ import (
 	"zoiko.io/notification-svc/internal/retry"
 	"zoiko.io/notification-svc/internal/senderauth"
 	"zoiko.io/notification-svc/internal/store"
+	"zoiko.io/eventing/kafkaout"
+	eventingoutbox "zoiko.io/eventing/outbox"
 	"zoiko.io/notification-svc/internal/telemetry"
 	"zoiko.io/notification-svc/internal/unsubscribe"
 	"zoiko.io/notification-svc/internal/vaultsecrets"
@@ -125,7 +127,12 @@ func main() {
 	log.Info("db pool connected")
 
 	// ── 4. Store, Kafka producer, clients ─────────────────────────────────────
-	pgStore := store.New(pool)
+	// The shared eventing outbox table must exist before the first write tries to enqueue
+	// into it; a missing table would otherwise fail template writes at request time.
+	if err := eventingoutbox.VerifySchema(pingCtx, pool); err != nil {
+		log.Fatal("eventing outbox schema missing", zap.Error(err))
+	}
+	pgStore := store.New(pool, store.WithEventRegion(cfg.EventResidencyRegion))
 	if cfg.QuotaEnabled {
 		pgStore.WithQuota(cfg.QuotaLimits)
 		log.Info("send quotas are on", zap.Any("limits", cfg.QuotaLimits))
@@ -663,6 +670,27 @@ func main() {
 	// Shares workerCtx with the retry worker, so both stop on the same cancel.
 	relay := outbox.NewRelay(pgStore, publisher, domainMetrics, log)
 	go relay.Run(workerCtx)
+
+	// Second relay, for the BIZ-03 template events on the shared eventing outbox. With no
+	// brokers configured the relay is not started: its events stay queued in eventing_outbox.
+	if len(cfg.Kafka.Brokers) == 0 {
+		log.Warn("no KAFKA_BROKERS configured: the eventing outbox relay is not running; BIZ-03 template events will queue in eventing_outbox")
+	} else {
+		eventingWriter, err := kafkaout.New(kafkaout.Config{
+			Brokers:                cfg.Kafka.Brokers,
+			Topic:                  cfg.Kafka.Topic,
+			AllowAutoTopicCreation: cfg.Env == "local",
+		})
+		if err != nil {
+			log.Fatal("eventing outbox kafka writer", zap.Error(err))
+		}
+		defer func() { _ = eventingWriter.Close() }()
+		eventingRelay, err := eventingoutbox.NewRelay(pool, eventingWriter, eventingoutbox.DefaultConfig(), log)
+		if err != nil {
+			log.Fatal("eventing outbox relay", zap.Error(err))
+		}
+		go eventingRelay.Run(workerCtx)
+	}
 
 	// INT-04 outbound webhooks: API, fan-out consumer and dispatcher (off unless enabled).
 	wireWebhookOut(workerCtx, cfg, log, pool, pgStore, authzClient, r)

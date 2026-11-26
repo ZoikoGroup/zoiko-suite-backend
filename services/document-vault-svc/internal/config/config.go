@@ -47,6 +47,14 @@ type Config struct {
 	ClamAVURL string
 
 	Kafka KafkaConfig
+
+	// EventResidencyRegion (EVENT_RESIDENCY_REGION, e.g. uk or eu-west) is stamped on
+	// every eventing-outbox event. Required: an event with a guessed region is worse
+	// than a service that refuses to start.
+	EventResidencyRegion string
+	// Env (ENV) is "local" for developer stacks; only then may the Kafka writer
+	// auto-create the topic.
+	Env string
 }
 
 // KafkaConfig mirrors every other producer in this platform's shape
@@ -73,8 +81,15 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	region := os.Getenv("EVENT_RESIDENCY_REGION")
+	if region == "" {
+		return nil, fmt.Errorf("EVENT_RESIDENCY_REGION is required (e.g. uk, eu-west): every emitted event must carry its residency region")
+	}
+
 	return &Config{
-		Port: port,
+		EventResidencyRegion: region,
+		Env:                  strEnv("ENV", "local"),
+		Port:                 port,
 		DB: DBConfig{
 			Host:     strEnv("DB_HOST", "localhost"),
 			Port:     dbPort,

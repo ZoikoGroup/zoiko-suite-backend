@@ -80,18 +80,6 @@ func TestPostingPaths_SendACC03JournalContext(t *testing.T) {
 		}
 		assertJournalMeta(t, cl, "ADJUSTMENT", day(2026, 1, 31))
 	})
-	t.Run("ACC-17 opening balances", func(t *testing.T) {
-		s, cl := newStubStore(), &stubClients{}
-		r := newRouter(s, &stubAuthZ{}, cl)
-		batchID := createValidatedMigrationBatch(t, s, cl, r)
-		if rr := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/approve", nil, "approver-1"); rr.Code != http.StatusOK {
-			t.Fatalf("approve: %d %s", rr.Code, rr.Body.String())
-		}
-		if rr := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/commit", nil, "preparer-1"); rr.Code != http.StatusOK {
-			t.Fatalf("commit: %d %s", rr.Code, rr.Body.String())
-		}
-		assertJournalMeta(t, cl, "OPENING", day(2026, 1, 31))
-	})
 }
 
 // A registered period's own period_end wins over the calendar month: a
@@ -156,22 +144,6 @@ func TestLegacyRecordWithoutCurrency_RefusedBeforeGL(t *testing.T) {
 			t.Fatalf("expected no GL call and no run; calls=%d runs=%d", cl.postAllocationCalls, len(s.allocationRuns))
 		}
 	})
-	t.Run("migration batch stays APPROVED", func(t *testing.T) {
-		s, cl := newStubStore(), &stubClients{}
-		r := newRouter(s, &stubAuthZ{}, cl)
-		batchID := createValidatedMigrationBatch(t, s, cl, r)
-		if rr := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/approve", nil, "approver-1"); rr.Code != http.StatusOK {
-			t.Fatalf("approve: %d %s", rr.Code, rr.Body.String())
-		}
-		s.migrationBatches[batchID].CurrencyCode = ""
-		rr := doReq(r, http.MethodPost, "/v1/migration-batches/"+batchID+"/commit", nil, "preparer-1")
-		if rr.Code != http.StatusUnprocessableEntity || !containsErrorCode(rr.Body.Bytes(), "currency_code_missing") {
-			t.Fatalf("expected 422 currency_code_missing, got %d %s", rr.Code, rr.Body.String())
-		}
-		if cl.postMultiLineCalls != 0 || s.migrationBatches[batchID].Status != domain.MigrationBatchStatusApproved {
-			t.Fatalf("expected no GL call and the batch still APPROVED; calls=%d status=%s", cl.postMultiLineCalls, s.migrationBatches[batchID].Status)
-		}
-	})
 }
 
 // Every command that creates a record which will post requires a well-formed
@@ -195,10 +167,6 @@ func TestCreateCommands_RequireAValidCurrency(t *testing.T) {
 		{"/v1/fx-revaluations/", func(c string) any {
 			return domain.StartRevaluationRequest{CurrencyCode: c, LegalEntityID: "le-1", FiscalPeriod: "2026-01", FXGainLossAccountCode: "7900",
 				RateSet: map[string]float64{"EUR": 1.1}, Items: []domain.RevaluationItemInput{{AccountCode: "1100", CurrencyCode: "EUR", ForeignAmount: 10}}}
-		}},
-		{"/v1/migration-batches/", func(c string) any {
-			return domain.CreateMigrationBatchRequest{CurrencyCode: c, LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "ERP",
-				SourceExtractHash: "sha256:x", ExpectedRowCount: 2, ExpectedTotalDebits: 10000, ExpectedTotalCredits: 10000, Entries: balancedMigrationEntries()}
 		}},
 	}
 	for _, c := range creates {

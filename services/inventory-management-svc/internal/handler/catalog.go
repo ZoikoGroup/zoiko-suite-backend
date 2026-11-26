@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/inventory-management-svc/internal/domain"
+	svcmiddleware "zoiko.io/inventory-management-svc/internal/middleware"
 )
 
 // ── POST /v1/catalog/offerings ──────────────────────────────────────────────
@@ -47,7 +49,7 @@ func (h *Handler) CreateOffering(w http.ResponseWriter, r *http.Request) {
 		Description: req.Description, Unit: req.Unit, AvailabilityRules: req.AvailabilityRules,
 		Status: domain.CatalogVersionStatusDraft, CreatedAt: now, CreatedByPrincipalID: principalID,
 	}
-	if err := h.store.CreateOffering(r.Context(), o, v, req.Variants); err != nil {
+	if err := h.store.CreateOffering(h.eventCtx(r), o, v, req.Variants); err != nil {
 		if errors.Is(err, domain.ErrDuplicateOfferingSKU) {
 			writeError(w, http.StatusUnprocessableEntity, "duplicate_sku", err.Error())
 			return
@@ -56,7 +58,6 @@ func (h *Handler) CreateOffering(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
-	h.publisher.PublishOfferingCreated(r.Context(), getCorrelationID(r), principalID, *o, *v)
 	writeJSON(w, http.StatusCreated, map[string]any{"offering": o, "version": v})
 }
 
@@ -321,7 +322,7 @@ func (h *Handler) ActivateOffering(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	tenantID, ok := h.requireTenant(w, r)
+	_, ok = h.requireTenant(w, r)
 	if !ok {
 		return
 	}
@@ -351,16 +352,12 @@ func (h *Handler) ActivateOffering(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	supersededID, err := h.store.ActivateOfferingVersion(r.Context(), id, versionID, principalID, now)
+	_, err = h.store.ActivateOfferingVersion(h.eventCtx(r), id, versionID, principalID, now)
 	if err != nil {
 		h.writeCatalogErr(w, err)
 		return
 	}
 	v.Status, v.ActivatedAt, v.ActivatedByPrincipalID = domain.CatalogVersionStatusActive, &now, &principalID
-	h.publisher.PublishOfferingActivated(r.Context(), getCorrelationID(r), principalID, tenantID, o.LegalEntityID, *v)
-	if supersededID != nil {
-		h.publisher.PublishOfferingVersionSuperseded(r.Context(), getCorrelationID(r), principalID, tenantID, o.LegalEntityID, id, *supersededID)
-	}
 	writeJSON(w, http.StatusOK, v)
 }
 
@@ -380,7 +377,7 @@ func (h *Handler) SuspendOfferingVersion(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	tenantID, ok := h.requireTenant(w, r)
+	_, ok = h.requireTenant(w, r)
 	if !ok {
 		return
 	}
@@ -399,12 +396,11 @@ func (h *Handler) SuspendOfferingVersion(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	now := time.Now().UTC()
-	if err := h.store.SuspendOfferingVersion(r.Context(), versionID, principalID, req.Reason, now); err != nil {
+	if err := h.store.SuspendOfferingVersion(h.eventCtx(r), versionID, principalID, req.Reason, now); err != nil {
 		h.writeCatalogErr(w, err)
 		return
 	}
 	v.Status, v.SuspendedAt, v.SuspendedByPrincipalID, v.SuspensionReason = domain.CatalogVersionStatusSuspended, &now, &principalID, &req.Reason
-	h.publisher.PublishOfferingSuspended(r.Context(), getCorrelationID(r), principalID, tenantID, o.LegalEntityID, *v)
 	writeJSON(w, http.StatusOK, v)
 }
 
@@ -424,7 +420,7 @@ func (h *Handler) RetireOfferingVersion(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	tenantID, ok := h.requireTenant(w, r)
+	_, ok = h.requireTenant(w, r)
 	if !ok {
 		return
 	}
@@ -443,12 +439,11 @@ func (h *Handler) RetireOfferingVersion(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	now := time.Now().UTC()
-	if err := h.store.RetireOfferingVersion(r.Context(), versionID, principalID, req.Reason, now); err != nil {
+	if err := h.store.RetireOfferingVersion(h.eventCtx(r), versionID, principalID, req.Reason, now); err != nil {
 		h.writeCatalogErr(w, err)
 		return
 	}
 	v.Status, v.RetiredAt, v.RetiredByPrincipalID, v.RetirementReason = domain.CatalogVersionStatusRetired, &now, &principalID, &req.Reason
-	h.publisher.PublishOfferingRetired(r.Context(), getCorrelationID(r), principalID, tenantID, o.LegalEntityID, *v)
 	writeJSON(w, http.StatusOK, v)
 }
 
@@ -624,4 +619,10 @@ func (h *Handler) VersionUsability(w http.ResponseWriter, r *http.Request) {
 		"missing_mappings": missing,
 		"reason":           reason,
 	})
+}
+
+// eventCtx carries the request's correlation id to the store, which writes the catalog events in the
+// same transaction as the change.
+func (h *Handler) eventCtx(r *http.Request) context.Context {
+	return svcmiddleware.WithCorrelation(r.Context(), getCorrelationID(r))
 }

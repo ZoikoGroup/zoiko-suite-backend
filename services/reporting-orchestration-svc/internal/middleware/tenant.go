@@ -48,13 +48,24 @@ const TenantIDKey contextKey = "tenant_id"
 // failure mode is an empty result rather than a shared bucket.
 func TenantMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Probes carry no tenant and touch no tenant data.
+		switch r.URL.Path {
+		case "/healthz", "/readyz", "/health":
+			next.ServeHTTP(w, r)
+			return
+		}
 		tenantID := r.Header.Get("X-Tenant-ID")
 		if tenantID == "" {
-			w.Header().Set("Content-Type", "application/json")
+			// RFC 9457 problem details, same shape as internal/handler.
+			w.Header().Set("Content-Type", "application/problem+json")
 			w.WriteHeader(http.StatusUnauthorized)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"error":   "missing_tenant_scope",
-				"message": "X-Tenant-ID is required — the gateway sets it from a verified identity envelope",
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"type":     "https://errors.zoiko.io/reporting/tenant-required",
+				"title":    http.StatusText(http.StatusUnauthorized),
+				"status":   http.StatusUnauthorized,
+				"code":     "TENANT_REQUIRED",
+				"detail":   "X-Tenant-Id is required — the gateway sets it from a verified identity envelope",
+				"instance": r.URL.Path,
 			})
 			return
 		}

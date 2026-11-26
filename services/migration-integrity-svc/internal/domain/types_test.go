@@ -152,12 +152,12 @@ func TestEvaluateJobStatus(t *testing.T) {
 func TestIntegrity_EntriesCarrySeverityFamilyAndOwner(t *testing.T) {
 	req := &ValidateMigrationRequest{LegalEntityID: "le", MigrationName: "m", SourceSystem: "s", TargetService: "t",
 		ExceptionOwnerID: " owner-7 ", RequiredFields: []string{"cost_centre"}, Records: []MigrationRecord{
-			rec("", map[string]string{"cost_centre": "CC"}),                   // no identity
-			rec("D", map[string]string{"cost_centre": "CC"}),                  // duplicate
-			rec("D", map[string]string{"cost_centre": "CC"}),                  // duplicate
-			rec("M", map[string]string{}),                                     // missing required
-			rec("T", map[string]string{"cost_centre": "CC", "amount": "N/A"}),            // bad amount
-			rec("C", map[string]string{"cost_centre": "CC", "currency_code": "ZZZ"}),      // bad currency
+			rec("", map[string]string{"cost_centre": "CC"}),                          // no identity
+			rec("D", map[string]string{"cost_centre": "CC"}),                         // duplicate
+			rec("D", map[string]string{"cost_centre": "CC"}),                         // duplicate
+			rec("M", map[string]string{}),                                            // missing required
+			rec("T", map[string]string{"cost_centre": "CC", "amount": "N/A"}),        // bad amount
+			rec("C", map[string]string{"cost_centre": "CC", "currency_code": "ZZZ"}), // bad currency
 		}}
 	checks, entries, _, _, _ := PerformIntegrityValidation(req, "job", "tenant")
 
@@ -257,8 +257,13 @@ func TestIntegrity_CurrencyCodeValidity(t *testing.T) {
 }
 
 func TestValidateRequest_ExceptionOwnerRequired(t *testing.T) {
+	// control_totals has been required since migration 000012 (ZS-MIG-001
+	// §17, MIG-INV-15), so the request declares a valid manifest; this test
+	// is only about the owner.
+	count := 1
 	r := ValidateMigrationRequest{LegalEntityID: "le", MigrationName: "m", SourceSystem: "s", TargetService: "t",
-		Records: []MigrationRecord{rec("A", nil)}, ExceptionOwnerID: "  "}
+		Records: []MigrationRecord{rec("A", nil)}, ExceptionOwnerID: "  ",
+		ControlTotals: &ControlTotalsDeclaration{RecordCount: &count, AmountTotal: "0"}}
 	if err := r.Validate(); err == nil || err.Error() != "exception_owner_id is required" {
 		t.Fatalf("blank owner must be refused, got %v", err)
 	}

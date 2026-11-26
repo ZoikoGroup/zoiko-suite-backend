@@ -25,16 +25,10 @@ import (
 	"time"
 )
 
-// ClockClass is the regime of a deadline (R-001 s7.1).
+// ClockClass is the regime of a deadline (R-001 s7.1). Its values are the
+// untyped ClockClass* constants in types.go, which both string and ClockClass
+// contexts accept.
 type ClockClass string
-
-const (
-	ClockClassHardLegal   ClockClass = "HARD_LEGAL"   // statute; a tenant SLA never moves it (R-INV-15)
-	ClockClassRegulatory  ClockClass = "REGULATORY"   // a regulator's deadline short of statute
-	ClockClassContractual ClockClass = "CONTRACTUAL"  // a contract term
-	ClockClassInternalSLA ClockClass = "INTERNAL_SLA" // the tenant's own target
-	ClockClassAdvisory    ClockClass = "ADVISORY"     // informational
-)
 
 // ClockClasses is the set of valid classes.
 var ClockClasses = map[ClockClass]bool{

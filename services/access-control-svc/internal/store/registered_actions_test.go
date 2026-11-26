@@ -153,12 +153,22 @@ var registeredActionMigrations = []struct {
 	{"000057_register_policy_evidence_redeliver", "policy-svc", map[string]string{
 		"POLICY_EVIDENCE_REDELIVER": "HIGH",
 	}},
+	{"000057_register_crm_read_actions", "counterparty-management-svc", map[string]string{
+		"CRM_READ":         "STANDARD",
+		"CRM_CONSENT_READ": "STANDARD",
+	}},
 	{"000058_register_policy_certification_actions", "policy-svc", map[string]string{
 		"POLICY_TEST_MANAGE":    "HIGH",
 		"POLICY_TEST_RUN":       "HIGH",
 		"POLICY_WAIVER_REQUEST": "STANDARD",
 		"POLICY_WAIVER_APPROVE": "HIGH",
 		"POLICY_SIMULATE":       "STANDARD",
+	}},
+	{"000058_register_restricted_classification_action", "document-vault-svc", map[string]string{
+		"CONFIRM_RESTRICTED_CLASSIFICATION": "HIGH",
+	}},
+	{"000059_register_comment_moderate_action", "comments-collaboration-svc", map[string]string{
+		"COMMENT_MODERATE": "STANDARD",
 	}},
 	{"000060_register_signatory_office_actions", "workflow-svc", map[string]string{
 		"SIGNATORY_SIGN_AS_DIRECTOR":          "HIGH",

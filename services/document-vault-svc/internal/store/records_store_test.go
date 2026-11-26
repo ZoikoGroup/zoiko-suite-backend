@@ -43,7 +43,7 @@ func baseDeclareParams(doc *domain.Document, v *domain.DocumentVersion, correlat
 // record with a real record class and jurisdiction scope.
 func TestDRC02_DeclareRecordV2_HappyPath(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc, v := createTestDocument(t, s, "happy-path")
 
 	rec, created, err := s.DeclareRecordV2(tenantCtx(), baseDeclareParams(doc, v, "corr-declare-1"))
@@ -63,7 +63,7 @@ func TestDRC02_DeclareRecordV2_HappyPath(t *testing.T) {
 // record at most once.
 func TestDRC02_DeclareRecordV2_SameVersionTwice_Refused(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc, v := createTestDocument(t, s, "declare-twice")
 
 	_, _, err := s.DeclareRecordV2(tenantCtx(), baseDeclareParams(doc, v, "corr-a"))
@@ -77,7 +77,7 @@ func TestDRC02_DeclareRecordV2_SameVersionTwice_Refused(t *testing.T) {
 // record, never a second one.
 func TestDRC02_DeclareRecordV2_IdempotentReplay(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc, v := createTestDocument(t, s, "idempotent")
 
 	params := baseDeclareParams(doc, v, "corr-replay")
@@ -95,7 +95,7 @@ func TestDRC02_DeclareRecordV2_IdempotentReplay(t *testing.T) {
 // any row is written.
 func TestDRC02_DeclareRecordV2_ValidationRefusals(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc, v := createTestDocument(t, s, "validation")
 
 	badClass := baseDeclareParams(doc, v, "corr-badclass")
@@ -114,7 +114,7 @@ func TestDRC02_DeclareRecordV2_ValidationRefusals(t *testing.T) {
 // record's facts is rejected at the database.
 func TestDRC02_DeclaredRecord_FactsAreImmutable(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc, v := createTestDocument(t, s, "immutable-facts")
 	rec, _, err := s.DeclareRecordV2(tenantCtx(), baseDeclareParams(doc, v, "corr-immutable"))
 	require.NoError(t, err)
@@ -129,7 +129,7 @@ func TestDRC02_DeclaredRecord_FactsAreImmutable(t *testing.T) {
 // mechanism DRC-I04's "correction uses supersession" describes.
 func TestDRC02_SupersedesRelationship_MovesTargetToSuperseded(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 
 	oldDoc, oldV := createTestDocument(t, s, "superseded-old")
 	newDoc, newV := createTestDocument(t, s, "superseded-new")
@@ -159,7 +159,7 @@ func TestDRC02_SupersedesRelationship_MovesTargetToSuperseded(t *testing.T) {
 // again.
 func TestDRC02_SupersedesRelationship_AlreadySuperseded_Refused(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 
 	doc1, v1 := createTestDocument(t, s, "double-supersede-1")
 	doc2, v2 := createTestDocument(t, s, "double-supersede-2")
@@ -188,7 +188,7 @@ func TestDRC02_SupersedesRelationship_AlreadySuperseded_Refused(t *testing.T) {
 // — it never changes either record's state.
 func TestDRC02_EvidencesRelationship_DoesNotChangeState(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 
 	doc1, v1 := createTestDocument(t, s, "evidences-1")
 	doc2, v2 := createTestDocument(t, s, "evidences-2")
@@ -220,7 +220,7 @@ func TestDRC02_EvidencesRelationship_DoesNotChangeState(t *testing.T) {
 // relationship cannot be recorded twice.
 func TestDRC02_RecordRelationship_SelfReferenceAndDuplicateRefused(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc, v := createTestDocument(t, s, "self-ref")
 	rec, _, err := s.DeclareRecordV2(tenantCtx(), baseDeclareParams(doc, v, "corr-self"))
 	require.NoError(t, err)
@@ -252,7 +252,7 @@ func TestDRC02_RecordRelationship_SelfReferenceAndDuplicateRefused(t *testing.T)
 // nothing.
 func TestDRC02_DeclareRecordV2_UnknownDocumentVersion_Refused(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc, _ := createTestDocument(t, s, "unknown-version")
 
 	params := domain.DeclareRecordV2Params{
@@ -269,7 +269,7 @@ func TestDRC02_DeclareRecordV2_UnknownDocumentVersion_Refused(t *testing.T) {
 // test in this suite already runs under.
 func TestDRC02_TenantIsolation(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	doc, v := createTestDocument(t, s, "tenant-isolation")
 	rec, _, err := s.DeclareRecordV2(tenantCtx(), baseDeclareParams(doc, v, "corr-tenant"))
 	require.NoError(t, err)

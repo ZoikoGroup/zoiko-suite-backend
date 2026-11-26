@@ -383,6 +383,46 @@ func (s *PgStore) GetVendorProfileByID(ctx context.Context, id string) (*domain.
 	return &p, nil
 }
 
+func (s *PgStore) ApproveVendorProfile(ctx context.Context, id, approvedBy string) (*domain.VendorProfile, error) {
+	tenantID, err := tenantScope(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var p domain.VendorProfile
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		err := tx.QueryRow(ctx, `
+			UPDATE vendor_profiles
+			   SET due_diligence_status = 'CLEARED', approved_at = now(), approved_by = $3, updated_at = now()
+			 WHERE vendor_profile_id = $1 AND tenant_id = $2 AND approved_at IS NULL
+			RETURNING vendor_profile_id, tenant_id, legal_entity_id, counterparty_id,
+			          vendor_name, vendor_status, due_diligence_status, risk_rating,
+			          approved_at, approved_by, created_at, updated_at
+		`, id, tenantID, approvedBy).Scan(
+			&p.VendorProfileID, &p.TenantID, &p.LegalEntityID, &p.CounterpartyID,
+			&p.VendorName, &p.VendorStatus, &p.DueDiligenceStatus, &p.RiskRating,
+			&p.ApprovedAt, &p.ApprovedBy, &p.CreatedAt, &p.UpdatedAt,
+		)
+		if errors.Is(err, pgx.ErrNoRows) {
+			var exists bool
+			if qerr := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM vendor_profiles WHERE vendor_profile_id = $1 AND tenant_id = $2)`, id, tenantID).Scan(&exists); qerr != nil {
+				return qerr
+			}
+			if exists {
+				return domain.ErrVendorProfileAlreadyApproved
+			}
+			return domain.ErrVendorProfileNotFound
+		}
+		return err
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrVendorProfileAlreadyApproved) || errors.Is(err, domain.ErrVendorProfileNotFound) {
+			return nil, err
+		}
+		return nil, mapPgError(err)
+	}
+	return &p, nil
+}
+
 func (s *PgStore) ListVendorProfiles(ctx context.Context, legalEntityID, counterpartyID string) ([]domain.VendorProfile, error) {
 	tenantID, err := tenantScope(ctx)
 	if err != nil {

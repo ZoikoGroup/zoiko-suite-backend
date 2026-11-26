@@ -287,7 +287,10 @@ func TestOutboundPG_ReserveSubmitSettleAndDropBody(t *testing.T) {
 			t.Errorf("%d %s events", n, want)
 		}
 	}
-	if n := o.countAs(cTenantA, `SELECT count(*) FROM eventing_outbox WHERE event_type LIKE '%outbound%' AND (convert_from(payload, 'UTF8') LIKE '%'||$1||'%' OR convert_from(payload, 'UTF8') LIKE '%10.00%')`, obKey); n != 0 {
+	// The secret is checked over the whole envelope. The amount is checked over the event's data member only:
+	// the envelope's own time/emitted_at carry fractional seconds, so a run that lands on ":10.00x" would
+	// otherwise match "10.00" and fail with no leak at all.
+	if n := o.countAs(cTenantA, `SELECT count(*) FROM eventing_outbox WHERE event_type LIKE '%outbound%' AND (convert_from(payload, 'UTF8') LIKE '%'||$1||'%' OR (convert_from(payload, 'UTF8')::jsonb->'data')::text LIKE '%10.00%')`, obKey); n != 0 {
 		t.Fatalf("%d outbound events leak a secret or a value", n)
 	}
 	if n := o.countAs(cTenantA, `SELECT count(*) FROM xic_outbound_events WHERE detail::text LIKE '%'||$1||'%' OR detail::text LIKE '%10.00%'`, obKey); n != 0 {

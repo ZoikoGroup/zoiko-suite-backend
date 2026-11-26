@@ -32,7 +32,7 @@ func createTestRendition(t *testing.T, s *store.PgStore, v *domain.DocumentVersi
 // with its own hash, and gets its own fixity manifest automatically.
 func TestDRC04_CreateRendition_HappyPath_SealsFixityManifest(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	_, v := createTestDocument(t, s, "drc04-happy")
 
 	rd := createTestRendition(t, s, v, domain.RenditionPreservation, "drc04-happy-rendition")
@@ -51,7 +51,7 @@ func TestDRC04_CreateRendition_HappyPath_SealsFixityManifest(t *testing.T) {
 
 func TestDRC04_CreateRendition_InvalidClass_Refused(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	_, v := createTestDocument(t, s, "drc04-invalid-class")
 
 	_, err := s.CreateRendition(tenantCtx(), domain.CreateRenditionParams{
@@ -64,7 +64,7 @@ func TestDRC04_CreateRendition_InvalidClass_Refused(t *testing.T) {
 
 func TestDRC04_CreateRendition_UnknownSourceVersion_Refused(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 
 	_, err := s.CreateRendition(tenantCtx(), domain.CreateRenditionParams{
 		SourceDocumentVersionID: "00000000-0000-0000-0000-000000000000", RenditionClass: string(domain.RenditionAccess),
@@ -78,7 +78,7 @@ func TestDRC04_CreateRendition_UnknownSourceVersion_Refused(t *testing.T) {
 // from an access copy) records real lineage via parent_rendition_id.
 func TestDRC04_CreateRendition_WithParentLineage(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	_, v := createTestDocument(t, s, "drc04-lineage")
 	access := createTestRendition(t, s, v, domain.RenditionAccess, "drc04-lineage-access")
 
@@ -99,7 +99,7 @@ func TestDRC04_CreateRendition_WithParentLineage(t *testing.T) {
 // matches stays VERIFIED.
 func TestDRC04_RecordVerification_MatchingHash_StaysVerified(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	_, v := createTestDocument(t, s, "drc04-verify-ok")
 	rd := createTestRendition(t, s, v, domain.RenditionPreservation, "drc04-verify-ok-rendition")
 	manifest, err := s.GetFixityManifestByRendition(tenantCtx(), rd.RenditionID)
@@ -121,7 +121,7 @@ func TestDRC04_RecordVerification_MatchingHash_StaysVerified(t *testing.T) {
 // code, not just in a comment.
 func TestDRC04_RecordVerification_ClaimedVerifiedWithWrongHash_Refused(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	_, v := createTestDocument(t, s, "drc04-fake-verify")
 	rd := createTestRendition(t, s, v, domain.RenditionPreservation, "drc04-fake-verify-rendition")
 	manifest, err := s.GetFixityManifestByRendition(tenantCtx(), rd.RenditionID)
@@ -144,7 +144,7 @@ func TestDRC04_RecordVerification_ClaimedVerifiedWithWrongHash_Refused(t *testin
 // again.
 func TestDRC04_FixityIncidentAndRepair_FullCycle(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	_, v := createTestDocument(t, s, "drc04-repair-cycle")
 	rd := createTestRendition(t, s, v, domain.RenditionPreservation, "drc04-repair-cycle-rendition")
 	manifest, err := s.GetFixityManifestByRendition(tenantCtx(), rd.RenditionID)
@@ -183,7 +183,7 @@ func TestDRC04_FixityIncidentAndRepair_FullCycle(t *testing.T) {
 
 func TestDRC04_StartRepair_WhenNotFailed_Refused(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	_, v := createTestDocument(t, s, "drc04-repair-not-failed")
 	rd := createTestRendition(t, s, v, domain.RenditionPreservation, "drc04-repair-not-failed-rendition")
 	manifest, err := s.GetFixityManifestByRendition(tenantCtx(), rd.RenditionID)
@@ -199,7 +199,7 @@ func TestDRC04_StartRepair_WhenNotFailed_Refused(t *testing.T) {
 // own fixity manifest, independent of any rendition.
 func TestDRC04_CreateFixityManifestForVersion_HappyPath(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	_, v := createTestDocument(t, s, "drc04-original-manifest")
 
 	manifest, err := s.CreateFixityManifestForVersion(tenantCtx(), v.DocumentVersionID, v.ChecksumSHA256, "preservation-bot")
@@ -216,7 +216,7 @@ func TestDRC04_CreateFixityManifestForVersion_HappyPath(t *testing.T) {
 // REDACTED_RENDITION — not any other rendition class.
 func TestDRC04_CreateRedactionProfile_WrongRenditionClass_Refused(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	_, v := createTestDocument(t, s, "drc04-redaction-wrong-class")
 	rd := createTestRendition(t, s, v, domain.RenditionAccess, "drc04-redaction-wrong-class-rendition")
 
@@ -229,7 +229,7 @@ func TestDRC04_CreateRedactionProfile_WrongRenditionClass_Refused(t *testing.T) 
 
 func TestDRC04_CreateRedactionProfile_HappyPath_AndDuplicateRefused(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	_, v := createTestDocument(t, s, "drc04-redaction-happy")
 	rd := createTestRendition(t, s, v, domain.RenditionRedacted, "drc04-redaction-happy-rendition")
 
@@ -256,7 +256,7 @@ func TestDRC04_CreateRedactionProfile_HappyPath_AndDuplicateRefused(t *testing.T
 // contents, not a caller-supplied value.
 func TestDRC04_CreateExportPackage_IncludedAndOmitted(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	_, v := createTestDocument(t, s, "drc04-export-happy")
 	rd := createTestRendition(t, s, v, domain.RenditionAccess, "drc04-export-happy-rendition")
 
@@ -294,7 +294,7 @@ func TestDRC04_CreateExportPackage_IncludedAndOmitted(t *testing.T) {
 
 func TestDRC04_CreateExportPackage_OmittedWithoutReason_Refused(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	_, v := createTestDocument(t, s, "drc04-export-no-reason")
 
 	_, err := s.CreateExportPackage(tenantCtx(), domain.CreateExportPackageParams{
@@ -308,7 +308,7 @@ func TestDRC04_CreateExportPackage_OmittedWithoutReason_Refused(t *testing.T) {
 
 func TestDRC04_CreateExportPackage_NoItems_Refused(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 
 	_, err := s.CreateExportPackage(tenantCtx(), domain.CreateExportPackageParams{
 		RequestedByPrincipalID: "exporter-1", Items: nil,
@@ -321,7 +321,7 @@ func TestDRC04_CreateExportPackage_NoItems_Refused(t *testing.T) {
 // produces a different hash.
 func TestDRC04_ExportPackageHash_DeterministicAndContentSensitive(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	_, v1 := createTestDocument(t, s, "drc04-hash-a")
 	_, v2 := createTestDocument(t, s, "drc04-hash-b")
 
@@ -350,7 +350,7 @@ func TestDRC04_ExportPackageHash_DeterministicAndContentSensitive(t *testing.T) 
 
 func TestDRC04_TenantIsolation(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	_, v := createTestDocument(t, s, "drc04-tenant-isolation")
 	rd := createTestRendition(t, s, v, domain.RenditionPreservation, "drc04-tenant-isolation-rendition")
 
@@ -365,7 +365,7 @@ func TestDRC04_TenantIsolation(t *testing.T) {
 // database level, not just by application convention.
 func TestDRC04_Rendition_RawUpdateRejectedByTrigger(t *testing.T) {
 	pool := requireTestDB(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("local"))
 	_, v := createTestDocument(t, s, "drc04-raw-update")
 	rd := createTestRendition(t, s, v, domain.RenditionPreservation, "drc04-raw-update-rendition")
 

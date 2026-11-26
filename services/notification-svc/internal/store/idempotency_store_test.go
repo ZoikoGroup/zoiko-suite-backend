@@ -14,7 +14,7 @@ import (
 
 func TestIdempotency_SameCorrelationDifferentKeys_BothCreated(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 
 	a := newNotification("tenant-a", "entity-1", "recipient-1", "payroll-run-7")
@@ -32,7 +32,7 @@ func TestIdempotency_SameCorrelationDifferentKeys_BothCreated(t *testing.T) {
 
 func TestIdempotency_SameKeyReplaysTheOriginal(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 
 	orig := newNotification("tenant-a", "entity-1", "recipient-1", "corr-k")
@@ -54,7 +54,7 @@ func TestIdempotency_SameKeyReplaysTheOriginal(t *testing.T) {
 // Unkeyed sends keep the pre-000012 behaviour: one row per correlation id.
 func TestIdempotency_UnkeyedStillDedupesOnCorrelation(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 
 	first := newNotification("tenant-a", "entity-1", "recipient-1", "corr-legacy")
@@ -73,7 +73,7 @@ func TestIdempotency_UnkeyedStillDedupesOnCorrelation(t *testing.T) {
 // does not have.
 func TestIdempotency_ConcurrentSameKey_ExactlyOneCreated(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 
 	const racers = 20

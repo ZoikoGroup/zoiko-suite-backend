@@ -73,6 +73,11 @@ const (
 	// Wave 2's Reclassify/SupersedeClassification.
 	ActionReclassifyRecord        = "RECLASSIFY_RECORD"
 	ActionSupersedeClassification = "SUPERSEDE_CLASSIFICATION"
+	// ActionConfirmRestrictedClassification is the additional, security/privacy-owner
+	// action BIZ-02's SoD line requires to confirm a RESTRICTED classification, or to
+	// supersede one. It is required on top of the ordinary confirm/supersede action,
+	// never instead of it.
+	ActionConfirmRestrictedClassification = "CONFIRM_RESTRICTED_CLASSIFICATION"
 )
 
 // Client is the interface the handler depends on, so tests can substitute a

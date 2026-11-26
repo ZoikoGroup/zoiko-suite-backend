@@ -21,8 +21,10 @@ import (
 	"zoiko.io/clause-template-svc/internal/events"
 	"zoiko.io/clause-template-svc/internal/handler"
 	"zoiko.io/clause-template-svc/internal/health"
+	"zoiko.io/clause-template-svc/internal/idempotency"
 	"zoiko.io/clause-template-svc/internal/middleware"
 	"zoiko.io/clause-template-svc/internal/mtls"
+	"zoiko.io/clause-template-svc/internal/outbox"
 	"zoiko.io/clause-template-svc/internal/store"
 	"zoiko.io/clause-template-svc/internal/telemetry"
 )
@@ -80,7 +82,15 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
 
-	h := handler.New(pgStore, publisher, authzClient, logger)
+	h := handler.New(pgStore, authzClient, logger)
+
+	// Transactional outbox relay: delivers the events each store write
+	// committed into outbox_events, retrying until Kafka accepts them.
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	if pool != nil {
+		go outbox.NewRelay(pool, publisher, 1500*time.Millisecond, 50, logger).Start(relayCtx)
+	}
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -94,6 +104,11 @@ func main() {
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+
+	// Replay protection for material writes: a retried POST/PUT with the same
+	// Idempotency-Key gets the first answer instead of running twice. Placed after
+	// the envelope middleware, which guarantees the key and tenant are present.
+	r.Use(idempotency.Middleware(idempotency.NewPgStore(pool), logger))
 
 	r.Get("/healthz", health.HealthzHandler)
 	r.Get("/readyz", health.ReadyzHandler(pool))
@@ -120,6 +135,7 @@ func main() {
 	<-stop
 
 	logger.Info("shutting down clause-template-svc gracefully...")
+	stopRelay()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 

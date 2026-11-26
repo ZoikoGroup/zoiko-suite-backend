@@ -14,6 +14,8 @@ import (
 	kmscrypto "zoiko.io/key-management-svc/internal/crypto"
 	"zoiko.io/key-management-svc/internal/domain"
 	svcenvelope "zoiko.io/key-management-svc/internal/envelope"
+	"zoiko.io/key-management-svc/internal/health"
+	"zoiko.io/key-management-svc/internal/idempotency"
 	"zoiko.io/key-management-svc/internal/siem"
 	"zoiko.io/key-management-svc/internal/store"
 )
@@ -101,11 +103,29 @@ type Handler struct {
 	authz  AuthzChecker
 	logger *zap.Logger
 
+	// idem answers a retried material write from its first response. nil
+	// disables replay protection: unit tests only; cmd/server always sets
+	// the Postgres-backed store.
+	idem idempotency.Store
+	// db is what /readyz pings. nil reports not-ready.
+	db health.Pinger
 	// vault and cipher back /v1/tokenize and /v1/detokenize. Set by
 	// WithVault; while unset those two routes refuse with 503 rather than
 	// tokenizing into nowhere.
 	vault  store.Vault
 	cipher *kmscrypto.Cipher
+}
+
+// WithIdempotency installs Idempotency-Key replay for material writes.
+func (h *Handler) WithIdempotency(s idempotency.Store) *Handler {
+	h.idem = s
+	return h
+}
+
+// WithReadiness sets the dependency /readyz checks.
+func (h *Handler) WithReadiness(db health.Pinger) *Handler {
+	h.db = db
+	return h
 }
 
 // requirePrincipal returns the gateway-verified principal, or refuses the
@@ -182,11 +202,20 @@ func NewRouter(h *Handler) http.Handler {
 	// Refusals rendered as RFC 9457 problem+json, like every other error here.
 	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
-	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "key-management-svc"})
-	})
+	// Probes are public: the envelope policy exempts them and the tenant
+	// check lives in the handlers below, not on the router.
+	r.Get("/healthz", health.HealthzHandler("key-management-svc"))
+	r.Get("/readyz", health.ReadyzHandler(h.db))
 	r.Route("/v1/keys", func(r chi.Router) {
+		// Replay protection (INV-08): a retried register/rotate/disable with
+		// the same Idempotency-Key gets the first answer instead of running
+		// again, which for rotate would otherwise advance the version twice.
+		// Scoped to /v1/keys on purpose: the replay store keeps response
+		// bodies, and /v1/detokenize answers with a raw value that must never
+		// be stored. Tokenize has its own idempotency in tokenized_values.
+		if h.idem != nil {
+			r.Use(idempotency.Middleware(h.idem, h.logger))
+		}
 		r.Post("/", h.RegisterKey)
 		r.Get("/", h.ListKeys)
 		r.Get("/{id}", h.GetKey)
@@ -230,6 +259,7 @@ func (h *Handler) RegisterKey(w http.ResponseWriter, r *http.Request) {
 		ExternalKeyARN: req.ExternalKeyARN,
 	}
 	if err := h.store.CreateKey(r.Context(), tenantID, key); err != nil {
+		h.logger.Error("register key failed", zap.Error(err))
 		h.errJSON(w, r, 500, "failed to register key")
 		return
 	}

@@ -34,6 +34,9 @@ func (f failingStore) RotateKey(context.Context, string, string) (*domain.Custom
 	return nil, f.err
 }
 func (f failingStore) DisableKey(context.Context, string, string) error { return f.err }
+func (f failingStore) ListKeyVersions(context.Context, string, string) ([]domain.KeyVersion, error) {
+	return nil, f.err
+}
 
 // storeErrorRoutes is every key route whose store errors used to be flattened: the
 // four Phase-4 handlers, each with a request that reaches its store call.

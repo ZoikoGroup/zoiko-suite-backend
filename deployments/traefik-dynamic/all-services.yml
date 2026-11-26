@@ -61,6 +61,14 @@ http:
             middlewares:
                 - strip-ai-governance-svc
             priority: 50
+        svc-anomaly-detection-svc:
+            rule: PathPrefix(`/anomaly-detection-svc`)
+            entryPoints:
+                - web
+            service: svc-anomaly-detection-svc
+            middlewares:
+                - strip-anomaly-detection-svc
+            priority: 50
         svc-asset-management-svc:
             rule: PathPrefix(`/asset-management-svc`)
             entryPoints:
@@ -93,6 +101,14 @@ http:
             middlewares:
                 - strip-bank-reconciliation-svc
             priority: 50
+        svc-banking-connector-svc:
+            rule: PathPrefix(`/banking-connector-svc`)
+            entryPoints:
+                - web
+            service: svc-banking-connector-svc
+            middlewares:
+                - strip-banking-connector-svc
+            priority: 50
         svc-benefits-svc:
             rule: PathPrefix(`/benefits-svc`)
             entryPoints:
@@ -116,6 +132,14 @@ http:
             service: svc-capability-registry-svc
             middlewares:
                 - strip-capability-registry-svc
+            priority: 50
+        svc-carta-svc:
+            rule: PathPrefix(`/carta-svc`)
+            entryPoints:
+                - web
+            service: svc-carta-svc
+            middlewares:
+                - strip-carta-svc
             priority: 50
         svc-clause-template-svc:
             rule: PathPrefix(`/clause-template-svc`)
@@ -149,6 +173,22 @@ http:
             middlewares:
                 - strip-compensation-svc
             priority: 50
+        svc-compliance-risk-scoring-svc:
+            rule: PathPrefix(`/compliance-risk-scoring-svc`)
+            entryPoints:
+                - web
+            service: svc-compliance-risk-scoring-svc
+            middlewares:
+                - strip-compliance-risk-scoring-svc
+            priority: 50
+        svc-compliance-status-svc:
+            rule: PathPrefix(`/compliance-status-svc`)
+            entryPoints:
+                - web
+            service: svc-compliance-status-svc
+            middlewares:
+                - strip-compliance-status-svc
+            priority: 50
         svc-configuration-feature-flag-svc:
             rule: PathPrefix(`/configuration-feature-flag-svc`)
             entryPoints:
@@ -156,6 +196,14 @@ http:
             service: svc-configuration-feature-flag-svc
             middlewares:
                 - strip-configuration-feature-flag-svc
+            priority: 50
+        svc-connectivity-api-bridge-svc:
+            rule: PathPrefix(`/connectivity-api-bridge-svc`)
+            entryPoints:
+                - web
+            service: svc-connectivity-api-bridge-svc
+            middlewares:
+                - strip-connectivity-api-bridge-svc
             priority: 50
         svc-consolidation-svc:
             rule: PathPrefix(`/consolidation-svc`)
@@ -245,6 +293,14 @@ http:
             middlewares:
                 - strip-employment-contracts-svc
             priority: 50
+        svc-esignature-integration-svc:
+            rule: PathPrefix(`/esignature-integration-svc`)
+            entryPoints:
+                - web
+            service: svc-esignature-integration-svc
+            middlewares:
+                - strip-esignature-integration-svc
+            priority: 50
         svc-evidence-manifest-svc:
             rule: PathPrefix(`/evidence-manifest-svc`)
             entryPoints:
@@ -261,6 +317,14 @@ http:
             middlewares:
                 - strip-evidence-requirements-svc
             priority: 50
+        svc-exception-escalation-svc:
+            rule: PathPrefix(`/exception-escalation-svc`)
+            entryPoints:
+                - web
+            service: svc-exception-escalation-svc
+            middlewares:
+                - strip-exception-escalation-svc
+            priority: 50
         svc-expense-claim-svc:
             rule: PathPrefix(`/expense-claim-svc`)
             entryPoints:
@@ -268,6 +332,30 @@ http:
             service: svc-expense-claim-svc
             middlewares:
                 - strip-expense-claim-svc
+            priority: 50
+        svc-external-data-feed-svc:
+            rule: PathPrefix(`/external-data-feed-svc`)
+            entryPoints:
+                - web
+            service: svc-external-data-feed-svc
+            middlewares:
+                - strip-external-data-feed-svc
+            priority: 50
+        svc-filing-preparation-svc:
+            rule: PathPrefix(`/filing-preparation-svc`)
+            entryPoints:
+                - web
+            service: svc-filing-preparation-svc
+            middlewares:
+                - strip-filing-preparation-svc
+            priority: 50
+        svc-filing-tracker-svc:
+            rule: PathPrefix(`/filing-tracker-svc`)
+            entryPoints:
+                - web
+            service: svc-filing-tracker-svc
+            middlewares:
+                - strip-filing-tracker-svc
             priority: 50
         svc-financial-close-svc:
             rule: PathPrefix(`/financial-close-svc`)
@@ -301,6 +389,14 @@ http:
             middlewares:
                 - strip-fiscal-calendar-svc
             priority: 50
+        svc-forecasting-svc:
+            rule: PathPrefix(`/forecasting-svc`)
+            entryPoints:
+                - web
+            service: svc-forecasting-svc
+            middlewares:
+                - strip-forecasting-svc
+            priority: 50
         svc-gateway-auth-svc:
             rule: PathPrefix(`/gateway-auth-svc`)
             entryPoints:
@@ -332,6 +428,14 @@ http:
             service: svc-governance-decision-log-svc
             middlewares:
                 - strip-governance-decision-log-svc
+            priority: 50
+        svc-hris-connector-svc:
+            rule: PathPrefix(`/hris-connector-svc`)
+            entryPoints:
+                - web
+            service: svc-hris-connector-svc
+            middlewares:
+                - strip-hris-connector-svc
             priority: 50
         svc-identity-context-svc:
             rule: PathPrefix(`/identity-context-svc`)
@@ -373,6 +477,14 @@ http:
             middlewares:
                 - strip-jurisdiction-rules-svc
             priority: 50
+        svc-key-management-svc:
+            rule: PathPrefix(`/key-management-svc`)
+            entryPoints:
+                - web
+            service: svc-key-management-svc
+            middlewares:
+                - strip-key-management-svc
+            priority: 50
         svc-kill-switch-registry-svc:
             rule: PathPrefix(`/kill-switch-registry-svc`)
             entryPoints:
@@ -396,6 +508,14 @@ http:
             service: svc-metric-registry-svc
             middlewares:
                 - strip-metric-registry-svc
+            priority: 50
+        svc-migration-integrity-svc:
+            rule: PathPrefix(`/migration-integrity-svc`)
+            entryPoints:
+                - web
+            service: svc-migration-integrity-svc
+            middlewares:
+                - strip-migration-integrity-svc
             priority: 50
         svc-mtls-management-svc:
             rule: PathPrefix(`/mtls-management-svc`)
@@ -613,6 +733,22 @@ http:
             middlewares:
                 - strip-purchase-request-svc
             priority: 50
+        svc-reconciliation-intelligence-svc:
+            rule: PathPrefix(`/reconciliation-intelligence-svc`)
+            entryPoints:
+                - web
+            service: svc-reconciliation-intelligence-svc
+            middlewares:
+                - strip-reconciliation-intelligence-svc
+            priority: 50
+        svc-reporting-orchestration-svc:
+            rule: PathPrefix(`/reporting-orchestration-svc`)
+            entryPoints:
+                - web
+            service: svc-reporting-orchestration-svc
+            middlewares:
+                - strip-reporting-orchestration-svc
+            priority: 50
         svc-retention-registry-svc:
             rule: PathPrefix(`/retention-registry-svc`)
             entryPoints:
@@ -645,6 +781,14 @@ http:
             middlewares:
                 - strip-secret-vault-integration-svc
             priority: 50
+        svc-siem-integration-svc:
+            rule: PathPrefix(`/siem-integration-svc`)
+            entryPoints:
+                - web
+            service: svc-siem-integration-svc
+            middlewares:
+                - strip-siem-integration-svc
+            priority: 50
         svc-source-authority-svc:
             rule: PathPrefix(`/source-authority-svc`)
             entryPoints:
@@ -676,6 +820,14 @@ http:
             service: svc-supplier-recovery-svc
             middlewares:
                 - strip-supplier-recovery-svc
+            priority: 50
+        svc-tax-authority-interface-svc:
+            rule: PathPrefix(`/tax-authority-interface-svc`)
+            entryPoints:
+                - web
+            service: svc-tax-authority-interface-svc
+            middlewares:
+                - strip-tax-authority-interface-svc
             priority: 50
         svc-tax-determination-svc:
             rule: PathPrefix(`/tax-determination-svc`)
@@ -725,6 +877,14 @@ http:
             middlewares:
                 - strip-vendor-due-diligence-svc
             priority: 50
+        svc-withholding-tax-svc:
+            rule: PathPrefix(`/withholding-tax-svc`)
+            entryPoints:
+                - web
+            service: svc-withholding-tax-svc
+            middlewares:
+                - strip-withholding-tax-svc
+            priority: 50
         svc-workflow-history-svc:
             rule: PathPrefix(`/workflow-history-svc`)
             entryPoints:
@@ -770,6 +930,10 @@ http:
             stripPrefix:
                 prefixes:
                     - /ai-governance-svc
+        strip-anomaly-detection-svc:
+            stripPrefix:
+                prefixes:
+                    - /anomaly-detection-svc
         strip-asset-management-svc:
             stripPrefix:
                 prefixes:
@@ -786,6 +950,10 @@ http:
             stripPrefix:
                 prefixes:
                     - /bank-reconciliation-svc
+        strip-banking-connector-svc:
+            stripPrefix:
+                prefixes:
+                    - /banking-connector-svc
         strip-benefits-svc:
             stripPrefix:
                 prefixes:
@@ -798,6 +966,10 @@ http:
             stripPrefix:
                 prefixes:
                     - /capability-registry-svc
+        strip-carta-svc:
+            stripPrefix:
+                prefixes:
+                    - /carta-svc
         strip-clause-template-svc:
             stripPrefix:
                 prefixes:
@@ -814,10 +986,22 @@ http:
             stripPrefix:
                 prefixes:
                     - /compensation-svc
+        strip-compliance-risk-scoring-svc:
+            stripPrefix:
+                prefixes:
+                    - /compliance-risk-scoring-svc
+        strip-compliance-status-svc:
+            stripPrefix:
+                prefixes:
+                    - /compliance-status-svc
         strip-configuration-feature-flag-svc:
             stripPrefix:
                 prefixes:
                     - /configuration-feature-flag-svc
+        strip-connectivity-api-bridge-svc:
+            stripPrefix:
+                prefixes:
+                    - /connectivity-api-bridge-svc
         strip-consolidation-svc:
             stripPrefix:
                 prefixes:
@@ -862,6 +1046,10 @@ http:
             stripPrefix:
                 prefixes:
                     - /employment-contracts-svc
+        strip-esignature-integration-svc:
+            stripPrefix:
+                prefixes:
+                    - /esignature-integration-svc
         strip-evidence-manifest-svc:
             stripPrefix:
                 prefixes:
@@ -870,10 +1058,26 @@ http:
             stripPrefix:
                 prefixes:
                     - /evidence-requirements-svc
+        strip-exception-escalation-svc:
+            stripPrefix:
+                prefixes:
+                    - /exception-escalation-svc
         strip-expense-claim-svc:
             stripPrefix:
                 prefixes:
                     - /expense-claim-svc
+        strip-external-data-feed-svc:
+            stripPrefix:
+                prefixes:
+                    - /external-data-feed-svc
+        strip-filing-preparation-svc:
+            stripPrefix:
+                prefixes:
+                    - /filing-preparation-svc
+        strip-filing-tracker-svc:
+            stripPrefix:
+                prefixes:
+                    - /filing-tracker-svc
         strip-financial-close-svc:
             stripPrefix:
                 prefixes:
@@ -890,6 +1094,10 @@ http:
             stripPrefix:
                 prefixes:
                     - /fiscal-calendar-svc
+        strip-forecasting-svc:
+            stripPrefix:
+                prefixes:
+                    - /forecasting-svc
         strip-gateway-auth-svc:
             stripPrefix:
                 prefixes:
@@ -906,6 +1114,10 @@ http:
             stripPrefix:
                 prefixes:
                     - /governance-decision-log-svc
+        strip-hris-connector-svc:
+            stripPrefix:
+                prefixes:
+                    - /hris-connector-svc
         strip-identity-context-svc:
             stripPrefix:
                 prefixes:
@@ -926,6 +1138,10 @@ http:
             stripPrefix:
                 prefixes:
                     - /jurisdiction-rules-svc
+        strip-key-management-svc:
+            stripPrefix:
+                prefixes:
+                    - /key-management-svc
         strip-kill-switch-registry-svc:
             stripPrefix:
                 prefixes:
@@ -938,6 +1154,10 @@ http:
             stripPrefix:
                 prefixes:
                     - /metric-registry-svc
+        strip-migration-integrity-svc:
+            stripPrefix:
+                prefixes:
+                    - /migration-integrity-svc
         strip-mtls-management-svc:
             stripPrefix:
                 prefixes:
@@ -1046,6 +1266,14 @@ http:
             stripPrefix:
                 prefixes:
                     - /purchase-request-svc
+        strip-reconciliation-intelligence-svc:
+            stripPrefix:
+                prefixes:
+                    - /reconciliation-intelligence-svc
+        strip-reporting-orchestration-svc:
+            stripPrefix:
+                prefixes:
+                    - /reporting-orchestration-svc
         strip-retention-registry-svc:
             stripPrefix:
                 prefixes:
@@ -1062,6 +1290,10 @@ http:
             stripPrefix:
                 prefixes:
                     - /secret-vault-integration-svc
+        strip-siem-integration-svc:
+            stripPrefix:
+                prefixes:
+                    - /siem-integration-svc
         strip-source-authority-svc:
             stripPrefix:
                 prefixes:
@@ -1078,6 +1310,10 @@ http:
             stripPrefix:
                 prefixes:
                     - /supplier-recovery-svc
+        strip-tax-authority-interface-svc:
+            stripPrefix:
+                prefixes:
+                    - /tax-authority-interface-svc
         strip-tax-determination-svc:
             stripPrefix:
                 prefixes:
@@ -1102,6 +1338,10 @@ http:
             stripPrefix:
                 prefixes:
                     - /vendor-due-diligence-svc
+        strip-withholding-tax-svc:
+            stripPrefix:
+                prefixes:
+                    - /withholding-tax-svc
         strip-workflow-history-svc:
             stripPrefix:
                 prefixes:
@@ -1135,6 +1375,10 @@ http:
             loadBalancer:
                 servers:
                     - url: http://ai-governance-svc:8146
+        svc-anomaly-detection-svc:
+            loadBalancer:
+                servers:
+                    - url: http://anomaly-detection-svc:8134
         svc-asset-management-svc:
             loadBalancer:
                 servers:
@@ -1151,6 +1395,10 @@ http:
             loadBalancer:
                 servers:
                     - url: http://bank-reconciliation-svc:8102
+        svc-banking-connector-svc:
+            loadBalancer:
+                servers:
+                    - url: http://banking-connector-svc:8145
         svc-benefits-svc:
             loadBalancer:
                 servers:
@@ -1163,6 +1411,10 @@ http:
             loadBalancer:
                 servers:
                     - url: http://capability-registry-svc:8145
+        svc-carta-svc:
+            loadBalancer:
+                servers:
+                    - url: http://carta-svc:8142
         svc-clause-template-svc:
             loadBalancer:
                 servers:
@@ -1179,10 +1431,22 @@ http:
             loadBalancer:
                 servers:
                     - url: http://compensation-svc:8111
+        svc-compliance-risk-scoring-svc:
+            loadBalancer:
+                servers:
+                    - url: http://compliance-risk-scoring-svc:8177
+        svc-compliance-status-svc:
+            loadBalancer:
+                servers:
+                    - url: http://compliance-status-svc:8132
         svc-configuration-feature-flag-svc:
             loadBalancer:
                 servers:
                     - url: http://configuration-feature-flag-svc:8086
+        svc-connectivity-api-bridge-svc:
+            loadBalancer:
+                servers:
+                    - url: http://connectivity-api-bridge-svc:8144
         svc-consolidation-svc:
             loadBalancer:
                 servers:
@@ -1227,6 +1491,10 @@ http:
             loadBalancer:
                 servers:
                     - url: http://employment-contracts-svc:8109
+        svc-esignature-integration-svc:
+            loadBalancer:
+                servers:
+                    - url: http://esignature-integration-svc:8148
         svc-evidence-manifest-svc:
             loadBalancer:
                 servers:
@@ -1235,10 +1503,26 @@ http:
             loadBalancer:
                 servers:
                     - url: http://evidence-requirements-svc:8130
+        svc-exception-escalation-svc:
+            loadBalancer:
+                servers:
+                    - url: http://exception-escalation-svc:8133
         svc-expense-claim-svc:
             loadBalancer:
                 servers:
                     - url: http://expense-claim-svc:8158
+        svc-external-data-feed-svc:
+            loadBalancer:
+                servers:
+                    - url: http://external-data-feed-svc:8149
+        svc-filing-preparation-svc:
+            loadBalancer:
+                servers:
+                    - url: http://filing-preparation-svc:8176
+        svc-filing-tracker-svc:
+            loadBalancer:
+                servers:
+                    - url: http://filing-tracker-svc:8131
         svc-financial-close-svc:
             loadBalancer:
                 servers:
@@ -1255,6 +1539,10 @@ http:
             loadBalancer:
                 servers:
                     - url: http://fiscal-calendar-svc:8173
+        svc-forecasting-svc:
+            loadBalancer:
+                servers:
+                    - url: http://forecasting-svc:8135
         svc-gateway-auth-svc:
             loadBalancer:
                 servers:
@@ -1271,6 +1559,10 @@ http:
             loadBalancer:
                 servers:
                     - url: http://governance-decision-log-svc:8083
+        svc-hris-connector-svc:
+            loadBalancer:
+                servers:
+                    - url: http://hris-connector-svc:8146
         svc-identity-context-svc:
             loadBalancer:
                 servers:
@@ -1291,6 +1583,10 @@ http:
             loadBalancer:
                 servers:
                     - url: http://jurisdiction-rules-svc:8082
+        svc-key-management-svc:
+            loadBalancer:
+                servers:
+                    - url: http://key-management-svc:8143
         svc-kill-switch-registry-svc:
             loadBalancer:
                 servers:
@@ -1303,6 +1599,10 @@ http:
             loadBalancer:
                 servers:
                     - url: http://metric-registry-svc:8149
+        svc-migration-integrity-svc:
+            loadBalancer:
+                servers:
+                    - url: http://migration-integrity-svc:8139
         svc-mtls-management-svc:
             loadBalancer:
                 servers:
@@ -1411,6 +1711,14 @@ http:
             loadBalancer:
                 servers:
                     - url: http://purchase-request-svc:8100
+        svc-reconciliation-intelligence-svc:
+            loadBalancer:
+                servers:
+                    - url: http://reconciliation-intelligence-svc:8137
+        svc-reporting-orchestration-svc:
+            loadBalancer:
+                servers:
+                    - url: http://reporting-orchestration-svc:8138
         svc-retention-registry-svc:
             loadBalancer:
                 servers:
@@ -1427,6 +1735,10 @@ http:
             loadBalancer:
                 servers:
                     - url: http://secret-vault-integration-svc:8087
+        svc-siem-integration-svc:
+            loadBalancer:
+                servers:
+                    - url: http://siem-integration-svc:8141
         svc-source-authority-svc:
             loadBalancer:
                 servers:
@@ -1443,6 +1755,10 @@ http:
             loadBalancer:
                 servers:
                     - url: http://supplier-recovery-svc:8165
+        svc-tax-authority-interface-svc:
+            loadBalancer:
+                servers:
+                    - url: http://tax-authority-interface-svc:8147
         svc-tax-determination-svc:
             loadBalancer:
                 servers:
@@ -1467,6 +1783,10 @@ http:
             loadBalancer:
                 servers:
                     - url: http://vendor-due-diligence-svc:8135
+        svc-withholding-tax-svc:
+            loadBalancer:
+                servers:
+                    - url: http://withholding-tax-svc:8129
         svc-workflow-history-svc:
             loadBalancer:
                 servers:

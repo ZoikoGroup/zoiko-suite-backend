@@ -73,7 +73,7 @@ func openTestPools(t *testing.T) (app, admin *pgxpool.Pool) {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS send_quota_counters, notice_acknowledgements, regulated_notice_events, regulated_notices, notification_delivery_evidence, recipient_preferences, communication_intent_versions, communication_intents, notification_delivery_attempts, event_outbox, webhook_dlq, action_tokens, email_suppressions, delivery_events, delivery_attempts, message_renders, message_intents, template_versions, template_definitions, notifications CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS eventing_outbox, send_quota_counters, notice_acknowledgements, regulated_notice_events, regulated_notices, notification_delivery_evidence, recipient_preferences, communication_intent_versions, communication_intents, notification_delivery_attempts, event_outbox, webhook_dlq, action_tokens, email_suppressions, delivery_events, delivery_attempts, message_renders, message_intents, template_versions, template_definitions, notifications CASCADE;`)
 
 	// Every migration, in order — discovered, not listed.
 	//
@@ -134,6 +134,7 @@ func openTestPools(t *testing.T) (app, admin *pgxpool.Pool) {
 		t.Fatalf("connect as %s: %v", appRole, err)
 	}
 	t.Cleanup(app.Close)
+	verifyEventContracts(t, pool)
 	return app, pool
 }
 
@@ -179,7 +180,7 @@ func newNotification(tenantID, legalEntityID, recipient, correlationID string) *
 // delivery â€” proved against the real unique index rather than a map stub.
 func TestPgStore_CreateNotification_Retried_IsIdempotent(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 
 	first := newNotification("tenant-a", "le-us", "principal-2", "corr-retry")
@@ -215,7 +216,7 @@ func TestPgStore_CreateNotification_Retried_IsIdempotent(t *testing.T) {
 // able to suppress another tenant's notification by guessing its key.
 func TestPgStore_CreateNotification_CorrelationIDIsScopedPerTenant(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	a := newNotification("tenant-a", "le-us", "principal-2", "corr-shared")
 	if created, err := s.CreateNotification(tenantCtx("tenant-a"), a); err != nil || !created {
@@ -238,7 +239,7 @@ func TestPgStore_CreateNotification_CorrelationIDIsScopedPerTenant(t *testing.T)
 // someone else's subject line.
 func TestPgStore_GetNotification_IsTenantScoped(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	n := newNotification("tenant-a", "le-us", "principal-2", "corr-scope")
 	if _, err := s.CreateNotification(tenantCtx("tenant-a"), n); err != nil {
@@ -262,7 +263,7 @@ func TestPgStore_GetNotification_IsTenantScoped(t *testing.T) {
 // status for a typo in a URL.
 func TestPgStore_GetNotification_MalformedID_IsNotFoundNotAnOutage(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	_, err := s.GetNotification(tenantCtx("tenant-a"), "not-a-uuid")
 	if !errors.Is(err, domain.ErrNotificationNotFound) {
@@ -273,7 +274,7 @@ func TestPgStore_GetNotification_MalformedID_IsNotFoundNotAnOutage(t *testing.T)
 // The register read must not cross tenants, and must honour its paging bounds.
 func TestPgStore_ListNotifications_IsTenantScopedAndPaged(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	for i := 0; i < 3; i++ {
 		n := newNotification("tenant-a", "le-us", "principal-2", "corr-a-"+strconv.Itoa(i))
@@ -329,7 +330,7 @@ func TestPgStore_ListNotifications_IsTenantScopedAndPaged(t *testing.T) {
 // actually filter â€” otherwise the handler's inbox scoping would be decorative.
 func TestPgStore_ListNotifications_FiltersByRecipient(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 
 	mine := newNotification("tenant-a", "le-us", "principal-me", "corr-mine")
@@ -353,7 +354,7 @@ func TestPgStore_ListNotifications_FiltersByRecipient(t *testing.T) {
 // conclude another tenant's notification.
 func TestPgStore_CompleteDelivery_IsTenantScoped(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	n := newNotification("tenant-a", "le-us", "principal-2", "corr-complete")
 	if _, err := s.CreateNotification(tenantCtx("tenant-a"), n); err != nil {
@@ -382,7 +383,7 @@ func TestPgStore_CompleteDelivery_IsTenantScoped(t *testing.T) {
 // added by migration 000006.
 func TestPgStore_MarkOutcomeUnknown_ThenResolveToSent(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	n := newNotification("tenant-a", "le-us", "principal-2", "corr-unknown-1")
 	if _, err := s.CreateNotification(tenantCtx("tenant-a"), n); err != nil {
@@ -438,7 +439,7 @@ func TestPgStore_MarkOutcomeUnknown_ThenResolveToSent(t *testing.T) {
 // notification not actually PENDING_UNKNOWN has nothing to resolve.
 func TestPgStore_ResolveDeliveryOutcome_NotPendingUnknown_ReturnsNotFound(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	n := newNotification("tenant-a", "le-us", "principal-2", "corr-unknown-2")
 	if _, err := s.CreateNotification(tenantCtx("tenant-a"), n); err != nil {
@@ -462,7 +463,7 @@ func TestPgStore_ResolveDeliveryOutcome_NotPendingUnknown_ReturnsNotFound(t *tes
 // TestPgStore_CompleteDelivery_IsTenantScoped for the new method.
 func TestPgStore_MarkOutcomeUnknown_IsTenantScoped(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	n := newNotification("tenant-a", "le-us", "principal-2", "corr-unknown-3")
 	if _, err := s.CreateNotification(tenantCtx("tenant-a"), n); err != nil {
@@ -481,7 +482,7 @@ func TestPgStore_MarkOutcomeUnknown_IsTenantScoped(t *testing.T) {
 // database itself, not only by the Go layer.
 func TestPgStore_PendingUnknownRequiresAReason(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	n := newNotification("tenant-a", "le-us", "principal-2", "corr-unknown-4")
 	if _, err := s.CreateNotification(tenantCtx("tenant-a"), n); err != nil {
@@ -510,7 +511,7 @@ func TestPgStore_PendingUnknownRequiresAReason(t *testing.T) {
 // against every tenant's rows.
 func TestPgStore_WithoutTenant_IsRefused(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 
 	if _, err := s.ListNotifications(context.Background(), domain.ListFilter{Limit: 10}); !errors.Is(err, domain.ErrIdentityMissing) {
 		t.Fatalf("list without tenant returned %v, want ErrIdentityMissing", err)

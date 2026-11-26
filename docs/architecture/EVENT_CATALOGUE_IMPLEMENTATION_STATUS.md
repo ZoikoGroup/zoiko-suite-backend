@@ -320,3 +320,108 @@ Behaviour changes to know about:
 - Not migrated: the existing counterparty events (`counterparty.*`) still use the old direct publisher,
   and `CloseOpportunity` still emits no event (it changes the stage to CLOSED_WON/LOST but never
   published `opportunity.stage_changed`; left as it was).
+
+### document-vault-svc (BIZ-01 / BIZ-02): nine events moved to the eventing outbox
+
+Nine events are written to `eventing_outbox` (migration 000017) in the same transaction as the change, as
+`com.zoikosuite.business.document.{record-declared,superseded,archived,disposition-requested,version-upload-quarantined}`
+and `com.zoikosuite.business.classification.{proposed,confirmed,reclassified,superseded}`, with payload schemas in
+`document-vault-svc/contracts/events` enforced by the store tests and extension catalogue entries (producer
+`Document Vault Service`). The old event_type is kept as the envelope's legacy type.
+
+Deliberately not moved: `document_created` and `document_version_committed` (named by ZS-SVC-S-001 section 9.3, so renaming
+them needs a decision between two specs), and the DRC retention, legal-hold and preservation events.
+
+Behaviour changes: `EVENT_RESIDENCY_REGION` is now required (compose sets it, default `local`), a write whose event
+cannot be built is rolled back, a second relay delivers the eventing outbox (not started when no Kafka brokers are
+configured), and the Docker build context moved to `services/`.
+
+Also fixed: the older relay failed every poll on a row with a NULL `legal_entity_id` (legal holds, export packages),
+which blocked every later event; it now scans a nullable value.
+
+Open: the catalogue's section 19 entries `business.document.stored`, `versioned` and `classification-changed` (producer
+"Document Service", no deployed owner) overlap in meaning with the new types and need reconciling.
+
+### notification-svc (BIZ-03): four template events moved to the eventing outbox
+
+`template.created`, `template.version_approved`, `template.published` and `template.retired` are written to
+`eventing_outbox` (migration 000035) in the same transaction as the change, as
+`com.zoikosuite.business.template.{created,version-approved,published,retired}`, with payload schemas in
+`notification-svc/contracts/events` enforced by the store tests. The old event_type is kept as the envelope's legacy type.
+Catalogue: `created`, `version-approved` and `retired` are new extension entries (producer `Notification Service`);
+`published` was already a section 19 entry whose producer "Template Service" had no owner, so the producer mapping
+now resolves "Template Service" to `notification-svc` (the service that hosts BIZ-03).
+
+Not moved: `notification.*`, `communication.*` and `delivery.attempt.*` stay on the service's own `event_outbox`.
+
+Behaviour changes: `EVENT_RESIDENCY_REGION` is now required (compose sets it, default `local`), a template write whose event
+cannot be built is rolled back, and a second relay delivers the eventing outbox (not started when no Kafka brokers are
+configured). The four event builders in `internal/events` were removed.
+
+Open: `eventing_outbox` has no row-level security (the shared library's table is cross-tenant by design, its relay drains
+every tenant), so the app role can read every tenant's envelopes; the service's legacy-RLS test excludes it explicitly.
+
+### exception-escalation-svc (BIZ-08): five deadline events moved to the eventing outbox
+
+`deadline.created`, `deadline.superseded`, `deadline.completed`, `deadline.due_soon` and `deadline.overdue` are written to
+`eventing_outbox` (migration 000007) in the same transaction as the change, as
+`com.zoikosuite.business.deadline.{created,superseded,completed,became-due-soon,became-overdue}`, with payload schemas in
+`exception-escalation-svc/contracts/events` enforced by the store tests and extension catalogue entries (producer
+`Exception Escalation Service`). The old event_type is kept as the envelope's legacy type. The two threshold events are named
+with `became-` because the catalogue lint requires past-tense facts.
+
+They were published by the handler after the commit with failures only logged; for due-soon and overdue the notified stamp was
+committed first, so a failed publish was never retried. Not moved: the exception-case, finding and task events.
+
+Behaviour changes: `EVENT_RESIDENCY_REGION` is now required (phase5 compose sets it, default `local`), a write whose event
+cannot be built is rolled back, a relay delivers the eventing outbox (not started with no brokers), and the Docker build
+context moved to `services/`.
+
+Open: the catalogue's section 19 entry `business.deadline.due` (producer "Deadline Service", no deployed owner) overlaps
+`became-due-soon` and `became-overdue` and needs reconciling.
+
+### comments-collaboration-svc (BIZ-09): five events moved to the eventing outbox
+
+`comment.added`, `comment.edited`, `comment.moderated`, `mention.created` and `thread.resolved` are written to `eventing_outbox`
+(migration 000004) in the same transaction as the change, as `com.zoikosuite.business.comment.{added,edited,moderated}`,
+`com.zoikosuite.business.mention.created` and `com.zoikosuite.business.thread.resolved`, with payload schemas in
+`comments-collaboration-svc/contracts/events` enforced by the store tests and extension catalogue entries (producer
+`Comments Collaboration Service`). The old event_type is kept as the envelope's legacy type. Payloads carry identifiers
+only, never the comment body; the envelope classification follows the thread's.
+
+They were published by the handler after the commit through a Kafka writer that could not report failure. The old
+`internal/events` publisher was removed.
+
+Behaviour changes: `EVENT_RESIDENCY_REGION` is now required (compose sets it, default `local`), a write whose event cannot be
+built is rolled back, a relay delivers the eventing outbox (not started with no brokers), and the Docker build context moved
+to `services/`.
+
+### exception-escalation-svc (BIZ-05): six task and case events moved to the eventing outbox
+
+`task.created`, `task.assigned`, `task.escalated`, `task.completed`, `task.reopened` and `case.closed` are written to the same
+`eventing_outbox` as the BIZ-08 deadline events, in the same transaction as the change, as
+`com.zoikosuite.business.task.{created,assigned,escalated,completed,reopened}` and `com.zoikosuite.business.case.closed`, with
+payload schemas in `exception-escalation-svc/contracts/events` enforced by the store tests. `task.created`, `task.completed` and
+`case.closed` already existed as section 19 entries with the unowned producers "Task Service" and "Case Service"; the producer
+mapping now resolves both to `exception-escalation-svc` (the service that hosts BIZ-05). `task.assigned`, `task.escalated` and
+`task.reopened` are new extension entries (producer `Exception Escalation Service`). The old event_type is kept as the envelope's
+legacy type.
+
+They were published by the handler after the commit with failures only logged. Not moved: the exception-case and audit-finding
+events. Open: the section 19 entry `business.case.opened` has no emitter.
+
+### inventory-management-svc (BIZ-07): five offering events moved to the eventing outbox
+
+`catalog.offering.created`, `activated`, `suspended`, `retired` and `catalog.offering_version.superseded` are written to
+`eventing_outbox` (migration 000014) in the same transaction as the change, as `com.zoikosuite.business.offering.{created,activated,
+suspended,retired}` and `com.zoikosuite.business.offering-version.superseded`, with payload schemas in
+`inventory-management-svc/contracts/events` enforced by the store tests and extension catalogue entries (producer
+`Inventory Management Service`). The old event_type is kept as the envelope's legacy type. The hand-written
+`asyncapi.biz07.yaml` and its drift test were removed (pre-standard names); the generated shared AsyncAPI is the contract.
+
+They were published by the handler after the commit through a Kafka writer that could not report failure. Not moved: the
+service's other events (items, locations, movements, valuation, stock counts, accounting events).
+
+Behaviour changes: `EVENT_RESIDENCY_REGION` is now required (compose sets it, default `local`), a write whose event cannot be
+built is rolled back, a relay delivers the eventing outbox (not started with no brokers), and the Docker build context moved
+to `services/`.

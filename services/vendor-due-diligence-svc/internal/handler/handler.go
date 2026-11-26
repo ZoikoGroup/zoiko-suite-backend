@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"zoiko.io/vendor-due-diligence-svc/internal/clients"
 	"zoiko.io/vendor-due-diligence-svc/internal/domain"
 	svcmiddleware "zoiko.io/vendor-due-diligence-svc/internal/middleware"
 	"zoiko.io/vendor-due-diligence-svc/internal/store"
@@ -33,6 +34,10 @@ type Store interface {
 	CreateVendorProfile(ctx context.Context, p *domain.VendorProfile) error
 	GetVendorProfileByID(ctx context.Context, profileID string) (*domain.VendorProfile, error)
 	ListVendorProfiles(ctx context.Context, legalEntityID, counterpartyID string) ([]domain.VendorProfile, error)
+	// ApproveVendorProfile records the approval (due diligence CLEARED,
+	// approved_at, approved_by) once. ErrVendorProfileAlreadyApproved when it
+	// already carries one.
+	ApproveVendorProfile(ctx context.Context, profileID, approvedBy string) (*domain.VendorProfile, error)
 }
 
 type Publisher interface {
@@ -56,6 +61,7 @@ type CounterpartyClient interface {
 const (
 	actionInitiate = "VENDOR_DD_INITIATE"
 	actionView     = "VENDOR_DD_VIEW"
+	actionApprove  = "VENDOR_DD_APPROVE"
 )
 
 // Pagination bounds for the register. The route previously had none at all, so
@@ -124,6 +130,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/", h.CreateVendorProfile)
 		r.Get("/", h.ListVendorProfiles)
 		r.Get("/{id}", h.GetVendorProfileByID)
+		r.Post("/{id}/approve", h.ApproveVendorProfile)
 	})
 }
 
@@ -240,7 +247,10 @@ func (h *Handler) CreateCheck(w http.ResponseWriter, r *http.Request) {
 
 	h.publisher.PublishCompleted(r.Context(), correlationID, *check)
 
-	h.updateCounterparty(r.Context(), tenantID, check.CounterpartyID, riskOutcome)
+	h.updateCounterparty(clients.WithCaller(r.Context(), clients.Caller{
+		PrincipalID: principalID, LegalEntityID: check.LegalEntityID,
+		CorrelationID: correlationID, CheckID: check.CheckID,
+	}), tenantID, check.CounterpartyID, riskOutcome)
 
 	writeJSON(w, http.StatusCreated, domain.CheckDetailResponse{
 		Check:    *check,
@@ -728,6 +738,64 @@ func (h *Handler) GetVendorProfileByID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, profile)
+}
+
+// ApproveVendorProfile approves a vendor for spend. It is refused unless the
+// counterparty's most recent screening completed CLEAR: approval records that
+// due diligence passed, so it cannot precede or contradict the screening.
+func (h *Handler) ApproveVendorProfile(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	id := chi.URLParam(r, "id")
+	profile, err := h.store.GetVendorProfileByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, domain.ErrVendorProfileNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "vendor profile not found")
+			return
+		}
+		h.log.Error("failed to get vendor profile", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "store_error", "vendor profile could not be read")
+		return
+	}
+	// Authorized against the profile's own legal entity, never a caller-supplied scope.
+	if err := h.authz.CheckAllowed(r.Context(), principalID, profile.LegalEntityID, actionApprove); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	if profile.ApprovedAt != nil {
+		writeError(w, http.StatusConflict, "already_approved", "vendor profile is already approved")
+		return
+	}
+	checks, err := h.store.ListChecks(r.Context(), store.ListFilter{
+		LegalEntityID:  profile.LegalEntityID,
+		CounterpartyID: profile.CounterpartyID,
+		Limit:          1,
+	})
+	if err != nil {
+		h.log.Error("failed to read screening for approval", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "store_error", "screening could not be read")
+		return
+	}
+	if len(checks) == 0 || checks[0].Status != "COMPLETED" || checks[0].RiskOutcome != "CLEAR" {
+		writeError(w, http.StatusUnprocessableEntity, "screening_not_clear",
+			"the counterparty's latest screening has not completed CLEAR; screen it before approving")
+		return
+	}
+	approved, err := h.store.ApproveVendorProfile(r.Context(), id, principalID)
+	if err != nil {
+		if errors.Is(err, domain.ErrVendorProfileAlreadyApproved) {
+			writeError(w, http.StatusConflict, "already_approved", "vendor profile is already approved")
+			return
+		}
+		h.log.Error("failed to approve vendor profile", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "store_error", "vendor profile could not be approved")
+		return
+	}
+	h.log.Info("vendor profile approved", zap.String("vendor_profile_id", id), zap.String("principal_id", principalID),
+		zap.String("screening_check_id", checks[0].CheckID))
+	writeJSON(w, http.StatusOK, approved)
 }
 
 func (h *Handler) ListVendorProfiles(w http.ResponseWriter, r *http.Request) {

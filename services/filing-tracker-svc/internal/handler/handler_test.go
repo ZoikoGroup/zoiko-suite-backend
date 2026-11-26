@@ -13,7 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/filing-tracker-svc/internal/domain"
-	"zoiko.io/filing-tracker-svc/internal/events"
+	"zoiko.io/filing-tracker-svc/internal/store"
 )
 
 // mockAuthz always grants, so handler tests exercise the store/publish flow
@@ -32,7 +32,7 @@ func newMockStore() *mockStore {
 	return &mockStore{items: make(map[string]*domain.FilingRequirement)}
 }
 
-func (m *mockStore) Create(ctx context.Context, f *domain.FilingRequirement) error {
+func (m *mockStore) Create(ctx context.Context, f *domain.FilingRequirement, _ store.EventMeta) error {
 	if f.FilingID == "" {
 		f.FilingID = "ftrk-test-202"
 	}
@@ -73,7 +73,7 @@ func (m *mockStore) List(ctx context.Context, legalEntityID, jurisdictionID, fil
 	return out, nil
 }
 
-func (m *mockStore) Update(ctx context.Context, f *domain.FilingRequirement) error {
+func (m *mockStore) Update(ctx context.Context, f *domain.FilingRequirement, _ store.EventMeta) error {
 	if _, ok := m.items[f.FilingID]; !ok {
 		return domain.ErrRequirementNotFound
 	}
@@ -82,7 +82,7 @@ func (m *mockStore) Update(ctx context.Context, f *domain.FilingRequirement) err
 	return nil
 }
 
-func (m *mockStore) Submit(ctx context.Context, id string, req *domain.SubmitFilingRequest) (*domain.FilingRequirement, error) {
+func (m *mockStore) Submit(ctx context.Context, id string, req *domain.SubmitFilingRequest, _ store.EventMeta) (*domain.FilingRequirement, error) {
 	f, ok := m.items[id]
 	if !ok {
 		return nil, domain.ErrRequirementNotFound
@@ -99,7 +99,7 @@ func (m *mockStore) Submit(ctx context.Context, id string, req *domain.SubmitFil
 	return f, nil
 }
 
-func (m *mockStore) Confirm(ctx context.Context, id string, req *domain.ConfirmFilingRequest) (*domain.FilingRequirement, error) {
+func (m *mockStore) Confirm(ctx context.Context, id string, req *domain.ConfirmFilingRequest, _ store.EventMeta) (*domain.FilingRequirement, error) {
 	f, ok := m.items[id]
 	if !ok {
 		return nil, domain.ErrRequirementNotFound
@@ -115,7 +115,7 @@ func (m *mockStore) Confirm(ctx context.Context, id string, req *domain.ConfirmF
 	return f, nil
 }
 
-func (m *mockStore) MarkOverdue(ctx context.Context, id, todayStr string) (*domain.FilingRequirement, error) {
+func (m *mockStore) MarkOverdue(ctx context.Context, id, todayStr string, _ store.EventMeta) (*domain.FilingRequirement, error) {
 	f, ok := m.items[id]
 	if !ok {
 		return nil, domain.ErrRequirementNotFound
@@ -125,18 +125,11 @@ func (m *mockStore) MarkOverdue(ctx context.Context, id, todayStr string) (*doma
 	return f, nil
 }
 
-type mockPublisher struct{}
-
-func (p *mockPublisher) Publish(ctx context.Context, params events.PublishParams) error {
-	return nil
-}
-
 func setupTestRouter() (*chi.Mux, *mockStore) {
 	st := newMockStore()
-	pub := &mockPublisher{}
 	az := &mockAuthz{}
 	logger, _ := zap.NewDevelopment()
-	h := New(st, pub, az, logger)
+	h := New(st, az, logger)
 
 	r := chi.NewRouter()
 	RegisterRoutes(r, h)
@@ -154,7 +147,7 @@ func TestScheduleSubmitAndConfirmFilingRequirement(t *testing.T) {
 		PeriodKey:       "2026-Q2",
 		DueDate:         "2026-08-07",
 		Notes:           "Quarterly VAT return filing",
-		CreatedBy:       "tax_manager",
+		CreatedBy:       "principal-tax-manager",
 	}
 	body, _ := json.Marshal(reqPayload)
 
@@ -177,7 +170,7 @@ func TestScheduleSubmitAndConfirmFilingRequirement(t *testing.T) {
 	// Submit filing
 	subReqPayload := domain.SubmitFilingRequest{
 		SubmissionReference: "HMRC-SUB-2026-9901",
-		SubmittedBy:         "tax_specialist",
+		SubmittedBy:         "principal-tax-specialist",
 	}
 	subBody, _ := json.Marshal(subReqPayload)
 
@@ -208,7 +201,8 @@ func TestScheduleSubmitAndConfirmFilingRequirement(t *testing.T) {
 
 	confReq := httptest.NewRequest("POST", "/v1/filing-tracker/requirements/"+created.FilingID+"/confirm", bytes.NewBuffer(confBody))
 	confReq.Header.Set("Content-Type", "application/json")
-	confReq.Header.Set("X-Principal-Id", "principal-tax-specialist")
+	// Confirmed by a different principal than the submitter (segregation of duties).
+	confReq.Header.Set("X-Principal-Id", "principal-tax-reviewer")
 	confW := httptest.NewRecorder()
 
 	r.ServeHTTP(confW, confReq)

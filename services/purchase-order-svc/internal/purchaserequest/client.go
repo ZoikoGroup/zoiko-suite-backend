@@ -19,9 +19,11 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/purchase-order-svc/internal/domain"
+	"zoiko.io/purchase-order-svc/internal/middleware"
 )
 
 // Client is the narrow interface the handler depends on.
@@ -70,6 +72,15 @@ func (c *HTTPClient) GetApprovedRequest(ctx context.Context, tenantID, legalEnti
 	// via its own TenantContext middleware, not a query param — see that
 	// service's internal/middleware/tenant.go.
 	req.Header.Set("X-Tenant-Id", tenantID)
+	// purchase-request-svc serves a principal-less read only to a declared
+	// internal service call (its authorizeRead); without this header every
+	// lookup came back 401 and PO creation from a PR failed closed.
+	req.Header.Set("X-Source-Channel", "system")
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+	req.Header.Set("X-Request-Id", uuid.NewString())
+	if cid := middleware.CorrelationIDFromContext(ctx); cid != "" {
+		req.Header.Set("X-Correlation-ID", cid)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {

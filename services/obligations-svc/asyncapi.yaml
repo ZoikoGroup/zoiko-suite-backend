@@ -33,6 +33,15 @@ channels:
       updated: {$ref: '#/components/messages/ObligationUpdated'}
       overdue: {$ref: '#/components/messages/ObligationOverdue'}
       closed: {$ref: '#/components/messages/ObligationClosed'}
+      validated: {$ref: '#/components/messages/ObligationValidated'}
+      dueSoon: {$ref: '#/components/messages/ObligationDueSoon'}
+      fulfilled: {$ref: '#/components/messages/ObligationFulfilled'}
+      waived: {$ref: '#/components/messages/ObligationWaived'}
+      notApplicable: {$ref: '#/components/messages/ObligationNotApplicable'}
+      superseded: {$ref: '#/components/messages/ObligationSuperseded'}
+      breached: {$ref: '#/components/messages/ObligationBreached'}
+      disputed: {$ref: '#/components/messages/ObligationDisputed'}
+      migrated: {$ref: '#/components/messages/ObligationMigrated'}
       definitionChanged: {$ref: '#/components/messages/ObligationDefinitionChanged'}
       mappingChanged: {$ref: '#/components/messages/ObligationEntityMappingChanged'}
       clockStarted: {$ref: '#/components/messages/ClockStarted'}
@@ -63,6 +72,15 @@ components:
     ObligationUpdated: {name: obligation.updated, title: 'Status, attributes, workflow link or filing changed (changed_fields)', payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
     ObligationOverdue: {name: obligation.overdue, title: The obligation's due_date passed while OPEN or IN_PROGRESS, payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
     ObligationClosed: {name: obligation.closed, title: The obligation was closed, payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ObligationValidated: {name: obligation.validated, title: 'An AI-extracted obligation was validated into PLANNED (WFC-05)', payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ObligationDueSoon: {name: obligation.due_soon, title: 'An EXTENDED obligation entered DUE_SOON (WFC-05)', payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ObligationFulfilled: {name: obligation.fulfilled, title: 'An EXTENDED obligation was fulfilled (WFC-05)', payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ObligationWaived: {name: obligation.waived, title: 'An EXTENDED obligation was waived (WFC-05)', payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ObligationNotApplicable: {name: obligation.not_applicable, title: 'An EXTENDED obligation was marked not applicable (WFC-05)', payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ObligationSuperseded: {name: obligation.superseded, title: 'An EXTENDED obligation was superseded by another (WFC-05)', payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ObligationBreached: {name: obligation.breached, title: 'An EXTENDED obligation was breached (WFC-05)', payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ObligationDisputed: {name: obligation.disputed, title: 'An EXTENDED obligation was disputed (WFC-05)', payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ObligationMigrated: {name: obligation.migrated, title: 'A legacy obligation was backfilled into the EXTENDED lifecycle', payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
     ObligationDefinitionChanged: {name: obligation.definition.changed, title: A definition was created, versioned or retired, payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
     ObligationEntityMappingChanged: {name: obligation.entity_mapping.changed, title: A definition was mapped to an entity or the mapping ended, payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
     ClockStarted: {name: obligation.clock.started, title: 'A deadline clock started (R-001 deadline_clock_started); a successor carries supersedes_clock_id', payload: {$ref: '#/components/schemas/ClockEnvelope'}}

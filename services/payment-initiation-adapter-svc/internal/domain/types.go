@@ -262,9 +262,13 @@ const (
 	ErrStoreUnavailable           = sentinel("store unavailable")
 
 	// ErrInvalidAmount/ErrAmountPrecision: Amount is not a positive decimal,
-	// or the NUMERIC(18,2) column cannot hold it exactly — see decimal.go.
+	// or the NUMERIC(18,4) column cannot hold it exactly — see decimal.go.
+	// ErrAmountPrecision is a column-capacity check only (4 decimal places,
+	// 14 integer digits, applied identically to every currency); a
+	// currency's own real decimal-places rule is
+	// ErrAmountExceedsCurrencyPrecision below.
 	ErrInvalidAmount   = sentinel("amount must be a positive decimal number")
-	ErrAmountPrecision = sentinel("amount must have at most two decimal places and at most 16 integer digits")
+	ErrAmountPrecision = sentinel("amount must have at most four decimal places and at most 14 integer digits")
 
 	// ErrAuthorizationFingerprintRequired/Mismatch/Unavailable are Wave
 	// 11a's real fingerprint verification outcomes for an

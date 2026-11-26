@@ -29,7 +29,7 @@ func classed(t *testing.T, s *store.PgStore, tenant, corr, class string) *domain
 
 // The class is stated at creation, stored, and read back.
 func TestCommunicationClass_IsStoredAndReadBack(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	n := classed(t, s, "tenant-class", "corr-class-1", "A1")
 	got, err := s.GetNotification(tenantCtx("tenant-class"), n.NotificationID)
 	require.NoError(t, err)
@@ -45,7 +45,7 @@ func TestCommunicationClass_IsStoredAndReadBack(t *testing.T) {
 // not by a retry, not by a resend, not by SQL.
 func TestCommunicationClass_IsFrozenAndConstrainedByTheDatabase(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	n := classed(t, s, "tenant-class", "corr-class-3", "M1")
 	bg := context.Background()
 
@@ -70,7 +70,7 @@ func TestCommunicationClass_IsFrozenAndConstrainedByTheDatabase(t *testing.T) {
 // transactional notice, and must stop an operational one.
 func TestCommunicationClass_SharedGateWithTheRealSuppressionStore(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenant := "tenant-gate"
 	ctx := tenantCtx(tenant)
 	engine := policy.NewPrecedenceEngine(s, zap.NewNop())
@@ -121,7 +121,7 @@ func (c *countingDeliverer) Deliver(_ context.Context, _ domain.Notification) do
 
 // The ledger pipeline records the template's class on its register row.
 func TestCommunicationClass_LedgerRegisterRowCarriesTheTemplateClass(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	tenant := "tenant-class-ledger"
 	ctx := tenantCtx(tenant)
 	del := &e2eDeliverer{delivered: true, response: "smtp h accepted; message-id=<class-ledger@example.com>"}

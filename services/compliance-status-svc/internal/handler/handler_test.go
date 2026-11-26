@@ -128,7 +128,7 @@ func TestCreateAndGetComplianceStatus(t *testing.T) {
 		"status_reason":               "All obligations fulfilled on time",
 		"evidence_sufficiency_state":  "SUFFICIENT",
 		"evaluated_at":                time.Now().UTC().Format(time.RFC3339),
-		"created_by_principal_id":     "risk_officer",
+		"created_by_principal_id":     "principal-test-01",
 	}
 	body, _ := json.Marshal(reqPayload)
 

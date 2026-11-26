@@ -1,6 +1,9 @@
 package handler_test
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
 	"net/http"
 	"testing"
 )
@@ -24,7 +27,10 @@ func withEnvelope(r *http.Request) *http.Request {
 	}
 	set("X-Tenant-Id", "tenant-test")
 	set("X-Principal-Id", "principal-test")
-	set("X-Legal-Entity-Id", "entity-test")
+	// A well-formed client declares the legal entity it acts for; a body
+	// legal_entity_id must repeat it. Default the header to the body's value
+	// so tests about other behaviour stay well-formed.
+	set("X-Legal-Entity-Id", bodyLegalEntityID(r, "entity-test"))
 	set("X-Request-Id", "req-test")
 	set("X-Correlation-ID", "corr-test")
 	set("X-Source-Channel", "api")
@@ -57,3 +63,23 @@ func itoa(n int) string {
 
 // Keeps the testing import honest in packages where no other file needs it.
 var _ = testing.Verbose
+
+// bodyLegalEntityID returns the request body's legal_entity_id (restoring the
+// body), or fallback when there is none.
+func bodyLegalEntityID(r *http.Request, fallback string) string {
+	if r.Body == nil || r.Body == http.NoBody {
+		return fallback
+	}
+	raw, err := io.ReadAll(r.Body)
+	r.Body = io.NopCloser(bytes.NewReader(raw))
+	if err != nil {
+		return fallback
+	}
+	var probe struct {
+		LegalEntityID string `json:"legal_entity_id"`
+	}
+	if json.Unmarshal(raw, &probe) != nil || probe.LegalEntityID == "" {
+		return fallback
+	}
+	return probe.LegalEntityID
+}

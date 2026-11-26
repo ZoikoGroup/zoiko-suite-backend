@@ -16,7 +16,7 @@ import (
 func strp(s string) *string { return &s }
 
 func TestIntentVersion_PrivacyBindingIsValidatedStoredAndFrozen(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	tenant := "tenant-privacy"
 	i := newIntent(t, s, tenant, "payroll.payslip_available")
 	ctx := tenantCtx(tenant)
@@ -58,7 +58,7 @@ func TestIntentVersion_PrivacyBindingIsValidatedStoredAndFrozen(t *testing.T) {
 
 func TestIntentVersion_PrivacyBindingCannotBeEditedInTheDatabase(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	tenant := "tenant-privacy-frozen"
 	i := newIntent(t, s, tenant, "payroll.payslip_available")
 	v := draftVersion(t, s, tenant, i.IntentID, func(p *domain.CreateIntentVersionParams) {
@@ -73,7 +73,7 @@ func TestIntentVersion_PrivacyBindingCannotBeEditedInTheDatabase(t *testing.T) {
 }
 
 func TestAttempts_RecordThePrivacyDecisionThatGovernedThem(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-priv-att")
 	n := seedNotification(t, s, "tenant-priv-att", "corr-priv-att")
 
@@ -102,7 +102,7 @@ func TestAttempts_RecordThePrivacyDecisionThatGovernedThem(t *testing.T) {
 }
 
 func TestAttempts_PrivacyResultMustBeAKnownValue(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	n := seedNotification(t, s, "tenant-priv-bad", "corr-priv-bad")
 	done := time.Now().UTC()
 	err := s.CompleteDelivery(tenantCtx("tenant-priv-bad"), n.NotificationID, "SENT", "", "250 ok", &done, "c",

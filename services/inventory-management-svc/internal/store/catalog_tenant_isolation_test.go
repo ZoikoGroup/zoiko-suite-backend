@@ -18,7 +18,7 @@ import (
 // may change A's data.
 func TestPgStore_Catalog_TenantIsolation(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenantA, tenantB := uuid.New().String(), uuid.New().String()
 	legalEntity := uuid.New().String() // same legal-entity id string on purpose
 	ctxA := svcmiddleware.WithTenant(context.Background(), tenantA)

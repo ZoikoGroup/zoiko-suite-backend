@@ -60,6 +60,23 @@ type IngestStatementLinesRequest struct {
 	OpeningBalance  float64           `json:"opening_balance"`
 	ClosingBalance  float64           `json:"closing_balance"`
 	Lines           []StatementLineIn `json:"lines"`
+
+	// RawFileContentBase64/RawFileContentType/RawFileName carry the
+	// original statement file's bytes, optional (SPEC_DEVIATIONS.md A10:
+	// "no raw payload, no raw file reference"). When present, the handler
+	// stores the file in document-vault-svc before calling the store and
+	// fills in RawFileDocumentID/RawFileChecksumSHA256 below. Omitting
+	// these three leaves ingestion exactly as it was before this field
+	// existed — no raw file is stored, same as every pre-existing caller.
+	RawFileContentBase64 string `json:"raw_file_content_base64,omitempty"`
+	RawFileContentType   string `json:"raw_file_content_type,omitempty"`
+	RawFileName          string `json:"raw_file_name,omitempty"`
+
+	// RawFileDocumentID/RawFileChecksumSHA256 are set by the handler (never
+	// by the caller) after a successful document-vault-svc upload, and
+	// persisted by the store alongside ContentHash.
+	RawFileDocumentID     string `json:"-"`
+	RawFileChecksumSHA256 string `json:"-"`
 }
 
 type StatementLineIn struct {
@@ -75,6 +92,39 @@ type IngestStatementResult struct {
 	Statement BankStatement   `json:"statement"`
 	Lines     []StatementLine `json:"lines"`
 	Created   bool            `json:"created"`
+}
+
+// BankStatementAcceptedEvent is BNK-03's spec-required
+// BankStatementAccepted event payload (ZS-SVC-E-001 BNK-03). It is the
+// first real signal downstream consumers (BNK-08 Cash Position) get that a
+// statement's closing_balance is now authoritative bank evidence for an
+// account/period — never time.Now(), the as-of date is the statement's own
+// StatementDate, because freshness must be judged against when the SOURCE
+// data is from, not when the event happened to be processed.
+type BankStatementAcceptedEvent struct {
+	StatementID    string    `json:"statement_id"`
+	ConnectionID   string    `json:"connection_id"`
+	TenantID       string    `json:"tenant_id"`
+	LegalEntityID  string    `json:"legal_entity_id"`
+	BankAccountID  string    `json:"bank_account_id"`
+	ClosingBalance float64   `json:"closing_balance"`
+	OpeningBalance float64   `json:"opening_balance"`
+	Currency       string    `json:"currency"`
+	StatementDate  time.Time `json:"statement_date"`
+	AcceptedAt     time.Time `json:"accepted_at"`
+}
+
+// BankStatementQuarantinedEvent is BNK-03's BankStatementQuarantined event
+// payload — enqueued at the two points that already transition a statement
+// to QUARANTINED (the balance-mismatch auto-quarantine in ValidateStatement
+// and the explicit QuarantineStatement command).
+type BankStatementQuarantinedEvent struct {
+	StatementID    string `json:"statement_id"`
+	ConnectionID   string `json:"connection_id"`
+	TenantID       string `json:"tenant_id"`
+	LegalEntityID  string `json:"legal_entity_id"`
+	BankAccountID  string `json:"bank_account_id"`
+	QuarantineReason string `json:"quarantine_reason"`
 }
 
 // BNK-04 Transaction Normalization. NORMALIZED is the steady state;

@@ -12,7 +12,6 @@ import (
 
 	"zoiko.io/filing-tracker-svc/internal/authz"
 	"zoiko.io/filing-tracker-svc/internal/domain"
-	"zoiko.io/filing-tracker-svc/internal/events"
 	"zoiko.io/filing-tracker-svc/internal/middleware"
 	"zoiko.io/filing-tracker-svc/internal/store"
 )
@@ -25,6 +24,17 @@ const (
 	ActionFilingSubmit            = "FILING_SUBMIT"
 	ActionFilingConfirm           = "FILING_CONFIRM"
 	ActionFilingMarkOverdue       = "FILING_MARK_OVERDUE"
+	// ActionFilingRequirementRead guards GET /requirements and
+	// GET /requirements/{id} (reads used to be served to any caller in the
+	// tenant without an authorization decision).
+	ActionFilingRequirementRead = "FILING_REQUIREMENT_READ"
+)
+
+// Stable error codes for refusals added by the read-authorization, actor
+// and segregation-of-duties rules.
+const (
+	codeActorMismatch       = "actor_mismatch"
+	codeSegregationOfDuties = "segregation_of_duties"
 )
 
 // AuthzClient is the authorization-svc contract this handler depends on.
@@ -34,15 +44,45 @@ type AuthzClient interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
 }
 
+// Handler serves the filing-tracker API. Events are not published from here:
+// every write emits its event through the store's transactional outbox,
+// delivered by internal/outbox.Relay.
 type Handler struct {
-	store     store.Store
-	publisher events.Publisher
-	authz     AuthzClient
-	logger    *zap.Logger
+	store  store.Store
+	authz  AuthzClient
+	logger *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthzClient, logger *zap.Logger) *Handler {
-	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+func New(st store.Store, az AuthzClient, logger *zap.Logger) *Handler {
+	return &Handler{store: st, authz: az, logger: logger}
+}
+
+// eventMeta is the identity recorded on the outbox event of a write.
+func eventMeta(r *http.Request, principalID string) store.EventMeta {
+	return store.EventMeta{ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID")}
+}
+
+// resolveActor applies the platform actor rule to a body-supplied actor
+// field: the actor of a write is the gateway-verified X-Principal-Id. An
+// absent field is filled from the principal; a different value is refused
+// 403 actor_mismatch. Returns the actor to store.
+func resolveActor(w http.ResponseWriter, field, claimed, principalID string) (string, bool) {
+	if claimed != "" && claimed != principalID {
+		writeCoded(w, http.StatusForbidden, codeActorMismatch, field+" must be the authenticated principal (X-Principal-Id)")
+		return "", false
+	}
+	return principalID, true
+}
+
+// authorizeRead requires a principal (401) holding FILING_REQUIREMENT_READ
+// for scope (403 on deny, 503 when authorization-svc is unreachable).
+// Pattern: purchase-request-svc authorizeRead.
+func (h *Handler) authorizeRead(w http.ResponseWriter, r *http.Request, scope string) bool {
+	principalID, ok := requirePrincipal(w, r)
+	if !ok {
+		return false
+	}
+	return h.checkAllowed(w, r, principalID, scope, ActionFilingRequirementRead)
 }
 
 // requirePrincipal extracts the caller's principal from the X-Principal-Id
@@ -104,6 +144,10 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	if !h.checkAllowed(w, r, principalID, req.LegalEntityID, ActionFilingRequirementCreate) {
 		return
 	}
+	createdBy, ok := resolveActor(w, "created_by", req.CreatedBy, principalID)
+	if !ok {
+		return
+	}
 
 	f := &domain.FilingRequirement{
 		TenantID:        tenantID,
@@ -114,24 +158,26 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		PeriodKey:       req.PeriodKey,
 		DueDate:         req.DueDate,
 		Notes:           req.Notes,
-		CreatedBy:       req.CreatedBy,
+		CreatedBy:       createdBy,
 	}
 
-	if err := h.store.Create(r.Context(), f); err != nil {
+	if err := h.store.Create(r.Context(), f, eventMeta(r, principalID)); err != nil {
+		if errors.Is(err, domain.ErrDuplicateRequirement) {
+			writeError(w, http.StatusConflict, domain.ErrDuplicateRequirement.Error())
+			return
+		}
 		h.logger.Error("create filing requirement failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to create filing requirement")
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "filing.due", FilingID: f.FilingID, TenantID: tenantID,
-		LegalEntityID: f.LegalEntityID, Jurisdiction: f.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: f,
-	})
 	writeJSON(w, http.StatusCreated, f)
 }
 
 func (h *Handler) GetByID(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	if _, ok := requirePrincipal(w, r); !ok {
+		return
+	}
 	f, err := h.store.GetByID(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, domain.ErrRequirementNotFound) {
@@ -139,6 +185,9 @@ func (h *Handler) GetByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to get filing requirement")
+		return
+	}
+	if !h.authorizeRead(w, r, f.LegalEntityID) {
 		return
 	}
 	writeJSON(w, http.StatusOK, f)
@@ -149,6 +198,16 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	jurisdictionID := r.URL.Query().Get("jurisdiction_id")
 	filingAuthority := r.URL.Query().Get("filing_authority")
 	status := r.URL.Query().Get("status")
+
+	// Authorized against the requested legal entity, or the tenant when the
+	// list spans entities (purchase-request-svc ListRequests).
+	scope := legalEntityID
+	if scope == "" {
+		scope = middleware.GetTenantID(r.Context())
+	}
+	if !h.authorizeRead(w, r, scope) {
+		return
+	}
 
 	requirements, err := h.store.List(r.Context(), legalEntityID, jurisdictionID, filingAuthority, status)
 	if err != nil {
@@ -166,7 +225,6 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	principalID, ok := requirePrincipal(w, r)
 	if !ok {
@@ -197,21 +255,16 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		existing.Notes = req.Notes
 	}
 
-	if err := h.store.Update(r.Context(), existing); err != nil {
+	if err := h.store.Update(r.Context(), existing, eventMeta(r, principalID)); err != nil {
+		h.logger.Error("update filing requirement failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to update filing requirement")
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "filing.requirement.updated", FilingID: id, TenantID: tenantID,
-		LegalEntityID: existing.LegalEntityID, Jurisdiction: existing.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: existing,
-	})
 	writeJSON(w, http.StatusOK, existing)
 }
 
 func (h *Handler) Submit(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	principalID, ok := requirePrincipal(w, r)
 	if !ok {
@@ -233,16 +286,23 @@ func (h *Handler) Submit(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.SubmissionReference == "" || req.SubmittedBy == "" {
-		writeError(w, http.StatusBadRequest, "submission_reference and submitted_by are required")
+	// submitted_by is no longer required in the body: the submitter is the
+	// authenticated principal (a differing value is refused below).
+	if req.SubmissionReference == "" {
+		writeError(w, http.StatusBadRequest, "submission_reference is required")
 		return
 	}
 
 	if !h.checkAllowed(w, r, principalID, existing.LegalEntityID, ActionFilingSubmit) {
 		return
 	}
+	submittedBy, ok := resolveActor(w, "submitted_by", req.SubmittedBy, principalID)
+	if !ok {
+		return
+	}
+	req.SubmittedBy = submittedBy
 
-	f, err := h.store.Submit(r.Context(), id, &req)
+	f, err := h.store.Submit(r.Context(), id, &req, eventMeta(r, principalID))
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrRequirementNotFound):
@@ -250,21 +310,16 @@ func (h *Handler) Submit(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, domain.ErrAlreadySubmitted):
 			writeError(w, http.StatusConflict, "filing requirement is already submitted")
 		default:
+			h.logger.Error("submit filing requirement failed", zap.Error(err))
 			writeError(w, http.StatusInternalServerError, "failed to submit filing requirement")
 		}
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "filing.submitted", FilingID: id, TenantID: tenantID,
-		LegalEntityID: f.LegalEntityID, Jurisdiction: f.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: f,
-	})
 	writeJSON(w, http.StatusOK, f)
 }
 
 func (h *Handler) Confirm(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	principalID, ok := requirePrincipal(w, r)
 	if !ok {
@@ -294,30 +349,35 @@ func (h *Handler) Confirm(w http.ResponseWriter, r *http.Request) {
 	if !h.checkAllowed(w, r, principalID, existing.LegalEntityID, ActionFilingConfirm) {
 		return
 	}
+	// Segregation of duties: the submitter may not confirm their own filing.
+	// Re-checked by the store under the row lock.
+	if existing.SubmittedBy != nil && *existing.SubmittedBy == principalID {
+		writeCoded(w, http.StatusForbidden, codeSegregationOfDuties, domain.ErrSegregationOfDuties.Error())
+		return
+	}
 
-	f, err := h.store.Confirm(r.Context(), id, &req)
+	f, err := h.store.Confirm(r.Context(), id, &req, eventMeta(r, principalID))
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrRequirementNotFound):
 			writeError(w, http.StatusNotFound, "filing requirement not found")
 		case errors.Is(err, domain.ErrAlreadyConfirmed):
 			writeError(w, http.StatusConflict, "filing requirement is already confirmed")
+		case errors.Is(err, domain.ErrNotSubmitted):
+			writeError(w, http.StatusConflict, domain.ErrNotSubmitted.Error())
+		case errors.Is(err, domain.ErrSegregationOfDuties):
+			writeCoded(w, http.StatusForbidden, codeSegregationOfDuties, domain.ErrSegregationOfDuties.Error())
 		default:
+			h.logger.Error("confirm filing requirement failed", zap.Error(err))
 			writeError(w, http.StatusInternalServerError, "failed to confirm filing requirement")
 		}
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "filing.confirmed", FilingID: id, TenantID: tenantID,
-		LegalEntityID: f.LegalEntityID, Jurisdiction: f.JurisdictionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: f,
-	})
 	writeJSON(w, http.StatusOK, f)
 }
 
 func (h *Handler) MarkOverdue(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	principalID, ok := requirePrincipal(w, r)
 	if !ok {
@@ -339,22 +399,19 @@ func (h *Handler) MarkOverdue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	todayStr := time.Now().Format("2006-01-02")
-	f, err := h.store.MarkOverdue(r.Context(), id, todayStr)
+	f, err := h.store.MarkOverdue(r.Context(), id, todayStr, eventMeta(r, principalID))
 	if err != nil {
 		if errors.Is(err, domain.ErrRequirementNotFound) {
 			writeError(w, http.StatusNotFound, "filing requirement not found")
 			return
 		}
+		if errors.Is(err, domain.ErrAlreadyOverdue) {
+			writeError(w, http.StatusConflict, "filing requirement is already marked overdue")
+			return
+		}
+		h.logger.Error("mark filing overdue failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to mark filing requirement overdue")
 		return
-	}
-
-	if f.Status == domain.StatusOverdue {
-		_ = h.publisher.Publish(r.Context(), events.PublishParams{
-			EventType: "filing.overdue", FilingID: id, TenantID: tenantID,
-			LegalEntityID: f.LegalEntityID, Jurisdiction: f.JurisdictionID, ActorID: principalID,
-			CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: f,
-		})
 	}
 	writeJSON(w, http.StatusOK, f)
 }
@@ -367,4 +424,10 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// writeCoded is writeError plus a stable machine-readable code (the "error"
+// field keeps its existing human-readable meaning).
+func writeCoded(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg, "code": code})
 }

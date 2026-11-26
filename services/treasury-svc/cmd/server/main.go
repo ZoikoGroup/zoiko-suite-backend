@@ -18,18 +18,23 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
+	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
 	"zoiko.io/treasury-svc/internal/authz"
 	"zoiko.io/treasury-svc/internal/clients"
 	"zoiko.io/treasury-svc/internal/config"
+	"zoiko.io/treasury-svc/internal/currency"
 	svcenvelope "zoiko.io/treasury-svc/internal/envelope"
+	"zoiko.io/treasury-svc/internal/events"
 	"zoiko.io/treasury-svc/internal/handler"
 	"zoiko.io/treasury-svc/internal/health"
 	svcmiddleware "zoiko.io/treasury-svc/internal/middleware"
 	"zoiko.io/treasury-svc/internal/mtls"
 	"zoiko.io/treasury-svc/internal/store"
 	"zoiko.io/treasury-svc/internal/telemetry"
+	"zoiko.io/treasury-svc/internal/tokenization"
+	"zoiko.io/eventing/inbox"
 	"zoiko.io/eventing/kafkaout"
 	"zoiko.io/eventing/outbox"
 )
@@ -43,6 +48,10 @@ func main() {
 	cfg, err := config.Load()
 	if err != nil {
 		_, _ = os.Stderr.WriteString("fatal: failed to load config: " + err.Error() + "\n")
+		os.Exit(1)
+	}
+	if err := cfg.Validate(); err != nil {
+		_, _ = os.Stderr.WriteString("fatal: invalid configuration: " + err.Error() + "\n")
 		os.Exit(1)
 	}
 
@@ -158,6 +167,27 @@ func main() {
 	clientsWrapper := clients.New(cfg.APServiceURL, cfg.ARServiceURL, cfg.ObligationsServiceURL, log)
 	transferClients := clients.NewTransferClients(cfg.PaymentAdapterServiceURL, cfg.LedgerServiceURL, cfg.IntercompanyServiceURL, log)
 	bankingConnectorClient := clients.NewBankingConnectorHTTPClient(cfg.BankingConnectorServiceURL)
+	var currencyClient handler.CurrencyClient
+	if cfg.CurrencyRegistryURL != "" {
+		currencyClient = currency.New(cfg.CurrencyRegistryURL)
+	}
+
+	// BNK-01's real account-identifier tokenization. TOKENIZATION_ENFORCED
+	// decides only whether NEW/ROTATED identifiers are tokenized. Reading an
+	// already-tokenized account's full number (the privileged
+	// GetBankAccountNumber route) needs the client regardless of that flag
+	// — an account tokenized while enforcement was on stays tokenized after
+	// it is turned back off — so the client is built whenever a service URL
+	// is configured. Building it makes no call; nothing reaches
+	// key-management-svc until a write is enforced or a tokenized account
+	// is read in full.
+	var tokenizer tokenization.Tokenizer
+	if cfg.TokenizationServiceURL != "" {
+		tokenizer = tokenization.NewClient(cfg.TokenizationServiceURL)
+	}
+	if cfg.TokenizationEnforced {
+		log.Info("bank account identifier tokenization enforced", zap.String("tokenization_service_url", cfg.TokenizationServiceURL))
+	}
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -177,8 +207,32 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, authzClient, clientsWrapper, transferClients, bankingConnectorClient, log)
+	h := handler.New(pgStore, authzClient, clientsWrapper, transferClients, bankingConnectorClient, log, currencyClient).
+		WithTokenization(tokenizer, cfg.TokenizationEnforced)
 	handler.RegisterRoutes(r, h)
+
+	// ── 4c. BankStatementAccepted consumer (BNK-08) ─────────────────────────
+	// Subscribes to banking-connector-svc's own events topic (not ours) for
+	// BankStatementAccepted and turns it into a real cash_balances row —
+	// this replaces the dead CreateCashBalance(0.00) placeholder that used
+	// to be written once, at account registration, and never updated
+	// again. Same non-fatal-broker posture as every other consumer in this
+	// platform (see bank-reconciliation-svc's own ConflictConsumer): a
+	// missing broker must not stop treasury-svc's own HTTP surface.
+	bankStatementConsumerCtx, stopBankStatementConsumer := context.WithCancel(context.Background())
+	defer stopBankStatementConsumer()
+	bankStatementReader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers: cfg.Kafka.Brokers,
+		Topic:   cfg.Kafka.BankStatementEventsTopic,
+		GroupID: cfg.Kafka.BankStatementConsumerGroupID,
+	})
+	bankStatementInbox, err := inbox.New(pgStore, events.ConsumerName, inbox.DefaultConfig())
+	if err != nil {
+		log.Fatal("bank-statement-accepted consumer: inbox", zap.Error(err))
+	}
+	bankStatementInbox.SetRegion(cfg.EventResidencyRegion)
+	bankStatementConsumer := events.NewBankStatementConsumer(log, pgStore, h, bankStatementInbox)
+	go bankStatementConsumer.Run(bankStatementConsumerCtx, bankStatementReader)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
 	healthH := health.New(pool, log)

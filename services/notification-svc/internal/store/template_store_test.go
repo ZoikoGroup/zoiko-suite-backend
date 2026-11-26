@@ -24,7 +24,7 @@ func newTestTemplate(t *testing.T, s *store.PgStore, ctx context.Context, owner 
 // proof, not just the handler-level stub check.
 func TestPgStore_CreateVersion_RejectsRetiredTemplate(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 	tmpl := newTestTemplate(t, s, ctx, "owner-1")
 
@@ -45,7 +45,7 @@ func TestPgStore_CreateVersion_RejectsRetiredTemplate(t *testing.T) {
 // version, not only ones flagged externally binding (Wave 1 decision).
 func TestPgStore_ApproveTemplate_RejectsSelfApproval(t *testing.T) {
 	pool, admin := openTestPools(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 	tmpl := newTestTemplate(t, s, ctx, "owner-1")
 	v, err := s.CreateVersion(ctx, domain.CreateVersionParams{
@@ -79,7 +79,7 @@ func TestPgStore_ApproveTemplate_RejectsSelfApproval(t *testing.T) {
 // that a superseded/terminal row can never be changed again.
 func TestPgStore_PublishTemplate_SupersedesPriorPublished_SameLocale(t *testing.T) {
 	pool, admin := openTestPools(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 	tmpl := newTestTemplate(t, s, ctx, "owner-1")
 
@@ -150,7 +150,7 @@ func TestPgStore_PublishTemplate_SupersedesPriorPublished_SameLocale(t *testing.
 // the template moves to RETIRED, not just one locale.
 func TestPgStore_RetireTemplate_RetiresPublishedVersionsAcrossLocales(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 	tmpl := newTestTemplate(t, s, ctx, "owner-1")
 
@@ -200,7 +200,7 @@ func TestPgStore_RetireTemplate_RetiresPublishedVersionsAcrossLocales(t *testing
 // letting it reach REVIEW.
 func TestPgStore_ValidateTemplate_RejectsMalformedContent(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 	tmpl := newTestTemplate(t, s, ctx, "owner-1")
 	v, err := s.CreateVersion(ctx, domain.CreateVersionParams{
@@ -220,7 +220,7 @@ func TestPgStore_ValidateTemplate_RejectsMalformedContent(t *testing.T) {
 // supplied, and renders correctly once they are.
 func TestPgStore_RenderPreview_RefusesPartialRender(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 	tmpl := newTestTemplate(t, s, ctx, "owner-1")
 	v, err := s.CreateVersion(ctx, domain.CreateVersionParams{
@@ -249,7 +249,7 @@ func TestPgStore_RenderPreview_RefusesPartialRender(t *testing.T) {
 // different templates is refused rather than silently diffed.
 func TestPgStore_CompareVersions_RejectsDifferentTemplates(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 	tmplA := newTestTemplate(t, s, ctx, "owner-1")
 	vA, err := s.CreateVersion(ctx, domain.CreateVersionParams{
@@ -276,7 +276,7 @@ func TestPgStore_CompareVersions_RejectsDifferentTemplates(t *testing.T) {
 // added/removed reflect the actual variable schema delta.
 func TestPgStore_CompareVersions_ReportsVariableAndContentDiff(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 	tmpl := newTestTemplate(t, s, ctx, "owner-1")
 	v1, err := s.CreateVersion(ctx, domain.CreateVersionParams{
@@ -315,7 +315,7 @@ func TestPgStore_CompareVersions_ReportsVariableAndContentDiff(t *testing.T) {
 // has an unpublished draft on top of an older published version.
 func TestPgStore_ListLocales_ReportsLatestAndPublishedPerLocale(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	ctx := tenantCtx("tenant-a")
 	tmpl := newTestTemplate(t, s, ctx, "owner-1")
 
@@ -372,7 +372,7 @@ func TestPgStore_ListLocales_ReportsLatestAndPublishedPerLocale(t *testing.T) {
 }
 
 func TestPgStore_ListLocales_UnknownTemplate_ReturnsNotFound(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openTestPool(t), store.WithEventRegion("local"))
 	_, err := s.ListLocales(tenantCtx("tenant-a"), "00000000-0000-0000-0000-000000000000")
 	if err != domain.ErrTemplateNotFound {
 		t.Fatalf("expected ErrTemplateNotFound, got %v", err)

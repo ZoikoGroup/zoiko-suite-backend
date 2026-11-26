@@ -6,6 +6,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"math/big"
 	"net/http"
 	"strconv"
 	"time"
@@ -16,6 +17,36 @@ import (
 	"zoiko.io/treasury-svc/internal/domain"
 	svcmiddleware "zoiko.io/treasury-svc/internal/middleware"
 )
+
+// validateCurrencyPrecision refuses amount if it uses more decimal places
+// than currencyCode's real ISO 4217 minor-unit count allows (e.g. any
+// fractional JPY amount, a 3rd decimal place on USD/GBP). It is a separate
+// check from domain.ValidatePositiveMoney/ValidateMoney, which only guard
+// this service's own NUMERIC(20,4) column capacity — a ceiling applied
+// identically to every currency, not the actual per-currency rule.
+//
+// Fails closed: h.currency == nil (CURRENCY_REGISTRY_URL not configured) or
+// currency-registry-svc unreachable/erroring both refuse the transfer rather
+// than silently skip the check — an amount whose real precision could not be
+// confirmed must not be accepted as correct.
+func (h *Handler) validateCurrencyPrecision(w http.ResponseWriter, r *http.Request, amount *big.Rat, currencyCode string) bool {
+	if h.currency == nil {
+		h.log.Error("validateCurrencyPrecision: no currency client configured (CURRENCY_REGISTRY_URL) — failing closed")
+		writeError(w, http.StatusServiceUnavailable, "currency_registry_unavailable", "cannot verify currency decimal precision")
+		return false
+	}
+	minorUnit, err := h.currency.MinorUnits(r.Context(), currencyCode, time.Now())
+	if err != nil {
+		h.log.Error("validateCurrencyPrecision: currency-registry-svc unavailable — failing closed", zap.String("currency_code", currencyCode), zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "currency_registry_unavailable", "cannot verify currency decimal precision")
+		return false
+	}
+	if err := domain.ValidateCurrencyPrecision(amount, minorUnit); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_amount", err.Error())
+		return false
+	}
+	return true
+}
 
 func (h *Handler) writeTransferErr(w http.ResponseWriter, err error) {
 	switch {
@@ -151,8 +182,16 @@ func (h *Handler) CreateTreasuryTransfer(w http.ResponseWriter, r *http.Request)
 	// Exact decimal, column-scale validation: an amount NUMERIC(20,4)
 	// would round is refused here, not silently changed before it reaches
 	// the hash, the threshold check, BNK-06, or the ledger.
-	if _, err := domain.ValidatePositiveMoney(req.Amount); err != nil {
+	amountRat, err := domain.ValidatePositiveMoney(req.Amount)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_amount", err.Error())
+		return
+	}
+	// Currency-specific precision, separate from the column-scale check
+	// above: a value that fits NUMERIC(20,4) can still have more decimal
+	// places than req.CurrencyCode actually allows (e.g. a fractional JPY
+	// amount, or a 3rd decimal place on USD/GBP).
+	if !h.validateCurrencyPrecision(w, r, amountRat, req.CurrencyCode) {
 		return
 	}
 	correlationID := r.Header.Get("X-Correlation-ID")
@@ -626,8 +665,12 @@ func (h *Handler) AmendTreasuryTransfer(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return
 	}
-	if _, err := domain.ValidatePositiveMoney(req.Amount); err != nil {
+	amendAmountRat, err := domain.ValidatePositiveMoney(req.Amount)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_amount", err.Error())
+		return
+	}
+	if !h.validateCurrencyPrecision(w, r, amendAmountRat, req.CurrencyCode) {
 		return
 	}
 	principalID, ok := h.requirePrincipal(w, r)

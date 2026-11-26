@@ -6,10 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"zoiko.io/reconciliation-intelligence-svc/internal/authz"
 	"zoiko.io/reconciliation-intelligence-svc/internal/banking"
@@ -18,8 +21,10 @@ import (
 	svcenvelope "zoiko.io/reconciliation-intelligence-svc/internal/envelope"
 	"zoiko.io/reconciliation-intelligence-svc/internal/financialcontrol"
 	"zoiko.io/reconciliation-intelligence-svc/internal/health"
+	"zoiko.io/reconciliation-intelligence-svc/internal/idempotency"
 	"zoiko.io/reconciliation-intelligence-svc/internal/ledger"
 	customMiddleware "zoiko.io/reconciliation-intelligence-svc/internal/middleware"
+	"zoiko.io/reconciliation-intelligence-svc/internal/problem"
 	"zoiko.io/reconciliation-intelligence-svc/internal/store"
 )
 
@@ -60,7 +65,17 @@ func NewHandler(s store.Store, a *authz.Client, fc *financialcontrol.Client, br 
 	}
 }
 
+// NewRouter builds the route tree with no database behind /readyz (it
+// reports 503) and no Idempotency-Key replay store. The server uses
+// NewRouterWithDeps.
 func NewRouter(h *Handler) http.Handler {
+	return NewRouterWithDeps(h, health.ReadyzHandler(nil), nil)
+}
+
+// NewRouterWithDeps is NewRouter with the readiness probe and the
+// Idempotency-Key replay store supplied (health.ReadyzHandler(pool) and
+// idempotency.NewPgStore(pool) in production). A nil idem disables replay.
+func NewRouterWithDeps(h *Handler, readyz http.HandlerFunc, idem idempotency.Store) http.Handler {
 	r := chi.NewRouter()
 
 	r.Use(middleware.RequestID)
@@ -75,11 +90,22 @@ func NewRouter(h *Handler) http.Handler {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
+	// Idempotency-Key required on every material write, in every envelope
+	// mode (the envelope's own refusal is off in observe mode).
+	r.Use(idempotency.RequireKey)
+
+	// Idempotency-Key replay: a retried write with the same key returns the
+	// first answer instead of running again. Reads and probes pass through.
+	if idem != nil {
+		r.Use(idempotency.Middleware(idem, h.logger))
+	}
+
 	// /healthz stays OUTSIDE the tenant gate. Liveness and readiness
 	// probes carry no tenant, so a blanket tenant requirement would 401
 	// every probe and the orchestrator would restart the container in a
 	// loop — a security fix that takes the service down.
 	r.Get("/healthz", health.Handler())
+	r.Get("/readyz", readyz)
 
 	// Everything below requires a gateway-verified tenant. Applied via
 	// With() on the route subtree rather than as a path exemption inside
@@ -112,12 +138,29 @@ func (h *Handler) AnalyzeReconciliation(w http.ResponseWriter, r *http.Request) 
 	dec.DisallowUnknownFields()
 	var req domain.AnalyzeReconciliationRequest
 	if err := dec.Decode(&req); err != nil {
-		h.respondError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			problem.Write(w, r, http.StatusRequestEntityTooLarge, "payload_too_large", fmt.Sprintf("request body exceeds %d bytes", maxBodyBytes))
+			return
+		}
+		problem.Write(w, r, http.StatusBadRequest, "invalid_body", "invalid request body: "+err.Error())
 		return
 	}
 
 	if err := req.Validate(); err != nil {
-		h.respondError(w, http.StatusBadRequest, err.Error())
+		problem.Write(w, r, http.StatusBadRequest, "validation_failed", err.Error())
+		return
+	}
+	// The header is the tenant authority; a body tenant_id may only repeat it.
+	if req.TenantID != "" && req.TenantID != tenantID {
+		problem.Write(w, r, http.StatusForbidden, "tenant_mismatch", "body tenant_id does not match X-Tenant-Id")
+		return
+	}
+	// The caller's legal-entity scope, when declared, is authoritative too: a
+	// body legal_entity_id may only repeat it. Otherwise a caller scoped to
+	// one entity could analyze (and persist a job for) another entity.
+	if scoped := strings.TrimSpace(r.Header.Get(svcenvelope.HeaderLegalEntityID)); scoped != "" && scoped != req.LegalEntityID {
+		problem.Write(w, r, http.StatusForbidden, "legal_entity_mismatch", "body legal_entity_id does not match X-Legal-Entity-Id")
 		return
 	}
 
@@ -140,7 +183,7 @@ func (h *Handler) AnalyzeReconciliation(w http.ResponseWriter, r *http.Request) 
 	// that entity's, or the authorization and the data would be about
 	// different entities.
 	if run.LegalEntityID != req.LegalEntityID {
-		h.respondError(w, http.StatusForbidden, "bank reconciliation run does not belong to legal_entity_id")
+		problem.Write(w, r, http.StatusForbidden, "run_entity_mismatch", "bank reconciliation run does not belong to legal_entity_id")
 		return
 	}
 	if run.Superseded() {
@@ -148,7 +191,7 @@ func (h *Handler) AnalyzeReconciliation(w http.ResponseWriter, r *http.Request) 
 		if run.SupersededByRunID != nil {
 			msg += " by run " + *run.SupersededByRunID
 		}
-		h.respondError(w, http.StatusConflict, msg)
+		problem.Write(w, r, http.StatusConflict, "run_superseded", msg)
 		return
 	}
 
@@ -202,7 +245,7 @@ func (h *Handler) AnalyzeReconciliation(w http.ResponseWriter, r *http.Request) 
 	items, err := domain.AnalyzeUnmatchedStatementLines(lines, run.RunID, tenantID, missingReferenceTolerance, search)
 	if err != nil {
 		h.logger.Error("analysis of bank reconciliation lines failed", zap.String("run_id", run.RunID), zap.Error(err))
-		h.respondError(w, http.StatusBadGateway, "bank-reconciliation-svc returned lines that could not be analyzed")
+		problem.Write(w, r, http.StatusBadGateway, "bank_reconciliation_unusable", "bank-reconciliation-svc returned lines that could not be analyzed")
 		return
 	}
 
@@ -218,10 +261,11 @@ func (h *Handler) AnalyzeReconciliation(w http.ResponseWriter, r *http.Request) 
 
 	if err := h.store.CreateJob(r.Context(), tenantID, job, items, principalID, r.Header.Get("X-Correlation-ID")); err != nil {
 		h.logger.Error("failed to save reconciliation job", zap.Error(err))
-		h.respondError(w, http.StatusInternalServerError, "failed to run reconciliation analysis")
+		problem.Write(w, r, http.StatusInternalServerError, "internal_error", "failed to run reconciliation analysis")
 		return
 	}
 
+	setETag(w, job.Version)
 	h.respondJSON(w, http.StatusCreated, job)
 }
 
@@ -235,7 +279,7 @@ func (h *Handler) ListJobs(w http.ResponseWriter, r *http.Request) {
 	status := r.URL.Query().Get("status")
 
 	if legalEntityID == "" {
-		h.respondError(w, http.StatusBadRequest, "legal_entity_id is required")
+		problem.Write(w, r, http.StatusBadRequest, "validation_failed", "legal_entity_id is required")
 		return
 	}
 	principalID, ok := h.requirePrincipal(w, r)
@@ -247,28 +291,72 @@ func (h *Handler) ListJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	jobs, err := h.store.ListJobs(r.Context(), tenantID, legalEntityID, sourceA, status)
+	if status != "" && !domain.KnownJobStatuses[status] {
+		problem.Write(w, r, http.StatusBadRequest, "validation_failed", "status must be one of ANALYZING, COMPLETED, ARCHIVED")
+		return
+	}
+	if sourceA != "" && !domain.KnownSourceSystems[domain.SourceSystem(sourceA)] {
+		problem.Write(w, r, http.StatusBadRequest, "validation_failed", "source_system_a is not a known source system")
+		return
+	}
+	limit, offset, perr := parsePaging(r)
+	if perr != "" {
+		problem.Write(w, r, http.StatusBadRequest, "validation_failed", perr)
+		return
+	}
+
+	jobs, err := h.store.ListJobs(r.Context(), tenantID, legalEntityID, sourceA, status, limit, offset)
 	if err != nil {
 		h.logger.Error("failed to list reconciliation jobs", zap.Error(err))
-		h.respondError(w, http.StatusInternalServerError, "failed to query reconciliation jobs")
+		problem.Write(w, r, http.StatusInternalServerError, "internal_error", "failed to query reconciliation jobs")
 		return
 	}
 
 	if jobs == nil {
 		jobs = []domain.ReconciliationJob{}
 	}
+	// The list is a summary: suggestions are read per job via GET /{id}.
+	for i := range jobs {
+		jobs[i].UnmatchedItems = nil
+	}
 
 	h.respondJSON(w, http.StatusOK, map[string]interface{}{
-		"data":  jobs,
-		"count": len(jobs),
+		"data":   jobs,
+		"count":  len(jobs),
+		"limit":  limit,
+		"offset": offset,
 	})
+}
+
+// parsePaging reads limit (default 50, 1..200) and offset (>= 0). Lists are
+// always bounded: an omitted limit is the default, never "every row".
+func parsePaging(r *http.Request) (limit, offset int, problem string) {
+	limit, offset = domain.DefaultJobListLimit, 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > domain.MaxJobListLimit {
+			return 0, 0, fmt.Sprintf("limit must be an integer between 1 and %d", domain.MaxJobListLimit)
+		}
+		limit = n
+	}
+	if v := r.URL.Query().Get("offset"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return 0, 0, "offset must be a non-negative integer"
+		}
+		offset = n
+	}
+	return limit, offset, ""
 }
 
 // GetJobByID is authorized against the job's own legal entity, in the same
 // order the write routes use: load (tenant-scoped by RLS), then check.
 func (h *Handler) GetJobByID(w http.ResponseWriter, r *http.Request) {
 	tenantID := customMiddleware.GetTenantID(r.Context())
-	id := chi.URLParam(r, "id")
+	id, ok := pathUUID(w, r, "id")
+	if !ok {
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -277,7 +365,7 @@ func (h *Handler) GetJobByID(w http.ResponseWriter, r *http.Request) {
 
 	job, err := h.store.GetJobByID(r.Context(), tenantID, id)
 	if err != nil {
-		h.respondError(w, http.StatusNotFound, "reconciliation job not found")
+		h.writeJobLoadErr(w, r, err)
 		return
 	}
 
@@ -286,35 +374,57 @@ func (h *Handler) GetJobByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	setETag(w, job.Version)
 	h.respondJSON(w, http.StatusOK, job)
 }
 
 func (h *Handler) ApplyResolution(w http.ResponseWriter, r *http.Request) {
 	tenantID := customMiddleware.GetTenantID(r.Context())
-	jobID := chi.URLParam(r, "id")
-	itemID := chi.URLParam(r, "itemId")
-
-	var req domain.ApplyResolutionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondError(w, http.StatusBadRequest, "invalid request body")
+	jobID, ok := pathUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	// Item ids are UUIDs; a malformed one is the caller's 400, never a
+	// database cast error relayed back.
+	itemID, ok := pathUUID(w, r, "itemId")
+	if !ok {
+		return
+	}
+	expectedVersion, ok := parseIfMatch(w, r)
+	if !ok {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	var req domain.ApplyResolutionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		problem.Write(w, r, http.StatusBadRequest, "invalid_body", "invalid request body: "+err.Error())
+		return
+	}
+
+	// A decision names its outcome explicitly: a missing status is refused,
+	// never read as approval.
 	if req.SuggestionStatus == "" {
-		req.SuggestionStatus = domain.StatusApproved
+		problem.Write(w, r, http.StatusBadRequest, "validation_failed", "suggestion_status is required")
+		return
 	}
 	if err := domain.ValidateResolutionTarget(req.SuggestionStatus); err != nil {
-		h.respondError(w, http.StatusBadRequest, err.Error())
+		problem.Write(w, r, http.StatusBadRequest, "validation_failed", err.Error())
+		return
+	}
+	// ZS-SVC-Z-001 INV-18: a manual decision carries its reason.
+	if strings.TrimSpace(req.ResolutionNotes) == "" {
+		problem.Write(w, r, http.StatusBadRequest, "validation_failed", "resolution_notes (the reason for the decision) is required")
 		return
 	}
 	if err := domain.ValidateAuthoritativeRef(req.SuggestionStatus, req.AuthoritativeRef); err != nil {
-		h.respondError(w, http.StatusBadRequest, err.Error())
+		problem.Write(w, r, http.StatusBadRequest, "validation_failed", err.Error())
 		return
 	}
 
 	job, err := h.store.GetJobByID(r.Context(), tenantID, jobID)
 	if err != nil {
-		h.respondError(w, http.StatusNotFound, "reconciliation job not found")
+		h.writeJobLoadErr(w, r, err)
 		return
 	}
 
@@ -328,19 +438,9 @@ func (h *Handler) ApplyResolution(w http.ResponseWriter, r *http.Request) {
 	}
 
 	item, err := h.store.ApplyResolution(r.Context(), tenantID, jobID, itemID, req.SuggestionStatus, req.ResolutionNotes,
-		req.AuthoritativeRef, job.LegalEntityID, principalID, r.Header.Get("X-Correlation-ID"))
-	if errors.Is(err, domain.ErrResolutionTransition) {
-		h.respondError(w, http.StatusConflict, err.Error())
-		return
-	}
-	// Whether a reference is required depends on the suggestion's
-	// recommendation, which the store reads with the row it locks.
-	if errors.Is(err, domain.ErrAuthoritativeRefRequired) || errors.Is(err, domain.ErrInvalidAuthoritativeRef) {
-		h.respondError(w, http.StatusBadRequest, err.Error())
-		return
-	}
+		req.AuthoritativeRef, job.LegalEntityID, principalID, r.Header.Get("X-Correlation-ID"), expectedVersion)
 	if err != nil {
-		h.respondError(w, http.StatusNotFound, err.Error())
+		h.writeCommandErr(w, r, err)
 		return
 	}
 
@@ -349,11 +449,18 @@ func (h *Handler) ApplyResolution(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) ArchiveJob(w http.ResponseWriter, r *http.Request) {
 	tenantID := customMiddleware.GetTenantID(r.Context())
-	id := chi.URLParam(r, "id")
+	id, ok := pathUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	expectedVersion, ok := parseIfMatch(w, r)
+	if !ok {
+		return
+	}
 
 	job, err := h.store.GetJobByID(r.Context(), tenantID, id)
 	if err != nil {
-		h.respondError(w, http.StatusNotFound, "reconciliation job not found")
+		h.writeJobLoadErr(w, r, err)
 		return
 	}
 
@@ -366,15 +473,83 @@ func (h *Handler) ArchiveJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.ArchiveJob(r.Context(), tenantID, id); err != nil {
-		h.respondError(w, http.StatusNotFound, "reconciliation job not found")
+	archived, err := h.store.ArchiveJob(r.Context(), tenantID, id, principalID, r.Header.Get("X-Correlation-ID"), expectedVersion)
+	if err != nil {
+		h.writeCommandErr(w, r, err)
 		return
 	}
 
-	h.respondJSON(w, http.StatusOK, map[string]string{
-		"message": "reconciliation job archived successfully",
-		"id":      id,
-	})
+	setETag(w, archived.Version)
+	h.respondJSON(w, http.StatusOK, archived)
+}
+
+// writeCommandErr maps the outcome of a decision or the archive.
+func (h *Handler) writeCommandErr(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, domain.ErrJobNotFound):
+		problem.Write(w, r, http.StatusNotFound, "job_not_found", "reconciliation job not found")
+	case errors.Is(err, domain.ErrItemNotFound):
+		problem.Write(w, r, http.StatusNotFound, "suggestion_not_found", "suggestion not found in this job")
+	case errors.Is(err, domain.ErrJobArchived):
+		problem.Write(w, r, http.StatusConflict, "job_archived", domain.ErrJobArchived.Error())
+	case errors.Is(err, domain.ErrVersionMismatch):
+		problem.Write(w, r, http.StatusPreconditionFailed, "version_mismatch", domain.ErrVersionMismatch.Error())
+	case errors.Is(err, domain.ErrSegregationOfDuties):
+		problem.Write(w, r, http.StatusForbidden, "segregation_of_duties", domain.ErrSegregationOfDuties.Error())
+	case errors.Is(err, domain.ErrResolutionTransition):
+		problem.Write(w, r, http.StatusConflict, "invalid_transition", err.Error())
+	case errors.Is(err, domain.ErrAuthoritativeRefRequired), errors.Is(err, domain.ErrInvalidAuthoritativeRef):
+		// Whether a reference is required depends on the suggestion's
+		// recommendation, which the store reads with the row it locks.
+		problem.Write(w, r, http.StatusBadRequest, "validation_failed", err.Error())
+	default:
+		h.logger.Error("reconciliation command failed", zap.Error(err))
+		problem.Write(w, r, http.StatusInternalServerError, "internal_error", "the command could not be completed")
+	}
+}
+
+// writeJobLoadErr: a job that does not exist and another tenant's job (hidden
+// by RLS) both read as not found.
+func (h *Handler) writeJobLoadErr(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, domain.ErrJobNotFound) {
+		problem.Write(w, r, http.StatusNotFound, "job_not_found", "reconciliation job not found")
+		return
+	}
+	h.logger.Error("load reconciliation job failed", zap.Error(err))
+	problem.Write(w, r, http.StatusInternalServerError, "internal_error", "could not load the reconciliation job")
+}
+
+// pathUUID reads a UUID path parameter; a malformed one is 400 invalid_id.
+func pathUUID(w http.ResponseWriter, r *http.Request, name string) (string, bool) {
+	raw := chi.URLParam(r, name)
+	id, err := uuid.Parse(raw)
+	if err != nil {
+		problem.Write(w, r, http.StatusBadRequest, "invalid_id", name+" must be a UUID")
+		return "", false
+	}
+	return id.String(), true
+}
+
+// parseIfMatch reads an optional If-Match carrying the job version as a
+// strong ETag ("3"). Absent means no precondition (0); malformed is 400.
+func parseIfMatch(w http.ResponseWriter, r *http.Request) (int, bool) {
+	raw := strings.TrimSpace(r.Header.Get("If-Match"))
+	if raw == "" {
+		return 0, true
+	}
+	v, err := strconv.Atoi(strings.Trim(raw, `"`))
+	if err != nil || v < 1 || len(raw) < 3 || raw[0] != '"' || raw[len(raw)-1] != '"' {
+		problem.Write(w, r, http.StatusBadRequest, "invalid_if_match", `If-Match must be the job version as a strong ETag, e.g. "3"`)
+		return 0, false
+	}
+	return v, true
+}
+
+// setETag exposes the aggregate version for the If-Match contract.
+func setETag(w http.ResponseWriter, version int) {
+	if version > 0 {
+		w.Header().Set("ETag", fmt.Sprintf("%q", strconv.Itoa(version)))
+	}
 }
 
 func (h *Handler) respondJSON(w http.ResponseWriter, code int, payload interface{}) {
@@ -383,17 +558,13 @@ func (h *Handler) respondJSON(w http.ResponseWriter, code int, payload interface
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-func (h *Handler) respondError(w http.ResponseWriter, code int, message string) {
-	h.respondJSON(w, code, map[string]string{"error": message})
-}
-
 // requirePrincipal reads the caller's identity from X-Principal-Id, set by
 // the gateway after identity verification. A request with no resolved
 // principal never passed identity verification — fail closed with 401.
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
 	principalID := r.Header.Get("X-Principal-Id")
 	if principalID == "" {
-		h.respondError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		problem.Write(w, r, http.StatusUnauthorized, "missing_principal", "X-Principal-Id header is required")
 		return "", false
 	}
 	return principalID, true
@@ -404,11 +575,11 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 // being unreachable) is 503 — fail closed, never allow silently.
 func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
 	if errors.Is(err, authz.ErrAuthorizationDenied) {
-		h.respondError(w, http.StatusForbidden, "authorization denied")
+		problem.Write(w, nil, http.StatusForbidden, "authorization_denied", "authorization denied")
 		return
 	}
 	h.logger.Error("authorization check failed", zap.Error(err))
-	h.respondError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+	problem.Write(w, nil, http.StatusServiceUnavailable, "authorization_unavailable", "authorization service unavailable")
 }
 
 // writeBankRecErr maps a bank-reconciliation-svc read failure. Every case
@@ -417,17 +588,17 @@ func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
 func (h *Handler) writeBankRecErr(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, bankrec.ErrRunNotFound):
-		h.respondError(w, http.StatusNotFound, "bank reconciliation run not found")
+		problem.Write(w, nil, http.StatusNotFound, "run_not_found", "bank reconciliation run not found")
 	case errors.Is(err, bankrec.ErrPopulationTooLarge):
-		h.respondError(w, http.StatusUnprocessableEntity, err.Error())
+		problem.Write(w, nil, http.StatusUnprocessableEntity, "population_too_large", err.Error())
 	case errors.Is(err, bankrec.ErrServiceUnavailable):
 		h.logger.Error("bank-reconciliation-svc read failed", zap.Error(err))
-		h.respondError(w, http.StatusServiceUnavailable, "bank-reconciliation-svc unavailable")
+		problem.Write(w, nil, http.StatusServiceUnavailable, "bank_reconciliation_unavailable", "bank-reconciliation-svc unavailable")
 	default:
 		// ErrRequestRefused, ErrInconsistent, ErrScopeMissing: the upstream
 		// answered, but not with something this service can stand behind.
 		h.logger.Error("bank-reconciliation-svc read failed", zap.Error(err))
-		h.respondError(w, http.StatusBadGateway, "bank-reconciliation-svc returned an unusable response")
+		problem.Write(w, nil, http.StatusBadGateway, "bank_reconciliation_unusable", "bank-reconciliation-svc returned an unusable response")
 	}
 }
 
@@ -539,15 +710,15 @@ func (h *Handler) readCanonicalCandidates(ctx context.Context, scope banking.Sco
 func (h *Handler) writeBankingErr(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, banking.ErrWindowTooLarge):
-		h.respondError(w, http.StatusUnprocessableEntity, "the bank account has too many canonical transactions in the candidate search window to read in one page")
+		problem.Write(w, nil, http.StatusUnprocessableEntity, "banking_window_too_large", "the bank account has too many canonical transactions in the candidate search window to read in one page")
 	case errors.Is(err, banking.ErrServiceUnavailable):
 		h.logger.Error("banking-connector-svc candidate read failed", zap.Error(err))
-		h.respondError(w, http.StatusServiceUnavailable, "banking-connector-svc unavailable")
+		problem.Write(w, nil, http.StatusServiceUnavailable, "banking_connector_unavailable", "banking-connector-svc unavailable")
 	default:
 		// ErrRequestRefused (including this principal lacking
 		// bank.transaction.read), ErrInconsistent, ErrScopeMissing.
 		h.logger.Error("banking-connector-svc candidate read was refused or inconsistent", zap.Error(err))
-		h.respondError(w, http.StatusBadGateway, "banking-connector-svc returned canonical transactions that could not be used")
+		problem.Write(w, nil, http.StatusBadGateway, "banking_connector_unusable", "banking-connector-svc returned canonical transactions that could not be used")
 	}
 }
 
@@ -557,13 +728,13 @@ func (h *Handler) writeBankingErr(w http.ResponseWriter, err error) {
 func (h *Handler) writeLedgerErr(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ledger.ErrWindowTooLarge):
-		h.respondError(w, http.StatusUnprocessableEntity, "the cash account has too many ledger entries in the candidate search window to read completely")
+		problem.Write(w, nil, http.StatusUnprocessableEntity, "ledger_window_too_large", "the cash account has too many ledger entries in the candidate search window to read completely")
 	case errors.Is(err, ledger.ErrServiceUnavailable):
 		h.logger.Error("general-ledger-svc candidate read failed", zap.Error(err))
-		h.respondError(w, http.StatusServiceUnavailable, "general-ledger-svc unavailable")
+		problem.Write(w, nil, http.StatusServiceUnavailable, "general_ledger_unavailable", "general-ledger-svc unavailable")
 	default:
 		h.logger.Error("general-ledger-svc candidate read was refused or inconsistent", zap.Error(err))
-		h.respondError(w, http.StatusBadGateway, "general-ledger-svc returned ledger entries that could not be used")
+		problem.Write(w, nil, http.StatusBadGateway, "general_ledger_unusable", "general-ledger-svc returned ledger entries that could not be used")
 	}
 }
 
@@ -576,13 +747,13 @@ func (h *Handler) writeLedgerErr(w http.ResponseWriter, err error) {
 // unreachable — 503, fail closed, never a guessed default.
 func (h *Handler) writeToleranceErr(w http.ResponseWriter, err error, metric string) {
 	if errors.Is(err, financialcontrol.ErrToleranceNotConfigured) {
-		h.respondError(w, http.StatusFailedDependency, "no governed tolerance policy configured for metric "+metric)
+		problem.Write(w, nil, http.StatusFailedDependency, "tolerance_not_configured", "no governed tolerance policy configured for metric "+metric)
 		return
 	}
 	if errors.Is(err, financialcontrol.ErrUnsupportedDateBasis) {
-		h.respondError(w, http.StatusFailedDependency, "governed tolerance policy for metric "+metric+" uses date_basis BUSINESS, which has no business-day calendar to count against; configure CALENDAR")
+		problem.Write(w, nil, http.StatusFailedDependency, "tolerance_date_basis_unsupported", "governed tolerance policy for metric "+metric+" uses date_basis BUSINESS, which has no business-day calendar to count against; configure CALENDAR")
 		return
 	}
 	h.logger.Error("financial-control-svc tolerance lookup failed", zap.String("metric", metric), zap.Error(err))
-	h.respondError(w, http.StatusServiceUnavailable, "financial-control-svc unavailable")
+	problem.Write(w, nil, http.StatusServiceUnavailable, "financial_control_unavailable", "financial-control-svc unavailable")
 }

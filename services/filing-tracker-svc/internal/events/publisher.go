@@ -71,6 +71,7 @@ func NewKafkaPublisher(brokers []string, topic string, logger *zap.Logger) *Kafk
 		Addr:                   kafka.TCP(brokers...),
 		Topic:                  topic,
 		Balancer:               &kafka.LeastBytes{},
+		BatchTimeout:           20 * time.Millisecond,
 		AllowAutoTopicCreation: true,
 	}
 	return &KafkaPublisher{writer: w, logger: logger}
@@ -82,18 +83,12 @@ func NewKafkaPublisherWithWriter(writer MessageWriter, logger *zap.Logger) *Kafk
 	return &KafkaPublisher{writer: writer, logger: logger}
 }
 
-// Publish sends a filing domain event to Kafka.
-//
-// EventID is a fresh UUID per call — it used to be the deterministic string
-// "evt-"+eventType+"-"+filingID, which collides across every repeat
-// occurrence of the same event type on the same filing. Any consumer
-// deduplicating via INSERT ... ON CONFLICT (event_id) DO NOTHING — the
-// exact pattern this platform's own evidence/history consumers use — would
-// have silently dropped a second, real event as if it were a redelivery of
-// the first.
-func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) error {
-	evt := Event{
-		EventID:       uuid.New().String(),
+// BuildEvent assembles the envelope for params with the given identity. The
+// outbox writes it at transaction time, so it carries the actor and
+// correlation of the request that caused the change.
+func BuildEvent(params PublishParams, eventID string, occurredAt time.Time) Event {
+	return Event{
+		EventID:       eventID,
 		EventType:     params.EventType,
 		EventVersion:  "1.0",
 		SchemaVersion: "1.0",
@@ -104,10 +99,24 @@ func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) erro
 		Jurisdiction:  params.Jurisdiction,
 		ActorID:       params.ActorID,
 		CorrelationID: params.CorrelationID,
-		OccurredAt:    time.Now().UTC(),
+		OccurredAt:    occurredAt.UTC(),
 		Payload:       params.Payload,
 	}
-	data, err := json.Marshal(evt)
+}
+
+// Publish sends a filing domain event to Kafka immediately. Request handlers
+// no longer call it (they write to the transactional outbox, which the relay
+// delivers through PublishOutbox); it is kept for tools and tests.
+//
+// EventID is a fresh UUID per call — it used to be the deterministic string
+// "evt-"+eventType+"-"+filingID, which collides across every repeat
+// occurrence of the same event type on the same filing. Any consumer
+// deduplicating via INSERT ... ON CONFLICT (event_id) DO NOTHING — the
+// exact pattern this platform's own evidence/history consumers use — would
+// have silently dropped a second, real event as if it were a redelivery of
+// the first.
+func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) error {
+	data, err := json.Marshal(BuildEvent(params, uuid.New().String(), time.Now()))
 	if err != nil {
 		return err
 	}
@@ -115,10 +124,18 @@ func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) erro
 		Key:   []byte(params.FilingID),
 		Value: data,
 	}); err != nil {
-		p.logger.Warn("kafka publish failed — event dropped",
+		p.logger.Warn("kafka publish failed",
 			zap.String("event_type", params.EventType),
 			zap.Error(err),
 		)
+		return err
 	}
 	return nil
+}
+
+// PublishOutbox writes one already-serialised envelope from the outbox,
+// keyed by filing ID as before, and returns the real delivery error so the
+// relay retries instead of marking the row published.
+func (p *KafkaPublisher) PublishOutbox(ctx context.Context, _ string, aggregateID string, payload []byte) error {
+	return p.writer.WriteMessages(ctx, kafka.Message{Key: []byte(aggregateID), Value: payload})
 }

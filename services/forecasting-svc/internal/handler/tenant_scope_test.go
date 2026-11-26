@@ -30,9 +30,8 @@ import (
 // the policy. That is worse than no policy: pg_class reports the policy
 // exists, and any test passing a real tenant goes green.
 //
-// These tests run against the in-memory store, so they prove the HTTP gate.
-// The database half is Priority 3 for this service — its policies are
-// USING-only, with no WITH CHECK and no FORCE.
+// These tests prove the HTTP gate; the database half (FORCE RLS + WITH
+// CHECK) is proven by internal/store TestRLS_EnforcedByDatabase.
 
 func TestMissingTenantHeader_Refused(t *testing.T) {
 	router := setupTestRouter(t)
@@ -66,15 +65,14 @@ func TestMissingTenantHeader_Refused(t *testing.T) {
 // TestHealthzDoesNotRequireTenant pins a regression I introduced while
 // fixing the above and caught here.
 //
-// The first version applied the tenant middleware globally with r.Use(), so
-// it wrapped /healthz too. Liveness and readiness probes carry no tenant, so
-// every probe would have returned 401 and the orchestrator would have
-// restarted the container in a loop — a security fix that takes the service
-// down. The gate now hangs off the /v1 subtree via r.With() instead.
+// The first version applied the tenant middleware globally with r.Use()
+// without exempting the probes, so every probe returned 401 and the
+// orchestrator would have restarted the container in a loop. The gate is now
+// global again (platform middleware order) but exempts /healthz, /readyz and
+// /health itself, so unknown paths without a tenant are still 401.
 //
-// This test exists so that re-adding r.Use(TenantMiddleware) fails loudly
-// rather than in production. Note it must assert on a request with NO
-// tenant header: with one, it would pass either way and prove nothing.
+// It must assert on a request with NO tenant header: with one, it would pass
+// either way and prove nothing.
 func TestHealthzDoesNotRequireTenant(t *testing.T) {
 	router := setupTestRouter(t)
 

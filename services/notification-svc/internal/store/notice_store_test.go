@@ -59,7 +59,7 @@ func mailboxAccepted(t *testing.T, s *store.PgStore, tenant, attemptID, fact str
 
 func TestNotice_LifecycleFromPreparedToAcknowledged(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenant := "tenant-notice"
 	ctx := tenantCtx(tenant)
 	iv := regulatedIntentVersion(t, s, tenant, "legal.notice_of_change")
@@ -124,7 +124,7 @@ func TestNotice_LifecycleFromPreparedToAcknowledged(t *testing.T) {
 }
 
 func TestNotice_NoAcknowledgementRequiredIsSatisfiedByPolicyNotLegallyServed(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	tenant := "tenant-notice-none"
 	iv := regulatedIntentVersion(t, s, tenant, "legal.fyi")
 	n, err := s.CreateNotice(tenantCtx(tenant), noticeParams(iv, domain.AckNone, time.Time{}))
@@ -141,7 +141,7 @@ func TestNotice_NoAcknowledgementRequiredIsSatisfiedByPolicyNotLegallyServed(t *
 }
 
 func TestNotice_ABounceOrAFailureIsAnExceptionNeverEvidence(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	tenant := "tenant-notice-bounce"
 	ctx := tenantCtx(tenant)
 	iv := regulatedIntentVersion(t, s, tenant, "legal.bounce")
@@ -162,7 +162,7 @@ func TestNotice_ABounceOrAFailureIsAnExceptionNeverEvidence(t *testing.T) {
 
 func TestNotice_NoResponseByTheDeadlineExpiresAndNeverAcknowledges(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenant := "tenant-notice-expire"
 	ctx := tenantCtx(tenant)
 	iv := regulatedIntentVersion(t, s, tenant, "legal.expire")
@@ -195,7 +195,7 @@ func TestNotice_NoResponseByTheDeadlineExpiresAndNeverAcknowledges(t *testing.T)
 }
 
 func TestNotice_ASweeperFindsOpenNoticesAcrossTenants(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	for _, tenant := range []string{"tenant-sweep-a", "tenant-sweep-b"} {
 		iv := regulatedIntentVersion(t, s, tenant, "legal.sweep")
 		n, err := s.CreateNotice(tenantCtx(tenant), noticeParams(iv, domain.AckReceipt, time.Now().Add(time.Hour)))
@@ -213,7 +213,7 @@ func TestNotice_ASweeperFindsOpenNoticesAcrossTenants(t *testing.T) {
 
 func TestNotice_ACorrectionIsANewVersionAndTheOriginalStaysVisible(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenant := "tenant-notice-correct"
 	ctx := tenantCtx(tenant)
 	iv := regulatedIntentVersion(t, s, tenant, "legal.correct")
@@ -254,7 +254,7 @@ func TestNotice_ACorrectionIsANewVersionAndTheOriginalStaysVisible(t *testing.T)
 
 func TestNotice_TheDatabaseHoldsTheLineEvenIfTheServiceDoesNot(t *testing.T) {
 	pool := openAdminTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("local"))
 	tenant := "tenant-notice-db"
 	iv := regulatedIntentVersion(t, s, tenant, "legal.db")
 	n, err := s.CreateNotice(tenantCtx(tenant), noticeParams(iv, domain.AckReceipt, time.Now().Add(time.Hour)))
@@ -293,7 +293,7 @@ func TestNotice_TheDatabaseHoldsTheLineEvenIfTheServiceDoesNot(t *testing.T) {
 }
 
 func TestNotice_RowLevelSecurityKeepsTenantsApart(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	iv := regulatedIntentVersion(t, s, "tenant-notice-a", "legal.rls")
 	n, err := s.CreateNotice(tenantCtx("tenant-notice-a"), noticeParams(iv, domain.AckNone, time.Time{}))
 	require.NoError(t, err)
@@ -332,7 +332,7 @@ func TestMigration000026_DownThenUp(t *testing.T) {
 // The transitions of one transaction share a timestamp; the history must still come back in
 // the order they happened, every time.
 func TestNotice_HistoryOrderIsStableWithinOneTransaction(t *testing.T) {
-	s := store.New(openAdminTestPool(t))
+	s := store.New(openAdminTestPool(t), store.WithEventRegion("local"))
 	tenant := "tenant-notice-order"
 	iv := regulatedIntentVersion(t, s, tenant, "legal.order")
 	for i := 0; i < 15; i++ {

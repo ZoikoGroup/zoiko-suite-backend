@@ -16,6 +16,8 @@ import (
 	"zoiko.io/compliance-risk-scoring-svc/internal/events"
 	"zoiko.io/compliance-risk-scoring-svc/internal/handler"
 	"zoiko.io/compliance-risk-scoring-svc/internal/mtls"
+	"zoiko.io/compliance-risk-scoring-svc/internal/outbox"
+	"zoiko.io/compliance-risk-scoring-svc/internal/service"
 	"zoiko.io/compliance-risk-scoring-svc/internal/store"
 	"zoiko.io/compliance-risk-scoring-svc/internal/telemetry"
 )
@@ -31,8 +33,6 @@ func main() {
 
 	logger.Info("Starting compliance-risk-scoring-svc", zap.String("port", cfg.Port))
 
-	var dataStore store.Store
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -47,15 +47,17 @@ func main() {
 	poolCfg.HealthCheckPeriod = 1 * time.Minute
 	dbPool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
-		logger.Warn("Failed to connect to database, falling back to MemoryStore", zap.Error(err))
-		dataStore = store.NewMemoryStore()
-	} else if err := dbPool.Ping(ctx); err != nil {
-		logger.Warn("Database ping failed, falling back to MemoryStore", zap.Error(err))
-		dataStore = store.NewMemoryStore()
+		logger.Fatal("failed to create db pool", zap.Error(err))
+	}
+	defer dbPool.Close()
+	// No in-memory fallback: a scoring service without its database cannot
+	// keep evidence. An unreachable database only makes /readyz report 503.
+	if err := dbPool.Ping(ctx); err != nil {
+		logger.Warn("database ping failed at startup; /readyz will report unavailable until it recovers", zap.Error(err))
 	} else {
 		logger.Info("Connected to PostgreSQL database")
-		dataStore = store.NewPgStore(dbPool)
 	}
+	dataStore := store.New(dbPool)
 
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	publisher := events.NewPublisher(brokers, cfg.KafkaTopic, logger)
@@ -72,7 +74,12 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthzURL, logger)
 	}
 
-	h := handler.NewHandler(dataStore, publisher, authzClient, logger)
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	go outbox.NewRelay(dataStore, publisher, logger, 2*time.Second).Run(relayCtx)
+
+	svc := service.New(dataStore, authzClient, logger)
+	h := handler.NewHandler(svc, dataStore, logger)
 	router := handler.NewRouter(h)
 
 	srv := &http.Server{
@@ -96,6 +103,7 @@ func main() {
 	<-quit
 
 	logger.Info("Shutting down server...")
+	stopRelay()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()

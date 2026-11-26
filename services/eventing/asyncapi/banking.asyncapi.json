@@ -34,11 +34,17 @@
     "bank-statement": {
       "address": "zoikosuite.banking.bank-statement.v1",
       "messages": {
+        "accepted": {
+          "$ref": "#/components/messages/bank-statement.accepted"
+        },
         "imported": {
           "$ref": "#/components/messages/bank-statement.imported"
         },
         "ingested": {
           "$ref": "#/components/messages/bank-statement.ingested"
+        },
+        "quarantined": {
+          "$ref": "#/components/messages/bank-statement.quarantined"
         }
       }
     },
@@ -309,6 +315,18 @@
         "x-zoiko-event-type": "com.zoikosuite.banking.bank-reconciliation.completed",
         "x-zoiko-origin": "spec"
       },
+      "bank-statement.accepted": {
+        "contentType": "application/json",
+        "description": "Producer: Banking Connector Service. Primary consumers / intent: treasury-svc (BNK-08 cash position recalculation). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.bank-statement.accepted",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Bank Statement: accepted.",
+        "title": "bank-statement accepted",
+        "x-zoiko-event-type": "com.zoikosuite.banking.bank-statement.accepted",
+        "x-zoiko-origin": "extension"
+      },
       "bank-statement.imported": {
         "contentType": "application/json",
         "description": "Producer: Banking. Primary consumers / intent: Normalization/reconciliation. Family: Banking, Cash & Payments. Origin: ZS-EVENT-001 section 19.",
@@ -331,6 +349,18 @@
         "summary": "Bank Statement: ingested.",
         "title": "bank-statement ingested",
         "x-zoiko-event-type": "com.zoikosuite.banking.bank-statement.ingested",
+        "x-zoiko-origin": "extension"
+      },
+      "bank-statement.quarantined": {
+        "contentType": "application/json",
+        "description": "Producer: Banking Connector Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Banking, Cash & Payments (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.banking.bank-statement.quarantined",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Bank Statement: quarantined.",
+        "title": "bank-statement quarantined",
+        "x-zoiko-event-type": "com.zoikosuite.banking.bank-statement.quarantined",
         "x-zoiko-origin": "extension"
       },
       "bank-transaction.normalized": {
@@ -1083,10 +1113,16 @@
       "description": "Producer(s): Banking, Banking Connector Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
       "messages": [
         {
+          "$ref": "#/channels/bank-statement/messages/accepted"
+        },
+        {
           "$ref": "#/channels/bank-statement/messages/imported"
         },
         {
           "$ref": "#/channels/bank-statement/messages/ingested"
+        },
+        {
+          "$ref": "#/channels/bank-statement/messages/quarantined"
         }
       ],
       "summary": "Publish bank-statement facts after the authoritative commit (transactional outbox)."

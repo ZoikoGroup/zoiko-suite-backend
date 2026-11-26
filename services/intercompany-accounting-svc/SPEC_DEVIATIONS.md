@@ -89,14 +89,36 @@ reconciliation-engine-svc holds for DATA-07.
   never `float64`). A1 and A5 stay open; the period and currency columns they
   need are now there.
 - **A5. The match compares the whole target journal, not its intercompany
-  line.** `MatchEntry` takes the larger of the journal's total debits and
-  total credits and compares that to the entry amount. A journal that also
-  carries non-intercompany lines (tax, a third-party leg) will mismatch, and a
-  journal of the right total but the wrong accounts will match. There is no
-  intercompany-account resolution ("Server-resolved: intercompany accounts")
-  and no matching-policy or tolerance version (fixed `0.001`). Needs an
-  intercompany account designation from the chart of accounts (ACC-01/02);
-  until then this is a known approximation.
+  line, and its tolerance was a hardcoded, unversioned literal. — Both
+  closed (B15 line-level resolution; B16 tolerance governance).** `MatchEntry` used to take the
+  larger of the journal's total debits and total credits and compare that to
+  the entry amount: a journal that also carried non-intercompany lines (tax,
+  a third-party leg) would mismatch, and a journal of the right total but the
+  wrong accounts would match. general-ledger-svc now carries ACC-01's
+  `IsIntercompanyAccount` classification (mirroring `IsControlAccount`'s
+  exact shape, including its maker-checker protection) and resolves it per
+  line on the same `GetJournal` response this service already called
+  (`JournalLine.IsIntercompanyAccount`, `internal/ledger/client.go`).
+  `MatchEntry` now sums only the lines the chart designates intercompany
+  (`intercompanyLineTotal`, `internal/handler/handler.go`) and compares that
+  to the pair's expected amount — the journal's other lines never enter the
+  comparison. A journal with no intercompany-designated line is a new
+  MISMATCH rule, `NO_INTERCOMPANY_LINES` (migration 000010), checked after
+  the four journal-level checks and before the amount comparison it would
+  otherwise make meaningless; multiple intercompany-designated lines are
+  summed (B15).
+
+  The matching-policy/tolerance version is now a governed, versioned object
+  (migration 000011, `intercompany_tolerance_policy_versions`; B16) rather
+  than the fixed `0.001` `big.Rat` literal `matchTolerance` used to be. The
+  tolerance's VALUE is unchanged — the spec gives no different number and
+  none is invented here — only its governance: who may publish a version
+  (an authorized principal, `INTERCOMPANY_TOLERANCE_POLICY_PUBLISH`), when
+  it takes effect (`effective_from`), and which version a historical match
+  attempt was evaluated under (`intercompany_match_attempts.tolerance_version`,
+  recorded on every attempt, never revised by a later publish). A tenant
+  that has never published a version still resolves to the fixed 0.001 at
+  version 0, so this closes no tenant's existing match outcome.
 - **A6. The source side was never verified. — Closed (B12).**
   `CreateIntercompanyPair` now fetches the named source journal from
   general-ledger-svc with the same `GetJournal` call `MatchEntry` uses and
@@ -537,3 +559,124 @@ reconciliation-engine-svc holds for DATA-07.
     each logically distinct action in a test uses its own key, since the real
     store treats a repeated key for the same command and pair as a replay, not
     a new attempt.
+- **B15. How the target journal's intercompany line(s) are resolved and
+  compared (A5).**
+  - *Classification lives in general-ledger-svc, not here.* ACC-11's
+    "Server-resolved: intercompany accounts" context is ACC-01's chart of
+    accounts, so the designation (`IsIntercompanyAccount`) is a
+    general-ledger-svc field, added as the exact structural twin of
+    `IsControlAccount` (same struct locations, same request/response
+    conventions, same maker-checker gate on `AmendAccountVersion`/
+    `ReparentAccount` — extended to trigger when `IsIntercompanyAccount` is
+    changing or already true, not a parallel mechanism). This service never
+    writes or reads the chart of accounts directly; it only reads the
+    classification already resolved onto each line of the journal it was
+    calling for anyway.
+  - *No new general-ledger-svc endpoint.* `GetJournal`
+    (`internal/ledger/client.go`'s only call) now resolves and sets
+    `is_intercompany_account` on every returned `JournalLine` from the
+    current chart of accounts, reusing `GetAccountByCode` — the same call
+    `checkAccountRestrictions` already makes for posting — rather than
+    adding a second cross-service call this service would have to make per
+    line. An account code the chart has never heard of resolves to `false`,
+    the same bootstrap posture every other reader of the chart takes for an
+    unregistered code.
+  - *Comparison basis.* `intercompanyLineTotal` is the direct, line-scoped
+    generalisation of the old `journalTotal`: sum the debit amounts of the
+    intercompany-designated lines, sum their credit amounts, take the
+    larger — restricted to the lines the chart classifies intercompany
+    instead of every line in the journal. `journalTotal` itself is kept
+    only for A6's create-time source-journal observation, which never
+    compares the amount it records (B12) and is out of this change's scope.
+  - *Zero intercompany-designated lines.* The target journal can pass all
+    four journal-level checks (exists, entity, FINALIZED, currency) and
+    still have no line the chart classifies intercompany — it is simply not
+    an intercompany entry. There is nothing to compare the pair's amount
+    against, so this is `NO_INTERCOMPANY_LINES`, a new MISMATCH rule
+    (migration 000010 widens the attempt table's CHECK), checked right
+    after the four journal-level checks and before the amount comparison —
+    the same "real accounting fact, not a retryable error" posture every
+    other MISMATCH rule already has, following `CURRENCY_MISMATCH`'s
+    pattern rather than inventing a new kind of refusal.
+  - *Multiple intercompany-designated lines are summed.* Not matched
+    against only the first. A pair's intercompany position can legitimately
+    be split across several lines (e.g. by dimension), and summing is
+    exactly what the old whole-journal comparison already did (sum every
+    debit, sum every credit, take the larger) — this is that same
+    arithmetic restricted to a different set of lines, not a new judgment
+    call about which line "is" the position.
+  - *Tolerance/matching-policy version.* Was still the fixed `0.001` as of
+    this entry's own writing (A5's other named gap) — out of scope for this
+    line-level fix. Closed separately, in a later pass: see B16.
+  - *Tests.* `internal/handler/intercompany_line_total_test.go` is a
+    white-box test (same package as the handler) proving the old and new
+    comparison bases genuinely diverge on one journal (a 5,000 intercompany
+    line plus an unrelated 50 tax line: old total 5,050, new total 5,000).
+    `internal/handler/a5_intercompany_line_match_test.go` proves the same
+    divergence end to end through `MatchEntry` — a journal the old
+    whole-journal comparison would have mismatched now matches (the tax-line
+    case), and a journal the old comparison would have wrongly matched (an
+    unrelated line padding the whole-journal total to the pair's amount
+    while the actual intercompany line differs) now correctly mismatches —
+    plus the zero-line and multiple-line cases. general-ledger-svc's
+    `TestGetJournal_ResolvesIntercompanyAccountPerLine` proves the
+    per-line resolution itself, and
+    `TestPgStore_AmendMarksIntercompanyAccount_RequiresApproval` /
+    `TestPgStore_UnmarksIntercompanyAccount_RequiresApproval` /
+    `TestPgStore_ReparentIntercompanyAccount_RequiresApproval` prove the
+    maker-checker gate on the classification mirrors `IsControlAccount`'s
+    own tests exactly (same-principal propose-and-approve refused, a
+    different principal succeeds).
+- **B16. The tolerance used in `MatchEntry`'s amount comparison is a
+  governed, versioned object, not a magic literal (A5's other named gap).**
+  Changed in this pass.
+  - *Shape mirrors a sibling service's existing versioned-policy pattern,*
+    rather than inventing a new one: `intercompany_tolerance_policy_versions`
+    (migration 000011) is structured like commercial-account-svc's
+    `entitlement_policy_versions` (its migration 000010) — an explicit,
+    caller-chosen `policy_version` (not a `SERIAL`, so a replayed publish for
+    the same number is a natural conflict rather than a race on an
+    auto-assigned one), `effective_from`-dated, immutable once written
+    (`reject_immutable_row`, already defined here by migration 000007),
+    `reason` + `created_by_principal_id` for governance evidence.
+  - *Tenant-scoped, not cross-tenant.* Unlike `entitlement_policy_versions`
+    (a single platform-wide table, because commercial-account-svc has a
+    seller plane), this table is keyed `(tenant_id, policy_version)`: this
+    service has no cross-tenant plane at all — every table here is
+    tenant-partitioned (`internal/store/pg_store.go`'s `withRLS`) — so there
+    is no single cross-tenant tolerance to govern, only each tenant's own.
+  - *Who may publish.* `POST /v1/intercompany/tolerance-policy`
+    (`Handler.PublishTolerancePolicy`), authorized via the existing
+    `AuthZClient.CheckAllowed` with a new action,
+    `INTERCOMPANY_TOLERANCE_POLICY_PUBLISH`. The call is checked with an
+    empty `legalEntityID` — a tenant-wide policy is not any one pair's or
+    legal entity's concern, the same "no single entity owns it" posture
+    `internal/store/pg_store.go`'s `enqueueEntryEvent` already documents for
+    this service's inherently two-entity pairs, reused rather than inventing
+    a per-entity scope a tenant-wide policy does not have.
+  - *Resolution.* `ResolveTolerancePolicy(tenantID, at)` returns the latest
+    published version whose `effective_from` is at or before `at`, or
+    version `0` and the fixed pre-governance `0.001` when the tenant has
+    never published one effective yet — never a stored row, so a tenant that
+    has not opted into tolerance governance sees no behavior change.
+    `MatchEntry` and the create-time source-journal check
+    (`verifySourceJournal`) both call it and record the result on their
+    attempt; the amount comparison itself now compares against the resolved
+    `*big.Rat`, not the old package-level `matchTolerance` var.
+  - *Append-only evidence, not a mutable config value.* Every
+    `intercompany_match_attempts` row now also carries `tolerance_version`
+    (migration 000011 adds the column, `DEFAULT 0` for every attempt
+    recorded before it existed). Publishing a later version never changes an
+    earlier attempt's recorded tolerance or tolerance_version — the same
+    append-only doctrine the rest of that table already has.
+  - *Not a new business value.* The tolerance amount itself is unchanged —
+    `0.001` keeps applying as version 0 until a tenant actually publishes a
+    version; the spec gives no different number and none is invented here.
+  - *Tests.* `internal/store/tolerance_policy_pg_test.go` (real Postgres):
+    `TestPgStore_TolerancePolicy_VersionedNotRetroactive` proves the default
+    (version 0, `0.001`) with nothing published; that a published version
+    takes effect only from its own `effective_from`, never retroactively
+    from when it was published; that a recorded attempt's `tolerance_version`
+    is unchanged after a later version is published; that republishing the
+    same version number is refused (`ErrTolerancePolicyVersionExists`); and
+    tenant isolation on the new table.
