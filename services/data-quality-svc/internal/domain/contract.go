@@ -122,7 +122,14 @@ type CertificationProfile struct {
 	// AllowRiskAcceptance lets certification proceed past an unresolved BLOCKER
 	// exception when a governed risk acceptance is recorded (section 8). False unless asked.
 	AllowRiskAcceptance bool `json:"allow_risk_acceptance"`
+	// ValidityWindowSeconds is how long a certification issued against this contract stays reliable. Zero means
+	// it never goes stale. It is frozen with the version and copied onto each certification when it is issued
+	// (ZS-SVC-Z-001 DQC-016 CERTIFICATION_STALE).
+	ValidityWindowSeconds int64 `json:"validity_window_seconds,omitempty"`
 }
+
+// MaxValidityWindowSeconds bounds a validity window at ten years: a longer one is "never" written as a number.
+const MaxValidityWindowSeconds = 10 * 365 * 24 * 3600
 
 // ContractBody is everything a version freezes.
 type ContractBody struct {
@@ -335,6 +342,9 @@ func (b ContractBody) Validate() error {
 				return err
 			}
 		}
+	}
+	if w := b.CertificationProfile.ValidityWindowSeconds; w < 0 || w > MaxValidityWindowSeconds {
+		return invalid("validity_window_seconds must be between 0 (never stale) and %d", MaxValidityWindowSeconds)
 	}
 	seen := map[string]bool{}
 	for _, k := range b.CertificationProfile.MandatoryRules {

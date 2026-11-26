@@ -69,6 +69,7 @@ func NewRouter(h *Handler) http.Handler {
 		registerContractRoutes(r, h)
 		registerRevocationRoutes(r, h)
 		registerFacadeRoutes(r, h)
+		registerRiskRoutes(r, h)
 	})
 
 	return r

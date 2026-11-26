@@ -50,6 +50,9 @@ type Store interface {
 	GetCertification(ctx context.Context, tenantID, runID string) (*domain.DQCertification, error)
 	RecordObservation(ctx context.Context, tenantID string, req domain.RecordObservationRequest, actor string, claim domain.IdempotencyClaim) (*domain.DQObservation, error)
 	GetObservation(ctx context.Context, tenantID, observationRunID string) (*domain.DQObservation, error)
+	RequestRiskAcceptance(ctx context.Context, tenantID, runID, actor string, req domain.RequestRiskAcceptanceRequest, claim domain.IdempotencyClaim) (*domain.RiskAcceptance, error)
+	ApproveRiskAcceptance(ctx context.Context, tenantID, acceptanceID, actor string, req domain.ApproveRiskAcceptanceRequest, claim domain.IdempotencyClaim) (*domain.RiskAcceptance, error)
+	ListRiskAcceptances(ctx context.Context, tenantID, runID string) ([]domain.RiskAcceptance, error)
 	RevokeCertification(ctx context.Context, tenantID, runID, actor string, req domain.RevokeCertificationRequest, claim domain.IdempotencyClaim) (*domain.CertificationRevocation, error)
 }
 
@@ -809,30 +812,45 @@ func (s *PgStore) CertifyDQ(ctx context.Context, tenantID, runID, actor string, 
 		if err != nil {
 			return err
 		}
-		if run.Status != domain.RunRunning {
+		if run.Status != domain.RunRunning && run.Status != domain.RunExceptionsOpen {
 			return fmt.Errorf("%w: run must be Running (clean, no failing results) to certify; it is %s", domain.ErrRunHasOpenIssues, run.Status)
 		}
+		results, err := loadResultsForRun(ctx, tx, runID)
+		if err != nil {
+			return err
+		}
+		src, err := loadRuleSourceForRun(ctx, tx, run)
+		if err != nil {
+			return err
+		}
+		// A run with exceptions open is certifiable only over GOVERNED risk acceptance: every mandatory result that is
+		// not a Pass is a Fail with an accepted risk acceptance (two approvers), and the certifier is independent of them.
+		var accepted []domain.AcceptedRisk
+		acceptedResults := []string{}
+		acceptedRules := map[string]bool{}
+		if run.Status == domain.RunExceptionsOpen {
+			accepted, err = s.acceptedRisksFor(ctx, tx, run, src, results, actor)
+			if err != nil {
+				return err
+			}
+			for _, a := range accepted {
+				acceptedResults = append(acceptedResults, a.ResultID)
+				acceptedRules[a.RuleKey] = true
+			}
+		}
 		var openIssues int
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM dq_issues WHERE run_id = $1 AND status = 'Open'`, runID).Scan(&openIssues); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM dq_issues WHERE run_id = $1 AND status = 'Open' AND NOT (result_id = ANY($2))`,
+			runID, acceptedResults).Scan(&openIssues); err != nil {
 			return err
 		}
 		if openIssues > 0 {
 			return domain.ErrRunHasOpenIssues
 		}
-
-		results, err := loadResultsForRun(ctx, tx, runID)
-		if err != nil {
-			return err
-		}
 		// Do not rely on the run's status alone. A run recorded before
 		// completeness was enforced can be Running with only some of the
 		// version's rules reported; certification re-derives completeness from
 		// the pinned version and the stored results (INV-04, INV-21).
-		src, err := loadRuleSourceForRun(ctx, tx, run)
-		if err != nil {
-			return err
-		}
-		if err := requireCompleteEvidence(src, results); err != nil {
+		if err := requireCompleteEvidence(src, results, acceptedRules); err != nil {
 			return err
 		}
 
@@ -841,7 +859,8 @@ func (s *PgStore) CertifyDQ(ctx context.Context, tenantID, runID, actor string, 
 		// this service first recorded it. Stale evidence is never certified; the
 		// remedy is a Reperform with current evidence, which is a recorded fact,
 		// not a flag flipped.
-		now := s.now().UTC()
+		// Truncated to the microsecond Postgres stores, so what is returned is exactly what was written.
+		now := s.now().UTC().Truncate(time.Microsecond)
 		asOf := run.StartedAt
 		if run.EvidenceAsOf != nil {
 			asOf = *run.EvidenceAsOf
@@ -853,7 +872,7 @@ func (s *PgStore) CertifyDQ(ctx context.Context, tenantID, runID, actor string, 
 		}
 
 		// The basis: WHAT is certified, independent of which run, who or when.
-		basisSHA256, err := certificationBasisHash(tenantID, run, src, asOf, s.maxAge, results, req)
+		basisSHA256, err := certificationBasisHash(tenantID, run, src, asOf, s.maxAge, results, req, accepted)
 		if err != nil {
 			return err
 		}
@@ -877,8 +896,8 @@ func (s *PgStore) CertifyDQ(ctx context.Context, tenantID, runID, actor string, 
 			RunID: run.RunID, RuleSetVersionID: run.RuleSetVersionID, ContractID: contractIDOf(run), ContractSHA256: src.ContractSHA256, PopulationRef: run.PopulationRef,
 			PopulationRowCount: run.PopulationRowCount, PopulationContentHash: run.PopulationContentHash, Results: results,
 			BasisSHA256: basisSHA256, EvidenceAsOf: &asOfUTC, EvidenceMaxAgeSeconds: int64(s.maxAge / time.Second),
-			CertifiedAgainstAge: int64(age / time.Second),
-			LineageManifestID:   req.LineageManifestID, LineageManifestSHA256: req.LineageManifestSHA256,
+			CertifiedAgainstAge: int64(age / time.Second), AcceptedRisks: accepted,
+			LineageManifestID: req.LineageManifestID, LineageManifestSHA256: req.LineageManifestSHA256,
 		}
 		summaryJSON, err := json.Marshal(summary)
 		if err != nil {
@@ -887,14 +906,24 @@ func (s *PgStore) CertifyDQ(ctx context.Context, tenantID, runID, actor string, 
 		sum := sha256.Sum256(summaryJSON)
 		summarySHA256 := hex.EncodeToString(sum[:])
 
+		// A contract that states a validity window freezes, on the certification, when it stops being reliable.
+		var windowSecs *int64
+		var validUntil *time.Time
+		if src.ValidityWindow > 0 {
+			w := src.ValidityWindow
+			u := now.Add(time.Duration(w) * time.Second).UTC()
+			windowSecs, validUntil = &w, &u
+		}
 		var cert domain.DQCertification
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO dq_certifications (certification_id, tenant_id, run_id, summary, summary_sha256, certified_at, certified_by,
-				basis_sha256, lineage_manifest_id, lineage_manifest_sha256, evidence_as_of, evidence_max_age_seconds)
-			VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12)
+				basis_sha256, lineage_manifest_id, lineage_manifest_sha256, evidence_as_of, evidence_max_age_seconds,
+				validity_window_seconds, valid_until)
+			VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 			RETURNING certification_id, tenant_id, run_id, summary_sha256, certified_at, certified_by`,
 			certID, tenantID, runID, summaryJSON, summarySHA256, now, actor,
 			basisSHA256, req.LineageManifestID, req.LineageManifestSHA256, asOfUTC, int64(s.maxAge/time.Second),
+			windowSecs, validUntil,
 		).Scan(&cert.CertificationID, &cert.TenantID, &cert.RunID, &cert.SummarySHA256, &cert.CertifiedAt, &cert.CertifiedBy); err != nil {
 			// The pre-check above covers the common case; this covers two
 			// certifications of one basis racing each other.
@@ -912,6 +941,7 @@ func (s *PgStore) CertifyDQ(ctx context.Context, tenantID, runID, actor string, 
 		}
 
 		cert.Status = domain.CertificationActive
+		cert.ValidityWindowSeconds, cert.ValidUntil = windowSecs, validUntil
 		out = &cert
 		if err := outbox.Insert(ctx, tx, outbox.Event{AggregateType: "dq_certification", AggregateID: cert.CertificationID,
 			EventType: "DATA.DQCertified", TenantID: &tenantID, Payload: cert}); err != nil {
@@ -944,6 +974,9 @@ type certificationBasis struct {
 	LineageManifestID     string       `json:"lineage_manifest_id"`
 	LineageManifestSHA256 string       `json:"lineage_manifest_sha256"`
 	Results               []basisEntry `json:"results"`
+	// AcceptedRisks are the acceptance ids the certification rests on, so the same failing evidence certified over
+	// different governed acceptances is a different basis, and a clean certification's basis is unchanged.
+	AcceptedRisks []string `json:"accepted_risks,omitempty"`
 }
 
 type basisEntry struct {
@@ -955,7 +988,7 @@ type basisEntry struct {
 }
 
 func certificationBasisHash(tenantID string, run *domain.DQRun, src *ruleSource, asOf time.Time, maxAge time.Duration,
-	results []domain.DQResult, req domain.CertifyDQRequest) (string, error) {
+	results []domain.DQResult, req domain.CertifyDQRequest, accepted []domain.AcceptedRisk) (string, error) {
 	b := certificationBasis{
 		TenantID: tenantID, RuleSetVersionID: run.RuleSetVersionID, PopulationRef: run.PopulationRef,
 		PopulationRowCount: run.PopulationRowCount, PopulationContentHash: run.PopulationContentHash,
@@ -973,6 +1006,10 @@ func certificationBasisHash(tenantID string, run *domain.DQRun, src *ruleSource,
 			FailCount: r.FailCount, FailureMagnitudeSum: r.FailureMagnitudeSum})
 	}
 	sort.Slice(b.Results, func(i, j int) bool { return b.Results[i].RuleKey < b.Results[j].RuleKey })
+	for _, a := range accepted {
+		b.AcceptedRisks = append(b.AcceptedRisks, a.AcceptanceID)
+	}
+	sort.Strings(b.AcceptedRisks)
 	raw, err := json.Marshal(b)
 	if err != nil {
 		return "", fmt.Errorf("encode certification basis: %w", err)
@@ -983,7 +1020,7 @@ func certificationBasisHash(tenantID string, run *domain.DQRun, src *ruleSource,
 
 // requireCompleteEvidence returns ErrEvidenceIncomplete unless every rule in
 // the pinned version has exactly one stored result and that result is a Pass.
-func requireCompleteEvidence(src *ruleSource, results []domain.DQResult) error {
+func requireCompleteEvidence(src *ruleSource, results []domain.DQResult, acceptedRules map[string]bool) error {
 	byRule := make(map[string]domain.DQResultStatus, len(results))
 	for _, r := range results {
 		byRule[r.RuleKey] = r.Status
@@ -995,6 +1032,10 @@ func requireCompleteEvidence(src *ruleSource, results []domain.DQResult) error {
 		status, ok := byRule[sp.Key]
 		if !ok {
 			return fmt.Errorf("%w: no result for rule %q", domain.ErrEvidenceIncomplete, sp.Key)
+		}
+		// A FAILED rule whose risk was governedly accepted is carried on the certification, not hidden by it.
+		if status == domain.ResultFail && acceptedRules[sp.Key] {
+			continue
 		}
 		if status != domain.ResultPass {
 			return fmt.Errorf("%w: rule %q is %s", domain.ErrEvidenceIncomplete, sp.Key, status)
@@ -1035,10 +1076,10 @@ func (s *PgStore) GetCertification(ctx context.Context, tenantID, runID string) 
 		var summaryJSON []byte
 		var basis *string
 		err := tx.QueryRow(ctx, `SELECT certification_id, tenant_id, run_id, summary, summary_sha256, certified_at, certified_by,
-				basis_sha256, lineage_manifest_id, lineage_manifest_sha256
+				basis_sha256, lineage_manifest_id, lineage_manifest_sha256, validity_window_seconds, valid_until
 			FROM dq_certifications WHERE run_id = $1`, runID,
 		).Scan(&cert.CertificationID, &cert.TenantID, &cert.RunID, &summaryJSON, &cert.SummarySHA256, &cert.CertifiedAt, &cert.CertifiedBy,
-			&basis, &cert.LineageManifestID, &cert.LineageManifestSHA256)
+			&basis, &cert.LineageManifestID, &cert.LineageManifestSHA256, &cert.ValidityWindowSeconds, &cert.ValidUntil)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrCertificationNotFound
 		}
@@ -1052,6 +1093,11 @@ func (s *PgStore) GetCertification(ctx context.Context, tenantID, runID string) 
 			cert.BasisSHA256 = *basis
 		}
 		cert.Status = domain.CertificationActive
+		// Past its validity window a certification is no longer to be relied on (DQC-016). Revocation, which is
+		// a deliberate act with a reason, outranks it below.
+		if cert.ValidUntil != nil && s.now().UTC().After(*cert.ValidUntil) {
+			cert.Status = domain.CertificationStale
+		}
 		var rev domain.CertificationRevocation
 		switch err := tx.QueryRow(ctx, `SELECT `+revocationCols+` FROM dq_certification_revocations WHERE certification_id = $1`, cert.CertificationID).Scan(revocationDest(&rev)...); {
 		case err == nil:

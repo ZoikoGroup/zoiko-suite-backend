@@ -324,9 +324,14 @@ type DQCertification struct {
 	// revocation is a separate append-only record (ZS-SVC-Z-001 RB-05, DQC-017).
 	Status     string                   `json:"status"`
 	Revocation *CertificationRevocation `json:"revocation,omitempty"`
+	// ValidityWindowSeconds and ValidUntil are set when the certification was issued against a contract that
+	// states a validity window; past ValidUntil the certification reads as STALE (DQC-016). Frozen at issue.
+	ValidityWindowSeconds *int64     `json:"validity_window_seconds,omitempty"`
+	ValidUntil            *time.Time `json:"valid_until,omitempty"`
 }
 
 const (
+	CertificationStale   = "STALE"
 	CertificationActive  = "ACTIVE"
 	CertificationRevoked = "REVOKED"
 )
@@ -399,14 +404,17 @@ func (r RevokeCertificationRequest) Validate() error {
 }
 
 type DQCertificationSummary struct {
-	RunID                 string     `json:"run_id"`
-	RuleSetVersionID      string     `json:"ruleset_version_id,omitempty"`
-	ContractID            string     `json:"contract_id,omitempty"`
-	ContractSHA256        string     `json:"contract_sha256,omitempty"`
-	PopulationRef         string     `json:"population_ref"`
-	PopulationRowCount    int64      `json:"population_row_count"`
-	PopulationContentHash string     `json:"population_content_hash"`
-	Results               []DQResult `json:"results"`
+	// AcceptedRisks are the governed risk acceptances the certification was issued over, when the run had a failed
+	// mandatory rule. Sealed with the rest, so the certification says on its face what it accepted and who approved.
+	AcceptedRisks         []AcceptedRisk `json:"accepted_risks,omitempty"`
+	RunID                 string         `json:"run_id"`
+	RuleSetVersionID      string         `json:"ruleset_version_id,omitempty"`
+	ContractID            string         `json:"contract_id,omitempty"`
+	ContractSHA256        string         `json:"contract_sha256,omitempty"`
+	PopulationRef         string         `json:"population_ref"`
+	PopulationRowCount    int64          `json:"population_row_count"`
+	PopulationContentHash string         `json:"population_content_hash"`
+	Results               []DQResult     `json:"results"`
 
 	// Freshness state at the moment of certification (TC-13), sealed with the rest.
 	BasisSHA256           string     `json:"basis_sha256,omitempty"`

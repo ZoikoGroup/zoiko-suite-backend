@@ -26,8 +26,12 @@ type ruleSource struct {
 	RuleSetVersionID *string
 	ContractID       *string
 	AssetID          string
-	ContractSHA256   string
-	Specs            []ruleSpec
+	ValidityWindow   int64 // seconds; 0 = a certification never goes stale
+	// AllowRiskAcceptance: the contract's certification profile permits certifying over a failed mandatory rule that
+	// carries a governed risk acceptance.
+	AllowRiskAcceptance bool
+	ContractSHA256      string
+	Specs               []ruleSpec
 }
 
 func (s *ruleSource) isContract() bool { return s.ContractID != nil }
@@ -50,7 +54,8 @@ func sourceFromRuleSet(v *domain.DQRuleSetVersion) *ruleSource {
 }
 
 func sourceFromContract(c *domain.ContractVersion) *ruleSource {
-	src := &ruleSource{ContractID: &c.ContractID, AssetID: c.AssetID, ContractSHA256: c.ContentSHA256}
+	src := &ruleSource{ContractID: &c.ContractID, AssetID: c.AssetID, ContractSHA256: c.ContentSHA256,
+		ValidityWindow: c.Body.CertificationProfile.ValidityWindowSeconds, AllowRiskAcceptance: c.Body.CertificationProfile.AllowRiskAcceptance}
 	mandatory := map[string]bool{}
 	for _, k := range c.Body.CertificationProfile.MandatoryRules {
 		mandatory[k] = true

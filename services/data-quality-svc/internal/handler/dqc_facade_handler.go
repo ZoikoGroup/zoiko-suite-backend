@@ -149,6 +149,15 @@ func (h *Handler) facadeError(w http.ResponseWriter, err error) bool {
 	case errors.As(err, &basis):
 		// "Conflict returns existing certification or 409": the 409 names the existing certification.
 		h.respondJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "code": "DQC-015", "existing_certification_id": basis.ExistingID})
+	case errors.Is(err, domain.ErrRiskNotFound):
+		h.respondError(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, domain.ErrRiskInvalid):
+		h.respondError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, domain.ErrRiskApproverIsRequester), errors.Is(err, domain.ErrRiskCertifierNotIndependent):
+		h.respondError(w, http.StatusForbidden, err.Error())
+	case errors.Is(err, domain.ErrRiskNotPermitted), errors.Is(err, domain.ErrRiskNotAcceptable), errors.Is(err, domain.ErrRiskAlreadyRequested),
+		errors.Is(err, domain.ErrRiskAlreadyApproved), errors.Is(err, domain.ErrRiskAlreadyAccepted):
+		h.respondError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, domain.ErrObservationNotFound):
 		h.respondError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, domain.ErrObservationMismatch):
