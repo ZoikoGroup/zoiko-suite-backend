@@ -66,6 +66,7 @@ func NewRouter(h *Handler, extra ...func(chi.Router)) http.Handler {
 		r.Post("/runs/{runID}:replay", h.ReplayFromCheckpoint)
 		r.Get("/runs/{runID}/quarantine-items", h.ListQuarantineItems)
 		r.Get("/checkpoints/{sourceID}", h.GetCheckpoint)
+		registerRunReleaseRoutes(r, h)
 		for _, register := range extra {
 			register(r)
 		}
@@ -353,6 +354,9 @@ func (h *Handler) respondFromError(w http.ResponseWriter, err error) {
 	if errors.As(err, &replay) {
 		w.Header().Set("Idempotent-Replayed", "true")
 		h.respondJSON(w, http.StatusOK, map[string]string{"resource_id": replay.ResourceID})
+		return
+	}
+	if h.runReleaseError(w, err) {
 		return
 	}
 	switch {
