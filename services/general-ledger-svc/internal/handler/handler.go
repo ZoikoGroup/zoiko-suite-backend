@@ -20,6 +20,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/general-ledger-svc/internal/close"
+	"zoiko.io/general-ledger-svc/internal/certwatch"
 	"zoiko.io/general-ledger-svc/internal/domain"
 	svcenvelope "zoiko.io/general-ledger-svc/internal/envelope"
 	"zoiko.io/general-ledger-svc/internal/evidencereq"
@@ -267,6 +268,12 @@ type Handler struct {
 	authz       AuthZClient
 	closeClient close.Client
 	evidence    EvidenceChecker
+	// certs records reliance on the certifications a journal's evidence cites; see WithCertificationReliance.
+	certs CertificationRelianceRecorder
+	// cwSweeper and cwStore are the certification watch (cert_watch.go); see WithCertificationWatch.
+	cwSweeper CertificationSweeper
+	cwStore   certwatch.Store
+	cwObserver certwatch.Observer
 	log         *zap.Logger
 
 	// ctl and policy are the kernel's manual-journal controls (standard §9); see WithJournalControls.
@@ -422,6 +429,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/by-id/{mapping_id}/activate", h.ActivateMapping)
 		r.Post("/by-id/{mapping_id}/supersede", h.SupersedeMapping)
 	})
+	r.Post("/v1/certification-watch/sweeps", h.SweepCertifications)
+	r.Get("/v1/certification-flags", h.ListCertificationFlags)
+	r.Post("/v1/certification-flags/{flag_id}/acknowledge", h.AcknowledgeCertificationFlag)
 	r.Route("/v1/postings", func(r chi.Router) {
 		r.Post("/events", h.PostAccountingEvent)
 		r.Post("/journals", h.PostApprovedJournal)
@@ -2181,6 +2191,9 @@ func (h *Handler) PostJournal(w http.ResponseWriter, r *http.Request) {
 	if !h.checkEvidence(w, r, header.TenantID, header.LegalEntityID, principalID, header.EvidenceRefs) {
 		return
 	}
+	if !h.recordCertificationReliance(w, r, header, principalID) {
+		return
+	}
 	if !h.refuseFutureDated(w, header) {
 		return
 	}
@@ -3536,6 +3549,9 @@ func (h *Handler) PostApprovedJournal(w http.ResponseWriter, r *http.Request) {
 		softCloseOverrideReason = *header.SoftCloseOverrideReason
 	}
 
+	if !h.recordCertificationReliance(w, r, header, principalID) {
+		return
+	}
 	if !h.refuseFutureDated(w, header) {
 		return
 	}

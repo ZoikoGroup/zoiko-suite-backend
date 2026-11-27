@@ -101,6 +101,8 @@ type QuarantineItem struct {
 	ResidencyRegion string    `json:"residency_region"`
 	QuarantinedAt   time.Time `json:"quarantined_at"`
 	QuarantinedBy   string    `json:"quarantined_by"`
+	// ReleaseState is QUARANTINED, RELEASE_PENDING, RELEASE_APPROVED or RELEASED (derived from the release ledger).
+	ReleaseState RunReleaseState `json:"release_state,omitempty"`
 }
 
 // BatchRecord represents a single record in a batch for commit/quarantine.
@@ -121,6 +123,9 @@ type CommitBatchRequest struct {
 	Classification  string        `json:"classification"`
 	ResidencyRegion string        `json:"residency_region"`
 	NextPosition    string        `json:"next_position"`
+	// ReleasesQuarantineID names the quarantined batch this one is the corrected re-submission of. It needs an
+	// approved release (INT-04); the batch must differ from the one quarantined, and landing consumes the approval.
+	ReleasesQuarantineID string `json:"releases_quarantine_id,omitempty"`
 }
 
 // QuarantineBatchRequest is the request to quarantine a batch.

@@ -110,8 +110,9 @@ func TestStartRun_RefusesPopulationWithoutEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = tx.Exec(f.ctx, `
-		INSERT INTO population_snapshots (snapshot_id, tenant_id, run_id, side, source_system, item_count, content_hash)
-		VALUES ('rps_00000000-0000-0000-0000-000000000001', $1, $2, 'Third', 'X', 0, repeat('0', 64))`, orgA, run.RunID)
+		INSERT INTO population_snapshots (snapshot_id, tenant_id, run_id, side, source_system, item_count, content_hash,
+			hash_algorithm, hash_serialization)
+		VALUES ('rps_00000000-0000-0000-0000-000000000001', $1, $2, 'Third', 'X', 0, repeat('0', 64), 'sha256', 'rpop-v1')`, orgA, run.RunID)
 	if err == nil || !strings.Contains(err.Error(), "population_snapshots_sourced_check") {
 		t.Fatalf("a snapshot without watermark/declared totals: %v, want population_snapshots_sourced_check", err)
 	}

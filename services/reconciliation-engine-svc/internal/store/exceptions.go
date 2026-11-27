@@ -18,7 +18,8 @@ import (
 const exceptionColumns = `exception_id, tenant_id, run_id, kind, COALESCE(item_id, ''), COALESCE(side, ''), COALESCE(ref_id, ''),
 	COALESCE(currency, ''), dimension, dimension_value, reason, amount_minor_units, detail, status,
 	raised_at, raised_by, resolved_at, resolved_by_match_id, category, assertion, severity, materiality, exposure_minor_units,
-	owner_role, owner_principal, due_at, authority_ref, evidence_ref, root_cause_code, root_cause_note, accepted_by, accepted_at`
+	owner_role, owner_principal, due_at, authority_ref, evidence_ref, root_cause_code, root_cause_note, accepted_by, accepted_at,
+	raised_generation, superseded_at, superseded_by, superseded_by_generation, superseded_reason`
 
 func scanException(row pgx.Row) (*domain.ReconciliationException, error) {
 	var e domain.ReconciliationException
@@ -27,7 +28,8 @@ func scanException(row pgx.Row) (*domain.ReconciliationException, error) {
 		&e.DimensionValue, &e.Reason, &e.AmountMinorUnits, &detail, &e.Status, &e.RaisedAt, &e.RaisedBy, &e.ResolvedAt,
 		&e.ResolvedByMatchID, &e.Category, &e.Assertion, &e.Severity, &e.Materiality, &e.ExposureMinor,
 		&e.OwnerRole, &e.Owner, &e.DueAt, &e.AuthorityRef, &e.EvidenceRef, &e.RootCauseCode, &e.RootCauseNote,
-		&e.AcceptedBy, &e.AcceptedAt); err != nil {
+		&e.AcceptedBy, &e.AcceptedAt,
+		&e.RaisedGeneration, &e.SupersededAt, &e.SupersededBy, &e.SupersededByGeneration, &e.SupersededReason); err != nil {
 		return nil, err
 	}
 	if len(detail) > 0 {
@@ -120,7 +122,33 @@ func assessRun(ctx context.Context, tx pgx.Tx, run *domain.ReconciliationRun) (d
 	if run.CertificationProfile != nil {
 		profile = *run.CertificationProfile
 	}
-	return domain.Assess(exps, mat, profile), nil
+	partial, err := partialSides(ctx, tx, run.RunID)
+	if err != nil {
+		return domain.RunAssessment{}, err
+	}
+	return domain.AssessWithScope(exps, mat, profile, partial), nil
+}
+
+// partialSides names the sides of the run's CURRENT snapshot generation whose source declared
+// the population a defined subset, with what the source said the subset is (a reperformance
+// replaces the generation, so a subset that has since been delivered whole no longer counts).
+func partialSides(ctx context.Context, tx pgx.Tx, runID string) (map[string]string, error) {
+	rows, err := tx.Query(ctx, `SELECT side, COALESCE(declared_controls->'completeness'->>'description', '') FROM population_snapshots
+		WHERE run_id = $1 AND completeness = 'PARTIAL'
+		  AND generation = (SELECT MAX(generation) FROM population_snapshots WHERE run_id = $1)`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("load partial populations: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var side, why string
+		if err := rows.Scan(&side, &why); err != nil {
+			return nil, err
+		}
+		out[side] = why
+	}
+	return out, rows.Err()
 }
 
 // ── Exception lifecycle ─────────────────────────────────────────────────────
@@ -394,6 +422,43 @@ func (s *PgStore) GetAssessment(ctx context.Context, tenantID, runID string) (*d
 		a, err := assessRun(ctx, tx, r)
 		out = &a
 		return err
+	})
+	return out, err
+}
+
+// PriorClosing returns the closing balance declared by the latest CERTIFIED, not-revoked run of
+// this entity for the same population and side whose declared roll-forward period ended before
+// periodStart: the figure this period's opening must equal (cross-period roll-forward). It is
+// read from the certified run's CURRENT snapshot generation, the one that was certified. A
+// revoked certification is not authoritative, so it is not used. nil when there is none.
+func (s *PgStore) PriorClosing(ctx context.Context, tenantID, legalEntityID, specRef, side, periodStart string) (*domain.PriorClosing, error) {
+	var out *domain.PriorClosing
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		var runID, periodEnd string
+		var closing []byte
+		err := tx.QueryRow(ctx, `
+			SELECT s.run_id, s.declared_controls->'roll_forward'->>'period_end', s.declared_controls->'roll_forward'->'closing'
+			FROM population_snapshots s
+			JOIN reconciliation_runs r ON r.run_id = s.run_id
+			WHERE s.tenant_id = $1 AND r.legal_entity_id = $2 AND s.spec_ref = $3 AND s.side = $4
+			  AND s.declared_controls ? 'roll_forward'
+			  AND (s.declared_controls->'roll_forward'->>'period_end')::date < $5::date
+			  AND r.status = 'Certified' AND r.certification_state = 'CERTIFIED'
+			  AND s.generation = (SELECT MAX(m.generation) FROM population_snapshots m WHERE m.run_id = s.run_id)
+			ORDER BY (s.declared_controls->'roll_forward'->>'period_end')::date DESC, r.certified_at DESC, s.run_id DESC
+			LIMIT 1`, tenantID, legalEntityID, specRef, side, periodStart).Scan(&runID, &periodEnd, &closing)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("load prior closing: %w", err)
+		}
+		p := domain.PriorClosing{RunID: runID, PeriodEnd: periodEnd}
+		if err := json.Unmarshal(closing, &p.Closing); err != nil {
+			return fmt.Errorf("decode prior closing: %w", err)
+		}
+		out = &p
+		return nil
 	})
 	return out, err
 }

@@ -152,7 +152,9 @@ B32–B33 close A12's manifest part and B34–B35 its revocation part.
   detail. Until it is decided, a currency declares exactly one kind (B15);
   declaring both is refused. Once decided, the change is a `combine` field on
   the currency tolerance (`EITHER` / `BOTH`), versioned with the policy.
-- **A16. What makes a run PARTIAL is unspecified.** Text checked:
+- **A16. What makes a run PARTIAL is unspecified. RESOLVED 2026-11-26 (step I of
+  docs/architecture/DQC_GAP_MATRIX.md); the text below is the original finding and the
+  paragraph after it says what was built.** Text checked:
   ZS-SVC-Z-001 DQC-03 result table "PARTIAL — Only defined subset matched;
   never presented as full population certification"; INV-26 "A partial
   reconciliation cannot be represented as full certification"; NP-26 "Partial
@@ -172,6 +174,23 @@ B32–B33 close A12's manifest part and B34–B35 its revocation part.
   question for the definition owner; once decided it is a definition field
   (the declared subset), a snapshot field (what was excluded and why) and an
   edge into PARTIAL.
+
+  **What was built (the subset model, a default taken without the definition
+  owner, to be confirmed).** Of the three readings above, the engine takes the
+  third: *a source that declares itself incomplete*. A source declares
+  `completeness: {scope: PARTIAL, description}` in its `declared_totals`
+  (control-population-contract.md, "Optional declared controls"); the engine
+  never infers a subset, and a run scope or exclusion list is still not a
+  subset concept. The snapshot freezes `completeness`, the declaration and what
+  re-performing it concluded (migration 000016). A run with a current
+  population that is a declared subset has result PARTIAL when nothing inside
+  it is wrong, VARIANCE when an exception is unresolved, and is never MATCH.
+  PARTIAL is never ELIGIBLE or CERTIFIED, so no narrower certification of the
+  subset exists: "cannot be represented as *full* certification" is honoured by
+  refusing certification outright, which is the safe reading until the owner
+  says otherwise. The database holds it: a run cannot be written PARTIAL unless
+  a current population is a declared subset, and cannot be written MATCH while
+  one is. A reperformance onto a whole population returns the run to MATCH.
 
 ## B. Interpretations and additions (decisions a reviewer may want to reverse)
 

@@ -23,7 +23,10 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w -X main.gitSHA=$
 
 FROM alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f
 
-RUN apk --no-cache add ca-certificates && adduser -D -H -u 10001 publicai
+# The base is digest-pinned, so a fixed OpenSSL published after the pin is not picked up by itself.
+# libcrypto3/libssl3 are upgraded explicitly (CVE-2026-124709, fixed in 3.5.9-r2); drop this once the
+# pinned alpine digest is bumped past it.
+RUN apk --no-cache add ca-certificates && apk --no-cache upgrade libcrypto3 libssl3 && adduser -D -H -u 10001 publicai
 
 WORKDIR /app
 COPY --from=builder /out/server /out/healthcheck /out/kbctl /app/

@@ -369,6 +369,12 @@
         "issued": {
           "$ref": "#/components/messages/reconciliation-certification.issued"
         },
+        "reliance-recorded": {
+          "$ref": "#/components/messages/reconciliation-certification.reliance-recorded"
+        },
+        "reliance-withdrawn": {
+          "$ref": "#/components/messages/reconciliation-certification.reliance-withdrawn"
+        },
         "revoked": {
           "$ref": "#/components/messages/reconciliation-certification.revoked"
         }
@@ -1551,6 +1557,30 @@
         "x-zoiko-event-type": "com.zoikosuite.accounting.reconciliation-certification.issued",
         "x-zoiko-origin": "extension"
       },
+      "reconciliation-certification.reliance-recorded": {
+        "contentType": "application/json",
+        "description": "Producer: Reconciliation Engine Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.reconciliation-certification.reliance-recorded",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation Certification: reliance-recorded.",
+        "title": "reconciliation-certification reliance-recorded",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.reconciliation-certification.reliance-recorded",
+        "x-zoiko-origin": "extension"
+      },
+      "reconciliation-certification.reliance-withdrawn": {
+        "contentType": "application/json",
+        "description": "Producer: Reconciliation Engine Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.accounting.reconciliation-certification.reliance-withdrawn",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Reconciliation Certification: reliance-withdrawn.",
+        "title": "reconciliation-certification reliance-withdrawn",
+        "x-zoiko-event-type": "com.zoikosuite.accounting.reconciliation-certification.reliance-withdrawn",
+        "x-zoiko-origin": "extension"
+      },
       "reconciliation-certification.revoked": {
         "contentType": "application/json",
         "description": "Producer: Reconciliation Engine Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Accounting Kernel (extension). Origin: extension (emitted by a service, not listed in section 19).",
@@ -2231,6 +2261,12 @@
       "messages": [
         {
           "$ref": "#/channels/reconciliation-certification/messages/issued"
+        },
+        {
+          "$ref": "#/channels/reconciliation-certification/messages/reliance-recorded"
+        },
+        {
+          "$ref": "#/channels/reconciliation-certification/messages/reliance-withdrawn"
         },
         {
           "$ref": "#/channels/reconciliation-certification/messages/revoked"

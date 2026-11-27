@@ -2,12 +2,14 @@ package store_test
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 
 	"zoiko.io/data-ingestion-svc/internal/domain"
+	"zoiko.io/data-ingestion-svc/internal/imports"
 )
 
 // FIN-CTRL-033 population against a real Postgres, through the UNPRIVILEGED role so row-level security is in force.
@@ -135,5 +137,74 @@ func TestImportBatchTieout_RawFactsAbsenceVisibleScopeAndIsolation(t *testing.T)
 	}
 	if moved, _ := q(tenant, entity, full, ""); moved.Watermark == first.Watermark {
 		t.Fatal("the watermark must change when the batch's counts change")
+	}
+}
+
+// ZS-SVC-Z-001 DQC-02 (step I): the batch's quarantine state is a raw fact of the tie-out population, so a
+// control can see FULL / PARTIAL / RELEASE_PENDING instead of inferring it from counts. The SQL mirrors
+// imports.DeriveQuarantineState (the store cannot import it), and this holds the two to the same answer.
+func TestImportBatchTieout_QuarantineStateMatchesTheDerivationRule(t *testing.T) {
+	f := newFixture(t)
+	tenant, entity := "tenant-qstate-"+uuid.NewString()[:8], "le-qstate-1"
+
+	item := func(batch string, row int, status string) {
+		f.t.Helper()
+		var domainStatus, reason, owner any
+		switch status {
+		case "IMPORTED":
+			domainStatus = 201
+		case "QUARANTINED":
+			reason, owner = "DOMAIN_REFUSED", "owning-team"
+		}
+		if _, err := f.admin.Exec(f.ctx, `
+			INSERT INTO import_items (batch_id, row_no, tenant_id, row_hash, item_values, status, idempotency_key, domain_status, quarantine_reason, quarantine_owner)
+			VALUES ($1, $2, $3, repeat('e', 64), '{}'::jsonb, $4, $5, $6, $7, $8)`,
+			batch, row, tenant, status, fmt.Sprintf("%s-%d", batch, row), domainStatus, reason, owner); err != nil {
+			f.t.Fatalf("seed item %d (%s): %v", row, status, err)
+		}
+	}
+	ledger := func(batch string, row int, kind, extra string) {
+		f.t.Helper()
+		if _, err := f.admin.Exec(f.ctx, `
+			INSERT INTO import_quarantine_ledger (tenant_id, batch_id, row_no, kind, actor, reason, owner, correction_ref)
+			VALUES ($1, $2, $3, $4, 'someone', 'because', `+map[string]string{"QUARANTINED": "'owning-team', NULL", "RELEASE_REQUESTED": "NULL, 'ticket-1'"}[kind]+`)`,
+			tenant, batch, row, kind); err != nil {
+			f.t.Fatalf("seed ledger %s: %v", kind, err)
+		}
+		_ = extra
+	}
+	seed := func(status string, statuses ...string) string {
+		b := f.seedBatch(tenant, entity, batchSeed{rows: len(statuses), valid: len(statuses), status: status})
+		for i, s := range statuses {
+			item(b, i+1, s)
+		}
+		return b
+	}
+
+	pending := seed("COMPLETED_WITH_EXCEPTIONS", "QUARANTINED", "IMPORTED")
+	ledger(pending, 1, "QUARANTINED", "")
+	ledger(pending, 1, "RELEASE_REQUESTED", "")
+
+	for name, c := range map[string]struct{ batch, want string }{
+		"nothing held":               {seed("COMPLETED", "IMPORTED", "IMPORTED"), "NONE"},
+		"some held":                  {seed("COMPLETED_WITH_EXCEPTIONS", "QUARANTINED", "IMPORTED"), "PARTIAL"},
+		"every counted item held":    {seed("COMPLETED_WITH_EXCEPTIONS", "QUARANTINED", "QUARANTINED", "SKIPPED"), "FULL"},
+		"the whole batch quarantine": {seed("QUARANTINED", "IMPORTED"), "FULL"},
+		"a release is awaited":       {pending, "RELEASE_PENDING"},
+		"no items at all":            {f.seedBatch(tenant, entity, batchSeed{status: "COMPLETED"}), "NONE"},
+	} {
+		p, err := f.s.QueryImportBatchTieout(f.ctx, tenant, domain.ImportBatchTieoutQuery{LegalEntityID: entity, BatchID: c.batch})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		got := p.Records[0].Attributes["quarantine_state"]
+		held, total, open, err := f.s.QuarantineCounts(f.ctx, tenant, c.batch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rule := string(imports.DeriveQuarantineState(imports.Status(p.Records[0].Attributes["batch_status"]), held, total, open))
+		if got != c.want || got != rule {
+			t.Fatalf("%s: tie-out says %q, derivation rule says %q, expected %q (held %d, total %d, open %d)", name, got, rule, c.want, held, total, open)
+		}
 	}
 }

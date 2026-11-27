@@ -238,7 +238,7 @@ func (e *Executor) deliver(ctx context.Context, b *Batch, spec Spec, it Item) {
 	res := s.targets.Do(ctx, TargetCall{
 		TargetKey: spec.Target.Key, Method: spec.Target.Method, Path: spec.Target.Path, Body: body,
 		TenantID: b.TenantID, LegalEntityID: b.LegalEntityID, Principal: orDefault(b.ExecutedBy, b.CreatedBy), Correlation: b.CorrelationID,
-		IdempotencyKey: it.IdempotencyKey, RequestID: fmt.Sprintf("%s:%d", it.IdempotencyKey, it.Attempts), SourceSystem: b.SourceSystem, Jurisdiction: b.JurisdictionContext,
+		IdempotencyKey: DeliveryKey(it), RequestID: fmt.Sprintf("%s:%d", DeliveryKey(it), it.Attempts), SourceSystem: b.SourceSystem, Jurisdiction: b.JurisdictionContext,
 	})
 	out := classifyTarget(spec, res)
 	attempts := it.Attempts // ClaimItems counts the attempt it hands out, so this one is included

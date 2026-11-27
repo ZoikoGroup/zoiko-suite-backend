@@ -171,6 +171,10 @@ func (e *AccountingEvent) Validate() error {
 	if e.TransactionCurrency != "" && !currencyRE.MatchString(e.TransactionCurrency) {
 		return bad("transaction_currency", "an ISO 4217 code")
 	}
+	// A reference that cites a certification in a form the posting path would refuse could never post: refuse it now.
+	if err := validateEvidenceRefs(e.EvidenceRefs); err != nil {
+		return bad("evidence_refs", err.Error())
+	}
 	if len(e.Facts) > 64 || len(e.Dimensions) > 24 || len(e.EvidenceRefs) > 50 {
 		return bad("facts", "too many facts, dimensions or evidence references")
 	}

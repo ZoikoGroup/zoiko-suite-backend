@@ -121,8 +121,10 @@ type Repo interface {
 // Service is the kernel's command side. It owns the rules; the Repo owns the storage and the invariants the database
 // holds by itself.
 type Service struct {
-	Repo  Repo
-	Clock func() time.Time
+	Repo Repo
+	// Reliance, when wired, records the certifications an accounting event cites when it is posted (reliance.go).
+	Reliance CertificationReliance
+	Clock    func() time.Time
 }
 
 func (s *Service) now() time.Time {

@@ -21,8 +21,10 @@ const (
 	ResultMatch         ResultState = "MATCH"
 	ResultVariance      ResultState = "VARIANCE"
 	ResultIndeterminate ResultState = "INDETERMINATE"
-	// ResultPartial is part of the DQC-03 vocabulary but cannot be entered: no
-	// spec defines what makes a run's population a "defined subset" (A16).
+	// ResultPartial: only a defined subset matched (DQC-03). A population is a defined subset
+	// only when its source DECLARES it so (DeclaredCompleteness, PARTIAL, with a description);
+	// the engine never infers it. A PARTIAL run is never ELIGIBLE or CERTIFIED (INV-26), and
+	// the database refuses a run PARTIAL unless a current population is a declared subset.
 	ResultPartial    ResultState = "PARTIAL"
 	ResultSuperseded ResultState = "SUPERSEDED"
 )
@@ -169,8 +171,6 @@ func ValidateResultTransition(fromStatus RunStatus, from, to ResultState) error 
 	switch to {
 	case ResultNotRun:
 		return fmt.Errorf("%w: a result cannot be reset to NOT_RUN", ErrInvalidTransition)
-	case ResultPartial:
-		return fmt.Errorf("%w: PARTIAL has no defined subset semantics yet (SPEC_DEVIATIONS A16)", ErrInvalidTransition)
 	case ResultSuperseded:
 		// Supersession is the only move out of a terminal run.
 		return nil

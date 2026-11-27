@@ -33,7 +33,7 @@ func TestDQ_HappyPath_RunAndCertify(t *testing.T) {
 		t.Fatalf("run status = %s, want Running (clean)", run.Status)
 	}
 
-	cert, err := f.s.CertifyDQ(f.ctx, orgA, run.RunID, "test-operator", f.claim("CertifyDQ", run.RunID))
+	cert, err := f.s.CertifyDQ(f.ctx, orgA, run.RunID, "test-operator", domain.CertifyDQRequest{}, f.claim("CertifyDQ", run.RunID))
 	if err != nil {
 		t.Fatalf("certify dq: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestDQ_NoDirectResolvePath_OnlyReperformClearsIssues(t *testing.T) {
 	}
 	// CertifyDQ on the still-failing run is refused — an assigned issue is
 	// not a resolved one.
-	if _, err := f.s.CertifyDQ(f.ctx, orgA, failingRun.RunID, "test-operator", f.claim("CertifyDQ-too-early", failingRun.RunID)); err == nil {
+	if _, err := f.s.CertifyDQ(f.ctx, orgA, failingRun.RunID, "test-operator", domain.CertifyDQRequest{}, f.claim("CertifyDQ-too-early", failingRun.RunID)); err == nil {
 		t.Fatal("certified a run with an unresolved (merely assigned) issue")
 	}
 
@@ -163,7 +163,7 @@ func TestDQ_NoDirectResolvePath_OnlyReperformClearsIssues(t *testing.T) {
 		t.Fatalf("old run after reperform: %+v (err=%v)", oldRun, err)
 	}
 
-	if _, err := f.s.CertifyDQ(f.ctx, orgA, reperformed.RunID, "test-operator", f.claim("CertifyDQ", reperformed.RunID)); err != nil {
+	if _, err := f.s.CertifyDQ(f.ctx, orgA, reperformed.RunID, "test-operator", domain.CertifyDQRequest{}, f.claim("CertifyDQ", reperformed.RunID)); err != nil {
 		t.Fatalf("certify the clean reperformed run: %v", err)
 	}
 }
@@ -252,7 +252,7 @@ func TestDQ_CertificationIsImmutableAtTheDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run dq: %v", err)
 	}
-	cert, err := f.s.CertifyDQ(f.ctx, orgA, run.RunID, "test-operator", f.claim("CertifyDQ", run.RunID))
+	cert, err := f.s.CertifyDQ(f.ctx, orgA, run.RunID, "test-operator", domain.CertifyDQRequest{}, f.claim("CertifyDQ", run.RunID))
 	if err != nil {
 		t.Fatalf("certify: %v", err)
 	}
@@ -286,7 +286,7 @@ func TestDQ_CertifiedRunIsImmutableAtTheDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run dq: %v", err)
 	}
-	if _, err := f.s.CertifyDQ(f.ctx, orgA, run.RunID, "test-operator", f.claim("CertifyDQ", run.RunID)); err != nil {
+	if _, err := f.s.CertifyDQ(f.ctx, orgA, run.RunID, "test-operator", domain.CertifyDQRequest{}, f.claim("CertifyDQ", run.RunID)); err != nil {
 		t.Fatalf("certify: %v", err)
 	}
 

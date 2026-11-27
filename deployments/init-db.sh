@@ -100,6 +100,11 @@ payment_initiation_adapter:payment-initiation-adapter
 payment_status:payment-status
 metric_registry:metric-registry
 source_authority:source-authority
+data_quality:data-quality
+data_lineage:data-lineage
+classification:classification
+data_ingestion:data-ingestion
+reconciliation_engine:reconciliation-engine
 jurisdiction_rules:jurisdiction-rules
 governance_decision_log:governance-decision-log
 policy:policy
@@ -276,7 +281,7 @@ for db in \
     payable_open_item payee_banking_identity payment_authorization payment_initiation_adapter payment_proposal payment_run payment_status payroll_exceptions payroll_run payroll_tax performance_review policy privacy_consent \
     privacy_decision privacy_purpose_registry privacy_rights privacy_transfer procurement_workflow \
     purchase_order purchase_request retention_registry schema_registry search_indexer secret_vault_integration \
-    source_authority spend_controls supplier_financial_profile supplier_recovery tax_determination tax_rules tenant_entity_registry treasury \
+    data_quality data_lineage classification data_ingestion reconciliation_engine source_authority spend_controls supplier_financial_profile supplier_recovery tax_determination tax_rules tenant_entity_registry treasury \
     vat_gst vendor_due_diligence workflow workflow_history workforce_compliance; do
     if [ "$(psql -tAX --username "$POSTGRES_USER" --dbname postgres \
             -c "SELECT 1 FROM pg_roles WHERE rolname = 'app_${db}'")" = "1" ]; then

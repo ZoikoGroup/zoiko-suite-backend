@@ -332,9 +332,11 @@ func TestImportAPI_AuthorizationAndIdentity(t *testing.T) {
 		t.Fatalf("denied commands must change nothing: %s", got.Status)
 	}
 	// profiles: published from the platform scope, by someone entitled to
+	// The denial uses a principal the client has not cached a decision for: authz decisions
+	// are cached for 5s per (principal, entity, action), and platAuth was GRANTED just above.
 	spec := plainSpec()
 	a.authz.deny["*|"+handler.ActionImportProfilePublish] = true
-	if r := a.do("POST", "/import-profiles", imports.PlatformScopeID, platAuth, map[string]any{"profile_key": "denied-prof", "spec": spec}); r.Code != 403 {
+	if r := a.do("POST", "/import-profiles", imports.PlatformScopeID, "platform-author-uncached", map[string]any{"profile_key": "denied-prof", "spec": spec}); r.Code != 403 {
 		t.Errorf("profile publish without the action: %d", r.Code)
 	}
 	delete(a.authz.deny, "*|"+handler.ActionImportProfilePublish)
@@ -492,9 +494,23 @@ func TestImportAPI_ItemQuarantineAndRetryOverHTTP(t *testing.T) {
 	if rc.Code != 409 || str(rc.JSON, "code") != "INT-RECON-011" || str(rc.JSON["batch"].(map[string]any), "status") != "COMPLETED_WITH_EXCEPTIONS" {
 		t.Fatalf("reconcile with an exception: %d %s", rc.Code, rc.Raw)
 	}
+	// A quarantined item is no longer simply retried, least of all by the person who quarantined it
+	// (ZS-SVC-Z-001 INV-12, NP-16). It leaves quarantine through a governed release: someone states
+	// the correction made in the owning domain, and someone ELSE holding the release authority decides.
 	rt := a.tenant("POST", fmt.Sprintf("/imports/%s/items/2:retry", b.BatchID), approver, map[string]any{"reason": "dispute resolved"})
-	if rt.Code != 202 {
-		t.Fatalf("retry: %d %s", rt.Code, rt.Raw)
+	if rt.Code != 409 || str(rt.JSON, "code") != "INT-QUAR-008" {
+		t.Fatalf("a plain retry of a quarantined item must be refused: %d %s", rt.Code, rt.Raw)
+	}
+	req := a.tenant("POST", fmt.Sprintf("/imports/%s/items/2:request-release", b.BatchID), approver,
+		map[string]any{"reason": "dispute resolved", "correction_ref": "credit-note CN-2041 issued in AR"})
+	if req.Code != 202 {
+		t.Fatalf("request release: %d %s", req.Code, req.Raw)
+	}
+	if self := a.tenant("POST", fmt.Sprintf("/imports/%s/items/2:approve-release", b.BatchID), approver, map[string]any{"reason": "ok"}); self.Code != 403 {
+		t.Fatalf("the person who quarantined and requested cannot approve their own release: %d %s", self.Code, self.Raw)
+	}
+	if ok := a.tenant("POST", fmt.Sprintf("/imports/%s/items/2:approve-release", b.BatchID), "release-controller-1", map[string]any{"reason": "credit note verified"}); ok.Code != 200 {
+		t.Fatalf("approve release: %d %s", ok.Code, ok.Raw)
 	}
 	if after := a.e.drain(a.e.batch(b.BatchID)); after.Status != imports.StatusCompleted {
 		t.Fatalf("once every item is imported the batch is COMPLETED: %s", after.Status)

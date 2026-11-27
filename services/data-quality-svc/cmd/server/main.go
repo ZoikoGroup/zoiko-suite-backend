@@ -55,7 +55,7 @@ func main() {
 		logger.Fatal("database ping failed", zap.Error(err))
 	}
 	logger.Info("Connected to PostgreSQL database")
-	dataStore := store.NewPgStore(dbPool)
+	dataStore := store.NewPgStore(dbPool).WithEvidenceMaxAge(cfg.EvidenceMaxAge)
 
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	publisher := events.NewPublisher(brokers, cfg.KafkaTopic, logger)

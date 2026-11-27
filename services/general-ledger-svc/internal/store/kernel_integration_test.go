@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/general-ledger-svc/internal/certwatch"
 	"zoiko.io/general-ledger-svc/internal/domain"
 	svcenvelope "zoiko.io/general-ledger-svc/internal/envelope"
 	"zoiko.io/general-ledger-svc/internal/handler"
@@ -44,6 +45,11 @@ type kenv struct {
 	periods *fakePeriods
 	pg      *store.PgStore
 	obs     *recObs
+	// The certification watch (certwatch): fakes for the issuing services behind the real recorder, sweeper and repository.
+	certSvc  *fakeCertService
+	status   *fakeStatusService
+	watch    *store.CertWatchRepo
+	recorder *certwatch.Recorder
 }
 
 type fakeAuthz struct{ e *kenv }
@@ -92,6 +98,9 @@ func newKEnv(t *testing.T) *kenv {
 	})
 	e.repo = store.NewKernelRepo(app, "uk")
 	e.svc = &kernel.Service{Repo: e.repo}
+	e.certSvc, e.status = &fakeCertService{}, newFakeStatusService()
+	e.watch = store.NewCertWatchRepo(app)
+	e.recorder = &certwatch.Recorder{Reliance: e.certSvc, Store: e.watch}
 	e.periods = &fakePeriods{states: map[string]string{}}
 	e.pg = store.New(app, zap.NewNop(), store.WithEventRegion("uk"))
 	e.obs = &recObs{}
@@ -103,7 +112,9 @@ func newKEnv(t *testing.T) *kenv {
 		WithObserver(e.obs).
 		WithSigner(kernel.HMACSigner{Key: []byte("test-signing-key-test-signing-key!!"), KeyID: "test-k1"}))
 	handler.RegisterRoutes(r, handler.New(e.pg, nopPublisher{}, fakeAuthz{e}, e.periods, kenvLogger()).
-		WithJournalControls(e.pg, handler.ManualJournalPolicy{EvidenceThresholdCents: 1000000}))
+		WithJournalControls(e.pg, handler.ManualJournalPolicy{EvidenceThresholdCents: 1000000}).
+		WithCertificationReliance(e.recorder).
+		WithCertificationWatch(&certwatch.Sweeper{Store: e.watch, Status: e.status}, e.watch))
 	e.ts = httptest.NewServer(r)
 	t.Cleanup(e.ts.Close)
 	return e

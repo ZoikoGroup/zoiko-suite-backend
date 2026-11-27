@@ -13,6 +13,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"os"
@@ -39,6 +40,8 @@ import (
 	"zoiko.io/general-ledger-svc/internal/currency"
 	svcenvelope "zoiko.io/general-ledger-svc/internal/envelope"
 	"zoiko.io/general-ledger-svc/internal/events"
+	"zoiko.io/general-ledger-svc/internal/certreliance"
+	"zoiko.io/general-ledger-svc/internal/certwatch"
 	"zoiko.io/general-ledger-svc/internal/evidencereq"
 	"zoiko.io/general-ledger-svc/internal/handler"
 	"zoiko.io/general-ledger-svc/internal/health"
@@ -232,14 +235,49 @@ func main() {
 	if err != nil {
 		log.Fatal("manual journal policy", zap.Error(err))
 	}
+	// The certification watch (ZS-SVC-Z-001 RB-05): recording a journal's or posting's reliance also puts the certification on the
+	// watch list, and a sweep flags what rests on one that was revoked.
+	certClient := certreliance.NewClient(cfg.DataQualityServiceURL, cfg.ReconciliationServiceURL)
+	certWatchRepo := store.NewCertWatchRepo(pool)
+	certRecorder := &certwatch.Recorder{Reliance: certClient, Store: certWatchRepo}
+	certSweeper := &certwatch.Sweeper{Store: certWatchRepo, Status: certClient}
+	// The watch's metrics: the schedule, the flags and the event consumer. The open-flag gauges are read at scrape time, as the outbox
+	// backlog is, and report NaN (never a reassuring zero) when the read fails.
+	certMetrics := telemetry.NewCertWatchMetrics("general-ledger-svc")
+	telemetry.RegisterFlagGauges("general-ledger-svc", certWatchRepo.OpenFlagStats, func(err error) { log.Warn("certification flag stats unavailable", zap.Error(err)) })
+	sweepCtx, cancelSweep := context.WithCancel(context.Background())
+	defer cancelSweep()
+	// The scheduled sweep (certwatch.Scheduler): it starts only when CERT_SWEEP_PRINCIPAL_ID names the principal it acts as, and says so
+	// in the log when it does not. It acts as that principal, authorized per legal entity like any caller.
+	certScheduler := &certwatch.Scheduler{Sweeper: certSweeper, Scopes: certWatchRepo, Authz: authzClient, Lock: certWatchRepo,
+		Principal: cfg.CertSweepPrincipalID, Interval: cfg.CertSweepInterval, ScopeLimit: 2 * time.Minute, Log: log, Observer: certMetrics}
+	go certScheduler.Run(sweepCtx)
+	// The event-driven trigger: hears about a revocation from the issuing service's reliance-withdrawn event in seconds, instead of at the
+	// next sweep. The event is only a trigger (the issuing service is asked what state the certification is in), so a lost, duplicated or
+	// forged event cannot raise a false flag, and the schedule above is the backstop. It acts as the same principal.
+	if cfg.CertSweepPrincipalID != "" && cfg.CertWithdrawalConsumer {
+		reactor := &certwatch.Reactor{Store: certWatchRepo, Sweeper: certSweeper, Authz: authzClient, Principal: cfg.CertSweepPrincipalID, Log: log, Observer: certMetrics}
+		withdrawalReader := kafka.NewReader(kafka.ReaderConfig{
+			Brokers: cfg.Kafka.Brokers, GroupTopics: cfg.CertWithdrawalTopics, GroupID: cfg.CertWithdrawalGroupID,
+			ErrorLogger: kafka.LoggerFunc(func(msg string, args ...interface{}) {
+				log.Debug("certification withdrawal consumer kafka reader: " + fmt.Sprintf(msg, args...))
+			}),
+		})
+		go (&certwatch.Consumer{Reactor: reactor, Log: log, Observer: certMetrics}).Run(sweepCtx, withdrawalReader)
+	} else {
+		log.Info("certification withdrawal consumer not started", zap.Bool("principal_configured", cfg.CertSweepPrincipalID != ""), zap.Bool("enabled", cfg.CertWithdrawalConsumer))
+	}
 	h := handler.New(pgStore, publisher, authzClient, closeClient, log).
 		WithEvidenceGate(evidencereq.NewClient(cfg.EvidenceRequirementsURL).WithLogger(log)).
+		WithCertificationReliance(certRecorder).
+		WithCertificationWatch(certSweeper, certWatchRepo).
+		WithCertificationObserver(certMetrics).
 		WithJournalControls(pgStore, manualPolicy)
 	handler.RegisterRoutes(r, h)
 
 	// Global Accounting Kernel (Wave 0): books, accounting events, posting rule sets, dry-run evaluation, dimensions.
 	kernelRepo := store.NewKernelRepo(pool, cfg.EventResidencyRegion)
-	kernelSvc := &kernel.Service{Repo: kernelRepo}
+	kernelSvc := &kernel.Service{Repo: kernelRepo, Reliance: certRecorder}
 	kernelH := handler.NewKernel(kernelSvc, kernelRepo, kernelRepo, currency.New(cfg.CurrencyRegistryURL), nil, authzClient, log).
 		WithPeriodGate(handler.ClosePeriodGate{Close: closeClient, Authz: authzClient}).
 		WithObserver(telemetry.NewKernelMetrics("general-ledger-svc"))

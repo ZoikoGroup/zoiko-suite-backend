@@ -33,8 +33,12 @@ const (
 	ActionImportExecute        = "DATA_IMPORT_EXECUTE"
 	ActionImportCancel         = "DATA_IMPORT_CANCEL"
 	ActionImportItemManage     = "DATA_IMPORT_ITEM_MANAGE"
-	ActionImportReconcile      = "DATA_IMPORT_RECONCILE"
-	ActionImportRead           = "DATA_IMPORT_READ"
+	// ActionImportQuarantineRelease decides a release from quarantine. It is deliberately not
+	// ActionImportItemManage: whoever works items can quarantine and ask for a release, but a release
+	// is granted only by someone holding this (ZS-SVC-Z-001 NP-16).
+	ActionImportQuarantineRelease = "DATA_IMPORT_QUARANTINE_RELEASE"
+	ActionImportReconcile         = "DATA_IMPORT_RECONCILE"
+	ActionImportRead              = "DATA_IMPORT_READ"
 )
 
 // ImportHandler serves the INT-06 API.
@@ -84,6 +88,12 @@ func RegisterImportRoutes(r chi.Router, h *ImportHandler) {
 	r.Get("/imports/{id}/log", h.logEntries)
 	r.Post("/imports/{id}/items/{row}:quarantine", h.quarantineItem)
 	r.Post("/imports/{id}/items/{row}:retry", h.retryItem)
+	r.Post("/imports/{id}/items/{row}:request-release", h.requestRelease)
+	r.Post("/imports/{id}/items/{row}:approve-release", h.approveRelease)
+	r.Post("/imports/{id}/items/{row}:refuse-release", h.refuseRelease)
+	r.Post("/dqc/quarantine/release", h.dqcQuarantineRelease)
+	r.Get("/imports/{id}/quarantine", h.quarantineView)
+	r.Get("/imports/{id}/items/{row}/quarantine", h.itemQuarantineView)
 }
 
 // ── problems ────────────────────────────────────────────────────────────────
@@ -123,10 +133,14 @@ func classifyImport(err error) problemOutcome {
 		return problemOutcome{http.StatusConflict, integration.CodeReconciliationBreak, err.Error(), 0}
 	case errors.Is(err, imports.ErrSelfApproval), errors.Is(err, imports.ErrProfileSelfCertify), errors.Is(err, imports.ErrNotPlatformScope):
 		return problemOutcome{http.StatusForbidden, integration.CodeAuthDenied, err.Error(), 0}
+	case errors.Is(err, imports.ErrNotIndependent):
+		return problemOutcome{http.StatusForbidden, integration.CodeAuthDenied, err.Error(), 0}
+	case errors.Is(err, imports.ErrReleaseRequired):
+		return problemOutcome{http.StatusConflict, integration.CodeQuarantined, err.Error(), 0}
 	case errors.Is(err, imports.ErrNoScanner), errors.Is(err, imports.ErrScannerUnavailable):
 		return problemOutcome{http.StatusServiceUnavailable, integration.CodeQuarantined, err.Error(), 30}
 	case errors.Is(err, imports.ErrInvalidState), errors.Is(err, imports.ErrProfileNotCertified), errors.Is(err, imports.ErrTargetNotConfigured),
-		errors.Is(err, imports.ErrRetryNotAllowed):
+		errors.Is(err, imports.ErrRetryNotAllowed), errors.Is(err, imports.ErrReleaseOpen), errors.Is(err, imports.ErrNoOpenRelease), errors.Is(err, imports.ErrStaleRelease):
 		return problemOutcome{http.StatusConflict, integration.CodeScopeDenied, err.Error(), 0}
 	case errors.Is(err, imports.ErrValidation), errors.Is(err, imports.ErrSchemaMismatch):
 		return problemOutcome{http.StatusBadRequest, integration.CodeSchemaMismatch, err.Error(), 0}
@@ -203,12 +217,17 @@ func decodeImportBody(w http.ResponseWriter, r *http.Request, dst any) error {
 
 // load fetches the batch and authorizes the caller against ITS legal entity.
 func (h *ImportHandler) load(w http.ResponseWriter, r *http.Request, action string) (imports.Actor, *imports.Batch, bool) {
+	return h.loadBatch(w, r, action, chi.URLParam(r, "id"))
+}
+
+// loadBatch is load for a batch named somewhere other than the URL path (a request body).
+func (h *ImportHandler) loadBatch(w http.ResponseWriter, r *http.Request, action, batchID string) (imports.Actor, *imports.Batch, bool) {
 	a, err := h.actor(r)
 	if err != nil {
 		h.problem(w, r, err)
 		return a, nil, false
 	}
-	b, err := h.svc.Get(r.Context(), a.TenantID, chi.URLParam(r, "id"))
+	b, err := h.svc.Get(r.Context(), a.TenantID, batchID)
 	if err != nil {
 		h.problem(w, r, err)
 		return a, nil, false

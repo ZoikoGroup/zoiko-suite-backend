@@ -69,6 +69,10 @@ type Fetched struct {
 	Watermark        string
 	DeclaredRowCount int64
 	DeclaredTotals   map[string]string
+	// Controls are the optional controls the source declared (hash total, sequence total,
+	// roll-forward, completeness) and Outcomes what re-performing each of them concluded.
+	Controls domain.DeclaredControls
+	Outcomes []domain.ControlOutcome
 }
 
 // Fetcher builds a population from a source.
@@ -115,6 +119,8 @@ func NewHTTPFetcher(endpoints map[string]string, client *http.Client) *HTTPFetch
 type declaredTotals struct {
 	RowCount int               `json:"row_count"`
 	Totals   map[string]string `json:"totals"`
+	// The optional controls (hash, sequence, roll_forward, completeness) sit beside the totals.
+	domain.DeclaredControls
 }
 
 type pageResponse struct {
@@ -188,13 +194,28 @@ func (f *HTTPFetcher) Fetch(ctx context.Context, spec domain.PopulationSpec, sco
 	if err := verifyDeclared(spec, all, declared); err != nil {
 		return nil, err
 	}
-	return &Fetched{Records: all, Watermark: watermark, DeclaredRowCount: int64(declared.RowCount), DeclaredTotals: declared.Totals}, nil
+	// The optional controls are re-performed against what was actually received. One that does
+	// not hold fails the population closed, as a wrong row count does; one that was not
+	// declared is recorded as NOT_DECLARED, never as passed.
+	outcomes, err := domain.VerifyDeclaredControls(declared.DeclaredControls, all)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s: %v", ErrSourceInconsistent, spec.Ref(), err)
+	}
+	return &Fetched{Records: all, Watermark: watermark, DeclaredRowCount: int64(declared.RowCount), DeclaredTotals: declared.Totals,
+		Controls: declared.DeclaredControls, Outcomes: outcomes}, nil
 }
 
 // sameDeclared compares two pages' declared totals by row count and exact
 // per-currency value (so "6" and "6.00" agree).
 func sameDeclared(a, b *declaredTotals) bool {
 	if a.RowCount != b.RowCount || len(a.Totals) != len(b.Totals) {
+		return false
+	}
+	// The optional controls describe the whole population too, so they cannot differ between
+	// pages either (compared as their canonical JSON, which sorts map keys).
+	ac, _ := json.Marshal(a.DeclaredControls)
+	bc, _ := json.Marshal(b.DeclaredControls)
+	if string(ac) != string(bc) {
 		return false
 	}
 	for c, v := range a.Totals {
@@ -371,6 +392,7 @@ func BuildPopulations(ctx context.Context, f Fetcher, def domain.ReconciliationD
 		if err != nil {
 			return nil, &PopulationError{Side: spec.Side, Err: err}
 		}
+		fp.Controls, fp.ControlOutcomes = got.Controls, got.Outcomes
 		out = append(out, fp)
 	}
 	return out, nil

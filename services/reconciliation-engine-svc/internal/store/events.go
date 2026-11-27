@@ -52,7 +52,10 @@ var (
 	evBreakStatusChanged = eventKind{"com.zoikosuite.accounting.reconciliation-break.status-changed", "CONTROL.ExceptionUpdated", aggregateBreak}
 	evCertIssued         = eventKind{"com.zoikosuite.accounting.reconciliation-certification.issued", "CONTROL.Certified", aggregateCertification}
 	evCertRevoked        = eventKind{"com.zoikosuite.accounting.reconciliation-certification.revoked", "CONTROL.CertificationRevoked", aggregateCertification}
-	evRulesPublished     = eventKind{"com.zoikosuite.accounting.reconciliation-definition.rule-version-published", "CONTROL.RuleVersionPublished", aggregateDefinition}
+	// New facts with no legacy consumers, so no legacy type (it defaults to the canonical one).
+	evCertRelianceRecorded          = eventKind{Type: "com.zoikosuite.accounting.reconciliation-certification.reliance-recorded", Aggregate: aggregateCertification}
+	evCertRelianceWithdrawn = eventKind{Type: "com.zoikosuite.accounting.reconciliation-certification.reliance-withdrawn", Aggregate: aggregateCertification}
+	evRulesPublished     =eventKind{"com.zoikosuite.accounting.reconciliation-definition.rule-version-published", "CONTROL.RuleVersionPublished", aggregateDefinition}
 	evRulesApproved      = eventKind{"com.zoikosuite.accounting.reconciliation-definition.rule-version-approved", "CONTROL.RuleVersionApproved", aggregateDefinition}
 )
 
@@ -93,4 +96,10 @@ func (s *PgStore) enqueueEvent(ctx context.Context, tx pgx.Tx, kind eventKind, t
 		return fmt.Errorf("build %s event: %w", kind.Type, err)
 	}
 	return outbox.Enqueue(ctx, tx, env)
+}
+
+// WithClock replaces the time source, for tests. It governs certification
+// freshness (a run's evidence age) and the time a certification is sealed.
+func WithClock(now func() time.Time) Option {
+	return func(s *PgStore) { s.now = now }
 }

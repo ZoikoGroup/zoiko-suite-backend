@@ -160,6 +160,43 @@ var registeredActionMigrations = []struct {
 	{"000059_register_comment_moderate_action", "comments-collaboration-svc", map[string]string{
 		"COMMENT_MODERATE": "STANDARD",
 	}},
+	{"000060_register_dqc_contract_actions", "data-quality-svc", map[string]string{
+		"DQC_CONTRACT_READ":    "STANDARD",
+		"DQC_CONTRACT_MANAGE":  "STANDARD",
+		"DQC_CONTRACT_PUBLISH": "HIGH",
+	}},
+	{"000061_register_data_import_actions", "data-ingestion-svc", map[string]string{
+		"DATA_IMPORT_PROFILE_PUBLISH":    "STANDARD",
+		"DATA_IMPORT_PROFILE_CERTIFY":    "HIGH",
+		"DATA_IMPORT_CREATE":             "STANDARD",
+		"DATA_IMPORT_UPLOAD":             "STANDARD",
+		"DATA_IMPORT_VALIDATE":           "STANDARD",
+		"DATA_IMPORT_APPROVE":            "HIGH",
+		"DATA_IMPORT_EXECUTE":            "HIGH",
+		"DATA_IMPORT_CANCEL":             "STANDARD",
+		"DATA_IMPORT_ITEM_MANAGE":        "STANDARD",
+		"DATA_IMPORT_QUARANTINE_RELEASE": "HIGH",
+		"DATA_IMPORT_RECONCILE":          "STANDARD",
+		"DATA_IMPORT_READ":               "STANDARD",
+	}},
+	{"000062_register_dqc_certification_revoke_action", "data-quality-svc", map[string]string{
+		"DQC_CERTIFICATION_REVOKE": "HIGH",
+	}},
+	{"000063_register_dqc_risk_actions", "data-quality-svc", map[string]string{
+		"DQC_RISK_REQUEST": "STANDARD",
+		"DQC_RISK_APPROVE": "CRITICAL",
+	}},
+	{"000064_register_dqc_reliance_action", "data-quality-svc", map[string]string{
+		"DQC_RELIANCE_RECORD": "STANDARD",
+	}},
+	{"000065_register_reconciliation_reliance_action", "reconciliation-engine-svc", map[string]string{
+		"RECONCILIATION_RELIANCE_RECORD": "STANDARD",
+	}},
+	{"000066_register_gl_certification_watch_actions", "general-ledger-svc", map[string]string{
+		"GL_CERTIFICATION_WATCH_SWEEP":      "STANDARD",
+		"GL_CERTIFICATION_FLAG_VIEW":        "STANDARD",
+		"GL_CERTIFICATION_FLAG_ACKNOWLEDGE": "HIGH",
+	}},
 }
 
 // templatePublishers are the migrations, in this list, that publish role

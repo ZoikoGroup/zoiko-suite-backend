@@ -54,6 +54,11 @@ services:
       - ../services/payment-status-svc/deployments/migrations:/migrations/payment-status:ro
       - ../services/metric-registry-svc/deployments/migrations:/migrations/metric-registry:ro
       - ../services/source-authority-svc/deployments/migrations:/migrations/source-authority:ro
+      - ../services/data-quality-svc/deployments/migrations:/migrations/data-quality:ro
+      - ../services/data-lineage-svc/deployments/migrations:/migrations/data-lineage:ro
+      - ../services/classification-svc/deployments/migrations:/migrations/classification:ro
+      - ../services/data-ingestion-svc/deployments/migrations:/migrations/data-ingestion:ro
+      - ../services/reconciliation-engine-svc/deployments/migrations:/migrations/reconciliation-engine:ro
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
       - ../services/governance-decision-log-svc/deployments/migrations:/migrations/governance-decision-log:ro
       - ../services/policy-svc/deployments/migrations:/migrations/policy:ro
@@ -2219,6 +2224,17 @@ services:
       EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       EVIDENCE_REQUIREMENTS_URL: "http://evidence-requirements-svc:8130"
+      DATA_QUALITY_SERVICE_URL: "http://data-quality-svc:8178"
+      RECONCILIATION_SERVICE_URL: "http://reconciliation-engine-svc:8182"
+      # The scheduled certification sweep (flags journals and postings resting on a revoked certification) runs only when a principal is
+      # named. That principal must be GRANTED GL_CERTIFICATION_WATCH_SWEEP on the entities it sweeps, and read on the certifications
+      # (DATA_QUALITY_READ / RECONCILIATION_READ); there is deliberately no default identity. CERT_SWEEP_INTERVAL: 1m-24h, or "off".
+      # CERT_SWEEP_PRINCIPAL_ID: "<service principal id>"
+      CERT_SWEEP_INTERVAL: "15m"
+      # With a principal named, GL also listens for the issuing services' reliance-withdrawn events (CERT_WITHDRAWAL_CONSUMER=off to
+      # disable; CERT_WITHDRAWAL_TOPICS, CERT_WITHDRAWAL_GROUP_ID to override) and checks the certification the moment one arrives. An
+      # event is only a trigger: the issuing service is asked, so a lost or forged event cannot cause a false flag, and the schedule
+      # above remains the backstop.
     depends_on:
       postgres:
         condition: service_healthy
@@ -6608,6 +6624,177 @@ services:
       retries: 5
       start_period: 15s
     restart: on-failure
+
+  # ── Domain 3 data-control services (ZS-SVC-N-001 DATA-02 / lineage / DATA-classification) ──
+  # Same shape as source-authority-svc: the pre-provisioned NOSUPERUSER/NOBYPASSRLS
+  # zoiko_app role, so the FORCE RLS policies in each 000001 migration actually bind
+  # the connection instead of being skipped by the superuser default.
+  data-quality-svc:
+    build:
+      context: ../services/data-quality-svc
+      dockerfile: Dockerfile
+    container_name: data-quality-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8178:8178"
+    environment:
+      PORT: "8178"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/data_quality?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_TOPIC: "zoiko.data.quality.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    restart: on-failure
+
+  data-lineage-svc:
+    build:
+      context: ../services/data-lineage-svc
+      dockerfile: Dockerfile
+    container_name: data-lineage-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8179:8179"
+    environment:
+      PORT: "8179"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/data_lineage?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_TOPIC: "zoiko.data.lineage.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    restart: on-failure
+
+  classification-svc:
+    build:
+      context: ../services/classification-svc
+      dockerfile: Dockerfile
+    container_name: classification-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8180:8180"
+    environment:
+      PORT: "8180"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/classification?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_TOPIC: "zoiko.data.classification.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    restart: on-failure
+
+  data-ingestion-svc:
+    build:
+      # The build context is services/ (not the service directory): go.mod replaces zoiko.io/eventing with ../eventing.
+      context: ../services
+      dockerfile: data-ingestion-svc/Dockerfile
+    container_name: data-ingestion-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8181:8181"
+    environment:
+      PORT: "8181"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/data_ingestion?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_TOPIC: "zoiko.data.ingestion.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      # Controlled imports (INT-06) are OFF unless a deployment turns them on, because enabling them needs the
+      # owning domains' base URLs (name=url, comma separated) and a malware scanner:
+      #   DATA_IMPORT_ENABLED=true DATA_IMPORT_TARGETS=ap=http://accounts-payable-svc:8099 DATA_IMPORT_CLAMAV_ADDR=clamav:3310
+      # IMPORT_ALLOW_BUILTIN_SCAN_ONLY is for development only (type, size and signature checks, not a malware engine).
+      IMPORT_ENABLED: "${DATA_IMPORT_ENABLED:-false}"
+      IMPORT_TARGETS: "${DATA_IMPORT_TARGETS:-}"
+      IMPORT_CLAMAV_ADDR: "${DATA_IMPORT_CLAMAV_ADDR:-}"
+      IMPORT_ALLOW_BUILTIN_SCAN_ONLY: "${DATA_IMPORT_ALLOW_BUILTIN_SCAN_ONLY:-false}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    restart: on-failure
+
+  reconciliation-engine-svc:
+    build:
+      # The build context is services/ (not the service directory): go.mod replaces zoiko.io/eventing with ../eventing.
+      context: ../services
+      dockerfile: reconciliation-engine-svc/Dockerfile
+    container_name: reconciliation-engine-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8182:8182"
+    environment:
+      PORT: "8182"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/reconciliation_engine?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_TOPIC: "zoiko.data.reconciliation_engine.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      # Required, no default in the service: the event envelope refuses an empty residency region.
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
+      # Registered population sources (name=base-url). A definition can select one by name and can never supply a URL.
+      # Empty means every StartRun is refused, which is the safe default until sources are registered, e.g.
+      #   RECONCILIATION_SOURCE_ENDPOINTS=accounts-receivable=http://accounts-receivable-svc:8101,general-ledger=http://general-ledger-svc:8098
+      SOURCE_ENDPOINTS: "${RECONCILIATION_SOURCE_ENDPOINTS:-}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    restart: on-failure
+
 
 volumes:
   postgres_data:

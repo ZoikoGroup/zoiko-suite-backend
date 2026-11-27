@@ -10,6 +10,16 @@ import (
 // DATA-03 Data Lineage, against real Postgres as the NOSUPERUSER
 // NOBYPASSRLS role.
 
+// fullProv is complete run, code/config and version-pin evidence — what a derivation
+// needs before its graph can be sealed.
+func fullProv(run string) domain.ProvenanceFields {
+	return domain.ProvenanceFields{
+		RunID: strp(run), BuildVersion: strp("build-2026.11.23+abc123"), ConfigDigest: strp(digest("cfg-" + run)),
+		Environment: strp("test"), Region: strp("eu-west-1"),
+		SourceVersion: strp("src@wm-100"), DerivedVersion: strp("out@v1"),
+	}
+}
+
 func (f *fixture) recordDerivation(org string, req domain.RecordDerivationRequest) *domain.LineageEdge {
 	f.t.Helper()
 	got, err := f.s.RecordDerivation(f.ctx, org, req, "test-operator", f.claim("RecordDerivation", req.SourceEntity.ExternalRef+"->"+req.DerivedEntity.ExternalRef))
@@ -26,7 +36,8 @@ func TestLineage_HappyPath_RecordSealQuery(t *testing.T) {
 	req := domain.RecordDerivationRequest{
 		SourceEntity: ref("landing_object", "lo-1"), ActivityType: "ingest",
 		TransformationVersion: strp("data-ingestion-svc:CommitBatch:v1"), Agent: "data-ingestion-svc",
-		DerivedEntity: ref("report_row", "rep-1"),
+		DerivedEntity:    ref("report_row", "rep-1"),
+		ProvenanceFields: fullProv("run-happy"),
 	}
 	edge := f.recordDerivation(orgA, req)
 	if edge.SourceEntityID == "" || edge.DerivedEntityID == "" || edge.ActivityID == "" {
@@ -252,7 +263,8 @@ func TestLineage_SealedManifestIsImmutableAtTheDatabase(t *testing.T) {
 	req := domain.RecordDerivationRequest{
 		SourceEntity: ref("landing_object", "lo-8"), ActivityType: "ingest",
 		TransformationVersion: strp("v1"), Agent: "data-ingestion-svc",
-		DerivedEntity: ref("report_row", "rep-8"),
+		DerivedEntity:    ref("report_row", "rep-8"),
+		ProvenanceFields: fullProv("run-immutable"),
 	}
 	edge := f.recordDerivation(orgA, req)
 	manifest, err := f.s.SealManifest(f.ctx, orgA, edge.DerivedEntityID, "test-operator", f.claim("SealManifest", edge.DerivedEntityID))

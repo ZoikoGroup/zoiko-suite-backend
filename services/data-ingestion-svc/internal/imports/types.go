@@ -146,24 +146,28 @@ const (
 
 // Item is one row of the file.
 type Item struct {
-	BatchID          string
-	RowNo            int
-	TenantID         string
-	RowHash          string
-	Values           map[string]any
-	Status           ItemStatus
-	ErrorCodes       []RowError
-	IdempotencyKey   string
-	Attempts         int
-	NextAttemptAt    time.Time
-	LockedUntil      *time.Time
-	DomainStatus     *int
-	ResultRef        string
-	LastErrorClass   string
-	QuarantineReason string
-	QuarantineOwner  string
-	QuarantinedBy    string
-	UpdatedAt        time.Time
+	BatchID        string
+	RowNo          int
+	TenantID       string
+	RowHash        string
+	Values         map[string]any
+	Status         ItemStatus
+	ErrorCodes     []RowError
+	IdempotencyKey string
+	Attempts       int
+	// ReleaseGeneration counts the times this item was released from quarantine. It selects the
+	// delivery key (see DeliveryKey): a release is a NEW attempt after a correction, so it must not
+	// replay the refusal the owning domain cached under the original key.
+	ReleaseGeneration int
+	NextAttemptAt     time.Time
+	LockedUntil       *time.Time
+	DomainStatus      *int
+	ResultRef         string
+	LastErrorClass    string
+	QuarantineReason  string
+	QuarantineOwner   string
+	QuarantinedBy     string
+	UpdatedAt         time.Time
 }
 
 // RowError is one reason a row is invalid. It names the column and a stable code, and
@@ -275,5 +279,89 @@ var (
 	ErrProfileSelfCertify  = errors.New("a profile cannot be certified by the person who authored it")
 	ErrTargetNotConfigured = errors.New("the profile names a target this deployment does not have")
 	ErrRetryNotAllowed     = errors.New("that item cannot be retried")
-	ErrIncompleteUpload    = errors.New("the upload is incomplete")
+
+	// Quarantine release (ZS-SVC-Z-001 INV-12, NP-16; migration 000003).
+	ErrReleaseRequired  = errors.New("a quarantined item is released through a governed release request, not retried")
+	ErrReleaseOpen      = errors.New("a release request for this item is already open")
+	ErrNoOpenRelease    = errors.New("this item has no open release request")
+	// ErrStaleRelease: a decision names the request it reviewed (optimistic concurrency), and that request
+	// is no longer the item's open one. Look again and decide on what is there now.
+	ErrStaleRelease = errors.New("the release request this decision names is not the item's open one; it has changed since it was read")
+	ErrNotIndependent   = errors.New("a release must be decided by someone other than the person who quarantined the item or asked for its release")
+	ErrIncompleteUpload = errors.New("the upload is incomplete")
 )
+
+// ── Quarantine governance (ZS-SVC-Z-001 DQC-02, INV-11/INV-12, TC-07/TC-08) ──
+
+// LedgerKind is one kind of entry in an item's quarantine ledger.
+type LedgerKind string
+
+const (
+	LedgerQuarantined       LedgerKind = "QUARANTINED"
+	LedgerReleaseRequested  LedgerKind = "RELEASE_REQUESTED"
+	LedgerReleaseRefused    LedgerKind = "RELEASE_REFUSED"
+	LedgerReleased          LedgerKind = "RELEASED"
+	LedgerRevalidated       LedgerKind = "REVALIDATED"
+	RevalidatedImported                = "IMPORTED"
+	RevalidatedRequarantine            = "QUARANTINED"
+	RevalidatedFailed                  = "FAILED"
+	// SystemActor is the ledger actor when the executor, not a person, quarantines an item.
+	SystemActor = "system:import-executor"
+)
+
+// LedgerEntry is one append-only fact about an item's quarantine. The item row says where
+// the item is now; the ledger says how it got there and who decided what.
+type LedgerEntry struct {
+	LedgerID            int64      `json:"ledger_id"`
+	BatchID             string     `json:"batch_id"`
+	RowNo               int        `json:"row_no"`
+	Kind                LedgerKind `json:"kind"`
+	Actor               string     `json:"actor"`
+	Reason              string     `json:"reason"`
+	Owner               string     `json:"owner,omitempty"`
+	CorrectionRef       string     `json:"correction_ref,omitempty"`
+	AnswersLedgerID     *int64     `json:"answers_ledger_id,omitempty"`
+	RevalidationOutcome string     `json:"revalidation_outcome,omitempty"`
+	CorrelationID       string     `json:"correlation_id,omitempty"`
+	OccurredAt          time.Time  `json:"occurred_at"`
+}
+
+// QuarantineState is the batch's quarantine control state.
+type QuarantineState string
+
+const (
+	QuarantineNone           QuarantineState = "NONE"
+	QuarantinePartial        QuarantineState = "PARTIAL"
+	QuarantineFull           QuarantineState = "FULL"
+	QuarantineReleasePending QuarantineState = "RELEASE_PENDING"
+)
+
+// QuarantineSummary is the batch's quarantine state with the counts behind it.
+type QuarantineSummary struct {
+	State               QuarantineState `json:"state"`
+	QuarantinedItems    int             `json:"quarantined_items"`
+	TotalItems          int             `json:"total_items"`
+	OpenReleaseRequests int             `json:"open_release_requests"`
+}
+
+// DeriveQuarantineState is the rule, kept in one place:
+//
+//   - a batch that was quarantined whole is FULL;
+//   - nothing quarantined is NONE;
+//   - any open release request makes it RELEASE_PENDING (a decision is awaited — the counts
+//     beside it say how much is still held);
+//   - every item quarantined is FULL, otherwise PARTIAL.
+func DeriveQuarantineState(batch Status, quarantined, total, openRequests int) QuarantineState {
+	switch {
+	case batch == StatusQuarantined:
+		return QuarantineFull
+	case quarantined == 0:
+		return QuarantineNone
+	case openRequests > 0:
+		return QuarantineReleasePending
+	case total > 0 && quarantined >= total:
+		return QuarantineFull
+	default:
+		return QuarantinePartial
+	}
+}

@@ -239,7 +239,19 @@ type PopulationSnapshot struct {
 	DeclaredRowCount      *int64            `json:"declared_row_count,omitempty"`
 	DeclaredTotals        map[string]string `json:"declared_totals,omitempty"`
 	ContentHash           string            `json:"content_hash"`
-	CreatedAt             time.Time         `json:"created_at"`
+	// HashAlgorithm and HashSerialization say how ContentHash was made, so it can be
+	// re-derived from the frozen items (INV-24; migration 000015).
+	HashAlgorithm     string    `json:"hash_algorithm"`
+	HashSerialization string    `json:"hash_serialization"`
+	CreatedAt         time.Time `json:"created_at"`
+	// Completeness is FULL (the whole in-scope population; every snapshot before migration
+	// 000016, and any source that declares nothing) or PARTIAL (the source declared a defined
+	// subset). DeclaredControls and ControlOutcomes are the optional controls the source declared
+	// and what re-performing each concluded (controls.go). A snapshot frozen before 000016 has
+	// no outcomes: nothing was checked, and that is what the empty list says.
+	Completeness     string           `json:"completeness"`
+	DeclaredControls DeclaredControls `json:"declared_controls"`
+	ControlOutcomes  []ControlOutcome `json:"control_outcomes"`
 }
 
 type PopulationItem struct {
@@ -404,6 +416,14 @@ type ReconciliationException struct {
 	RootCauseNote *string           `json:"root_cause_note,omitempty"`
 	AcceptedBy    *string           `json:"accepted_by,omitempty"`
 	AcceptedAt    *time.Time        `json:"accepted_at,omitempty"`
+	// RaisedGeneration is the snapshot generation a BALANCE exception was raised
+	// under (an item exception's is its item's). SUPERSEDED exceptions say who, when,
+	// by which generation and why (step D, migration 000014).
+	RaisedGeneration       *int       `json:"raised_generation,omitempty"`
+	SupersededAt           *time.Time `json:"superseded_at,omitempty"`
+	SupersededBy           *string    `json:"superseded_by,omitempty"`
+	SupersededByGeneration *int       `json:"superseded_by_generation,omitempty"`
+	SupersededReason       *string    `json:"superseded_reason,omitempty"`
 	// Derived on read, never stored (§7 attention signals, §20 aging).
 	AgeDays   *int     `json:"age_days,omitempty"`
 	Attention []string `json:"attention,omitempty"`
@@ -468,10 +488,23 @@ type Certification struct {
 	// Revocation is set on read once the certification has been revoked
 	// (B34). It is a separate record: the sealed certification above, and its
 	// manifest hash, are never changed by a revocation.
-	Revocation     *CertificationRevocation `json:"revocation,omitempty"`
-	ManifestSHA256 string                   `json:"manifest_sha256"`
-	SealedAt       time.Time                `json:"sealed_at"`
-	SealedBy       string                   `json:"sealed_by"`
+	Revocation *CertificationRevocation `json:"revocation,omitempty"`
+	// BasisSHA256 identifies WHAT was certified, independent of the run, the
+	// certifier and the seal time, so the same evidence has the same basis and is
+	// unique per tenant (section 11). Set from migration 000013 on; certifications
+	// sealed earlier have none and are not given one.
+	BasisSHA256           string  `json:"basis_sha256,omitempty"`
+	LineageManifestID     *string `json:"lineage_manifest_id,omitempty"`
+	LineageManifestSHA256 *string `json:"lineage_manifest_sha256,omitempty"`
+	// Freshness state sealed with the certification (TC-13).
+	EvidenceOldestAt      *time.Time `json:"evidence_oldest_at,omitempty"`
+	EvidenceMaxAgeSeconds *int64     `json:"evidence_max_age_seconds,omitempty"`
+	// ManifestSerialization names how the manifest was encoded before ManifestSHA256
+	// was taken (INV-24). Nil on certifications sealed before migration 000015.
+	ManifestSerialization *string   `json:"manifest_serialization,omitempty"`
+	ManifestSHA256        string    `json:"manifest_sha256"`
+	SealedAt              time.Time `json:"sealed_at"`
+	SealedBy              string    `json:"sealed_by"`
 }
 
 type SupersedeRunRequest struct {
@@ -490,11 +523,19 @@ func (r SupersedeRunRequest) Validate() error {
 }
 
 var (
-	ErrDefinitionNotFound     = errorString("reconciliation definition not found")
-	ErrRunNotFound            = errorString("reconciliation run not found")
-	ErrItemNotFound           = errorString("population item not found")
-	ErrRunNotOpen             = errorString("reconciliation run is not open for this operation")
-	ErrOpenExceptionsRemain   = errorString("open exceptions remain; resolve them before certifying")
+	ErrDefinitionNotFound   = errorString("reconciliation definition not found")
+	ErrRunNotFound          = errorString("reconciliation run not found")
+	ErrItemNotFound         = errorString("population item not found")
+	ErrRunNotOpen           = errorString("reconciliation run is not open for this operation")
+	ErrOpenExceptionsRemain = errorString("open exceptions remain; resolve them before certifying")
+
+	// ZS-SVC-Z-001 DQC-05 / DQC-016 / NP-43 and section 11.
+	ErrEvidenceStale            = errorString("the run's frozen populations are older than the certification profile's freshness window; reperform it to freeze current evidence")
+	ErrCertificationBasisExists = errorString("a certification with the same basis already exists")
+
+	// ErrUnknownHashFormat: a hash made under an algorithm or serialization this
+	// build does not know cannot be re-derived, and is never guessed at (INV-15).
+	ErrUnknownHashFormat      = errorString("unknown population hash format")
 	ErrRunImmutable           = errorString("reconciliation run is certified and immutable")
 	ErrExceptionAlreadyClosed = errorString("exception is already resolved")
 	ErrIdempotencyKeyReused   = errorString("idempotency key was already used for a different request")

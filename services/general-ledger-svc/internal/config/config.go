@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -49,6 +50,26 @@ type Config struct {
 	// EvidenceRequirementsURL is the base URL of evidence-requirements-svc.
 	// Posting is a finalization path and must not skip required evidence.
 	EvidenceRequirementsURL string
+
+	// DataQualityServiceURL and ReconciliationServiceURL are the services that issue the certifications a journal's evidence may
+	// cite (evidence reference "certification:<service>:<run id>"). A posted journal records its reliance with the issuing service
+	// so a later revocation can name it (ZS-SVC-Z-001 RB-05, DQC-017). A journal that cites no certification never calls them.
+	DataQualityServiceURL    string
+	ReconciliationServiceURL string
+
+	// CertSweepPrincipalID (CERT_SWEEP_PRINCIPAL_ID) is the principal the scheduled certification sweep acts as, and CertSweepInterval
+	// (CERT_SWEEP_INTERVAL, default 15m, "off" to disable) how often it runs. Without a principal the scheduler does not start: there is no
+	// default identity, because the principal must be GRANTED GL_CERTIFICATION_WATCH_SWEEP on the entities it sweeps and read on the
+	// certifications, like anyone else (no service self-authorizes).
+	CertSweepPrincipalID string
+	CertSweepInterval    time.Duration
+
+	// The event-driven trigger (certwatch.Consumer): CertWithdrawalConsumer (CERT_WITHDRAWAL_CONSUMER, "on" by default, "off" to disable),
+	// the topics it reads (CERT_WITHDRAWAL_TOPICS, comma separated; default both issuing services' event topics) and its consumer group
+	// (CERT_WITHDRAWAL_GROUP_ID). It starts only when CertSweepPrincipalID is set, because it acts as the same principal as the schedule.
+	CertWithdrawalConsumer bool
+	CertWithdrawalTopics   []string
+	CertWithdrawalGroupID  string
 
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
@@ -109,6 +130,18 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	sweepInterval, err := ParseCertSweepInterval(os.Getenv("CERT_SWEEP_INTERVAL"))
+	if err != nil {
+		return nil, err
+	}
+	withdrawalOn, err := ParseOnOff("CERT_WITHDRAWAL_CONSUMER", os.Getenv("CERT_WITHDRAWAL_CONSUMER"), true)
+	if err != nil {
+		return nil, err
+	}
+	withdrawalTopics, err := ParseTopics(os.Getenv("CERT_WITHDRAWAL_TOPICS"))
+	if err != nil {
+		return nil, err
+	}
 	timeout := 300 * time.Millisecond
 	if v := strings.TrimSpace(os.Getenv("PERIOD_GATE_SHADOW_TIMEOUT")); v != "" {
 		d, perr := time.ParseDuration(v)
@@ -147,6 +180,8 @@ func Load() (*Config, error) {
 		MTLSManagementServiceURL:       env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 		CloseServiceURL:                env("CLOSE_SERVICE_URL", "http://financial-close-svc:8104"),
 		EvidenceRequirementsURL:        env("EVIDENCE_REQUIREMENTS_URL", "http://evidence-requirements-svc:8130"),
+		DataQualityServiceURL:          env("DATA_QUALITY_SERVICE_URL", "http://data-quality-svc:8178"),
+		ReconciliationServiceURL:       env("RECONCILIATION_SERVICE_URL", "http://reconciliation-engine-svc:8182"),
 		OTELExporterEndpoint:           env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 		PeriodGateMode:                 mode,
 		AccountingPeriodURL:            env("ACCOUNTING_PERIOD_URL", "http://accounting-period-svc:8174"),
@@ -156,6 +191,11 @@ func Load() (*Config, error) {
 		SnapshotSigningKey:             env("SNAPSHOT_SIGNING_KEY", ""),
 		SnapshotSigningKeyID:           env("SNAPSHOT_SIGNING_KEY_ID", "k1"),
 		PeriodGateShadowTimeout:        timeout,
+		CertSweepPrincipalID:           strings.TrimSpace(os.Getenv("CERT_SWEEP_PRINCIPAL_ID")),
+		CertSweepInterval:              sweepInterval,
+		CertWithdrawalConsumer:         withdrawalOn,
+		CertWithdrawalTopics:           withdrawalTopics,
+		CertWithdrawalGroupID:          env("CERT_WITHDRAWAL_GROUP_ID", "general-ledger-svc.certification-withdrawals"),
 	}, nil
 }
 
@@ -193,4 +233,68 @@ func ParsePeriodGateMode(raw string) (string, error) {
 	default:
 		return "", fmt.Errorf("invalid PERIOD_GATE_MODE %q: allowed values are off or shadow (enforce is not implemented in this phase)", raw)
 	}
+}
+
+const (
+	defaultCertSweepInterval = 15 * time.Minute
+	minCertSweepInterval     = time.Minute
+	maxCertSweepInterval     = 24 * time.Hour
+)
+
+// ParseCertSweepInterval validates CERT_SWEEP_INTERVAL: unset means 15 minutes, "off" (or 0) disables the schedule, and anything
+// else is a duration between one minute and 24 hours. A sweep calls other services for every watched certification, so a tighter
+// bound than a minute is refused, and one longer than a day would leave a revocation unfound for longer than the sweep is worth.
+func ParseCertSweepInterval(raw string) (time.Duration, error) {
+	v := strings.ToLower(strings.TrimSpace(raw))
+	switch v {
+	case "":
+		return defaultCertSweepInterval, nil
+	case "off", "0", "0s":
+		return 0, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < minCertSweepInterval || d > maxCertSweepInterval {
+		return 0, fmt.Errorf("CERT_SWEEP_INTERVAL %q must be \"off\" or a duration between %s and %s, such as 15m", raw, minCertSweepInterval, maxCertSweepInterval)
+	}
+	return d, nil
+}
+
+// ParseOnOff validates a switch such as CERT_WITHDRAWAL_CONSUMER: unset means def, and only on/off (any case) is accepted, so a typo
+// such as "of" stops the service at startup instead of silently leaving the feature in a state nobody chose.
+func ParseOnOff(name, raw string, def bool) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "":
+		return def, nil
+	case "on", "true":
+		return true, nil
+	case "off", "false":
+		return false, nil
+	}
+	return false, fmt.Errorf("%s %q must be on or off", name, raw)
+}
+
+var topicNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,248}$`)
+
+// DefaultCertWithdrawalTopics are the event topics of the two services that issue certifications.
+var DefaultCertWithdrawalTopics = []string{"zoiko.data.quality.events", "zoiko.data.reconciliation_engine.events"}
+
+// ParseTopics validates CERT_WITHDRAWAL_TOPICS: unset means both issuing services' topics, otherwise a comma separated list of valid,
+// distinct topic names.
+func ParseTopics(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return append([]string(nil), DefaultCertWithdrawalTopics...), nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, t := range strings.Split(raw, ",") {
+		t = strings.TrimSpace(t)
+		if !topicNameRe.MatchString(t) {
+			return nil, fmt.Errorf("CERT_WITHDRAWAL_TOPICS: %q is not a valid topic name", t)
+		}
+		if !seen[t] {
+			seen[t] = true
+			out = append(out, t)
+		}
+	}
+	return out, nil
 }

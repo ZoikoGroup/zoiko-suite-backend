@@ -228,6 +228,10 @@ type FrozenPopulation struct {
 	DeclaredRowCount int64
 	DeclaredTotals   map[string]string
 	Items            []PopulationItemInput
+	// Controls are the optional source-declared controls and ControlOutcomes what the engine
+	// concluded about each (controls.go). Both are frozen with the snapshot as evidence.
+	Controls        DeclaredControls
+	ControlOutcomes []ControlOutcome
 }
 
 // NewFrozenPopulation converts verified source records into frozen items at
@@ -282,6 +286,53 @@ func ControlTotals(items []PopulationItemInput) (perCurrency []CurrencyTotal, to
 	}
 	sort.Slice(perCurrency, func(i, j int) bool { return perCurrency[i].Currency < perCurrency[j].Currency })
 	return perCurrency, total, nil
+}
+
+// The hash a snapshot records is only evidence if it can be re-derived, and it can
+// only be re-derived if it says HOW it was made (ZS-SVC-Z-001 INV-24: hash totals
+// pin canonical serialization and algorithm version). A snapshot therefore records
+// its algorithm and serialization, and a verifier dispatches on them: an unknown one
+// is reported, never guessed at (INV-15). If the serialization below ever changes it
+// gets a NEW identifier, and the old one stays verifiable for as long as snapshots
+// made with it exist.
+const (
+	PopulationHashAlgorithm     = "sha256"
+	PopulationHashSerialization = "rpop-v1" // HashPopulation's exact format
+
+	// CertificationManifestSerialization names how a certification manifest is
+	// encoded before it is hashed: Go encoding/json of the manifest struct, fields in
+	// declaration order, maps with sorted keys.
+	CertificationManifestSerialization = "rcm-v1"
+)
+
+// PopulationHashCheck is the result of re-deriving one snapshot's content hash.
+type PopulationHashCheck struct {
+	SnapshotID        string `json:"snapshot_id"`
+	Side              string `json:"side"`
+	Generation        int    `json:"generation"`
+	HashAlgorithm     string `json:"hash_algorithm"`
+	HashSerialization string `json:"hash_serialization"`
+	StoredHash        string `json:"stored_hash"`
+	RecomputedHash    string `json:"recomputed_hash,omitempty"`
+	// Verified is true only when the hash was re-derived and equals the stored one.
+	// A snapshot whose algorithm or serialization is not recognised is NOT verified,
+	// and says why in Reason; it is never assumed to match.
+	Verified bool   `json:"verified"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+// RecomputePopulationHash re-derives a population hash under the algorithm and
+// serialization it was made with, or refuses (ErrUnknownHashFormat).
+func RecomputePopulationHash(algorithm, serialization string, items []PopulationItemInput) (string, error) {
+	if algorithm != PopulationHashAlgorithm {
+		return "", fmt.Errorf("%w: algorithm %q", ErrUnknownHashFormat, algorithm)
+	}
+	switch serialization {
+	case PopulationHashSerialization:
+		return HashPopulation(items), nil
+	default:
+		return "", fmt.Errorf("%w: serialization %q", ErrUnknownHashFormat, serialization)
+	}
 }
 
 // HashPopulation is a deterministic sha256 fingerprint of a frozen population:

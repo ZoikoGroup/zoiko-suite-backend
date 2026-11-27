@@ -850,13 +850,16 @@ func (s *Service) QuarantineItem(ctx context.Context, a Actor, batchID string, r
 	if b.Status != StatusImporting {
 		return fmt.Errorf("%w: items are quarantined while the batch is importing (%s)", ErrInvalidState, b.Status)
 	}
-	return s.repo.QuarantineItem(ctx, a.TenantID, batchID, rowNo, reason, owner, a.PrincipalID, []Event{{
+	return s.repo.QuarantineItem(ctx, a.TenantID, batchID, rowNo, reason, owner, a.PrincipalID, a.CorrelationID, []Event{{
 		Type: EventItemQuarantined, Payload: map[string]any{"batch_id": batchID, "row_no": rowNo, "reason": reason, "owner": owner, "by": a.PrincipalID},
 	}})
 }
 
 // RetryItem puts a quarantined or failed item back in the queue (a person decided it should be
 // tried again, and said why). A batch that had finished with exceptions resumes importing.
+// RetryItem puts a FAILED item back in the queue. A QUARANTINED item is refused (ErrReleaseRequired):
+// leaving quarantine is a governed decision with its own authority, independence and evidence, not
+// a retry (ZS-SVC-Z-001 INV-12). See RequestRelease and DecideRelease.
 func (s *Service) RetryItem(ctx context.Context, a Actor, batchID string, rowNo int, reason string) error {
 	if strings.TrimSpace(reason) == "" {
 		return fmt.Errorf("%w: a reason is required", ErrValidation)

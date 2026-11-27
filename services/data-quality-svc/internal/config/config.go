@@ -2,6 +2,8 @@ package config
 
 import (
 	"os"
+	"strconv"
+	"time"
 )
 
 type Config struct {
@@ -22,6 +24,12 @@ type Config struct {
 	// MTLSManagementServiceURL is where this service provisions its own
 	// client-side mTLS identity, used only when AuthzMTLSEnabled is true.
 	MTLSManagementServiceURL string
+
+	// EvidenceMaxAge is the freshness window: evidence older than this cannot be
+	// certified (ZS-SVC-Z-001 DQC-05). From DQ_EVIDENCE_MAX_AGE_SECONDS; unset,
+	// zero or invalid falls back to the store default (24h) — an unlimited window
+	// is deliberately not expressible.
+	EvidenceMaxAge time.Duration
 }
 
 func Load() *Config {
@@ -34,6 +42,10 @@ func Load() *Config {
 	authzMTLSEnabled := os.Getenv("AUTHZ_MTLS_ENABLED") == "true"
 	authzMTLSURL := getEnv("AUTHZ_MTLS_URL", "https://authorization-svc:8449")
 	mtlsManagementServiceURL := getEnv("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140")
+	var evidenceMaxAge time.Duration
+	if secs, err := strconv.ParseInt(os.Getenv("DQ_EVIDENCE_MAX_AGE_SECONDS"), 10, 64); err == nil && secs > 0 {
+		evidenceMaxAge = time.Duration(secs) * time.Second
+	}
 
 	return &Config{
 		Port:                     port,
@@ -45,6 +57,7 @@ func Load() *Config {
 		AuthzMTLSEnabled:         authzMTLSEnabled,
 		AuthzMTLSURL:             authzMTLSURL,
 		MTLSManagementServiceURL: mtlsManagementServiceURL,
+		EvidenceMaxAge:           evidenceMaxAge,
 	}
 }
 

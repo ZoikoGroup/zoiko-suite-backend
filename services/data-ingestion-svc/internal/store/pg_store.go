@@ -33,6 +33,11 @@ type Store interface {
 	GetCheckpoint(ctx context.Context, tenantID, sourceID string) (*domain.SourceCheckpoint, error)
 	ListQuarantineItems(ctx context.Context, tenantID, runID string) ([]domain.QuarantineItem, error)
 
+	// Governed release of run-level quarantine (INT-04).
+	RequestRunRelease(ctx context.Context, tenantID, runID, quarantineID, actor string, req domain.RunReleaseRequest, claim domain.IdempotencyClaim) error
+	DecideRunRelease(ctx context.Context, tenantID, runID, quarantineID, actor string, release bool, dec domain.RunReleaseDecision, claim domain.IdempotencyClaim) error
+	RunQuarantineLedger(ctx context.Context, tenantID, runID, quarantineID string) ([]domain.RunReleaseEntry, domain.RunReleaseState, error)
+
 	// QueryImportBatchTieout serves the FIN-CTRL-033 control population (see control_population.go).
 	QueryImportBatchTieout(ctx context.Context, tenantID string, q domain.ImportBatchTieoutQuery) (*domain.ControlPopulationPage, error)
 }
@@ -257,6 +262,12 @@ func (s *PgStore) CommitBatch(ctx context.Context, tenantID string, req domain.C
 		if err := claimIdempotency(ctx, tx, claim); err != nil {
 			return err
 		}
+		// A quarantined payload cannot land again except under an approved release (INT-04); a batch submitted under
+		// one must be a correction. After the claim, so a replay of a landing that consumed a release still replays.
+		approvedRelease, releasedItem, err := releaseForCommit(ctx, tx, tenantID, run, req)
+		if err != nil {
+			return err
+		}
 		now := time.Now().UTC()
 		var landedCount int
 		var landedRecords []domain.BatchRecord
@@ -287,6 +298,11 @@ func (s *PgStore) CommitBatch(ctx context.Context, tenantID string, req domain.C
 			return fmt.Errorf("insert landing object: %w", err)
 		}
 		out = got
+		if approvedRelease != nil {
+			if err := consumeRelease(ctx, tx, tenantID, releasedItem, approvedRelease, landingID, actor); err != nil {
+				return err
+			}
+		}
 
 		// Advance the checkpoint to the caller's declared next position —
 		// the whole point of the checkpoint existing, so a restart resumes
@@ -440,7 +456,18 @@ func (s *PgStore) ListQuarantineItems(ctx context.Context, tenantID, runID strin
 			}
 			out = append(out, *q)
 		}
-		return rows.Err()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		rows.Close()
+		for i := range out {
+			ledger, err := loadRunLedger(ctx, tx, out[i].QuarantineID)
+			if err != nil {
+				return err
+			}
+			out[i].ReleaseState = domain.DeriveRunReleaseState(ledger)
+		}
+		return nil
 	})
 	return out, err
 }

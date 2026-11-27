@@ -126,6 +126,9 @@ func (r RulesInput) RuleSet() (RuleSet, error) {
 	if err := r.ExceptionPolicy.Validate(); err != nil {
 		return RuleSet{}, err
 	}
+	if err := r.CertificationProfile.Validate(); err != nil {
+		return RuleSet{}, err
+	}
 	rs := RuleSet{Populations: r.Populations, MatchKeyFields: r.MatchKeyFields, BalanceDimensions: r.BalanceDimensions,
 		AmountScale: *r.AmountScale, Tolerance: r.Tolerance, Materiality: r.Materiality, ExceptionPolicy: *r.ExceptionPolicy,
 		CertificationProfile: r.CertificationProfile}

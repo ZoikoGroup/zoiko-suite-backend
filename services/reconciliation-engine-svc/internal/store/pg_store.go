@@ -42,14 +42,26 @@ type Store interface {
 		failure domain.RunFailure, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
 	Match(ctx context.Context, tenantID, runID string, req domain.MatchRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
 	RaiseException(ctx context.Context, tenantID, runID string, req domain.RaiseExceptionRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationException, error)
+	// PriorClosing is the closing balance the latest certified, not-revoked run of the same
+	// entity, population and side declared for a period ending before periodStart (nil if none).
+	PriorClosing(ctx context.Context, tenantID, legalEntityID, specRef, side, periodStart string) (*domain.PriorClosing, error)
 	Reperform(ctx context.Context, tenantID, runID string, pops []domain.FrozenPopulation, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
 	Certify(ctx context.Context, tenantID, runID string, actor string, authority *domain.AuthoritySnapshot, claim domain.IdempotencyClaim) (*domain.Certification, error)
+	// CertifyWithEvidence is Certify plus the optional references the certification
+	// binds (a lineage manifest). Certify is it with none.
+	CertifyWithEvidence(ctx context.Context, tenantID, runID string, actor string, authority *domain.AuthoritySnapshot, req domain.CertifyRequest, claim domain.IdempotencyClaim) (*domain.Certification, error)
 	RevokeCertification(ctx context.Context, tenantID, runID string, req domain.RevokeCertificationRequest, actor string,
 		authority *domain.AuthoritySnapshot, claim domain.IdempotencyClaim) (*domain.CertificationRevocation, error)
+	RecordReliance(ctx context.Context, tenantID, runID, actor string, req domain.RecordRelianceRequest) (*domain.CertificationReliance, bool, error)
+	GetBlastRadius(ctx context.Context, tenantID, runID string) (*domain.BlastRadius, error)
+	GetRelianceStanding(ctx context.Context, tenantID, legalEntityID string, subj domain.RelianceSubject) (*domain.RelianceStanding, error)
 	SupersedeRun(ctx context.Context, tenantID, runID string, req domain.SupersedeRunRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
 
 	GetRun(ctx context.Context, tenantID, runID string) (*domain.ReconciliationRun, error)
 	GetPopulationSnapshots(ctx context.Context, tenantID, runID string) ([]domain.PopulationSnapshot, error)
+	// VerifyPopulationHashes re-derives every snapshot's content hash from its frozen
+	// items, under the algorithm and serialization recorded with it (INV-24).
+	VerifyPopulationHashes(ctx context.Context, tenantID, runID string) ([]domain.PopulationHashCheck, error)
 	GetMatchResults(ctx context.Context, tenantID, runID string) ([]domain.MatchResult, error)
 	GetExceptions(ctx context.Context, tenantID, runID string) ([]domain.ReconciliationException, error)
 	GetCertification(ctx context.Context, tenantID, runID string) (*domain.Certification, error)
@@ -65,10 +77,11 @@ type Store interface {
 type PgStore struct {
 	pool        *pgxpool.Pool
 	eventRegion string
+	now         func() time.Time
 }
 
 func NewPgStore(pool *pgxpool.Pool, opts ...Option) *PgStore {
-	s := &PgStore{pool: pool}
+	s := &PgStore{pool: pool, now: func() time.Time { return time.Now().UTC() }}
 	for _, o := range opts {
 		o(s)
 	}
@@ -589,14 +602,35 @@ func freezePopulation(ctx context.Context, tx pgx.Tx, tenantID, runID string, sc
 	if err != nil {
 		return fmt.Errorf("encode declared totals: %w", err)
 	}
+	// The optional declared controls are frozen with the snapshot, with what re-performing each
+	// concluded. A population frozen without outcomes would claim nothing was checked, so the
+	// outcomes must be present exactly when controls were looked at (they always are on the
+	// source path); a hand-built population with neither is stored as such.
+	completeness := domain.ScopeFull
+	if pop.Controls.Partial() {
+		completeness = domain.ScopePartial
+	}
+	controlsJSON, err := json.Marshal(pop.Controls)
+	if err != nil {
+		return fmt.Errorf("encode declared controls: %w", err)
+	}
+	if pop.ControlOutcomes == nil {
+		pop.ControlOutcomes = []domain.ControlOutcome{}
+	}
+	outcomesJSON, err := json.Marshal(pop.ControlOutcomes)
+	if err != nil {
+		return fmt.Errorf("encode control outcomes: %w", err)
+	}
 
 	snapshotID := newID(domain.PrefixSnapshot)
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO population_snapshots (snapshot_id, tenant_id, run_id, side, generation, source_system, spec_ref, source_watermark,
-			item_count, amount_scale, control_totals, declared_row_count, declared_totals, content_hash)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+			item_count, amount_scale, control_totals, declared_row_count, declared_totals, content_hash,
+			hash_algorithm, hash_serialization, completeness, declared_controls, control_outcomes)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`,
 		snapshotID, tenantID, runID, pop.Side, generation, pop.SourceSystem, pop.SpecRef, pop.Watermark,
-		len(pop.Items), scale, controlJSON, pop.DeclaredRowCount, declaredJSON, domain.HashPopulation(pop.Items)); err != nil {
+		len(pop.Items), scale, controlJSON, pop.DeclaredRowCount, declaredJSON, domain.HashPopulation(pop.Items),
+		domain.PopulationHashAlgorithm, domain.PopulationHashSerialization, completeness, controlsJSON, outcomesJSON); err != nil {
 		return fmt.Errorf("freeze population snapshot: %w", err)
 	}
 
@@ -705,7 +739,7 @@ func insertItemException(ctx context.Context, tx pgx.Tx, tenantID string, run *d
 	return nil
 }
 
-func insertBalanceException(ctx context.Context, tx pgx.Tx, tenantID string, run *domain.ReconciliationRun, actor, sideA, sideB string, v domain.BalanceVariance) error {
+func insertBalanceException(ctx context.Context, tx pgx.Tx, tenantID string, run *domain.ReconciliationRun, generation int, actor, sideA, sideB string, v domain.BalanceVariance) error {
 	scope := "population"
 	if v.Dimension != "" {
 		scope = fmt.Sprintf("%s=%q", v.Dimension, v.DimensionValue)
@@ -724,13 +758,16 @@ func insertBalanceException(ctx context.Context, tx pgx.Tx, tenantID string, run
 		return err
 	}
 	args := append([]any{newID(domain.PrefixException), tenantID, run.RunID, v.Currency, v.Dimension, v.DimensionValue, reason,
-		v.Difference, detail, actor}, g.values()...)
-	// Raised once per run, currency and bucket however often matching is re-run.
+		v.Difference, detail, actor, generation}, g.values()...)
+	// Raised once per run, currency, bucket and snapshot generation however often
+	// matching is re-run within that generation. A re-test that finds the same bucket
+	// again, with whatever numbers, is a NEW generation's exception beside the
+	// superseded old one (migration 000014) — it is never silently dropped.
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO reconciliation_exceptions (exception_id, tenant_id, run_id, kind, currency, dimension, dimension_value, reason,
-			amount_minor_units, detail, raised_by, `+governanceInsertColumns+`)
-		VALUES ($1, $2, $3, 'BALANCE', $4, $5, $6, $7, $8, $9, $10, `+governancePlaceholders(11)+`)
-		ON CONFLICT (run_id, currency, dimension, dimension_value) WHERE kind = 'BALANCE' DO NOTHING`, args...); err != nil {
+			amount_minor_units, detail, raised_by, raised_generation, `+governanceInsertColumns+`)
+		VALUES ($1, $2, $3, 'BALANCE', $4, $5, $6, $7, $8, $9, $10, $11, `+governancePlaceholders(12)+`)
+		ON CONFLICT (run_id, currency, dimension, dimension_value, raised_generation) WHERE kind = 'BALANCE' DO NOTHING`, args...); err != nil {
 		return fmt.Errorf("raise balance exception: %w", err)
 	}
 	return nil
@@ -752,6 +789,10 @@ func runAutoMatch(ctx context.Context, tx pgx.Tx, tenantID, actor string, run *d
 		return domain.ErrLegacyRecord
 	}
 	sideA, sideB, err := runSides(ctx, tx, run.RunID)
+	if err != nil {
+		return err
+	}
+	generation, err := currentGeneration(ctx, tx, run.RunID)
 	if err != nil {
 		return err
 	}
@@ -799,11 +840,89 @@ func runAutoMatch(ctx context.Context, tx pgx.Tx, tenantID, actor string, run *d
 		return err
 	}
 	for _, v := range variances {
-		if err := insertBalanceException(ctx, tx, tenantID, run, actor, sideA, sideB, v); err != nil {
+		if err := insertBalanceException(ctx, tx, tenantID, run, generation, actor, sideA, sideB, v); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// currentGeneration is the run's latest snapshot generation: the evidence matching,
+// totals and certification are always about.
+func currentGeneration(ctx context.Context, tx pgx.Tx, runID string) (int, error) {
+	var g int
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(generation), 0) FROM population_snapshots WHERE run_id = $1`, runID).Scan(&g); err != nil {
+		return 0, fmt.Errorf("load current generation: %w", err)
+	}
+	if g < 1 {
+		return 0, fmt.Errorf("reconciliation run %s has no frozen population", runID)
+	}
+	return g, nil
+}
+
+// supersedeEarlierGenerations is the re-test's effect on the findings it replaces
+// (ZS-SVC-Z-001 DQC-05 "Re-test", INV-23; migration 000014). Every exception still
+// being worked that was raised under a generation EARLIER than `generation` is
+// moved to SUPERSEDED, with who, when, by which generation and why — nothing is
+// deleted, and the new generation's own matching (which has already run) is what
+// defines the live exception set: a break the re-read still finds is raised again
+// on the new evidence, one it no longer finds simply ends.
+//
+// ACCEPTED_RISK and CLOSED exceptions are left exactly as they are: acceptance is
+// final (INV-19) and a closure rests on a manual match that really happened.
+// An item exception's generation is its item's snapshot's; a balance exception's is
+// the one it recorded when raised.
+func (s *PgStore) supersedeEarlierGenerations(ctx context.Context, tx pgx.Tx, tenantID string, run *domain.ReconciliationRun,
+	generation int, actor string, claim domain.IdempotencyClaim) (int, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT e.exception_id, e.status, e.owner_principal, COALESCE(ps.generation, e.raised_generation) AS from_generation
+		FROM reconciliation_exceptions e
+		LEFT JOIN population_items pi ON pi.item_id = e.item_id
+		LEFT JOIN population_snapshots ps ON ps.snapshot_id = pi.snapshot_id
+		WHERE e.run_id = $1 AND e.status IN ('OPEN', 'INVESTIGATING', 'REMEDIATED')
+		  AND COALESCE(ps.generation, e.raised_generation) < $2
+		ORDER BY e.exception_id
+		FOR UPDATE OF e`, run.RunID, generation)
+	if err != nil {
+		return 0, fmt.Errorf("load earlier-generation exceptions: %w", err)
+	}
+	type earlier struct {
+		id             string
+		status         domain.ExceptionStatus
+		owner          *string
+		fromGeneration int
+	}
+	var found []earlier
+	for rows.Next() {
+		var e earlier
+		if err := rows.Scan(&e.id, &e.status, &e.owner, &e.fromGeneration); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		found = append(found, e)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	for _, e := range found {
+		reason := fmt.Sprintf("superseded by the generation %d re-test: raised on generation %d evidence; generation %d's own matching defines the live exceptions",
+			generation, e.fromGeneration, generation)
+		got, err := scanException(tx.QueryRow(ctx, `
+			UPDATE reconciliation_exceptions
+			   SET status = 'SUPERSEDED', superseded_at = NOW(), superseded_by = $2, superseded_by_generation = $3, superseded_reason = $4
+			 WHERE exception_id = $1 RETURNING `+exceptionColumns, e.id, actor, generation, reason))
+		if err != nil {
+			return 0, fmt.Errorf("supersede exception: %w", err)
+		}
+		if err := insertExceptionTransition(ctx, tx, tenantID, e.id, e.status, domain.ExceptionSuperseded, e.owner, reason, nil, actor); err != nil {
+			return 0, err
+		}
+		if err := s.enqueueEvent(ctx, tx, evBreakStatusChanged, tenantID, run.LegalEntityID, e.id, actor, claim, got); err != nil {
+			return 0, err
+		}
+	}
+	return len(found), nil
 }
 
 func openRunStatuses() map[domain.RunStatus]bool {
@@ -1241,7 +1360,15 @@ func (s *PgStore) Reperform(ctx context.Context, tenantID, runID string, pops []
 			return err
 		}
 
+		superseded, err := s.supersedeEarlierGenerations(ctx, tx, tenantID, run, generation, actor, claim)
+		if err != nil {
+			return err
+		}
+
 		reason := fmt.Sprintf("reperformed against generation %d (%s)", generation, note)
+		if superseded > 0 {
+			reason += fmt.Sprintf("; superseded %d exception(s) raised on earlier generations", superseded)
+		}
 		updated, err := settleResult(ctx, tx, tenantID, run, domain.RunReperformed, reason, actor)
 		if err != nil {
 			return err
@@ -1256,15 +1383,23 @@ func (s *PgStore) Reperform(ctx context.Context, tenantID, runID string, pops []
 
 const certificationColumns = `certification_id, tenant_id, run_id, definition_version, matched_count, exception_count,
 	total_asserted_minor_units, control_totals, result_state, assessment, authority_snapshot, populations, manual_matches,
-	manifest_sha256, sealed_at, sealed_by`
+	manifest_sha256, sealed_at, sealed_by,
+	basis_sha256, lineage_manifest_id, lineage_manifest_sha256, evidence_oldest_at, evidence_max_age_seconds,
+	manifest_serialization`
 
 func scanCertification(row pgx.Row) (*domain.Certification, error) {
 	var c domain.Certification
 	var totals, assessment, authority, populations, manual []byte
+	var basis *string
 	if err := row.Scan(&c.CertificationID, &c.TenantID, &c.RunID, &c.DefinitionVersion, &c.MatchedCount, &c.ExceptionCount,
 		&c.TotalAssertedMinor, &totals, &c.ResultState, &assessment, &authority, &populations, &manual,
-		&c.ManifestSHA256, &c.SealedAt, &c.SealedBy); err != nil {
+		&c.ManifestSHA256, &c.SealedAt, &c.SealedBy,
+		&basis, &c.LineageManifestID, &c.LineageManifestSHA256, &c.EvidenceOldestAt, &c.EvidenceMaxAgeSeconds,
+		&c.ManifestSerialization); err != nil {
 		return nil, err
+	}
+	if basis != nil {
+		c.BasisSHA256 = *basis
 	}
 	// Certifications sealed before migration 000010 have none of the three; none
 	// is reconstructed.
@@ -1299,6 +1434,17 @@ func scanCertification(row pgx.Row) (*domain.Certification, error) {
 }
 
 type certificationManifest struct {
+	// How this manifest is encoded before it is hashed (INV-24).
+	ManifestSerialization string `json:"manifest_serialization"`
+	// What the certification rests on, and the freshness state it was issued
+	// under (DQC-05, TC-13, section 11).
+	BasisSHA256           string     `json:"basis_sha256"`
+	EvidenceOldestAt      *time.Time `json:"evidence_oldest_at"`
+	EvidenceMaxAgeSeconds *int64     `json:"evidence_max_age_seconds,omitempty"`
+	EvidenceAgeSeconds    int64      `json:"evidence_age_seconds_at_certification"`
+	LineageManifestID     *string    `json:"lineage_manifest_id,omitempty"`
+	LineageManifestSHA256 *string    `json:"lineage_manifest_sha256,omitempty"`
+
 	RunID                string                            `json:"run_id"`
 	DefinitionVersion    int64                             `json:"definition_version"`
 	RulesSHA256          string                            `json:"rules_sha256"`
@@ -1370,9 +1516,14 @@ func certifiedPopulations(ctx context.Context, tx pgx.Tx, runID string) ([]domai
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, domain.CertifiedPopulation{SnapshotID: p.SnapshotID, Side: p.Side, Generation: p.Generation,
+		cp := domain.CertifiedPopulation{SnapshotID: p.SnapshotID, Side: p.Side, Generation: p.Generation,
 			SourceSystem: p.SourceSystem, SpecRef: p.SpecRef, SourceWatermark: p.SourceWatermark, ItemCount: p.ItemCount,
-			DeclaredRowCount: p.DeclaredRowCount, DeclaredTotals: p.DeclaredTotals, ContentHash: p.ContentHash})
+			DeclaredRowCount: p.DeclaredRowCount, DeclaredTotals: p.DeclaredTotals, ContentHash: p.ContentHash,
+			FrozenAt: p.CreatedAt.UTC(), HashAlgorithm: p.HashAlgorithm, HashSerialization: p.HashSerialization}
+		if !p.DeclaredControls.IsZero() || len(p.ControlOutcomes) > 0 {
+			cp.Completeness, cp.DeclaredControls, cp.ControlOutcomes = p.Completeness, &p.DeclaredControls, p.ControlOutcomes
+		}
+		out = append(out, cp)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -1462,6 +1613,22 @@ func runPreparers(ctx context.Context, tx pgx.Tx, run *domain.ReconciliationRun)
 // traceable, or nothing is certified.
 func (s *PgStore) Certify(ctx context.Context, tenantID, runID string, actor string, authority *domain.AuthoritySnapshot,
 	claim domain.IdempotencyClaim) (*domain.Certification, error) {
+	return s.CertifyWithEvidence(ctx, tenantID, runID, actor, authority, domain.CertifyRequest{}, claim)
+}
+
+// CertifyWithEvidence is Certify plus the freshness check and certification
+// basis (ZS-SVC-Z-001 DQC-05, TC-13, section 11):
+//
+//   - if the run's pinned certification profile declares a freshness window, the
+//     run is refused once its oldest frozen population is older than it;
+//   - the certification seals a basis hash of WHAT it certifies, independent of
+//     the run, the certifier and the seal time, unique per tenant;
+//   - an optional lineage manifest reference is bound into that basis.
+func (s *PgStore) CertifyWithEvidence(ctx context.Context, tenantID, runID string, actor string, authority *domain.AuthoritySnapshot,
+	req domain.CertifyRequest, claim domain.IdempotencyClaim) (*domain.Certification, error) {
+	if err := req.Validate(); err != nil {
+		return nil, err
+	}
 	if !authority.Traceable(actor) {
 		return nil, domain.ErrAuthorityUntraceable
 	}
@@ -1515,7 +1682,7 @@ func (s *PgStore) Certify(ctx context.Context, tenantID, runID string, actor str
 		if err := tx.QueryRow(ctx, `SELECT count(*) FROM match_results WHERE run_id = $1`, runID).Scan(&matchedCount); err != nil {
 			return err
 		}
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM reconciliation_exceptions WHERE run_id = $1`, runID).Scan(&exceptionCount); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM reconciliation_exceptions WHERE run_id = $1 AND status <> 'SUPERSEDED'`, runID).Scan(&exceptionCount); err != nil {
 			return err
 		}
 		totals, err := sideControlTotals(ctx, tx, runID)
@@ -1547,8 +1714,46 @@ func (s *PgStore) Certify(ctx context.Context, tenantID, runID string, actor str
 			return fmt.Errorf("encode manual matches: %w", err)
 		}
 
-		sealedAt := time.Now().UTC()
+		sealedAt := s.now().UTC()
+
+		// Freshness (DQC-05, NP-43, DQC-016): evidence is as old as its oldest
+		// frozen side. Only a profile that declares a window is held to one — a
+		// profile written before the field existed keeps its behaviour — and the
+		// remedy is a Reperform, which freezes new evidence as a recorded fact.
+		oldest := populations[0].FrozenAt
+		for _, p := range populations[1:] {
+			if p.FrozenAt.Before(oldest) {
+				oldest = p.FrozenAt
+			}
+		}
+		var maxAgeSeconds *int64
+		if run.CertificationProfile != nil && run.CertificationProfile.MaxEvidenceAgeSeconds != nil {
+			maxAgeSeconds = run.CertificationProfile.MaxEvidenceAgeSeconds
+			if age := sealedAt.Sub(oldest); age > time.Duration(*maxAgeSeconds)*time.Second {
+				return fmt.Errorf("%w: evidence is %s old, the profile allows %ds", domain.ErrEvidenceStale,
+					age.Round(time.Second), *maxAgeSeconds)
+			}
+		}
+
+		// The basis: WHAT is certified, independent of run, certifier and time.
+		basisSHA256, err := certificationBasisHash(tenantID, run, matchedCount, exceptionCount, int64(len(manual)), totals, populations, req)
+		if err != nil {
+			return err
+		}
+		var existingID string
+		switch err := tx.QueryRow(ctx, `SELECT certification_id FROM certifications WHERE tenant_id = $1 AND basis_sha256 = $2`,
+			tenantID, basisSHA256).Scan(&existingID); {
+		case err == nil:
+			return fmt.Errorf("%w: %s", domain.ErrCertificationBasisExists, existingID)
+		case !errors.Is(err, pgx.ErrNoRows):
+			return err
+		}
+		oldestUTC := oldest.UTC()
 		manifest, err := json.Marshal(certificationManifest{
+			ManifestSerialization: domain.CertificationManifestSerialization,
+			BasisSHA256:           basisSHA256, EvidenceOldestAt: &oldestUTC, EvidenceMaxAgeSeconds: maxAgeSeconds,
+			EvidenceAgeSeconds: int64(sealedAt.Sub(oldest) / time.Second),
+			LineageManifestID:  req.LineageManifestID, LineageManifestSHA256: req.LineageManifestSHA256,
 			RunID: runID, DefinitionVersion: run.DefinitionVersion, RulesSHA256: run.RulesSHA256, AmountScale: run.AmountScale, Tolerance: run.Tolerance,
 			MatchKeyFields: run.MatchKeyFields, BalanceDimensions: run.BalanceDimensions,
 			Materiality: run.Materiality, CertificationProfile: run.CertificationProfile, ResultState: run.ResultState,
@@ -1564,12 +1769,21 @@ func (s *PgStore) Certify(ctx context.Context, tenantID, runID string, actor str
 		cert, err := scanCertification(tx.QueryRow(ctx, `
 			INSERT INTO certifications (certification_id, tenant_id, run_id, definition_version, matched_count,
 				exception_count, control_totals, result_state, assessment, authority_snapshot, populations, manual_matches,
-				manifest_sha256, sealed_at, sealed_by)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+				manifest_sha256, sealed_at, sealed_by,
+				basis_sha256, lineage_manifest_id, lineage_manifest_sha256, evidence_oldest_at, evidence_max_age_seconds, manifest_serialization)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
 			RETURNING `+certificationColumns,
 			certID, tenantID, runID, run.DefinitionVersion, matchedCount, exceptionCount, totalsJSON, string(run.ResultState),
-			assessmentJSON, authorityJSON, populationsJSON, manualJSON, sha256Hex(manifest), sealedAt, actor))
+			assessmentJSON, authorityJSON, populationsJSON, manualJSON, sha256Hex(manifest), sealedAt, actor,
+			basisSHA256, req.LineageManifestID, req.LineageManifestSHA256, oldestUTC, maxAgeSeconds,
+			domain.CertificationManifestSerialization))
 		if err != nil {
+			// The pre-check covers the common case; this covers two
+			// certifications of one basis racing each other.
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "uq_certifications_basis" {
+				return domain.ErrCertificationBasisExists
+			}
 			return fmt.Errorf("seal certification: %w", err)
 		}
 
@@ -1689,15 +1903,23 @@ func (s *PgStore) SupersedeRun(ctx context.Context, tenantID, runID string, req 
 // ── Read surfaces ────────────────────────────────────────────────────────────
 
 const snapshotColumns = `snapshot_id, tenant_id, run_id, side, generation, source_system, spec_ref, source_watermark, item_count, amount_scale,
-	total_amount_minor_units, control_totals, declared_row_count, declared_totals, content_hash, created_at`
+	total_amount_minor_units, control_totals, declared_row_count, declared_totals, content_hash, created_at,
+	hash_algorithm, hash_serialization, completeness, declared_controls, control_outcomes`
 
 func scanSnapshot(row pgx.Row) (*domain.PopulationSnapshot, error) {
 	var p domain.PopulationSnapshot
 	var specRef, watermark *string
-	var control, declared []byte
+	var control, declared, controls, outcomes []byte
 	if err := row.Scan(&p.SnapshotID, &p.TenantID, &p.RunID, &p.Side, &p.Generation, &p.SourceSystem, &specRef, &watermark, &p.ItemCount,
-		&p.AmountScale, &p.TotalAmountMinorUnits, &control, &p.DeclaredRowCount, &declared, &p.ContentHash, &p.CreatedAt); err != nil {
+		&p.AmountScale, &p.TotalAmountMinorUnits, &control, &p.DeclaredRowCount, &declared, &p.ContentHash, &p.CreatedAt,
+		&p.HashAlgorithm, &p.HashSerialization, &p.Completeness, &controls, &outcomes); err != nil {
 		return nil, err
+	}
+	if err := json.Unmarshal(controls, &p.DeclaredControls); err != nil {
+		return nil, fmt.Errorf("decode declared controls: %w", err)
+	}
+	if err := json.Unmarshal(outcomes, &p.ControlOutcomes); err != nil {
+		return nil, fmt.Errorf("decode control outcomes: %w", err)
 	}
 	if specRef != nil {
 		p.SpecRef = *specRef
@@ -1807,4 +2029,168 @@ func (s *PgStore) GetTransitions(ctx context.Context, tenantID, runID string) ([
 		return rows.Err()
 	})
 	return out, err
+}
+
+// certificationBasis is the canonical content hashed into basis_sha256: WHAT was
+// certified — the pinned rules, the frozen populations by content, the result and
+// the lineage reference — and deliberately NOT the run id, snapshot ids,
+// generation, the certifier, the authority decision or any timestamp. Two
+// certifications over the same evidence therefore share a basis wherever and
+// whenever they are sealed. Struct field order is fixed; maps encode sorted.
+type certificationBasis struct {
+	TenantID             string                            `json:"tenant_id"`
+	DefinitionVersion    int64                             `json:"definition_version"`
+	RulesSHA256          string                            `json:"rules_sha256"`
+	AmountScale          int                               `json:"amount_scale"`
+	Tolerance            *domain.TolerancePolicy           `json:"tolerance"`
+	MatchKeyFields       []string                          `json:"match_key_fields"`
+	BalanceDimensions    []string                          `json:"balance_dimensions"`
+	Materiality          *domain.MaterialityPolicy         `json:"materiality"`
+	CertificationProfile *domain.CertificationProfile      `json:"certification_profile"`
+	ResultState          domain.ResultState                `json:"result_state"`
+	MatchedCount         int64                             `json:"matched_count"`
+	ExceptionCount       int64                             `json:"exception_count"`
+	ManualMatchCount     int64                             `json:"manual_match_count"`
+	ControlTotals        map[string][]domain.CurrencyTotal `json:"control_totals"`
+	Populations          []basisPopulation                 `json:"populations"`
+	LineageManifestID    string                            `json:"lineage_manifest_id"`
+	LineageManifestSHA   string                            `json:"lineage_manifest_sha256"`
+}
+
+type basisPopulation struct {
+	Side             string            `json:"side"`
+	SourceSystem     string            `json:"source_system"`
+	SpecRef          string            `json:"spec_ref"`
+	SourceWatermark  string            `json:"source_watermark"`
+	ItemCount        int64             `json:"item_count"`
+	DeclaredRowCount *int64            `json:"declared_row_count"`
+	DeclaredTotals   map[string]string `json:"declared_totals"`
+	ContentHash      string            `json:"content_hash"`
+	// A different serialization is different evidence of the same content.
+	HashAlgorithm     string `json:"hash_algorithm"`
+	HashSerialization string `json:"hash_serialization"`
+	// What the source declared beyond its totals. Omitted when it declared nothing, so the
+	// basis of evidence without declared controls is byte for byte what it was before.
+	DeclaredControls *domain.DeclaredControls `json:"declared_controls,omitempty"`
+}
+
+func certificationBasisHash(tenantID string, run *domain.ReconciliationRun, matched, exceptions, manualMatches int64,
+	totals map[string][]domain.CurrencyTotal, populations []domain.CertifiedPopulation, req domain.CertifyRequest) (string, error) {
+	b := certificationBasis{
+		TenantID: tenantID, DefinitionVersion: run.DefinitionVersion, RulesSHA256: run.RulesSHA256, AmountScale: run.AmountScale,
+		Tolerance: run.Tolerance, MatchKeyFields: run.MatchKeyFields, BalanceDimensions: run.BalanceDimensions,
+		Materiality: run.Materiality, CertificationProfile: run.CertificationProfile, ResultState: run.ResultState,
+		MatchedCount: matched, ExceptionCount: exceptions, ManualMatchCount: manualMatches, ControlTotals: totals,
+	}
+	if req.LineageManifestID != nil {
+		b.LineageManifestID, b.LineageManifestSHA = *req.LineageManifestID, *req.LineageManifestSHA256
+	}
+	for _, p := range populations {
+		bp := basisPopulation{Side: p.Side, SourceSystem: p.SourceSystem, SpecRef: p.SpecRef,
+			SourceWatermark: p.SourceWatermark, ItemCount: p.ItemCount, DeclaredRowCount: p.DeclaredRowCount,
+			DeclaredTotals: p.DeclaredTotals, ContentHash: p.ContentHash,
+			HashAlgorithm: p.HashAlgorithm, HashSerialization: p.HashSerialization}
+		if p.DeclaredControls != nil && !p.DeclaredControls.IsZero() {
+			bp.DeclaredControls = p.DeclaredControls
+		}
+		b.Populations = append(b.Populations, bp)
+	}
+	sort.Slice(b.Populations, func(i, j int) bool { return b.Populations[i].Side < b.Populations[j].Side })
+	raw, err := json.Marshal(b)
+	if err != nil {
+		return "", fmt.Errorf("encode certification basis: %w", err)
+	}
+	return sha256Hex(raw), nil
+}
+
+// VerifyPopulationHashes re-derives the content hash of every snapshot of the run
+// (every side, every generation) from its frozen items, under the algorithm and
+// serialization recorded with it, and reports each. A hash is evidence only if
+// this can be done: it is how a restore, a replay or a tampered row is caught
+// (ZS-SVC-Z-001 INV-24, NP-60, TC-19). A snapshot made under a format this build
+// does not know is reported as NOT verified, with the reason — never assumed to
+// match (INV-15).
+func (s *PgStore) VerifyPopulationHashes(ctx context.Context, tenantID, runID string) ([]domain.PopulationHashCheck, error) {
+	var out []domain.PopulationHashCheck
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM reconciliation_runs WHERE tenant_id = $1 AND run_id = $2)`,
+			tenantID, runID).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			return domain.ErrRunNotFound
+		}
+		rows, err := tx.Query(ctx, `SELECT `+snapshotColumns+` FROM population_snapshots WHERE tenant_id = $1 AND run_id = $2 ORDER BY side, generation`,
+			tenantID, runID)
+		if err != nil {
+			return err
+		}
+		var snaps []domain.PopulationSnapshot
+		for rows.Next() {
+			p, err := scanSnapshot(rows)
+			if err != nil {
+				rows.Close()
+				return err
+			}
+			snaps = append(snaps, *p)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, p := range snaps {
+			check := domain.PopulationHashCheck{SnapshotID: p.SnapshotID, Side: p.Side, Generation: p.Generation,
+				HashAlgorithm: p.HashAlgorithm, HashSerialization: p.HashSerialization, StoredHash: p.ContentHash}
+			items, err := loadSnapshotItems(ctx, tx, p.SnapshotID)
+			if err != nil {
+				return err
+			}
+			got, err := domain.RecomputePopulationHash(p.HashAlgorithm, p.HashSerialization, items)
+			switch {
+			case errors.Is(err, domain.ErrUnknownHashFormat):
+				check.Reason = err.Error()
+			case err != nil:
+				return err
+			default:
+				check.RecomputedHash = got
+				check.Verified = got == p.ContentHash
+				if !check.Verified {
+					check.Reason = "the frozen items no longer hash to the recorded content hash"
+				}
+			}
+			out = append(out, check)
+		}
+		return nil
+	})
+	return out, err
+}
+
+// loadSnapshotItems reads a snapshot's frozen items back in the shape that was hashed.
+func loadSnapshotItems(ctx context.Context, tx pgx.Tx, snapshotID string) ([]domain.PopulationItemInput, error) {
+	rows, err := tx.Query(ctx, `SELECT source_record_id, ref_id, amount_minor_units, currency, occurred_at, dimensions
+		FROM population_items WHERE snapshot_id = $1`, snapshotID)
+	if err != nil {
+		return nil, fmt.Errorf("load snapshot items: %w", err)
+	}
+	defer rows.Close()
+	var out []domain.PopulationItemInput
+	for rows.Next() {
+		var it domain.PopulationItemInput
+		var sourceID *string
+		var dims []byte
+		if err := rows.Scan(&sourceID, &it.RefID, &it.AmountMinorUnits, &it.Currency, &it.OccurredAt, &dims); err != nil {
+			return nil, err
+		}
+		if sourceID != nil {
+			it.SourceRecordID = *sourceID
+		}
+		if len(dims) > 0 {
+			if err := json.Unmarshal(dims, &it.Dimensions); err != nil {
+				return nil, fmt.Errorf("decode item dimensions: %w", err)
+			}
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
 }

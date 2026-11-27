@@ -1093,6 +1093,106 @@ groups:
           description: "Posting is one transaction; a slow one usually means lock contention on a period seal or an overloaded database."
 
   # ---------------------------------------------------------------------------
+  # Certification watch (general-ledger-svc, ZS-SVC-Z-001 RB-05 / DQC-017)
+  # ---------------------------------------------------------------------------
+  #
+  # The ledger finds out that a certification it relied on was revoked (a scheduled sweep, plus the issuing services' reliance-withdrawn
+  # events as a faster trigger) and flags every posted journal and posting that rests on it until a person decides. Two kinds of alert:
+  # the WATCH ITSELF failing (it is silent when it fails: no flag looks exactly like nothing to flag), and a FLAG existing (finance's).
+  #
+  # The sweep runs on one replica at a time (an advisory lock), so freshness is judged on the MAX across replicas.
+  #
+  # Runbook: docs/architecture/DQC_GAP_MATRIX.md, steps L, L2, L3, L4.
+  - name: gl-certification-watch
+    rules:
+      - alert: GLCertSweepStale
+        expr: >-
+          max(gl_cert_sweep_interval_seconds{service="general-ledger-svc"}) > 0
+          and (time() - max(gl_cert_sweep_last_success_timestamp_seconds{service="general-ledger-svc"}))
+              > 3 * max(gl_cert_sweep_interval_seconds{service="general-ledger-svc"})
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "general-ledger-svc: the certification sweep has not completed cleanly for three intervals"
+          description: >-
+            Until it does, a revoked certification is found only if a withdrawal event happens to arrive. Look at
+            gl_cert_sweep_runs_total by outcome: error means the pass could not run (database or lock); partial means every pass is
+            skipping a scope (GLCertSweepScopesUnauthorized) or cannot check a certification (GLCertSweepFailing); no runs at all
+            means the process is down. The schedule being off is reported as an interval of 0 and does not alert.
+
+      - alert: GLCertSweepScopesUnauthorized
+        expr: increase(gl_cert_sweep_scopes_total{service="general-ledger-svc",result="unauthorized"}[1h]) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "general-ledger-svc: the certification sweep principal is not authorized to sweep some legal entities"
+          description: >-
+            Those entities are NOT being checked: a revoked certification one of them relied on will go unflagged. Grant
+            CERT_SWEEP_PRINCIPAL_ID's principal GL_CERTIFICATION_WATCH_SWEEP on them (and read on the certifications). The log names
+            each skipped tenant and entity.
+
+      - alert: GLCertSweepFailing
+        expr: >-
+          increase(gl_cert_sweep_scopes_total{service="general-ledger-svc",result="error"}[30m]) > 0
+          or increase(gl_cert_sweep_certifications_unchecked_total{service="general-ledger-svc"}[30m]) > 0
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "general-ledger-svc: the certification sweep cannot check some certifications"
+          description: >-
+            An unchecked certification is never treated as in force, but it is not being verified either. Usually the issuing
+            service (data-quality-svc or reconciliation-engine-svc) is unreachable or the principal lacks read on the certification;
+            the log names each one. A scope error is a database failure for that entity.
+
+      - alert: GLCertFlagsRaised
+        expr: increase(gl_cert_flags_raised_total{service="general-ledger-svc"}[15m]) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "general-ledger-svc: journals or postings were flagged because a certification they rest on was revoked"
+          description: >-
+            This is a finance matter, not a fault. GET /v1/certification-flags?legal_entity_id=...&status=OPEN lists what is flagged and
+            why; each flag waits for a person to decide (reverse, correct, or accept) and acknowledge it with a reason. Nothing is
+            reversed automatically. The trigger label says how it was found: schedule, event or manual.
+
+      - alert: GLCertFlagAwaitingDecisionTooLong
+        expr: gl_cert_flags_oldest_open_age_seconds{service="general-ledger-svc"} > 7 * 24 * 3600
+        labels:
+          severity: ticket
+        annotations:
+          summary: "general-ledger-svc: a flag on a journal resting on a revoked certification has waited over seven days"
+          description: >-
+            Seven days is a default, to be set by the owner of the decision. The oldest open flag is the age shown; gl_cert_flags_open
+            is how many are waiting. A flag leaves both only when a person acknowledges it.
+
+      - alert: GLCertFlagStatsUnavailable
+        expr: gl_cert_flags_open{service="general-ledger-svc"} != gl_cert_flags_open{service="general-ledger-svc"}
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "general-ledger-svc: the open-flag gauges cannot be read"
+          description: >-
+            The gauges report NaN when their database read fails, never a reassuring zero, so GLCertFlagAwaitingDecisionTooLong cannot
+            fire while this does. Check the database; the log says "certification flag stats unavailable".
+
+      - alert: GLCertWithdrawalConsumerUnhealthy
+        expr: >-
+          increase(gl_cert_withdrawal_events_total{service="general-ledger-svc",result="failed"}[30m]) > 0
+          or rate(gl_cert_consumer_errors_total{service="general-ledger-svc",kind="read"}[10m]) > 0
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "general-ledger-svc: the certification withdrawal event consumer is failing"
+          description: >-
+            The scheduled sweep still finds revocations, only later, so this is not urgent while GLCertSweepStale is quiet. A read
+            error is the broker (or a topic that does not exist); a failed event is one that could not be checked after retries,
+            usually the issuing service or the database. The event is left to the sweep.
+
+  # ---------------------------------------------------------------------------
   # evidence-requirements-svc (Governance Platform 7/7)
   # ---------------------------------------------------------------------------
   #
