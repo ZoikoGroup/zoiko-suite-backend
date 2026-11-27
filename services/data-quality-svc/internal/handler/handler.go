@@ -70,6 +70,7 @@ func NewRouter(h *Handler) http.Handler {
 		registerRevocationRoutes(r, h)
 		registerFacadeRoutes(r, h)
 		registerRiskRoutes(r, h)
+		registerRelianceRoutes(r, h)
 	})
 
 	return r

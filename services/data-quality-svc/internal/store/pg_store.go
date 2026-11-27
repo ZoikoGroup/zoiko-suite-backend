@@ -54,6 +54,9 @@ type Store interface {
 	ApproveRiskAcceptance(ctx context.Context, tenantID, acceptanceID, actor string, req domain.ApproveRiskAcceptanceRequest, claim domain.IdempotencyClaim) (*domain.RiskAcceptance, error)
 	ListRiskAcceptances(ctx context.Context, tenantID, runID string) ([]domain.RiskAcceptance, error)
 	RevokeCertification(ctx context.Context, tenantID, runID, actor string, req domain.RevokeCertificationRequest, claim domain.IdempotencyClaim) (*domain.CertificationRevocation, error)
+	RecordReliance(ctx context.Context, tenantID, runID, actor string, req domain.RecordRelianceRequest) (*domain.CertificationReliance, bool, error)
+	GetBlastRadius(ctx context.Context, tenantID, runID string) (*domain.BlastRadius, error)
+	GetRelianceStanding(ctx context.Context, tenantID string, subj domain.RelianceSubject) (*domain.RelianceStanding, error)
 }
 
 // DefaultEvidenceMaxAge is the freshness window applied when none is configured:
@@ -1167,12 +1170,33 @@ func (s *PgStore) RevokeCertification(ctx context.Context, tenantID, runID, acto
 		if basis != nil {
 			basisStr = *basis
 		}
-		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "dq_certification", AggregateID: certID,
+		// The blast radius: everything recorded as relying on this certification. The count goes on the revocation
+		// itself, and each reliance gets its own event so the owning service learns that what it built on is withdrawn.
+		// The certification row is locked FOR UPDATE above and a reliance cannot be recorded once the revocation exists
+		// (service and trigger), so this is the complete set and no later reliance can be added to it.
+		rels, err := loadReliances(ctx, tx, certID)
+		if err != nil {
+			return err
+		}
+		if err := outbox.Insert(ctx, tx, outbox.Event{AggregateType: "dq_certification", AggregateID: certID,
 			EventType: "dqc.certification.revoked", TenantID: &tenantID, Payload: map[string]any{
 				"revocation_id": rev.RevocationID, "certification_id": certID, "run_id": runID, "reason_code": rev.ReasonCode,
 				"reason": rev.Reason, "evidence_refs": rev.EvidenceRefs, "revoked_by": actor, "effective_from": rev.RevokedAt, "revoked_at": rev.RevokedAt,
-				"summary_sha256": summarySHA, "basis_sha256": basisStr,
-			}})
+				"summary_sha256": summarySHA, "basis_sha256": basisStr, "relying_count": len(rels),
+			}}); err != nil {
+			return err
+		}
+		for _, rl := range rels {
+			if err := outbox.Insert(ctx, tx, outbox.Event{AggregateType: "dq_certification", AggregateID: certID,
+				EventType: "dqc.certification.reliance-withdrawn", TenantID: &tenantID, Payload: map[string]any{
+					"reliance_id": rl.RelianceID, "certification_id": certID, "run_id": runID, "revocation_id": rev.RevocationID,
+					"relying_service": rl.RelyingService, "relying_object_type": rl.RelyingObjectType, "relying_object_id": rl.RelyingObjectID,
+					"reason_code": rev.ReasonCode, "effective_from": rev.RevokedAt,
+				}}); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	return out, err
 }

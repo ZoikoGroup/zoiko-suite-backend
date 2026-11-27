@@ -258,7 +258,9 @@ func (h *Handler) contractError(w http.ResponseWriter, err error) bool {
 		h.respondError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, domain.ErrCertificationAlreadyRevoked):
 		h.respondError(w, http.StatusConflict, err.Error())
-	case errors.Is(err, domain.ErrRevocationInvalid):
+	case errors.Is(err, domain.ErrRelianceInactive):
+		h.respondError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, domain.ErrRelianceInvalid), errors.Is(err, domain.ErrRevocationInvalid):
 		h.respondError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, domain.ErrContractNotIndependent), errors.Is(err, domain.ErrRevokerIsCertifier):
 		h.respondError(w, http.StatusForbidden, err.Error())

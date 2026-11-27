@@ -43,6 +43,7 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	_, _ = pool.Exec(ctx, `
+		DROP TABLE IF EXISTS dq_certification_reliances CASCADE;
 		DROP TABLE IF EXISTS dq_certifications CASCADE;
 		DROP FUNCTION IF EXISTS enforce_dq_certification_immutability() CASCADE;
 		DROP TABLE IF EXISTS dq_issues CASCADE;
