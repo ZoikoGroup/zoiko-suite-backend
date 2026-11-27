@@ -186,6 +186,17 @@ var registeredActionMigrations = []struct {
 		"DQC_RISK_REQUEST": "STANDARD",
 		"DQC_RISK_APPROVE": "CRITICAL",
 	}},
+	{"000064_register_dqc_reliance_action", "data-quality-svc", map[string]string{
+		"DQC_RELIANCE_RECORD": "STANDARD",
+	}},
+	{"000065_register_reconciliation_reliance_action", "reconciliation-engine-svc", map[string]string{
+		"RECONCILIATION_RELIANCE_RECORD": "STANDARD",
+	}},
+	{"000066_register_gl_certification_watch_actions", "general-ledger-svc", map[string]string{
+		"GL_CERTIFICATION_WATCH_SWEEP":      "STANDARD",
+		"GL_CERTIFICATION_FLAG_VIEW":        "STANDARD",
+		"GL_CERTIFICATION_FLAG_ACKNOWLEDGE": "HIGH",
+	}},
 }
 
 // templatePublishers are the migrations, in this list, that publish role
