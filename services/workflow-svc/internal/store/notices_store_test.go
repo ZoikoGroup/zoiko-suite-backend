@@ -313,12 +313,25 @@ func TestPgStore_RLS_NoticesAsTheRuntimeRole(t *testing.T) {
 	}
 	rows := noticesOf(t, admin, inst.WorkflowInstanceID)
 	wantTold(t, "quorum met", told(rows[4:]), "approver-2/workflow.approval_requested", "requester-1/workflow.stage_approved")
-	if !strings.HasPrefix(rows[4].Body, "Stage 1 was approved.") &&
-		!strings.HasPrefix(rows[4].Body, "Stage 1 of your request") &&
-		!strings.HasPrefix(rows[4].Body, "<p>Stage 1 of your request") {
-		t.Fatalf("unexpected body: %q", rows[4].Body)
+
+	// Row order inside one transition is not stable (all notices share a
+	// timestamp), so select the requester's notice instead of trusting an
+	// index: the quorum tally is synthetic and must never be quoted.
+	var requesterBodies []string
+	for _, r := range rows[4:] {
+		if strings.Contains(r.Body, "quorum vote") {
+			t.Fatal("the synthetic quorum tally is not a comment and must not be quoted")
+		}
+		if r.RecipientPrincipalID == "requester-1" && r.SourceEventType == "workflow.stage_approved" {
+			requesterBodies = append(requesterBodies, r.Body)
+		}
 	}
-	if strings.Contains(rows[4].Body+rows[6].Body, "quorum vote") {
-		t.Fatal("the synthetic quorum tally is not a comment and must not be quoted")
+	if len(requesterBodies) != 2 {
+		t.Fatalf("expected the requester's stage-approved notice on IN_APP and EMAIL, got %d", len(requesterBodies))
+	}
+	for _, body := range requesterBodies {
+		if !strings.HasPrefix(body, "Stage 1 of your request") && !strings.HasPrefix(body, "<p>Stage 1 of your request") {
+			t.Fatalf("unexpected body: %q", body)
+		}
 	}
 }
