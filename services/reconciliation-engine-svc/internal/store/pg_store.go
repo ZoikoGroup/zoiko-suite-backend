@@ -42,6 +42,9 @@ type Store interface {
 		failure domain.RunFailure, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
 	Match(ctx context.Context, tenantID, runID string, req domain.MatchRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
 	RaiseException(ctx context.Context, tenantID, runID string, req domain.RaiseExceptionRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationException, error)
+	// PriorClosing is the closing balance the latest certified, not-revoked run of the same
+	// entity, population and side declared for a period ending before periodStart (nil if none).
+	PriorClosing(ctx context.Context, tenantID, legalEntityID, specRef, side, periodStart string) (*domain.PriorClosing, error)
 	Reperform(ctx context.Context, tenantID, runID string, pops []domain.FrozenPopulation, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
 	Certify(ctx context.Context, tenantID, runID string, actor string, authority *domain.AuthoritySnapshot, claim domain.IdempotencyClaim) (*domain.Certification, error)
 	// CertifyWithEvidence is Certify plus the optional references the certification
@@ -49,6 +52,9 @@ type Store interface {
 	CertifyWithEvidence(ctx context.Context, tenantID, runID string, actor string, authority *domain.AuthoritySnapshot, req domain.CertifyRequest, claim domain.IdempotencyClaim) (*domain.Certification, error)
 	RevokeCertification(ctx context.Context, tenantID, runID string, req domain.RevokeCertificationRequest, actor string,
 		authority *domain.AuthoritySnapshot, claim domain.IdempotencyClaim) (*domain.CertificationRevocation, error)
+	RecordReliance(ctx context.Context, tenantID, runID, actor string, req domain.RecordRelianceRequest) (*domain.CertificationReliance, bool, error)
+	GetBlastRadius(ctx context.Context, tenantID, runID string) (*domain.BlastRadius, error)
+	GetRelianceStanding(ctx context.Context, tenantID, legalEntityID string, subj domain.RelianceSubject) (*domain.RelianceStanding, error)
 	SupersedeRun(ctx context.Context, tenantID, runID string, req domain.SupersedeRunRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
 
 	GetRun(ctx context.Context, tenantID, runID string) (*domain.ReconciliationRun, error)
@@ -596,16 +602,35 @@ func freezePopulation(ctx context.Context, tx pgx.Tx, tenantID, runID string, sc
 	if err != nil {
 		return fmt.Errorf("encode declared totals: %w", err)
 	}
+	// The optional declared controls are frozen with the snapshot, with what re-performing each
+	// concluded. A population frozen without outcomes would claim nothing was checked, so the
+	// outcomes must be present exactly when controls were looked at (they always are on the
+	// source path); a hand-built population with neither is stored as such.
+	completeness := domain.ScopeFull
+	if pop.Controls.Partial() {
+		completeness = domain.ScopePartial
+	}
+	controlsJSON, err := json.Marshal(pop.Controls)
+	if err != nil {
+		return fmt.Errorf("encode declared controls: %w", err)
+	}
+	if pop.ControlOutcomes == nil {
+		pop.ControlOutcomes = []domain.ControlOutcome{}
+	}
+	outcomesJSON, err := json.Marshal(pop.ControlOutcomes)
+	if err != nil {
+		return fmt.Errorf("encode control outcomes: %w", err)
+	}
 
 	snapshotID := newID(domain.PrefixSnapshot)
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO population_snapshots (snapshot_id, tenant_id, run_id, side, generation, source_system, spec_ref, source_watermark,
 			item_count, amount_scale, control_totals, declared_row_count, declared_totals, content_hash,
-			hash_algorithm, hash_serialization)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+			hash_algorithm, hash_serialization, completeness, declared_controls, control_outcomes)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`,
 		snapshotID, tenantID, runID, pop.Side, generation, pop.SourceSystem, pop.SpecRef, pop.Watermark,
 		len(pop.Items), scale, controlJSON, pop.DeclaredRowCount, declaredJSON, domain.HashPopulation(pop.Items),
-		domain.PopulationHashAlgorithm, domain.PopulationHashSerialization); err != nil {
+		domain.PopulationHashAlgorithm, domain.PopulationHashSerialization, completeness, controlsJSON, outcomesJSON); err != nil {
 		return fmt.Errorf("freeze population snapshot: %w", err)
 	}
 
@@ -1491,10 +1516,14 @@ func certifiedPopulations(ctx context.Context, tx pgx.Tx, runID string) ([]domai
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, domain.CertifiedPopulation{SnapshotID: p.SnapshotID, Side: p.Side, Generation: p.Generation,
+		cp := domain.CertifiedPopulation{SnapshotID: p.SnapshotID, Side: p.Side, Generation: p.Generation,
 			SourceSystem: p.SourceSystem, SpecRef: p.SpecRef, SourceWatermark: p.SourceWatermark, ItemCount: p.ItemCount,
 			DeclaredRowCount: p.DeclaredRowCount, DeclaredTotals: p.DeclaredTotals, ContentHash: p.ContentHash,
-			FrozenAt: p.CreatedAt.UTC(), HashAlgorithm: p.HashAlgorithm, HashSerialization: p.HashSerialization})
+			FrozenAt: p.CreatedAt.UTC(), HashAlgorithm: p.HashAlgorithm, HashSerialization: p.HashSerialization}
+		if !p.DeclaredControls.IsZero() || len(p.ControlOutcomes) > 0 {
+			cp.Completeness, cp.DeclaredControls, cp.ControlOutcomes = p.Completeness, &p.DeclaredControls, p.ControlOutcomes
+		}
+		out = append(out, cp)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -1875,16 +1904,22 @@ func (s *PgStore) SupersedeRun(ctx context.Context, tenantID, runID string, req 
 
 const snapshotColumns = `snapshot_id, tenant_id, run_id, side, generation, source_system, spec_ref, source_watermark, item_count, amount_scale,
 	total_amount_minor_units, control_totals, declared_row_count, declared_totals, content_hash, created_at,
-	hash_algorithm, hash_serialization`
+	hash_algorithm, hash_serialization, completeness, declared_controls, control_outcomes`
 
 func scanSnapshot(row pgx.Row) (*domain.PopulationSnapshot, error) {
 	var p domain.PopulationSnapshot
 	var specRef, watermark *string
-	var control, declared []byte
+	var control, declared, controls, outcomes []byte
 	if err := row.Scan(&p.SnapshotID, &p.TenantID, &p.RunID, &p.Side, &p.Generation, &p.SourceSystem, &specRef, &watermark, &p.ItemCount,
 		&p.AmountScale, &p.TotalAmountMinorUnits, &control, &p.DeclaredRowCount, &declared, &p.ContentHash, &p.CreatedAt,
-		&p.HashAlgorithm, &p.HashSerialization); err != nil {
+		&p.HashAlgorithm, &p.HashSerialization, &p.Completeness, &controls, &outcomes); err != nil {
 		return nil, err
+	}
+	if err := json.Unmarshal(controls, &p.DeclaredControls); err != nil {
+		return nil, fmt.Errorf("decode declared controls: %w", err)
+	}
+	if err := json.Unmarshal(outcomes, &p.ControlOutcomes); err != nil {
+		return nil, fmt.Errorf("decode control outcomes: %w", err)
 	}
 	if specRef != nil {
 		p.SpecRef = *specRef
@@ -2034,6 +2069,9 @@ type basisPopulation struct {
 	// A different serialization is different evidence of the same content.
 	HashAlgorithm     string `json:"hash_algorithm"`
 	HashSerialization string `json:"hash_serialization"`
+	// What the source declared beyond its totals. Omitted when it declared nothing, so the
+	// basis of evidence without declared controls is byte for byte what it was before.
+	DeclaredControls *domain.DeclaredControls `json:"declared_controls,omitempty"`
 }
 
 func certificationBasisHash(tenantID string, run *domain.ReconciliationRun, matched, exceptions, manualMatches int64,
@@ -2048,10 +2086,14 @@ func certificationBasisHash(tenantID string, run *domain.ReconciliationRun, matc
 		b.LineageManifestID, b.LineageManifestSHA = *req.LineageManifestID, *req.LineageManifestSHA256
 	}
 	for _, p := range populations {
-		b.Populations = append(b.Populations, basisPopulation{Side: p.Side, SourceSystem: p.SourceSystem, SpecRef: p.SpecRef,
+		bp := basisPopulation{Side: p.Side, SourceSystem: p.SourceSystem, SpecRef: p.SpecRef,
 			SourceWatermark: p.SourceWatermark, ItemCount: p.ItemCount, DeclaredRowCount: p.DeclaredRowCount,
 			DeclaredTotals: p.DeclaredTotals, ContentHash: p.ContentHash,
-			HashAlgorithm: p.HashAlgorithm, HashSerialization: p.HashSerialization})
+			HashAlgorithm: p.HashAlgorithm, HashSerialization: p.HashSerialization}
+		if p.DeclaredControls != nil && !p.DeclaredControls.IsZero() {
+			bp.DeclaredControls = p.DeclaredControls
+		}
+		b.Populations = append(b.Populations, bp)
 	}
 	sort.Slice(b.Populations, func(i, j int) bool { return b.Populations[i].Side < b.Populations[j].Side })
 	raw, err := json.Marshal(b)

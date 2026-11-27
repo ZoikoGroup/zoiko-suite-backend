@@ -244,6 +244,14 @@ type PopulationSnapshot struct {
 	HashAlgorithm     string    `json:"hash_algorithm"`
 	HashSerialization string    `json:"hash_serialization"`
 	CreatedAt         time.Time `json:"created_at"`
+	// Completeness is FULL (the whole in-scope population; every snapshot before migration
+	// 000016, and any source that declares nothing) or PARTIAL (the source declared a defined
+	// subset). DeclaredControls and ControlOutcomes are the optional controls the source declared
+	// and what re-performing each concluded (controls.go). A snapshot frozen before 000016 has
+	// no outcomes: nothing was checked, and that is what the empty list says.
+	Completeness     string           `json:"completeness"`
+	DeclaredControls DeclaredControls `json:"declared_controls"`
+	ControlOutcomes  []ControlOutcome `json:"control_outcomes"`
 }
 
 type PopulationItem struct {

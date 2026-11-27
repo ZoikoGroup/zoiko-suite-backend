@@ -118,6 +118,9 @@ func (h *Handler) routes(r chi.Router) {
 	r.Post("/runs/{runID}:reperform", h.Reperform)
 	r.Post("/runs/{runID}:certify", h.Certify)
 	r.Post("/runs/{runID}:revoke-certification", h.RevokeCertification)
+	r.Post("/runs/{runID}/certification/reliances", h.RecordReliance)
+	r.Get("/runs/{runID}/certification/blast-radius", h.GetBlastRadius)
+	r.Get("/certification-reliances", h.GetRelianceStanding)
 	r.Post("/runs/{runID}:supersede", h.SupersedeRun)
 	r.Get("/runs/{runID}/populations", h.GetPopulationSnapshots)
 	r.Get("/runs/{runID}/population-hashes", h.VerifyPopulationHashes)
@@ -450,6 +453,9 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 	scope := source.Scope{TenantID: tenantID, PrincipalID: principalID, LegalEntityID: def.LegalEntityID,
 		PeriodID: req.PeriodID, CorrelationID: r.Header.Get("X-Correlation-ID")}
 	pops, err := source.BuildPopulations(readCtx, h.fetcher, *def, req, scope)
+	if err == nil {
+		err = h.checkContinuity(readCtx, tenantID, def.LegalEntityID, pops)
+	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), persistTimeout)
 	defer cancel()
 	var popErr *source.PopulationError
@@ -561,6 +567,9 @@ func (h *Handler) Reperform(w http.ResponseWriter, r *http.Request) {
 	scope := source.Scope{TenantID: tenantID, PrincipalID: principalID, LegalEntityID: run.LegalEntityID,
 		PeriodID: run.PeriodID, CorrelationID: r.Header.Get("X-Correlation-ID")}
 	pops, err := source.BuildPopulations(readCtx, h.fetcher, def, req, scope)
+	if err == nil {
+		err = h.checkContinuity(readCtx, tenantID, run.LegalEntityID, pops)
+	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), persistTimeout)
 	defer cancel()
 	var popErr *source.PopulationError
@@ -973,6 +982,8 @@ func (h *Handler) respondFromError(w http.ResponseWriter, err error) {
 	case errors.Is(err, domain.ErrNotExceptionOwner), errors.Is(err, domain.ErrNotIndependent), errors.Is(err, domain.ErrSelfApproval),
 		errors.Is(err, domain.ErrNotIndependentCertifier), errors.Is(err, domain.ErrRevokerIsCertifier):
 		h.respondError(w, http.StatusForbidden, err.Error())
+	case errors.Is(err, domain.ErrRelianceInvalid):
+		h.respondError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, domain.ErrAuthorityUntraceable), errors.Is(err, domain.ErrRevokerAuthorityUntraceable):
 		h.respondError(w, http.StatusServiceUnavailable, err.Error())
 	case errors.Is(err, domain.ErrDefinitionNotFound), errors.Is(err, domain.ErrRunNotFound),
@@ -985,6 +996,7 @@ func (h *Handler) respondFromError(w http.ResponseWriter, err error) {
 		errors.Is(err, domain.ErrReplacementNotTerminal), errors.Is(err, domain.ErrReplacementAlreadyUsed),
 		errors.Is(err, domain.ErrInvalidTransition), errors.Is(err, domain.ErrRunNotEvaluated),
 		errors.Is(err, domain.ErrRunNotEligible), errors.Is(err, domain.ErrNoEffectiveRules),
+		errors.Is(err, domain.ErrRelianceInactive),
 		errors.Is(err, domain.ErrEvidenceStale), errors.Is(err, domain.ErrCertificationBasisExists),
 		errors.Is(err, domain.ErrDefinitionExists), errors.Is(err, domain.ErrRuleVersionConflict),
 		errors.Is(err, domain.ErrRuleVersionApproved), errors.Is(err, domain.ErrBackdatedRuleVersion):

@@ -532,6 +532,37 @@ type RunAssessment struct {
 //     run; accepting it would need an authority tier this service does not
 //     have — A9).
 func Assess(exps []Exposure, p MaterialityPolicy, profile CertificationProfile) RunAssessment {
+	return AssessWithScope(exps, p, profile, nil)
+}
+
+// AssessWithScope is Assess for a run some of whose populations the source declared a
+// defined subset (ZS-SVC-Z-001 DQC-03 PARTIAL, INV-26, NP-26: "a partial reconciliation
+// cannot be represented as full certification"). partial names those sides with what the
+// source said the subset is. Such a run is never certifiable, whatever its exceptions say,
+// and when nothing is wrong inside the subset its result is PARTIAL rather than MATCH: only the
+// subset matched. Any unresolved exception still makes it VARIANCE, which is the worse finding.
+func AssessWithScope(exps []Exposure, p MaterialityPolicy, profile CertificationProfile, partial map[string]string) RunAssessment {
+	ra := assess(exps, p, profile)
+	if len(partial) == 0 {
+		return ra
+	}
+	sides := make([]string, 0, len(partial))
+	for s := range partial {
+		sides = append(sides, s)
+	}
+	sort.Strings(sides)
+	for _, s := range sides {
+		ra.CertificationBlocks = append(ra.CertificationBlocks,
+			fmt.Sprintf("population %q is a declared subset (%s), not the full population", s, partial[s]))
+	}
+	if ra.ResultState == ResultMatch {
+		ra.ResultState = ResultPartial
+	}
+	ra.Certifiable = false
+	return ra
+}
+
+func assess(exps []Exposure, p MaterialityPolicy, profile CertificationProfile) RunAssessment {
 	ra := RunAssessment{Unresolved: map[ExceptionStatus]int{}, AcceptedRiskIDs: []string{}, PermitAcceptedRisk: profile.PermitAcceptedRisk}
 	working := 0
 	for _, e := range exps {

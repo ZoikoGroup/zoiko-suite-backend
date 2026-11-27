@@ -248,3 +248,42 @@ func TestRuleClassification(t *testing.T) {
 		}
 	}
 }
+
+// ZS-SVC-Z-001 DQC-03 / INV-26 / NP-26 (step I): a declared subset is PARTIAL and never certifiable.
+func TestAssessWithScope_PartialIsNeverCertifiable(t *testing.T) {
+	p := MaterialityPolicy{Currencies: map[string]int64{"USD": 1000}}
+	permit := CertificationProfile{PermitAcceptedRisk: true}
+	subset := map[string]string{"A": "EMEA accounts only"}
+
+	a := AssessWithScope(nil, p, CertificationProfile{}, subset)
+	if a.ResultState != ResultPartial || a.Certifiable || CertificationFor(a) != CertUncertified {
+		t.Fatalf("a clean subset: %+v", a)
+	}
+	if !strings.Contains(strings.Join(a.CertificationBlocks, ";"), "EMEA accounts only") {
+		t.Fatalf("the block must say which subset: %v", a.CertificationBlocks)
+	}
+	// Whatever the profile says, a subset cannot be certified, including immaterial accepted risk.
+	small := []Exposure{{ExceptionID: "x1", Status: ExceptionAcceptedRisk, Currency: "USD", ItemID: "i1", Minor: 3}}
+	if a := AssessWithScope(small, p, permit, subset); a.Certifiable || a.ResultState != ResultVariance {
+		t.Fatalf("accepted risk on a subset: %+v", a)
+	}
+	// An unresolved exception is the worse finding: VARIANCE, not PARTIAL.
+	open := []Exposure{{ExceptionID: "x1", Status: ExceptionOpen, Currency: "USD", ItemID: "i1", Minor: 3}}
+	if a := AssessWithScope(open, p, permit, subset); a.ResultState != ResultVariance || a.Certifiable {
+		t.Fatalf("open exception on a subset: %+v", a)
+	}
+	// No declared subset: exactly Assess.
+	if a := AssessWithScope(nil, p, CertificationProfile{}, nil); a.ResultState != ResultMatch || !a.Certifiable {
+		t.Fatalf("full population: %+v", a)
+	}
+	// The lifecycle refuses a PARTIAL run ELIGIBLE or CERTIFIED regardless.
+	if err := ValidateLifecycleTransition(RunRunning, RunRunning, ResultPartial, CertEligible, false); err == nil {
+		t.Fatal("a PARTIAL run was allowed to be ELIGIBLE")
+	}
+	if err := ValidateLifecycleTransition(RunRunning, RunCertified, ResultPartial, CertCertified, false); err == nil {
+		t.Fatal("a PARTIAL run entered Certified")
+	}
+	if err := ValidateLifecycleTransition(RunRunning, RunRunning, ResultPartial, CertUncertified, false); err != nil {
+		t.Fatalf("a PARTIAL, uncertified, running run is a legal state: %v", err)
+	}
+}

@@ -61,6 +61,7 @@ func openAdminPoolThrough(t *testing.T, include func(name string) bool) *pgxpool
 		DROP TABLE IF EXISTS reconciliation_run_transitions CASCADE;
 		DROP TABLE IF EXISTS outbox_events CASCADE;
 		DROP TABLE IF EXISTS idempotency_keys CASCADE;
+		DROP TABLE IF EXISTS reconciliation_certification_reliances CASCADE;
 		DROP TABLE IF EXISTS certifications CASCADE;
 		DROP TABLE IF EXISTS reconciliation_exceptions CASCADE;
 		DROP TABLE IF EXISTS match_results CASCADE;

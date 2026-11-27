@@ -74,7 +74,11 @@ func TestResult_Transitions(t *testing.T) {
 		{"unchanged", RunRunning, ResultMatch, ResultMatch, true},
 		{"INV-05: indeterminate to match", RunRunning, ResultIndeterminate, ResultMatch, false},
 		{"reset", RunRunning, ResultMatch, ResultNotRun, false},
-		{"partial has no semantics", RunRunning, ResultMatch, ResultPartial, false},
+		{"subset matched", RunRunning, ResultNotRun, ResultPartial, true},
+		{"subset delivered whole later", RunRunning, ResultPartial, ResultMatch, true},
+		{"subset with an exception", RunRunning, ResultPartial, ResultVariance, true},
+		{"INV-05: indeterminate to partial", RunRunning, ResultIndeterminate, ResultPartial, false},
+		{"certified result stays frozen against partial", RunCertified, ResultMatch, ResultPartial, false},
 		{"certified result frozen", RunCertified, ResultMatch, ResultVariance, false},
 		{"failed result frozen", RunFailed, ResultIndeterminate, ResultVariance, false},
 	} {

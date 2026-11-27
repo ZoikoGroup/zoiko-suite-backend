@@ -62,6 +62,12 @@ type CertifiedPopulation struct {
 	// How ContentHash was made. Empty on certifications sealed before migration 000015.
 	HashAlgorithm     string `json:"hash_algorithm,omitempty"`
 	HashSerialization string `json:"hash_serialization,omitempty"`
+	// What the source declared beyond its totals and how each control was re-performed
+	// (controls.go). Absent when the source declared none, so a certification of such evidence
+	// is sealed exactly as before.
+	Completeness     string            `json:"completeness,omitempty"`
+	DeclaredControls *DeclaredControls `json:"declared_controls,omitempty"`
+	ControlOutcomes  []ControlOutcome  `json:"control_outcomes,omitempty"`
 }
 
 // MatchedItem is one side of a manual match, as frozen.

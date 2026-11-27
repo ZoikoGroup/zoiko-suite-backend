@@ -228,6 +228,10 @@ type FrozenPopulation struct {
 	DeclaredRowCount int64
 	DeclaredTotals   map[string]string
 	Items            []PopulationItemInput
+	// Controls are the optional source-declared controls and ControlOutcomes what the engine
+	// concluded about each (controls.go). Both are frozen with the snapshot as evidence.
+	Controls        DeclaredControls
+	ControlOutcomes []ControlOutcome
 }
 
 // NewFrozenPopulation converts verified source records into frozen items at

@@ -52,7 +52,10 @@ var (
 	evBreakStatusChanged = eventKind{"com.zoikosuite.accounting.reconciliation-break.status-changed", "CONTROL.ExceptionUpdated", aggregateBreak}
 	evCertIssued         = eventKind{"com.zoikosuite.accounting.reconciliation-certification.issued", "CONTROL.Certified", aggregateCertification}
 	evCertRevoked        = eventKind{"com.zoikosuite.accounting.reconciliation-certification.revoked", "CONTROL.CertificationRevoked", aggregateCertification}
-	evRulesPublished     = eventKind{"com.zoikosuite.accounting.reconciliation-definition.rule-version-published", "CONTROL.RuleVersionPublished", aggregateDefinition}
+	// New facts with no legacy consumers, so no legacy type (it defaults to the canonical one).
+	evCertRelianceRecorded          = eventKind{Type: "com.zoikosuite.accounting.reconciliation-certification.reliance-recorded", Aggregate: aggregateCertification}
+	evCertRelianceWithdrawn = eventKind{Type: "com.zoikosuite.accounting.reconciliation-certification.reliance-withdrawn", Aggregate: aggregateCertification}
+	evRulesPublished     =eventKind{"com.zoikosuite.accounting.reconciliation-definition.rule-version-published", "CONTROL.RuleVersionPublished", aggregateDefinition}
 	evRulesApproved      = eventKind{"com.zoikosuite.accounting.reconciliation-definition.rule-version-approved", "CONTROL.RuleVersionApproved", aggregateDefinition}
 )
 

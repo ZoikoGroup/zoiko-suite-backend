@@ -42,8 +42,21 @@ const importBatchTieoutScope = `
 	           'failed_items',           b.failed_items::text,
 	           'skipped_items',          b.skipped_items::text,
 	           'declared_control_total', COALESCE(b.declared_control_total, ''),
-	           'computed_control_total', COALESCE(b.computed_control_total, '')) AS attrs
+	           'computed_control_total', COALESCE(b.computed_control_total, ''),
+	           'quarantine_state',       CASE WHEN b.status = 'QUARANTINED' THEN 'FULL'
+	                                          WHEN q.held = 0 THEN 'NONE'
+	                                          WHEN q.open_requests > 0 THEN 'RELEASE_PENDING'
+	                                          WHEN q.total > 0 AND q.held >= q.total THEN 'FULL'
+	                                          ELSE 'PARTIAL' END) AS attrs
 	FROM import_batches b
+	CROSS JOIN LATERAL (
+	    SELECT (SELECT count(*) FROM import_items i WHERE i.tenant_id = b.tenant_id AND i.batch_id = b.batch_id AND i.status = 'QUARANTINED') AS held,
+	           (SELECT count(*) FROM import_items i WHERE i.tenant_id = b.tenant_id AND i.batch_id = b.batch_id AND i.status NOT IN ('INVALID', 'SKIPPED')) AS total,
+	           (SELECT count(*) FROM import_quarantine_ledger r
+	              JOIN import_items i ON i.batch_id = r.batch_id AND i.row_no = r.row_no AND i.status = 'QUARANTINED'
+	             WHERE r.tenant_id = b.tenant_id AND r.batch_id = b.batch_id AND r.kind = 'RELEASE_REQUESTED'
+	               AND NOT EXISTS (SELECT 1 FROM import_quarantine_ledger c WHERE c.answers_ledger_id = r.ledger_id)) AS open_requests
+	) q
 	WHERE b.tenant_id = $1::text
 	  AND b.legal_entity_id = $2::text
 	  AND b.batch_id = $3::text`

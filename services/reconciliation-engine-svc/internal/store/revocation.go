@@ -149,9 +149,32 @@ func (s *PgStore) RevokeCertification(ctx context.Context, tenantID, runID strin
 		}
 
 		out = v
+		// The blast radius: everything recorded as relying on this certification. The run is locked FOR UPDATE above and
+		// a reliance cannot be recorded once the certification is no longer CERTIFIED (service and trigger), so this is
+		// the complete set. The count goes on the revocation event and each reliance gets its own withdrawal event, so
+		// the owning service learns that what it built on is withdrawn.
+		rels, err := loadReliances(ctx, tx, tenantID, certID)
+		if err != nil {
+			return err
+		}
 		// DQC-05's dqc.certification.revoked: the prior certification, the
 		// reason and the effective time (revoked_at), plus the evidence.
-		return s.enqueueEvent(ctx, tx, evCertRevoked, tenantID, run.LegalEntityID, certID, actor, claim, v)
+		if err := s.enqueueEvent(ctx, tx, evCertRevoked, tenantID, run.LegalEntityID, certID, actor, claim, struct {
+			*domain.CertificationRevocation
+			RelyingCount int `json:"relying_count"`
+		}{v, len(rels)}); err != nil {
+			return err
+		}
+		for _, rl := range rels {
+			if err := s.enqueueEvent(ctx, tx, evCertRelianceWithdrawn, tenantID, run.LegalEntityID, certID, actor, claim, map[string]any{
+				"reliance_id": rl.RelianceID, "certification_id": certID, "run_id": runID, "revocation_id": v.RevocationID,
+				"relying_service": rl.RelyingService, "relying_object_type": rl.RelyingObjectType, "relying_object_id": rl.RelyingObjectID,
+				"effective_from": v.RevokedAt,
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	return out, err
 }
