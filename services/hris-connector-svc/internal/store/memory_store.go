@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"zoiko.io/hris-connector-svc/internal/domain"
+	"zoiko.io/hris-connector-svc/internal/events"
 	"zoiko.io/hris-connector-svc/internal/middleware"
 )
 
@@ -14,6 +15,21 @@ type MemoryStore struct {
 	mu           sync.RWMutex
 	integrations map[string]*domain.HrisIntegration
 	jobs         map[string]*domain.SyncJob
+	outbox       []events.Event
+}
+
+// Outbox returns the events written with each change, in order (the memory
+// counterpart of the outbox_events table).
+func (m *MemoryStore) Outbox() []events.Event {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return append([]events.Event(nil), m.outbox...)
+}
+
+func (m *MemoryStore) enqueue(ctx context.Context, aggregateID string, ev events.PublishParams) {
+	ev.TenantID = middleware.GetTenantID(ctx)
+	ev.AggregateID = aggregateID
+	m.outbox = append(m.outbox, events.NewEvent(ev))
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -29,7 +45,7 @@ func NewMemoryStore() *MemoryStore {
 // against a fake that cannot fail, which is how the unscoped reads here
 // survived. Both implementations answer the same question the same way, so
 // a handler test proves something about production.
-func (m *MemoryStore) CreateIntegration(ctx context.Context, integration *domain.HrisIntegration) error {
+func (m *MemoryStore) CreateIntegration(ctx context.Context, integration *domain.HrisIntegration, ev events.PublishParams) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -43,6 +59,7 @@ func (m *MemoryStore) CreateIntegration(ctx context.Context, integration *domain
 	integration.TenantID = middleware.GetTenantID(ctx)
 
 	m.integrations[integration.IntegrationID] = integration
+	m.enqueue(ctx, integration.IntegrationID, ev)
 	return nil
 }
 
@@ -79,7 +96,7 @@ func (m *MemoryStore) ListIntegrations(ctx context.Context, legalEntityID string
 	return res, nil
 }
 
-func (m *MemoryStore) CreateSyncJob(ctx context.Context, job *domain.SyncJob) error {
+func (m *MemoryStore) CreateSyncJob(ctx context.Context, job *domain.SyncJob, ev events.PublishParams) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -90,6 +107,7 @@ func (m *MemoryStore) CreateSyncJob(ctx context.Context, job *domain.SyncJob) er
 	job.TenantID = middleware.GetTenantID(ctx)
 
 	m.jobs[job.JobID] = job
+	m.enqueue(ctx, job.JobID, ev)
 	return nil
 }
 

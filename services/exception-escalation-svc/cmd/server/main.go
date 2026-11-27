@@ -23,8 +23,10 @@ import (
 	"zoiko.io/exception-escalation-svc/internal/events"
 	"zoiko.io/exception-escalation-svc/internal/handler"
 	"zoiko.io/exception-escalation-svc/internal/health"
+	"zoiko.io/exception-escalation-svc/internal/idempotency"
 	"zoiko.io/exception-escalation-svc/internal/middleware"
 	"zoiko.io/exception-escalation-svc/internal/mtls"
+	"zoiko.io/exception-escalation-svc/internal/outbox"
 	"zoiko.io/exception-escalation-svc/internal/store"
 	"zoiko.io/exception-escalation-svc/internal/telemetry"
 )
@@ -113,7 +115,15 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
 
-	h := handler.New(pgStore, publisher, authzClient, logger)
+	h := handler.New(pgStore, authzClient, logger)
+
+	// Transactional outbox relay: every write enqueues its event in the same
+	// transaction as the change; the relay delivers it with retry.
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	if pool != nil {
+		go outbox.NewRelay(pool, publisher, 0, 0, logger).Start(relayCtx)
+	}
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -127,6 +137,11 @@ func main() {
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+
+	// Replay protection for material writes: a retried POST/PUT with the same
+	// Idempotency-Key gets the first answer instead of running twice. Placed after
+	// the envelope middleware, which guarantees the key and tenant are present.
+	r.Use(idempotency.Middleware(idempotency.NewPgStore(pool), logger))
 
 	r.Get("/healthz", health.HealthzHandler)
 	r.Get("/readyz", health.ReadyzHandler(pool))

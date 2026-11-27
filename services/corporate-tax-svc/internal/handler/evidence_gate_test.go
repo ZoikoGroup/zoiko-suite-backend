@@ -50,7 +50,7 @@ func evidenceStore() *stubStore {
 func evidenceRouter(t *testing.T, st *stubStore, e EvidenceChecker) chi.Router {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContextMiddleware)
-	RegisterRoutes(r, New(st, &stubPublisher{}, newStubAuthzServer(t), zap.NewNop()).WithEvidenceGate(e))
+	RegisterRoutes(r, New(st, newStubAuthzServer(t), zap.NewNop()).WithEvidenceGate(e))
 	return r
 }
 

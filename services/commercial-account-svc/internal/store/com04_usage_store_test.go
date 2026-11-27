@@ -383,6 +383,98 @@ func TestUsage_ReopenWindow(t *testing.T) {
 	}
 }
 
+// A9: ReopenWindow must carry forward the usage_adjustments that targeted
+// the superseded statement, and (re)compute event_count/quarantined_count
+// from what actually re-homes, not leave them at zero — otherwise
+// recertifying the replacement would reproduce only the raw events' total
+// and silently drop the adjustment lineage (a real divergence: without the
+// fix, the replacement's recertified total would be short by the
+// adjustment's own quantity).
+func TestUsage_ReopenWindow_CarriesAdjustmentsAndCountsForward(t *testing.T) {
+	f := newSub(t)
+	dim := "user_id"
+	f.registerMeter("active.users", 1, "UNIQUE_COUNT", &dim)
+	f.publishPlan("business", planOpts{autoRenew: true})
+	sub := activateNow(f, f.sv(f.start(f.startParams(f.account, "business", day(11)))), day(11))
+
+	// A quarantined event (missing the required dimension) in term1, linked
+	// to term1's own statement as its origin.
+	e, err := f.s.RegisterUsageEvent(f.ctx, f.org, sub.SubscriptionID, "active.users", 1, "evt-missing-dim",
+		domain.EventInput{Quantity: "1", OccurredAt: day(12)}, "app-svc", day(12),
+		f.claim("app-svc", "ingest", "active.users/evt-missing-dim"))
+	if err != nil || e.Status != domain.UsageQuarantined || e.StatementID == nil {
+		t.Fatalf("quarantine setup: %+v (err=%v)", e, err)
+	}
+	origin := *e.StatementID
+	f.closeAndCertify(sub.SubscriptionID, sub.CurrentTerm.TermNo, "active.users", day(20))
+
+	renewAt := sub.CurrentTerm.EndsAt.Add(time.Hour)
+	sub2 := f.sv(f.s.Renew(f.ctxOrg, f.seller(sub, renewAt), f.tclaim(f.org, operator, "renew", sub.SubscriptionID)))
+	targetTerm := sub2.CurrentTerm.TermNo
+	f.mustRegisterUniqueEvent(sub.SubscriptionID, "active.users", "evt-organic", "u1", renewAt.Add(time.Hour), renewAt.Add(time.Hour))
+	targetStatement, err := f.s.GetUsage(f.ctxOrg, sub.SubscriptionID, targetTerm, "active.users")
+	if err != nil {
+		t.Fatalf("get term2 usage: %v", err)
+	}
+
+	adj, err := f.s.CreateUsageAdjustment(f.ctx, targetStatement.StatementID, "active.users", "evt-missing-dim",
+		"investigated: this occurrence should count", publisher, day(13),
+		f.claim(publisher, "adjust", "evt-missing-dim"))
+	if err != nil {
+		t.Fatalf("create usage adjustment: %v", err)
+	}
+	if adj.OriginStatementID != origin {
+		t.Fatalf("adjustment origin: %+v", adj)
+	}
+
+	// Certify term2 (u1 organically, plus the redirected occurrence's empty
+	// dimension as a second distinct value): a real, independently-verified
+	// EventCount and TotalQuantity to compare the reopened replacement
+	// against after recertification.
+	orig := f.closeAndCertify(sub.SubscriptionID, targetTerm, "active.users", renewAt.Add(2*time.Hour))
+	if orig.TotalQuantity != "2" || orig.EventCount != 2 {
+		t.Fatalf("original certification: total=%s event_count=%d, want total=2 event_count=2", orig.TotalQuantity, orig.EventCount)
+	}
+
+	reopened, err := f.s.ReopenWindow(f.ctx, orig.StatementID, checker, "dispute resolved in customer's favor",
+		renewAt.Add(3*time.Hour), f.claim(checker, "reopen", orig.StatementID))
+	if err != nil || reopened.Status != domain.StatementOpen {
+		t.Fatalf("reopen: %+v (err=%v)", reopened, err)
+	}
+	// Recomputed from what actually re-homed, matching the original exactly
+	// — not the zero-value a pre-fix reopen would have left it at.
+	if reopened.EventCount != orig.EventCount {
+		t.Fatalf("replacement event_count = %d, want %d (matching the original before any fix regression)", reopened.EventCount, orig.EventCount)
+	}
+	if reopened.QuarantinedCount != 0 {
+		t.Fatalf("replacement quarantined_count = %d, want 0 (no quarantined events target this window)", reopened.QuarantinedCount)
+	}
+
+	// The adjustment itself carried forward onto the replacement (a fresh,
+	// distinct row — usage_adjustments are immutable, so this can never be
+	// the same row the original targeted).
+	carried, err := f.s.GetUsageAdjustment(f.ctx, reopened.StatementID, "active.users", "evt-missing-dim")
+	if err != nil || carried == nil || carried.AdjustmentID == adj.AdjustmentID || carried.Quantity != adj.Quantity {
+		t.Fatalf("carried-forward adjustment: %+v (err=%v), original was %+v", carried, err, adj)
+	}
+	// The original adjustment, still targeting the now-superseded statement,
+	// is untouched — full lineage preserved, nothing silently rewritten.
+	untouched, err := f.s.GetUsageAdjustment(f.ctx, orig.StatementID, "active.users", "evt-missing-dim")
+	if err != nil || untouched == nil || untouched.AdjustmentID != adj.AdjustmentID {
+		t.Fatalf("original adjustment was disturbed: %+v (err=%v)", untouched, err)
+	}
+
+	// Recertifying the replacement reproduces the original total plus its
+	// adjustment lineage — the whole point of A9. Without the fix, this
+	// would certify total=1 (the organic event alone), silently dropping
+	// the adjustment's contribution to the total the first certification
+	// actually had.
+	recert := f.closeAndCertify(sub.SubscriptionID, targetTerm, "active.users", renewAt.Add(4*time.Hour))
+	if recert.StatementID != reopened.StatementID || recert.TotalQuantity != orig.TotalQuantity {
+		t.Fatalf("recertification after reopen: %+v, want total=%s on %s", recert, orig.TotalQuantity, reopened.StatementID)
+	}
+}
+
 func TestUsage_UniqueCountAggregation(t *testing.T) {
 	f := newSub(t)
 	dim := "user_id"

@@ -25,13 +25,22 @@ COPY banking-connector-svc/go.mod banking-connector-svc/go.sum ./
 RUN go mod download
 
 COPY banking-connector-svc/ ./
-RUN CGO_ENABLED=0 GOOS=linux go build -o /server ./cmd/server
-RUN CGO_ENABLED=0 GOOS=linux go build -o /healthcheck ./cmd/healthcheck
+
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /app/server ./cmd/server
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /app/healthcheck ./cmd/healthcheck
 
 FROM alpine:3.19
+
 RUN apk add --no-cache ca-certificates tzdata
+
 WORKDIR /app
-COPY --from=builder /server /app/server
-COPY --from=builder /healthcheck /app/healthcheck
+
+COPY --from=builder /app/server /app/server
+COPY --from=builder /app/healthcheck /app/healthcheck
+
 EXPOSE 8145
+
+# cmd/healthcheck probes the public /healthz endpoint.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=3   CMD ["/app/healthcheck"]
+
 ENTRYPOINT ["/app/server"]

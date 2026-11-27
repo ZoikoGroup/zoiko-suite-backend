@@ -9,27 +9,25 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
 	"zoiko.io/eventing/adapter"
 	"zoiko.io/eventing/adapter/ext"
 	"zoiko.io/eventing/egress"
-	"zoiko.io/eventing/kafkaout"
 	"zoiko.io/eventing/integration"
+	"zoiko.io/eventing/kafkaout"
 	"zoiko.io/eventing/outbox"
 	"zoiko.io/eventing/signature"
 	"zoiko.io/tax-authority-interface-svc/internal/authority"
 	"zoiko.io/tax-authority-interface-svc/internal/authz"
 	"zoiko.io/tax-authority-interface-svc/internal/config"
-	svcenvelope "zoiko.io/tax-authority-interface-svc/internal/envelope"
 	"zoiko.io/tax-authority-interface-svc/internal/events"
 	"zoiko.io/tax-authority-interface-svc/internal/handler"
-	"zoiko.io/tax-authority-interface-svc/internal/health"
+	"zoiko.io/tax-authority-interface-svc/internal/idempotency"
 	"zoiko.io/tax-authority-interface-svc/internal/middleware"
 	"zoiko.io/tax-authority-interface-svc/internal/mtls"
+	"zoiko.io/tax-authority-interface-svc/internal/router"
 	"zoiko.io/tax-authority-interface-svc/internal/store"
 	"zoiko.io/tax-authority-interface-svc/internal/telemetry"
 )
@@ -140,25 +138,11 @@ func main() {
 		logger.Info("authority adapter enabled", zap.Int("callback_providers", len(cbCfg)))
 	}
 
-	r := chi.NewRouter()
-	r.Use(chimiddleware.RequestID)
-	r.Use(chimiddleware.RealIP)
-	r.Use(chimiddleware.Logger)
-	r.Use(chimiddleware.Recoverer)
-
-	r.Get("/healthz", health.Handler())
-	// The authority callback receiver is machine-authenticated by signature, not by a tenant header, so it sits
-	// outside the tenant-context group.
-	handler.RegisterCallbackRoute(r, h)
-
-	r.Group(func(r chi.Router) {
-		r.Use(middleware.TenantContext)
-		// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after Recoverer and telemetry so a
-		// refusal is still traced, and ahead of every handler so no request reaches business logic without a
-		// resolved tenant, actor, correlation and — on material writes — an idempotency key.
-		// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
-		r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
-		handler.RegisterRoutes(r, h)
+	r := router.New(router.Deps{
+		DB:      dbpool,
+		Idem:    idempotency.NewPgStore(dbpool),
+		Handler: h,
+		Logger:  logger,
 	})
 
 	srv := &http.Server{

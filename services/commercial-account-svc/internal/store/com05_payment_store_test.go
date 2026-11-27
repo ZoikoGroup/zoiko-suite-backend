@@ -3,6 +3,7 @@ package store_test
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"zoiko.io/commercial-account-svc/internal/domain"
 	svcmiddleware "zoiko.io/commercial-account-svc/internal/middleware"
@@ -261,5 +262,74 @@ func TestPayment_ResolvedAttemptIsImmutableAtTheDatabase(t *testing.T) {
 	}
 	if _, err := tx.Exec(f.ctx, `UPDATE payment_attempts SET status = 'FAILED' WHERE attempt_id = $1`, a.AttemptID); err == nil {
 		t.Fatal("a raw UPDATE against a resolved payment attempt was not rejected")
+	}
+}
+
+// A11: GetCollectionState's billing-health summary must extend to
+// PAST_DUE/COLLECTIONS/WRITTEN_OFF, derived from this invoice's own real
+// dunning case (NOTICE_1/NOTICE_2 vs RESTRICTED/SUSPENDED) and write-off —
+// not invented tracking, and never just CURRENT/PAYMENT_PENDING/PAID/FAILED
+// from payment attempts alone.
+func TestPayment_CollectionStateCoversPastDueCollectionsAndWrittenOff(t *testing.T) {
+	f := newSub(t)
+	f.mustPublishDunningPolicy(1, 7, 14, 21, 30)
+	f.publishPlan("business", planOpts{autoRenew: true, base: "25.00"})
+	f.openBillingAccount(f.org)
+	sub := activateNow(f, f.sv(f.start(f.startParams(f.account, "business", day(11)))), day(11))
+
+	// PAST_DUE: an open dunning case still at an early notice stage, with no
+	// payment attempt recorded at all.
+	inv1 := f.issueSimpleInvoice(f.org, sub.SubscriptionID, sub.CurrentTerm.TermNo)
+	dc1, err := f.startDunning(inv1.InvoiceID)
+	if err != nil || dc1.Status != domain.DunningNotice1 {
+		t.Fatalf("start dunning (invoice 1): %+v (err=%v)", dc1, err)
+	}
+	state, err := f.s.GetCollectionState(f.ctxOrg, inv1.InvoiceID)
+	if err != nil || state != domain.CollectionPastDue {
+		t.Fatalf("collection state at NOTICE_1: %v (err=%v)", state, err)
+	}
+
+	// COLLECTIONS: the same case escalated to RESTRICTED.
+	for i := 0; i < 2; i++ { // NOTICE_1 -> NOTICE_2 -> RESTRICTED
+		dc1, err = f.s.AdvanceDunning(f.ctx, dc1.CaseID, publisher, day(32+i), f.claim(publisher, "advance", dc1.CaseID))
+		if err != nil {
+			t.Fatalf("advance dunning (step %d): %v", i, err)
+		}
+	}
+	if dc1.Status != domain.DunningRestricted {
+		t.Fatalf("case after two advances: %+v", dc1)
+	}
+	state, err = f.s.GetCollectionState(f.ctxOrg, inv1.InvoiceID)
+	if err != nil || state != domain.CollectionCollections {
+		t.Fatalf("collection state at RESTRICTED: %v (err=%v)", state, err)
+	}
+
+	// WRITTEN_OFF: a second, independent invoice (a fresh term via renewal —
+	// a subscription term can only ever have one issued invoice) with its
+	// own recorded write-off — outranks a would-be PAST_DUE from its own
+	// dunning case.
+	renewAt := sub.CurrentTerm.EndsAt.Add(time.Hour)
+	sub2 := f.sv(f.s.Renew(f.ctxOrg, f.seller(sub, renewAt), f.tclaim(f.org, operator, "renew-1", sub.SubscriptionID)))
+	inv2 := f.issueSimpleInvoice(f.org, sub.SubscriptionID, sub2.CurrentTerm.TermNo)
+	if _, err := f.startDunning(inv2.InvoiceID); err != nil {
+		t.Fatalf("start dunning (invoice 2): %v", err)
+	}
+	if _, err := f.applyWriteOff(inv2.InvoiceID, "25.00", "uncollectible"); err != nil {
+		t.Fatalf("apply write-off: %v", err)
+	}
+	state, err = f.s.GetCollectionState(f.ctxOrg, inv2.InvoiceID)
+	if err != nil || state != domain.CollectionWrittenOff {
+		t.Fatalf("collection state after write-off: %v (err=%v)", state, err)
+	}
+
+	// A third, untouched invoice (another fresh term) is still plain
+	// CURRENT — the extension must not make every invoice report a worse
+	// state than it actually has.
+	renewAt2 := sub2.CurrentTerm.EndsAt.Add(time.Hour)
+	sub3 := f.sv(f.s.Renew(f.ctxOrg, f.seller(sub2, renewAt2), f.tclaim(f.org, operator, "renew-2", sub.SubscriptionID)))
+	inv3 := f.issueSimpleInvoice(f.org, sub.SubscriptionID, sub3.CurrentTerm.TermNo)
+	state, err = f.s.GetCollectionState(f.ctxOrg, inv3.InvoiceID)
+	if err != nil || state != domain.CollectionCurrent {
+		t.Fatalf("collection state with no attempt, case or write-off: %v (err=%v)", state, err)
 	}
 }

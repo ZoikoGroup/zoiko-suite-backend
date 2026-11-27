@@ -88,6 +88,7 @@ func TestMain(m *testing.M) {
 		treasury_transfers,
 		cash_balances, cash_position_snapshots,
 		fx_exposure_snapshots, fx_rates,
+		bank_account_identifier_tokens,
 		bank_account_ownership_evidence, bank_account_history, bank_accounts,
 		liquidity_thresholds,
 		eventing_outbox
@@ -107,6 +108,8 @@ func TestMain(m *testing.M) {
 		"000011_add_eventing_outbox.up.sql",
 		"000012_eventing_outbox_rls.up.sql",
 		"000013_bnk01_history_reason_columns.up.sql",
+		"000014_eventing_inbox.up.sql",
+		"000015_add_bnk01_identifier_tokens.up.sql",
 	} {
 		sql, err := os.ReadFile("../../deployments/migrations/" + migration)
 		if err != nil {
@@ -151,13 +154,15 @@ func cleanTables(t *testing.T) {
 		"ALTER TABLE bank_accounts DISABLE TRIGGER trg_reject_bank_account_mutation",
 		"ALTER TABLE bank_account_ownership_evidence DISABLE TRIGGER trg_reject_ownership_evidence_mutation",
 		"ALTER TABLE bank_account_history DISABLE TRIGGER trg_reject_account_history_mutation",
+		"ALTER TABLE bank_account_identifier_tokens DISABLE TRIGGER trg_reject_identifier_token_mutation",
 		"ALTER TABLE treasury_transfers DISABLE TRIGGER trg_reject_terminal_transfer_mutation",
 		"ALTER TABLE cash_position_snapshots DISABLE TRIGGER trg_reject_cash_position_mutation",
 		"ALTER TABLE fx_exposure_snapshots DISABLE TRIGGER trg_reject_fx_exposure_snapshot_mutation",
-		"DELETE FROM treasury_transfers; DELETE FROM cash_balances; DELETE FROM bank_account_ownership_evidence; DELETE FROM bank_account_history; DELETE FROM cash_position_snapshots; DELETE FROM fx_exposure_snapshots; DELETE FROM bank_accounts; DELETE FROM liquidity_thresholds;",
+		"DELETE FROM treasury_transfers; DELETE FROM cash_balances; DELETE FROM bank_account_identifier_tokens; DELETE FROM bank_account_ownership_evidence; DELETE FROM bank_account_history; DELETE FROM cash_position_snapshots; DELETE FROM fx_exposure_snapshots; DELETE FROM bank_accounts; DELETE FROM liquidity_thresholds;",
 		"ALTER TABLE bank_accounts ENABLE TRIGGER trg_reject_bank_account_mutation",
 		"ALTER TABLE bank_account_ownership_evidence ENABLE TRIGGER trg_reject_ownership_evidence_mutation",
 		"ALTER TABLE bank_account_history ENABLE TRIGGER trg_reject_account_history_mutation",
+		"ALTER TABLE bank_account_identifier_tokens ENABLE TRIGGER trg_reject_identifier_token_mutation",
 		"ALTER TABLE treasury_transfers ENABLE TRIGGER trg_reject_terminal_transfer_mutation",
 		"ALTER TABLE cash_position_snapshots ENABLE TRIGGER trg_reject_cash_position_mutation",
 		"ALTER TABLE fx_exposure_snapshots ENABLE TRIGGER trg_reject_fx_exposure_snapshot_mutation",

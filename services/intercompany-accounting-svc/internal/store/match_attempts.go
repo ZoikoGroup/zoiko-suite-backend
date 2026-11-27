@@ -51,11 +51,11 @@ func insertMatchAttempt(ctx context.Context, tx pgx.Tx, tenantID string, a *doma
 			target_journal_id, expected_target_amount, expected_target_currency,
 			observed_target_amount, observed_target_currency, observed_target_legal_entity_id,
 			observed_target_status, observed_target_fiscal_period,
-			examined_journal_ids, tolerance, fiscal_period, attempted_by, correlation_id)
+			examined_journal_ids, tolerance, tolerance_version, fiscal_period, attempted_by, correlation_id)
 		VALUES ($1, $2, $3, $4, $5,
 			$6, $7::numeric, $8, $9::numeric, $10, $11, $12, $13,
 			$14, $15::numeric, $16, $17::numeric, $18, $19, $20, $21,
-			$22, $23::numeric, $24, $25, $26)
+			$22, $23::numeric, $24, $25, $26, $27)
 		RETURNING attempt_id, attempted_at
 	`, tenantID, a.IntercompanyEntryID, a.Outcome, a.FailedRule, a.Message,
 		a.Source.JournalID, string(a.Source.ExpectedAmount), a.Source.ExpectedCurrency,
@@ -64,7 +64,7 @@ func insertMatchAttempt(ctx context.Context, tx pgx.Tx, tenantID string, a *doma
 		a.Target.JournalID, string(a.Target.ExpectedAmount), a.Target.ExpectedCurrency,
 		decimalText(a.Target.ObservedAmount), a.Target.ObservedCurrency, a.Target.ObservedLegalEntityID,
 		a.Target.ObservedStatus, a.Target.ObservedFiscalPeriod,
-		examined, string(a.Tolerance), a.FiscalPeriod, a.AttemptedBy, correlationID,
+		examined, string(a.Tolerance), a.ToleranceVersion, a.FiscalPeriod, a.AttemptedBy, correlationID,
 	).Scan(&a.AttemptID, &a.AttemptedAt)
 	if err != nil {
 		return fmt.Errorf("record match attempt: %w", err)
@@ -89,7 +89,7 @@ func (s *PgStore) ListMatchAttempts(ctx context.Context, id string) ([]domain.Ma
 			       target_journal_id, expected_target_amount::text, expected_target_currency,
 			       observed_target_amount::text, observed_target_currency, observed_target_legal_entity_id,
 			       observed_target_status, observed_target_fiscal_period,
-			       examined_journal_ids, tolerance::text, fiscal_period, attempted_by, correlation_id, attempted_at
+			       examined_journal_ids, tolerance::text, tolerance_version, fiscal_period, attempted_by, correlation_id, attempted_at
 			FROM intercompany_match_attempts
 			WHERE tenant_id = $1 AND intercompany_entry_id = $2
 			ORDER BY attempt_id
@@ -107,7 +107,7 @@ func (s *PgStore) ListMatchAttempts(ctx context.Context, id string) ([]domain.Ma
 				&a.Target.JournalID, &a.Target.ExpectedAmount, &a.Target.ExpectedCurrency,
 				&a.Target.ObservedAmount, &a.Target.ObservedCurrency, &a.Target.ObservedLegalEntityID,
 				&a.Target.ObservedStatus, &a.Target.ObservedFiscalPeriod,
-				&a.ExaminedJournalIDs, &a.Tolerance, &a.FiscalPeriod, &a.AttemptedBy, &a.CorrelationID, &a.AttemptedAt,
+				&a.ExaminedJournalIDs, &a.Tolerance, &a.ToleranceVersion, &a.FiscalPeriod, &a.AttemptedBy, &a.CorrelationID, &a.AttemptedAt,
 			); err != nil {
 				return err
 			}

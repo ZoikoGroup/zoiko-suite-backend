@@ -11,14 +11,24 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/clause-template-svc/internal/authz"
 	"zoiko.io/clause-template-svc/internal/domain"
-	"zoiko.io/clause-template-svc/internal/events"
+	"zoiko.io/clause-template-svc/internal/store"
 )
 
 type stubStore struct {
 	clauses    map[string]*domain.Clause
 	templates  map[string]*domain.ContractTemplate
 	deviations map[string]*domain.DeviationRule
+	// writes counts store writes; lastAudit is the attribution the handler
+	// attached to the last one (store.WithAudit).
+	writes    int
+	lastAudit store.Audit
+}
+
+func (s *stubStore) recordAudit(ctx context.Context) {
+	s.writes++
+	s.lastAudit, _ = store.AuditFrom(ctx)
 }
 
 func newStubStore() *stubStore {
@@ -29,7 +39,8 @@ func newStubStore() *stubStore {
 	}
 }
 
-func (s *stubStore) CreateClause(_ context.Context, c *domain.Clause) error {
+func (s *stubStore) CreateClause(ctx context.Context, c *domain.Clause) error {
+	s.recordAudit(ctx)
 	if c.ClauseID == "" {
 		c.ClauseID = "cls-test-001"
 	}
@@ -55,7 +66,8 @@ func (s *stubStore) ListClauses(_ context.Context, _, _ string) ([]domain.Clause
 	return out, nil
 }
 
-func (s *stubStore) UpdateClause(_ context.Context, c *domain.Clause, _ string) error {
+func (s *stubStore) UpdateClause(ctx context.Context, c *domain.Clause, _ string) error {
+	s.recordAudit(ctx)
 	existing, ok := s.clauses[c.ClauseID]
 	if !ok {
 		return domain.ErrClauseNotFound
@@ -67,7 +79,8 @@ func (s *stubStore) UpdateClause(_ context.Context, c *domain.Clause, _ string) 
 	return nil
 }
 
-func (s *stubStore) SubmitClauseForLegalReview(_ context.Context, id, submittedBy string) (*domain.Clause, error) {
+func (s *stubStore) SubmitClauseForLegalReview(ctx context.Context, id, submittedBy string) (*domain.Clause, error) {
+	s.recordAudit(ctx)
 	c, ok := s.clauses[id]
 	if !ok {
 		return nil, domain.ErrClauseNotFound
@@ -80,7 +93,8 @@ func (s *stubStore) SubmitClauseForLegalReview(_ context.Context, id, submittedB
 	return c, nil
 }
 
-func (s *stubStore) ApproveClause(_ context.Context, id, approvedBy string) (*domain.Clause, error) {
+func (s *stubStore) ApproveClause(ctx context.Context, id, approvedBy string) (*domain.Clause, error) {
+	s.recordAudit(ctx)
 	c, ok := s.clauses[id]
 	if !ok {
 		return nil, domain.ErrClauseNotFound
@@ -96,7 +110,8 @@ func (s *stubStore) ApproveClause(_ context.Context, id, approvedBy string) (*do
 	return c, nil
 }
 
-func (s *stubStore) ActivateClause(_ context.Context, id, activatedBy string) (*domain.Clause, error) {
+func (s *stubStore) ActivateClause(ctx context.Context, id, activatedBy string) (*domain.Clause, error) {
+	s.recordAudit(ctx)
 	c, ok := s.clauses[id]
 	if !ok {
 		return nil, domain.ErrClauseNotFound
@@ -109,7 +124,8 @@ func (s *stubStore) ActivateClause(_ context.Context, id, activatedBy string) (*
 	return c, nil
 }
 
-func (s *stubStore) RetireClause(_ context.Context, id, retiredBy string) (*domain.Clause, error) {
+func (s *stubStore) RetireClause(ctx context.Context, id, retiredBy string) (*domain.Clause, error) {
+	s.recordAudit(ctx)
 	c, ok := s.clauses[id]
 	if !ok {
 		return nil, domain.ErrClauseNotFound
@@ -122,7 +138,8 @@ func (s *stubStore) RetireClause(_ context.Context, id, retiredBy string) (*doma
 	return c, nil
 }
 
-func (s *stubStore) SupersedeClause(_ context.Context, id, supersededBy string) (*domain.Clause, error) {
+func (s *stubStore) SupersedeClause(ctx context.Context, id, supersededBy string) (*domain.Clause, error) {
+	s.recordAudit(ctx)
 	c, ok := s.clauses[id]
 	if !ok {
 		return nil, domain.ErrClauseNotFound
@@ -139,7 +156,8 @@ func (s *stubStore) ListClauseVersions(_ context.Context, _ string) ([]domain.Cl
 	return nil, nil
 }
 
-func (s *stubStore) CreateTemplate(_ context.Context, t *domain.ContractTemplate) error {
+func (s *stubStore) CreateTemplate(ctx context.Context, t *domain.ContractTemplate) error {
+	s.recordAudit(ctx)
 	if t.TemplateID == "" {
 		t.TemplateID = "tmpl-test-001"
 	}
@@ -165,12 +183,14 @@ func (s *stubStore) ListTemplates(_ context.Context, _, _ string) ([]domain.Cont
 	return out, nil
 }
 
-func (s *stubStore) UpdateTemplate(_ context.Context, t *domain.ContractTemplate) error {
+func (s *stubStore) UpdateTemplate(ctx context.Context, t *domain.ContractTemplate) error {
+	s.recordAudit(ctx)
 	s.templates[t.TemplateID] = t
 	return nil
 }
 
-func (s *stubStore) ApproveTemplate(_ context.Context, id, approvedBy string) (*domain.ContractTemplate, error) {
+func (s *stubStore) ApproveTemplate(ctx context.Context, id, approvedBy string) (*domain.ContractTemplate, error) {
+	s.recordAudit(ctx)
 	t, ok := s.templates[id]
 	if !ok {
 		return nil, domain.ErrTemplateNotFound
@@ -183,7 +203,8 @@ func (s *stubStore) ApproveTemplate(_ context.Context, id, approvedBy string) (*
 	return t, nil
 }
 
-func (s *stubStore) CreateDeviationRule(_ context.Context, d *domain.DeviationRule) error {
+func (s *stubStore) CreateDeviationRule(ctx context.Context, d *domain.DeviationRule) error {
+	s.recordAudit(ctx)
 	if d.DeviationID == "" {
 		d.DeviationID = "dev-test-001"
 	}
@@ -209,7 +230,8 @@ func (s *stubStore) ListDeviationRules(_ context.Context, _, _, _ string) ([]dom
 	return out, nil
 }
 
-func (s *stubStore) ApproveDeviationRule(_ context.Context, id, approvedBy string) (*domain.DeviationRule, error) {
+func (s *stubStore) ApproveDeviationRule(ctx context.Context, id, approvedBy string) (*domain.DeviationRule, error) {
+	s.recordAudit(ctx)
 	d, ok := s.deviations[id]
 	if !ok {
 		return nil, domain.ErrDeviationNotFound
@@ -225,14 +247,6 @@ func (s *stubStore) ApproveDeviationRule(_ context.Context, id, approvedBy strin
 	return d, nil
 }
 
-type stubPublisher struct{}
-
-func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error {
-	return nil
-}
-
-var _ events.Publisher = (*stubPublisher)(nil)
-
 // stubAuthz grants every request by default; tests can flip decision to
 // force a denial or unavailable-service response.
 type stubAuthz struct {
@@ -247,7 +261,7 @@ var _ AuthZClient = (*stubAuthz)(nil)
 
 func newTestHandler() *Handler {
 	logger, _ := zap.NewDevelopment()
-	return New(newStubStore(), &stubPublisher{}, &stubAuthz{}, logger)
+	return New(newStubStore(), &stubAuthz{}, logger)
 }
 
 func buildRequest(method, path string, body interface{}) *http.Request {
@@ -275,7 +289,7 @@ func TestCreateClause(t *testing.T) {
 		Body:           "All information shared shall remain confidential...",
 		JurisdictionID: "us-delaware",
 		EffectiveFrom:  "2026-01-01",
-		CreatedBy:      "user-001",
+		CreatedBy:      "user-test-01", // repeats the principal: accepted
 	}
 	w := httptest.NewRecorder()
 	h.CreateClause(w, buildRequest(http.MethodPost, "/v1/clauses", body))
@@ -312,7 +326,7 @@ func TestApproveClause_BySameSubmitter_Returns403(t *testing.T) {
 		Status: domain.StatusLegalReview, SubmittedBy: &submitter,
 	}
 	logger, _ := zap.NewDevelopment()
-	h := New(store, &stubPublisher{}, &stubAuthz{}, logger)
+	h := New(store, &stubAuthz{}, logger)
 	router := newChiRouter(h)
 
 	w := httptest.NewRecorder()
@@ -330,7 +344,7 @@ func TestClauseFullLifecycle_ReachesActive(t *testing.T) {
 		Status: domain.StatusDraft, SubmittedBy: &submitter,
 	}
 	logger, _ := zap.NewDevelopment()
-	h := New(store, &stubPublisher{}, &stubAuthz{}, logger)
+	h := New(store, &stubAuthz{}, logger)
 	router := newChiRouter(h)
 
 	// Submit (DRAFT -> LEGAL_REVIEW), then approve as a different principal.
@@ -366,7 +380,7 @@ func TestUpdateClause_RefusedOnceApproved(t *testing.T) {
 		Status: domain.StatusApproved, Title: "Original", Body: "Original body", Category: domain.ClauseCategoryOther,
 	}
 	logger, _ := zap.NewDevelopment()
-	h := New(store, &stubPublisher{}, &stubAuthz{}, logger)
+	h := New(store, &stubAuthz{}, logger)
 	router := newChiRouter(h)
 
 	w := httptest.NewRecorder()
@@ -385,7 +399,7 @@ func TestApproveDeviationRule_BySameProposer_Returns403(t *testing.T) {
 		Status: domain.DeviationStatusProposed, ProposedBy: "user-test-01",
 	}
 	logger, _ := zap.NewDevelopment()
-	h := New(store, &stubPublisher{}, &stubAuthz{}, logger)
+	h := New(store, &stubAuthz{}, logger)
 	router := newChiRouter(h)
 
 	w := httptest.NewRecorder()
@@ -418,7 +432,7 @@ func TestCreateTemplate(t *testing.T) {
 		ClauseIDs:      []string{"cls-001", "cls-002"},
 		JurisdictionID: "us-delaware",
 		EffectiveFrom:  "2026-01-01",
-		CreatedBy:      "user-001",
+		CreatedBy:      "user-test-01", // repeats the principal: accepted
 	}
 	w := httptest.NewRecorder()
 	h.CreateTemplate(w, buildRequest(http.MethodPost, "/v1/templates", body))
@@ -452,7 +466,7 @@ func TestClauseTemplate_ReadEndpoints_RequirePrincipal(t *testing.T) {
 		Status: domain.DeviationStatusProposed, ProposedBy: "user-test-01",
 	}
 
-	h := New(store, &stubPublisher{}, &stubAuthz{}, zap.NewNop())
+	h := New(store, &stubAuthz{}, zap.NewNop())
 	router := newChiRouter(h)
 
 	endpoints := []string{
@@ -477,3 +491,119 @@ func TestClauseTemplate_ReadEndpoints_RequirePrincipal(t *testing.T) {
 	}
 }
 
+// --- Actor identity (the actor of a write is X-Principal-Id) ---
+
+func assertCoded(t *testing.T, w *httptest.ResponseRecorder, status int, code string) {
+	t.Helper()
+	if w.Code != status {
+		t.Fatalf("expected %d, got %d — %s", status, w.Code, w.Body.String())
+	}
+	var body map[string]string
+	_ = json.NewDecoder(w.Body).Decode(&body)
+	if body["code"] != code {
+		t.Fatalf("expected code %q, got %q", code, body["code"])
+	}
+}
+
+func seededStub() *stubStore {
+	st := newStubStore()
+	st.clauses["cls-001"] = &domain.Clause{ClauseID: "cls-001", TenantID: "tenant-test-01", LegalEntityID: "le-001",
+		Title: "C", Category: "CONFIDENTIALITY", Body: "b", Status: domain.StatusDraft}
+	st.templates["tmpl-001"] = &domain.ContractTemplate{TemplateID: "tmpl-001", TenantID: "tenant-test-01", LegalEntityID: "le-001",
+		Title: "T", ContractType: "NDA", Status: domain.StatusDraft}
+	return st
+}
+
+func TestWrites_BodyActorDisagreeingWithPrincipal_Returns403ActorMismatch(t *testing.T) {
+	cases := []struct {
+		name, method, path string
+		body               interface{}
+	}{
+		{"create clause", http.MethodPost, "/v1/clauses", domain.CreateClauseRequest{Title: "t", Body: "b", Category: "CONFIDENTIALITY", LegalEntityID: "le-001", CreatedBy: "someone-else"}},
+		{"update clause", http.MethodPut, "/v1/clauses/cls-001", domain.UpdateClauseRequest{Title: "t2", UpdatedBy: "someone-else"}},
+		{"create template", http.MethodPost, "/v1/templates", domain.CreateTemplateRequest{Title: "t", ContractType: "NDA", LegalEntityID: "le-001", CreatedBy: "someone-else"}},
+		{"update template", http.MethodPut, "/v1/templates/tmpl-001", domain.UpdateTemplateRequest{Title: "t2", UpdatedBy: "someone-else"}},
+		{"create deviation", http.MethodPost, "/v1/deviation-rules", domain.CreateDeviationRuleRequest{LegalEntityID: "le-001", JurisdictionID: "us-de", Description: "x", RiskClassification: "LOW", ProposedBy: "someone-else"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := seededStub()
+			router := newChiRouter(New(st, &stubAuthz{}, zap.NewNop()))
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, buildRequest(tc.method, tc.path, tc.body))
+			assertCoded(t, w, http.StatusForbidden, "actor_mismatch")
+			if st.writes != 0 {
+				t.Fatalf("a refused write reached the store (%d writes)", st.writes)
+			}
+		})
+	}
+}
+
+// created_by absent from the body is filled from the principal (it used to be
+// stored verbatim from the body, empty included).
+func TestCreate_AbsentCreatedBy_IsThePrincipal(t *testing.T) {
+	st := seededStub()
+	router := newChiRouter(New(st, &stubAuthz{}, zap.NewNop()))
+	for _, tc := range []struct {
+		path string
+		body interface{}
+	}{
+		{"/v1/clauses", domain.CreateClauseRequest{Title: "t", Body: "b", Category: "CONFIDENTIALITY", LegalEntityID: "le-001"}},
+		{"/v1/templates", domain.CreateTemplateRequest{Title: "t", ContractType: "NDA", LegalEntityID: "le-001"}},
+	} {
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, buildRequest(http.MethodPost, tc.path, tc.body))
+		if w.Code != http.StatusCreated {
+			t.Fatalf("%s: expected 201, got %d — %s", tc.path, w.Code, w.Body.String())
+		}
+		var resp struct {
+			CreatedBy string `json:"created_by"`
+		}
+		_ = json.NewDecoder(w.Body).Decode(&resp)
+		if resp.CreatedBy != "user-test-01" {
+			t.Fatalf("%s: created_by = %q, want the principal", tc.path, resp.CreatedBy)
+		}
+		if st.lastAudit.ActorID != "user-test-01" {
+			t.Fatalf("%s: store write attributed to %q, want the principal", tc.path, st.lastAudit.ActorID)
+		}
+	}
+}
+
+// Every lifecycle write reaches the store carrying the principal as the
+// outbox event's actor.
+func TestLifecycleWrites_CarryAuditToStore(t *testing.T) {
+	st := seededStub()
+	router := newChiRouter(New(st, &stubAuthz{}, zap.NewNop()))
+	w := httptest.NewRecorder()
+	r := buildRequest(http.MethodPost, "/v1/clauses/cls-001/submit-legal-review", nil)
+	r.Header.Set("X-Correlation-ID", "corr-9")
+	router.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — %s", w.Code, w.Body.String())
+	}
+	if st.lastAudit != (store.Audit{ActorID: "user-test-01", CorrelationID: "corr-9"}) {
+		t.Fatalf("audit = %+v", st.lastAudit)
+	}
+}
+
+func TestWrites_WithoutPrincipal_Return401(t *testing.T) {
+	st := seededStub()
+	router := newChiRouter(New(st, &stubAuthz{}, zap.NewNop()))
+	r := buildRequest(http.MethodPost, "/v1/clauses", domain.CreateClauseRequest{Title: "t", Body: "b", Category: "CONFIDENTIALITY"})
+	r.Header.Del("X-Principal-Id")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, r)
+	if w.Code != http.StatusUnauthorized || st.writes != 0 {
+		t.Fatalf("expected 401 and no write, got %d (%d writes)", w.Code, st.writes)
+	}
+}
+
+func TestWrites_AuthzDeny_Returns403(t *testing.T) {
+	st := seededStub()
+	router := newChiRouter(New(st, &stubAuthz{err: authz.ErrAuthorizationDenied}, zap.NewNop()))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/clauses", domain.CreateClauseRequest{Title: "t", Body: "b", Category: "CONFIDENTIALITY", LegalEntityID: "le-001"}))
+	if w.Code != http.StatusForbidden || st.writes != 0 {
+		t.Fatalf("expected 403 and no write, got %d (%d writes)", w.Code, st.writes)
+	}
+}

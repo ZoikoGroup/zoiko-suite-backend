@@ -17,9 +17,11 @@ import (
 	"zoiko.io/banking-connector-svc/internal/authz"
 	"zoiko.io/banking-connector-svc/internal/clients"
 	"zoiko.io/banking-connector-svc/internal/config"
+	"zoiko.io/banking-connector-svc/internal/documentvault"
 	svcenvelope "zoiko.io/banking-connector-svc/internal/envelope"
 	"zoiko.io/banking-connector-svc/internal/handler"
 	"zoiko.io/banking-connector-svc/internal/health"
+	"zoiko.io/banking-connector-svc/internal/idempotency"
 	"zoiko.io/banking-connector-svc/internal/middleware"
 	"zoiko.io/banking-connector-svc/internal/mtls"
 	"zoiko.io/banking-connector-svc/internal/store"
@@ -142,6 +144,7 @@ func main() {
 	// validation). pgStore already satisfies store.BNK02Store.
 	bankAcctClient := clients.NewBankAccountHTTPClient(cfg.TreasuryServiceURL)
 	vaultClient := clients.NewVaultHTTPClient(cfg.VaultServiceURL)
+	documentVaultClient := documentvault.NewHTTPClient(cfg.DocumentVaultServiceURL, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -158,8 +161,10 @@ func main() {
 	// never report healthy. Found running this stack for real under
 	// docker-compose.phase7.yml; invisible in the native-process run, which
 	// polled the port directly rather than through Docker's HEALTHCHECK.
-	// A liveness probe must not require a verified tenant identity.
+	// A liveness probe must not require a verified tenant identity; nor does
+	// the readiness probe.
 	r.Get("/healthz", health.Handler())
+	r.Get("/readyz", health.ReadyHandler(dbpool))
 
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.TenantContext)
@@ -171,9 +176,14 @@ func main() {
 		// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 		r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
+		// Idempotency-Key replay for material writes (INV-08): a retried write
+		// with the same key is answered from its first response, not re-run.
+		r.Use(idempotency.Middleware(idempotency.NewPgStore(dbpool), logger))
+
+		handler.RegisterAll(r, h, st, bankAcctClient, vaultClient)
 		handler.RegisterRoutes(r, h)
 		handler.RegisterBNK02Routes(r, h, st, bankAcctClient, vaultClient)
-		handler.RegisterBNK0304Routes(r, h, st)
+		handler.RegisterBNK0304Routes(r, h, st, documentVaultClient)
 		handler.RegisterControlPopulationRoutes(r, h, st)
 	})
 

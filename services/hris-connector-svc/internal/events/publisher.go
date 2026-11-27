@@ -20,9 +20,12 @@ import (
 // actor field, so actor_id is threaded through explicitly from each
 // handler's already-verified principalID.
 type Event struct {
-	EventID       string      `json:"event_id"`
-	EventType     string      `json:"event_type"`
-	EventVersion  string      `json:"event_version"`
+	EventID      string `json:"event_id"`
+	EventType    string `json:"event_type"`
+	EventVersion string `json:"event_version"`
+	// SchemaVersion is the field the platform audit consumer (audit-event-store-svc)
+	// requires; EventVersion is kept for existing consumers. Same value.
+	SchemaVersion string      `json:"schema_version"`
 	SourceService string      `json:"source_service"`
 	AggregateID   string      `json:"aggregate_id"`
 	TenantID      string      `json:"tenant_id"`
@@ -82,13 +85,17 @@ func NewKafkaPublisherWithWriter(writer MessageWriter, topic string, logger *zap
 	return &KafkaPublisher{writer: writer, topic: topic, logger: logger}
 }
 
-func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) error {
-	evt := Event{
+// NewEvent builds the envelope for params. The transactional outbox stores
+// exactly this value at write time, so the message the relay later delivers
+// is the one Publish used to write directly.
+func NewEvent(params PublishParams) Event {
+	return Event{
 		// A fresh UUID per publish, not a deterministic string — see
 		// docs/architecture/known-gaps.md's event_id collision writeup.
 		EventID:       "evt-" + uuid.New().String(),
 		EventType:     params.EventType,
 		EventVersion:  "1.0",
+		SchemaVersion: "1.0",
 		SourceService: "hris-connector-svc",
 		AggregateID:   params.AggregateID,
 		TenantID:      params.TenantID,
@@ -98,6 +105,17 @@ func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) erro
 		OccurredAt:    time.Now().UTC(),
 		Payload:       params.Payload,
 	}
+}
+
+// PublishOutbox writes one outbox row's stored envelope to the topic, keyed by
+// the aggregate id as Publish always was. It satisfies outbox.Publisher; a
+// failure is returned so the relay retries the row.
+func (p *KafkaPublisher) PublishOutbox(ctx context.Context, outboxEventID, aggregateID string, payload []byte) error {
+	return p.writer.WriteMessages(ctx, kafka.Message{Key: []byte(aggregateID), Value: payload})
+}
+
+func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) error {
+	evt := NewEvent(params)
 	data, err := json.Marshal(evt)
 	if err != nil {
 		return err

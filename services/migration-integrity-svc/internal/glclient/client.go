@@ -146,21 +146,21 @@ type StageRequest struct {
 // It is intentionally a subset: this service reads general-ledger-svc's
 // batch, it never re-derives or re-states its financial content.
 type Batch struct {
-	BatchID         string          `json:"batch_id"`
-	Status          string          `json:"status"`
-	JournalID       string          `json:"journal_id,omitempty"`
-	JournalNumber   string          `json:"journal_number,omitempty"`
-	EvidenceHash    string          `json:"evidence_hash,omitempty"`
-	Reconciliation  *Reconciliation `json:"reconciliation,omitempty"`
-	Existing        bool            `json:"existing,omitempty"`
+	BatchID        string          `json:"batch_id"`
+	Status         string          `json:"status"`
+	JournalID      string          `json:"journal_id,omitempty"`
+	JournalNumber  string          `json:"journal_number,omitempty"`
+	EvidenceHash   string          `json:"evidence_hash,omitempty"`
+	Reconciliation *Reconciliation `json:"reconciliation,omitempty"`
+	Existing       bool            `json:"existing,omitempty"`
 }
 
 type Reconciliation struct {
-	Status        string   `json:"status"`
-	JournalID     string   `json:"journal_id"`
-	JournalNumber string   `json:"journal_number"`
-	JournalHash   string   `json:"journal_hash"`
-	Differences   []Diff   `json:"differences"`
+	Status        string `json:"status"`
+	JournalID     string `json:"journal_id"`
+	JournalNumber string `json:"journal_number"`
+	JournalHash   string `json:"journal_hash"`
+	Differences   []Diff `json:"differences"`
 }
 
 type Diff struct {
@@ -177,8 +177,8 @@ type Issue struct {
 }
 
 type Preview struct {
-	Batch *Batch `json:"batch"`
-	Ready bool   `json:"ready_to_approve"`
+	Batch    *Batch `json:"batch"`
+	Ready    bool   `json:"ready_to_approve"`
 	Analysis struct {
 		Issues []Issue `json:"issues"`
 	} `json:"analysis"`

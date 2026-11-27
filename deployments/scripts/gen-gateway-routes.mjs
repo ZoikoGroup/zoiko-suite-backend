@@ -49,6 +49,7 @@ function readServices() {
   let composeName = null;
   let container = null;
   let port = null;
+  const hostPorts = new Map();
 
   // A block is one of our Go services iff it builds from ../services (or from
   // the repo root, as search-indexer-svc does). Infra runs from `image:` and
@@ -73,6 +74,11 @@ function readServices() {
       isGoService = false;
       continue;
     }
+    // Published host port ("HOST:CONTAINER" or "IP:HOST:CONTAINER"). It can
+    // differ from PORT when the container port is already published by
+    // another service; the route index must show what a browser can reach.
+    const hp = /^ {6}- "(?:[\d.]+:)?(\d+):(\d+)"\s*$/.exec(line);
+    if (hp && composeName) hostPorts.set(composeName, Number(hp[1]));
     if (/^ {6}context:\s*(\.\.\/services\/|\.\.\s*$)/.test(line)) isGoService = true;
     const cn = /^ {4}container_name:\s*(\S+)\s*$/.exec(line);
     if (cn) container = cn[1];
@@ -89,6 +95,7 @@ function readServices() {
     }
   }
   flushPending();
+  for (const s of found) s.hostPort = hostPorts.get(s.composeName) ?? null;
 
   const unrouted = containersWithoutPort.filter((c) => !EXCLUDE.has(c));
   if (unrouted.length > 0) {
@@ -173,9 +180,9 @@ const routes = [
   "# Every service is reachable on the single gateway port at its path prefix.",
   "# The direct port still works and is useful when the gateway itself is suspect.",
   "",
-  "| Path prefix | Service | Direct port |",
-  "| --- | --- | --- |",
-  ...services.map((s) => `| \`/${s.container}\` | ${s.container} | ${s.port} |`),
+  "| Path prefix | Service | Container port | Host port |",
+  "| --- | --- | --- | --- |",
+  ...services.map((s) => `| \`/${s.container}\` | ${s.container} | ${s.port} | ${s.hostPort ?? "not published"} |`),
   "",
 ].join("\n");
 writeFileSync(join(OUT_DIR, "ROUTES.md"), routes, "utf8");

@@ -13,7 +13,7 @@ import (
 )
 
 func newTransferRouter(s *mockStore, authz *mockAuthz, tc handler.TransferClients) chi.Router {
-	h := handler.New(s, authz, &mockClients{}, tc, nil, zap.NewNop())
+	h := handler.New(s, authz, &mockClients{}, tc, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 	return r

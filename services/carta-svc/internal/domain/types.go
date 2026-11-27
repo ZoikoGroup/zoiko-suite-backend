@@ -25,7 +25,7 @@ const (
 
 type AccessContext struct {
 	SubjectID           string `json:"subject_id"`
-	SubjectType         string `json:"subject_type"` // USER, SERVICE_ACCOUNT, BOT
+	SubjectType         string `json:"subject_type"`       // USER, SERVICE_ACCOUNT, BOT
 	DeviceTrustLevel    int    `json:"device_trust_level"` // 0 to 100
 	IPAddress           string `json:"ip_address"`
 	IsKnownLocation     bool   `json:"is_known_location"`
@@ -45,6 +45,10 @@ type CartaAssessment struct {
 	Decision            Decision      `json:"decision"`
 	RiskFactors         []string      `json:"risk_factors"`
 	AssessmentTimestamp time.Time     `json:"assessment_timestamp"`
+	// EvaluatedBy is the verified principal (X-Principal-Id) that requested
+	// the evaluation. Empty when the caller presented none (gateway-auth-svc
+	// scoring a request during authentication); never taken from the body.
+	EvaluatedBy string `json:"evaluated_by,omitempty"`
 }
 
 type EvaluateRequest struct {

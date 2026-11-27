@@ -1,6 +1,25 @@
 # ACC-01 A1 — adding legal-entity/book to account identity
 
-Status: **plan only, no code changes**. Written in response to SPEC_DEVIATIONS
+Status: **superseded — do not implement.** A1 is closed by a different,
+already-shipped design: entity/book-scoped `account_scope_versions`
+(migration `000026_account_scope_versions`, commit `7728f0c6`, 2026-10-26),
+documented in `SPEC_DEVIATIONS.md` A1 and B13. That design deliberately keeps
+`chart_of_accounts`/`account_versions` tenant-wide for what an account *is*
+(code, type, control nature), versioning only what can legitimately differ by
+entity/book (name, hierarchy parent, ACTIVE/INACTIVE status) — specifically
+*not* the nullable-column, relaxed-uniqueness, independent-account-type
+approach sketched below. This plan predates that context (it was written
+2026-11-07, after the scope-versions commit, seemingly without it) and is
+kept here only as a record of an approach that was considered and correctly
+rejected: building it now would reverse a deliberate, reasoned decision (B13)
+and reopen the exact cross-service `account_code` ambiguity (§1 below) B13
+was written to avoid. If a future need genuinely requires independent
+per-entity account types, that is a fresh decision to make explicitly against
+B13 — not a reason to resume this plan as written.
+
+---
+
+Original status line (now superseded): **plan only, no code changes**. Written in response to SPEC_DEVIATIONS
 A1: this service keys accounts by `tenant_id + account_code` only; the spec's
 purpose line ("for each legal entity and accounting book"), required inputs
 (`entity_id; book_id`) and §24 data model all make entity/book part of an

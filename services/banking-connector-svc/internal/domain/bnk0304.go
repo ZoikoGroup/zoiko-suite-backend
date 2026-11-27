@@ -60,6 +60,23 @@ type IngestStatementLinesRequest struct {
 	OpeningBalance  float64           `json:"opening_balance"`
 	ClosingBalance  float64           `json:"closing_balance"`
 	Lines           []StatementLineIn `json:"lines"`
+
+	// RawFileContentBase64/RawFileContentType/RawFileName carry the
+	// original statement file's bytes, optional (SPEC_DEVIATIONS.md A10:
+	// "no raw payload, no raw file reference"). When present, the handler
+	// stores the file in document-vault-svc before calling the store and
+	// fills in RawFileDocumentID/RawFileChecksumSHA256 below. Omitting
+	// these three leaves ingestion exactly as it was before this field
+	// existed — no raw file is stored, same as every pre-existing caller.
+	RawFileContentBase64 string `json:"raw_file_content_base64,omitempty"`
+	RawFileContentType   string `json:"raw_file_content_type,omitempty"`
+	RawFileName          string `json:"raw_file_name,omitempty"`
+
+	// RawFileDocumentID/RawFileChecksumSHA256 are set by the handler (never
+	// by the caller) after a successful document-vault-svc upload, and
+	// persisted by the store alongside ContentHash.
+	RawFileDocumentID     string `json:"-"`
+	RawFileChecksumSHA256 string `json:"-"`
 }
 
 type StatementLineIn struct {

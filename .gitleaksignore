@@ -58,3 +58,9 @@ b4634f13b0fe152baeb1971abbf6c1c68a7c8852:services/eventing/integration/integrati
 # synthetic JWT as a test vector the gate must refuse. It is not a credential. The line now
 # carries `gitleaks:allow`; this covers the commit that introduced it, already pushed.
 1d8de38117e437afca4d7c1fd10164d81664e4e7:services/eventing/envelope/secrets_test.go:jwt:31
+#
+# Blocks 6-10 (37d5b869, siem-integration-svc): pg_integration_test.go carries a
+# fake exporter credential ("dd-api-key-LIVE-0123...") that the test proves is
+# stored sealed and never echoed. It is not a secret. The line now carries
+# `gitleaks:allow`; this covers the commit already pushed.
+37d5b86950db3d6e54cb4d3575837f902d2dbbb4:services/siem-integration-svc/internal/handler/pg_integration_test.go:generic-api-key:162

@@ -1,29 +1,23 @@
+// Package handler is the HTTP layer of migration-integrity-svc. One file per
+// route (validate_migration.go, get_job.go, list_jobs.go, remediate_entry.go,
+// archive_job.go); shared request plumbing lives in request.go and the error
+// mapping in errors.go. ROUTES.md at the service root documents the contract.
 package handler
 
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
-	"strings"
-	"time"
 
-	"github.com/go-chi/chi/v5"
-	chiMiddleware "github.com/go-chi/chi/v5/middleware"
-	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"zoiko.io/migration-integrity-svc/internal/authz"
-	"zoiko.io/migration-integrity-svc/internal/domain"
-	svcenvelope "zoiko.io/migration-integrity-svc/internal/envelope"
 	"zoiko.io/migration-integrity-svc/internal/glclient"
-	"zoiko.io/migration-integrity-svc/internal/health"
-	"zoiko.io/migration-integrity-svc/internal/middleware"
 	"zoiko.io/migration-integrity-svc/internal/store"
 )
 
+// Authorization actions checked against authorization-svc, always at the
+// legal entity that owns the job.
 const (
-	principalIDHeader = "X-Principal-Id"
-
 	ActionMigrationJobValidate = "MIGRATION_JOB_VALIDATE"
 	ActionMigrationJobArchive  = "MIGRATION_JOB_ARCHIVE"
 	ActionMigrationJobView     = "MIGRATION_JOB_VIEW"
@@ -33,10 +27,10 @@ const (
 	// from the field-level actions above because promoting a batch into
 	// general-ledger-svc and issuing a certificate are materially bigger
 	// authorities than running or reading a validation job.
-	ActionMigrationBatchPromote   = "MIGRATION_BATCH_PROMOTE"
-	ActionMigrationBatchView      = "MIGRATION_BATCH_VIEW"
-	ActionMigrationCrosswalkWrite = "MIGRATION_CROSSWALK_WRITE"
-	ActionMigrationCrosswalkView  = "MIGRATION_CROSSWALK_VIEW"
+	ActionMigrationBatchPromote     = "MIGRATION_BATCH_PROMOTE"
+	ActionMigrationBatchView        = "MIGRATION_BATCH_VIEW"
+	ActionMigrationCrosswalkWrite   = "MIGRATION_CROSSWALK_WRITE"
+	ActionMigrationCrosswalkView    = "MIGRATION_CROSSWALK_VIEW"
 	ActionMigrationCertificateIssue = "MIGRATION_CERTIFICATE_ISSUE"
 	ActionMigrationCertificateView  = "MIGRATION_CERTIFICATE_VIEW"
 
@@ -46,12 +40,27 @@ const (
 	// have their own). Extract actions are per-legal-entity, matching
 	// batch-ref/job scoping, since an extract names exactly one
 	// legal_entity_id.
-	ActionMigrationProgramWrite  = "MIGRATION_PROGRAM_WRITE"
-	ActionMigrationProgramView   = "MIGRATION_PROGRAM_VIEW"
-	ActionMigrationExtractWrite  = "MIGRATION_EXTRACT_REGISTER"
-	ActionMigrationExtractView   = "MIGRATION_EXTRACT_VIEW"
+	ActionMigrationProgramWrite = "MIGRATION_PROGRAM_WRITE"
+	ActionMigrationProgramView  = "MIGRATION_PROGRAM_VIEW"
+	ActionMigrationExtractWrite = "MIGRATION_EXTRACT_REGISTER"
+	ActionMigrationExtractView  = "MIGRATION_EXTRACT_VIEW"
 )
 
+// Idempotency operations: the stored replay is bound to one operation, so a
+// key reused on a different route is a conflict, not a replay.
+const (
+	operationValidate    = "migration.validate"
+	operationRemediate   = "migration.audit_entry.disposition"
+	operationArchive     = "migration.archive"
+	headerPrincipalID    = "X-Principal-Id"
+	headerLegalEntityID  = "X-Legal-Entity-Id"
+	headerCorrelationID  = "X-Correlation-ID"
+	headerIdempotencyKey = "Idempotency-Key"
+	headerIfMatch        = "If-Match"
+	headerReplayed       = "Idempotent-Replayed"
+)
+
+// Handler serves the /v1/migrations routes.
 type Handler struct {
 	store                   store.Store
 	authz                   *authz.Client
@@ -84,304 +93,11 @@ func (h *Handler) WithControlPlane(cp store.ControlPlaneStore, gl *glclient.Clie
 	return h
 }
 
-func NewRouter(h *Handler) http.Handler {
-	r := chi.NewRouter()
-	r.Use(chiMiddleware.RequestID)
-	r.Use(chiMiddleware.RealIP)
-	r.Use(chiMiddleware.Logger)
-	r.Use(chiMiddleware.Recoverer)
-
-	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
-	// Recoverer so a refusal is still traced, and ahead of every handler so no
-	// request reaches business logic without a resolved tenant, actor,
-	// correlation and — on material writes — an idempotency key.
-	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
-	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
-
-	// /healthz stays OUTSIDE the tenant gate. Liveness and readiness
-	// probes carry no tenant, so a blanket tenant requirement would 401
-	// every probe and the orchestrator would restart the container in a
-	// loop — a security fix that takes the service down.
-	r.Get("/healthz", health.Handler())
-
-	// Everything below requires a gateway-verified tenant. Applied via
-	// With() on the route subtree rather than as a path exemption inside
-	// the middleware: comparing r.URL.Path to skip an auth gate is a
-	// classic bypass source (traversal, trailing slash, case). The route
-	// tree is the source of truth for what is and is not protected.
-	r.With(middleware.TenantMiddleware).Route("/v1/migrations", func(r chi.Router) {
-		r.Post("/validate", h.ValidateMigration)
-		r.Get("/", h.ListJobs)
-		r.Get("/{id}", h.GetJobByID)
-		r.Post("/{id}/audit/{entryId}/remediate", h.RemediateEntry)
-		r.Delete("/{id}", h.ArchiveJob)
-
-		// Control plane: ties a validated job to a real general-ledger-svc
-		// batch, the permanent legacy<->canonical identity crosswalk, and
-		// the certificate issued once GL's own Post+Reconcile succeed.
-		r.Post("/crosswalk", h.UpsertCrosswalk)
-		r.Get("/crosswalk", h.GetCrosswalkEntry)
-		r.Post("/{id}/promote", h.PromoteBatch)
-		r.Get("/{id}/batch-ref", h.GetBatchRef)
-		r.Post("/{id}/certificate", h.IssueCertificate)
-		r.Get("/{id}/certificate", h.GetCertificate)
-
-		// MigrationProgram: the top-level tracking object a batch/extract
-		// may optionally belong to.
-		r.Post("/programs", h.CreateProgram)
-		r.Get("/programs/{id}", h.GetProgram)
-		r.Post("/programs/{id}/status", h.UpdateProgramStatus)
-
-		// SourceExtract: immutable, versioned landing of source data. No
-		// update route exists anywhere for it -- a correction is a new
-		// version, registered via the same POST.
-		r.Post("/extracts", h.RegisterExtract)
-		r.Get("/extracts/{id}", h.GetExtract)
-		r.Get("/extracts", h.ListExtractVersions)
-	})
-
-	return r
-}
-
-// ─── Handlers ─────────────────────────────────────────────────────────────────
-
-func (h *Handler) ValidateMigration(w http.ResponseWriter, r *http.Request) {
-	tenantID := middleware.GetTenantID(r.Context())
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-
-	var req domain.ValidateMigrationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.errJSON(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if err := req.Validate(); err != nil {
-		h.errJSON(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	if !h.checkAllowed(w, r, principalID, req.LegalEntityID, ActionMigrationJobValidate) {
-		return
-	}
-
-	// SourceExtractID, when given, binds this run to a registered, immutable
-	// SourceExtract (MIG-INV-03) instead of validating raw records with no
-	// frozen record of what was submitted. Backward compatible: a request
-	// that omits it validates exactly as this endpoint behaved before
-	// SourceExtract existed.
-	var extract *domain.SourceExtract
-	if strings.TrimSpace(req.SourceExtractID) != "" {
-		if h.cp == nil {
-			h.errJSON(w, http.StatusNotImplemented, "source_extract_id was given but the migration control plane is not configured on this instance")
-			return
-		}
-		var err error
-		extract, err = h.cp.GetExtractByID(r.Context(), tenantID, strings.TrimSpace(req.SourceExtractID))
-		if err != nil {
-			h.errJSON(w, http.StatusNotFound, "source_extract_id does not name a registered source extract in this tenant")
-			return
-		}
-		if extract.LegalEntityID != req.LegalEntityID {
-			h.errJSON(w, http.StatusConflict, "the source extract was registered for a different legal_entity_id")
-			return
-		}
-		// The frozen extract and what is being validated against it must be
-		// the same population: a mismatch means either a different
-		// submission is silently standing in for this extract, or the
-		// extract header itself does not describe what was actually landed
-		// -- either way, validating it as that extract would be wrong.
-		if extract.RecordCount != len(req.Records) {
-			h.errJSON(w, http.StatusConflict, fmt.Sprintf(
-				"record count mismatch: extract %s v%d declares %d records, but %d were submitted for validation",
-				extract.ExtractID, extract.Version, extract.RecordCount, len(req.Records)))
-			return
-		}
-	}
-
-	jobID := uuid.New().String()
-	now := time.Now()
-
-	checks, entries, validCount, invalidCount, score := domain.PerformIntegrityValidation(&req, jobID, tenantID)
-
-	// An MQ0 entry fails the job at any score (SPEC_DEVIATIONS A6): the
-	// acceptance decision is the one place this service can "stop" a run.
-	blockers := domain.CountBlockers(entries)
-	status := domain.EvaluateJobStatus(score, validCount, invalidCount, blockers, h.integrityScoreThreshold)
-
-	job := &domain.MigrationJob{
-		ID:                      jobID,
-		LegalEntityID:           req.LegalEntityID,
-		MigrationName:           req.MigrationName,
-		SourceSystem:            req.SourceSystem,
-		TargetService:           req.TargetService,
-		TotalRecordsCount:       len(req.Records),
-		ValidRecordsCount:       validCount,
-		InvalidRecordsCount:     invalidCount,
-		IntegrityScore:          score,
-		IntegrityScoreThreshold: h.integrityScoreThreshold,
-		BlockerCount:            blockers,
-		Status:                  status,
-		StartedAt:               &now,
-		CompletedAt:             &now,
-	}
-	if extract != nil {
-		job.SourceExtractID = extract.ID
-		job.SourceExtractVersion = extract.Version
-	}
-
-	if err := h.store.CreateJob(r.Context(), tenantID, job, checks, entries, principalID, r.Header.Get("X-Correlation-ID")); err != nil {
-		h.logger.Error("failed to save migration job", zap.Error(err))
-		h.errJSON(w, http.StatusInternalServerError, "failed to persist migration validation results")
-		return
-	}
-
-	h.okJSON(w, http.StatusCreated, job)
-}
-
-func (h *Handler) GetJobByID(w http.ResponseWriter, r *http.Request) {
-	tenantID := middleware.GetTenantID(r.Context())
-	id := chi.URLParam(r, "id")
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-
-	job, err := h.store.GetJobByID(r.Context(), tenantID, id)
-	if err != nil {
-		h.errJSON(w, http.StatusNotFound, "migration job not found")
-		return
-	}
-
-	// Reads are authorized per legal entity, like the writes: tenant scope
-	// (RLS) alone let any principal of the tenant read every entity's
-	// migration jobs. The job is fetched first because its own legal entity
-	// is what must be authorized — the caller names no entity on this route.
-	if !h.checkAllowed(w, r, principalID, job.LegalEntityID, ActionMigrationJobView) {
-		return
-	}
-
-	h.okJSON(w, http.StatusOK, job)
-}
-
-// ListJobs lists migration jobs for one legal entity, authorized at that
-// entity. The entity is REQUIRED: this is the read that used to hand any
-// principal of the tenant every entity's jobs, and a tenant-wide listing has
-// no legal entity to authorize against. A caller holding view rights for the
-// entity gets the list; a caller without gets a 403, not a silently filtered
-// subset (which would read as "there is nothing there").
-func (h *Handler) ListJobs(w http.ResponseWriter, r *http.Request) {
-	tenantID := middleware.GetTenantID(r.Context())
-	legalEntityID := r.URL.Query().Get("legal_entity_id")
-	status := r.URL.Query().Get("status")
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if legalEntityID == "" {
-		h.errJSON(w, http.StatusBadRequest, "legal_entity_id is required to list migration jobs (reads are authorized per legal entity)")
-		return
-	}
-	if !h.checkAllowed(w, r, principalID, legalEntityID, ActionMigrationJobView) {
-		return
-	}
-
-	jobs, err := h.store.ListJobs(r.Context(), tenantID, legalEntityID, status)
-	if err != nil {
-		h.logger.Error("failed to list migration jobs", zap.Error(err))
-		h.errJSON(w, http.StatusInternalServerError, "failed to query migration jobs")
-		return
-	}
-	if jobs == nil {
-		jobs = []domain.MigrationJob{}
-	}
-	h.okJSON(w, http.StatusOK, map[string]interface{}{"data": jobs, "count": len(jobs)})
-}
-
-func (h *Handler) RemediateEntry(w http.ResponseWriter, r *http.Request) {
-	tenantID := middleware.GetTenantID(r.Context())
-	jobID := chi.URLParam(r, "id")
-	entryID := chi.URLParam(r, "entryId")
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-
-	job, err := h.store.GetJobByID(r.Context(), tenantID, jobID)
-	if err != nil {
-		h.errJSON(w, http.StatusNotFound, "migration job not found")
-		return
-	}
-
-	if !h.checkAllowed(w, r, principalID, job.LegalEntityID, ActionAuditEntryRemediate) {
-		return
-	}
-
-	var req domain.RemediateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.errJSON(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if err := req.Validate(); err != nil {
-		h.errJSON(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	// An MQ0's disposition is "executive/domain owner resolution required"
-	// (§16): holding AUDIT_ENTRY_REMEDIATE is not enough, the resolver must
-	// be the owner named on the entry. Entries recorded before owners
-	// existed carry none and fall back to the action check alone (A6).
-	for _, e := range job.AuditEntries {
-		if e.ID == entryID && e.Severity.Blocks() && e.OwnerID != "" && e.OwnerID != principalID {
-			h.errJSON(w, http.StatusForbidden, "an MQ0 blocker can only be resolved by its owner")
-			return
-		}
-	}
-
-	entry, err := h.store.RemediateEntry(r.Context(), tenantID, jobID, entryID,
-		strings.TrimSpace(req.RemediationReason), strings.TrimSpace(req.RemediationEvidenceRef),
-		principalID, r.Header.Get("X-Correlation-ID"))
-	if err != nil {
-		h.errJSON(w, http.StatusNotFound, err.Error())
-		return
-	}
-
-	h.okJSON(w, http.StatusOK, entry)
-}
-
-func (h *Handler) ArchiveJob(w http.ResponseWriter, r *http.Request) {
-	tenantID := middleware.GetTenantID(r.Context())
-	id := chi.URLParam(r, "id")
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-
-	job, err := h.store.GetJobByID(r.Context(), tenantID, id)
-	if err != nil {
-		h.errJSON(w, http.StatusNotFound, "migration job not found")
-		return
-	}
-
-	if !h.checkAllowed(w, r, principalID, job.LegalEntityID, ActionMigrationJobArchive) {
-		return
-	}
-
-	if err := h.store.ArchiveJob(r.Context(), tenantID, id, principalID, r.Header.Get("X-Correlation-ID")); err != nil {
-		h.errJSON(w, http.StatusNotFound, "migration job not found")
-		return
-	}
-
-	h.okJSON(w, http.StatusOK, map[string]string{"message": "migration job archived", "id": id})
-}
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Control-plane helpers ────────────────────────────────────────────────────
+//
+// control_plane.go (batch ref, crosswalk, certificate, program, extract) keeps
+// the {"error": msg} body shape it shipped with; the job routes in this
+// package answer application/problem+json through errors.go.
 
 func (h *Handler) okJSON(w http.ResponseWriter, code int, payload interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -397,9 +113,9 @@ func (h *Handler) errJSON(w http.ResponseWriter, code int, msg string) {
 // X-Principal-Id request header. If missing, it writes a 401 response and
 // returns ok=false so the caller can abort the request.
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
-	principalID := r.Header.Get(principalIDHeader)
+	principalID := r.Header.Get(headerPrincipalID)
 	if principalID == "" {
-		h.errJSON(w, http.StatusUnauthorized, "missing "+principalIDHeader+" header")
+		h.errJSON(w, http.StatusUnauthorized, "missing "+headerPrincipalID+" header")
 		return "", false
 	}
 	return principalID, true

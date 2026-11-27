@@ -17,6 +17,7 @@ package events_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/segmentio/kafka-go"
@@ -40,6 +41,7 @@ type envelope struct {
 	EventID       string `json:"event_id"`
 	EventType     string `json:"event_type"`
 	EventVersion  string `json:"event_version"`
+	SchemaVersion string `json:"schema_version"`
 	SourceService string `json:"source_service"`
 	CorrelationID string `json:"correlation_id"`
 	TenantID      string `json:"tenant_id"`
@@ -54,46 +56,45 @@ func decode(t *testing.T, msg kafka.Message) envelope {
 	return env
 }
 
-func TestPublish_EnvelopeCarriesActorAndCorrelationID(t *testing.T) {
+func TestNewEvent_EnvelopeCarriesActorAndCorrelationID(t *testing.T) {
 	w := &fakeWriter{}
 	p := events.NewKafkaPublisherWithWriter(w, "zoiko.contract.events", zap.NewNop())
 
-	err := p.Publish(context.Background(), events.PublishParams{
+	ev := events.NewEvent("evt-1", events.PublishParams{
 		EventType: "contract.activated", ContractID: "contract-1", TenantID: "tenant-1",
 		LegalEntityID: "entity-1", ActorID: "signer-1", CorrelationID: "corr-1",
 		Payload: map[string]string{"status": "ACTIVE"},
 	})
+	body, err := json.Marshal(ev)
 	require.NoError(t, err)
+	require.NoError(t, p.PublishOutbox(context.Background(), "evt-1", "contract-1", body))
 	require.Len(t, w.msgs, 1)
 
 	env := decode(t, w.msgs[0])
 	assert.Equal(t, "contract.activated", env.EventType)
 	assert.Equal(t, "1.0", env.EventVersion)
+	assert.Equal(t, "1.0", env.SchemaVersion)
+	assert.Equal(t, "contract-lifecycle-svc", env.SourceService)
 	assert.Equal(t, "tenant-1", env.TenantID)
 	assert.Equal(t, "entity-1", env.LegalEntityID)
 	assert.Equal(t, "signer-1", env.ActorID)
 	assert.Equal(t, "corr-1", env.CorrelationID)
-	assert.NotEmpty(t, env.EventID)
+	assert.Equal(t, "evt-1", env.EventID)
+	assert.Equal(t, "contract-1", string(w.msgs[0].Key), "keyed by contract id, as before")
+	require.Len(t, w.msgs[0].Headers, 1)
+	assert.Equal(t, "X-Event-ID", w.msgs[0].Headers[0].Key)
+	assert.Equal(t, "evt-1", string(w.msgs[0].Headers[0].Value))
 }
 
-// TestPublish_RepeatEventsOnSameContract_GetDistinctEventIDs is the
-// regression test for the real bug this fix closes.
-func TestPublish_RepeatEventsOnSameContract_GetDistinctEventIDs(t *testing.T) {
-	w := &fakeWriter{}
-	p := events.NewKafkaPublisherWithWriter(w, "zoiko.contract.events", zap.NewNop())
+// A broker failure is returned to the relay (which keeps the row and retries);
+// the old Publish logged and returned nil, losing the event.
+func TestPublishOutbox_ReturnsBrokerError(t *testing.T) {
+	p := events.NewKafkaPublisherWithWriter(failingWriter{}, "zoiko.contract.events", zap.NewNop())
+	require.Error(t, p.PublishOutbox(context.Background(), "evt-1", "contract-1", []byte(`{}`)))
+}
 
-	for i := 0; i < 2; i++ {
-		err := p.Publish(context.Background(), events.PublishParams{
-			EventType: "contract.updated", ContractID: "contract-1", TenantID: "tenant-1",
-			LegalEntityID: "entity-1", ActorID: "editor-1", CorrelationID: "corr-x",
-			Payload: map[string]int{"version": i + 1},
-		})
-		require.NoError(t, err)
-	}
+type failingWriter struct{}
 
-	require.Len(t, w.msgs, 2)
-	first := decode(t, w.msgs[0])
-	second := decode(t, w.msgs[1])
-	assert.NotEqual(t, first.EventID, second.EventID,
-		"DUPLICATE EVENT_ID: two distinct contract.updated events on the same contract must not collide — a dedup consumer would drop the second one")
+func (failingWriter) WriteMessages(context.Context, ...kafka.Message) error {
+	return errors.New("broker down")
 }

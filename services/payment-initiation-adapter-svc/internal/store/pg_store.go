@@ -187,8 +187,13 @@ func scanAttempt(row pgx.Row) (*domain.PaymentInitiationAttempt, error) {
 // adapter — see internal/domain's package doc. Relies on the migration's
 // unique index on idempotency_key to reject a duplicate.
 func (s *PgStore) PrepareAttempt(ctx context.Context, tenantID string, req domain.PrepareAttemptRequest, principalID, correlationID string) (*domain.PaymentInitiationAttempt, error) {
-	// A6: NUMERIC(18,2) rounds an amount with more places instead of
+	// A6: NUMERIC(18,4) rounds an amount with more places instead of
 	// refusing it, so an amount it cannot hold exactly never reaches it.
+	// This is the same column-capacity check the handler already ran
+	// before this store call — the per-currency precision rule
+	// (domain.ValidateCurrencyPrecision) lives in the handler, which is
+	// where the currency is resolved from currency-registry-svc; this is a
+	// defense-in-depth re-check of the column's own ceiling only.
 	if _, err := domain.ValidatePositiveAmount(req.Amount); err != nil {
 		return nil, err
 	}

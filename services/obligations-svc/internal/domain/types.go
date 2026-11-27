@@ -92,6 +92,130 @@ type Obligation struct {
 	// the obligation was raised from; both nil for a free-standing obligation.
 	ObligationDefinitionID *string `json:"obligation_definition_id,omitempty"`
 	DefinitionVersion      *int    `json:"definition_version,omitempty"`
+
+	// ── WFC-05 consolidation (Doc 04 §2.1 / ZS-SVC-R-001 §7) ────────────────
+	//
+	// LifecycleModel discriminates LEGACY (the original OPEN/IN_PROGRESS/
+	// OVERDUE/CLOSED machine below, untouched for any existing caller) from
+	// EXTENDED (the WFC-05 9-state machine — see ExtendedObligationStatus*
+	// constants and store.extendedTransitions). An obligation is one or the
+	// other for its whole life; the field is never reinterpreted in place.
+	LifecycleModel string `json:"lifecycle_model"`
+
+	// ClockClass: HARD_LEGAL | REGULATORY | CONTRACTUAL | INTERNAL_SLA |
+	// ADVISORY (spec §7.1). Data only.
+	ClockClass string `json:"clock_class"`
+
+	// ExtractedByAI marks a CANDIDATE obligation proposed by AI/document
+	// extraction rather than entered manually. LEG-07 §9.1: "AI extraction
+	// cannot activate obligation without validation" — such an obligation
+	// starts at CANDIDATE and may only reach PLANNED via
+	// ValidateExtractedObligation.
+	ExtractedByAI bool       `json:"extracted_by_ai"`
+	ValidatedAt   *time.Time `json:"validated_at,omitempty"`
+	ValidatedBy   *string    `json:"validated_by,omitempty"`
+
+	// Due-date provenance (§9.1), certified when the obligation is scheduled
+	// into ACTIVE.
+	SourceClauseID     *string    `json:"source_clause_id,omitempty"`
+	TriggerDescription *string    `json:"trigger_description,omitempty"`
+	CalculationMethod  *string    `json:"calculation_method,omitempty"`
+	ScheduledAt        *time.Time `json:"scheduled_at,omitempty"`
+	ScheduledBy        *string    `json:"scheduled_by,omitempty"`
+
+	DueSoonMarkedAt *time.Time `json:"due_soon_marked_at,omitempty"`
+	DueMarkedAt     *time.Time `json:"due_marked_at,omitempty"`
+	DueMarkedBy     *string    `json:"due_marked_by,omitempty"`
+	InProgressAt    *time.Time `json:"in_progress_at,omitempty"`
+	InProgressBy    *string    `json:"in_progress_by,omitempty"`
+
+	FulfilledAt            *time.Time `json:"fulfilled_at,omitempty"`
+	FulfilledBy            *string    `json:"fulfilled_by,omitempty"`
+	FulfillmentEvidenceRef *string    `json:"fulfillment_evidence_ref,omitempty"`
+
+	WaivedAt                 *time.Time `json:"waived_at,omitempty"`
+	WaivedBy                 *string    `json:"waived_by,omitempty"`
+	WaiverAuthorityReference *string    `json:"waiver_authority_reference,omitempty"`
+	WaiverReasonCode         *string    `json:"waiver_reason_code,omitempty"`
+
+	NotApplicableAt     *time.Time `json:"not_applicable_at,omitempty"`
+	NotApplicableBy     *string    `json:"not_applicable_by,omitempty"`
+	NotApplicableReason *string    `json:"not_applicable_reason,omitempty"`
+
+	// BreachedAt/By/Note record the fact of breach only. Breach status does
+	// not automatically create financial accrual, payment or legal remedy;
+	// target domains act separately — enforced by never calling out to any
+	// of them from this transition.
+	BreachedAt *time.Time `json:"breached_at,omitempty"`
+	BreachedBy *string    `json:"breached_by,omitempty"`
+	BreachNote *string    `json:"breach_note,omitempty"`
+
+	DisputedAt    *time.Time `json:"disputed_at,omitempty"`
+	DisputedBy    *string    `json:"disputed_by,omitempty"`
+	DisputeReason *string    `json:"dispute_reason,omitempty"`
+
+	SupersededByObligationID *string `json:"superseded_by_obligation_id,omitempty"`
+
+	EffectiveFrom *time.Time `json:"effective_from,omitempty"`
+	EffectiveTo   *time.Time `json:"effective_to,omitempty"`
+}
+
+// Lifecycle models.
+const (
+	LifecycleModelLegacy   = "LEGACY"
+	LifecycleModelExtended = "EXTENDED"
+)
+
+// Clock classes (spec §7.1).
+const (
+	ClockClassHardLegal   = "HARD_LEGAL"
+	ClockClassRegulatory  = "REGULATORY"
+	ClockClassContractual = "CONTRACTUAL"
+	ClockClassInternalSLA = "INTERNAL_SLA"
+	ClockClassAdvisory    = "ADVISORY"
+)
+
+// Extended (WFC-05) obligation_status values — spec §7.2's 9-state model
+// plus CANDIDATE. Only legal when LifecycleModel == LifecycleModelExtended;
+// the LEGACY OPEN/IN_PROGRESS/OVERDUE/CLOSED machine is entirely separate
+// and store.legalTransitions is unchanged by these.
+const (
+	ExtendedStatusCandidate     = "CANDIDATE"
+	ExtendedStatusPlanned       = "PLANNED"
+	ExtendedStatusActive        = "ACTIVE"
+	ExtendedStatusDueSoon       = "DUE_SOON"
+	ExtendedStatusDue           = "DUE"
+	ExtendedStatusOverdue       = "OVERDUE"
+	ExtendedStatusFulfilled     = "FULFILLED"
+	ExtendedStatusWaived        = "WAIVED"
+	ExtendedStatusNotApplicable = "NOT_APPLICABLE"
+	ExtendedStatusSuperseded    = "SUPERSEDED"
+	// Carried over from obligation-tracking-svc's lifecycle — spec §7.2 does
+	// not name these two explicitly, but obligation-tracking-svc's existing
+	// callers (contract-derived obligations) rely on them, and dropping them
+	// in a consolidation would be a silent capability loss, not a cleanup.
+	ExtendedStatusInProgress = "IN_PROGRESS"
+	ExtendedStatusBreached   = "BREACHED"
+	ExtendedStatusDisputed   = "DISPUTED"
+)
+
+// ExtendedTransitionEvidence carries the evidence fields a specific EXTENDED
+// transition requires. Only the fields relevant to the target status are
+// read; the others are ignored. Validated against the target status by
+// store.TransitionExtended — e.g. ExtendedStatusWaived requires
+// WaiverAuthorityReference and WaiverReasonCode both non-empty, per spec
+// §7.1 "Waiver ... cannot be a hidden admin toggle".
+type ExtendedTransitionEvidence struct {
+	TriggerDescription       string
+	CalculationMethod        string
+	SourceClauseID           string
+	FulfillmentEvidenceRef   string
+	WaiverAuthorityReference string
+	WaiverReasonCode         string
+	NotApplicableReason      string
+	BreachNote               string
+	DisputeReason            string
+	SupersededByObligationID string
 }
 
 // FilingRequirement is a filing obligation scoped under a parent Obligation.
@@ -110,6 +234,21 @@ type FilingRequirement struct {
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
 	RowVersion int       `json:"row_version"`
+
+	// ── filing-tracker-svc parity (migration 000013) ──────────────────────
+	JurisdictionID *string    `json:"jurisdiction_id,omitempty"`
+	PeriodKey      *string    `json:"period_key,omitempty"`
+	DueDate        *time.Time `json:"due_date,omitempty"`
+
+	SubmissionReference *string    `json:"submission_reference,omitempty"`
+	SubmittedAt         *time.Time `json:"submitted_at,omitempty"`
+	SubmittedBy         *string    `json:"submitted_by,omitempty"`
+
+	ConfirmationReference *string    `json:"confirmation_reference,omitempty"`
+	ConfirmedAt           *time.Time `json:"confirmed_at,omitempty"`
+
+	RejectionReason *string `json:"rejection_reason,omitempty"`
+	Notes           *string `json:"notes,omitempty"`
 }
 
 // CreateObligationParams holds input parameters for creating an obligation.
@@ -136,6 +275,46 @@ type CreateObligationParams struct {
 	// definition is not mapped to.
 	ObligationDefinitionID string `json:"-"`
 	DefinitionVersion      int    `json:"-"`
+
+	// ── WFC-05 consolidation ─────────────────────────────────────────────
+	// LifecycleModel: empty defaults to LifecycleModelLegacy in the store —
+	// every existing caller that does not set this field gets byte-for-byte
+	// the same behavior as before this field existed.
+	LifecycleModel     string  `json:"lifecycle_model,omitempty"`
+	ClockClass         string  `json:"clock_class,omitempty"`
+	ExtractedByAI      bool    `json:"extracted_by_ai,omitempty"`
+	SourceClauseID     string  `json:"source_clause_id,omitempty"`
+	TriggerDescription string  `json:"trigger_description,omitempty"`
+	CalculationMethod  string  `json:"calculation_method,omitempty"`
+	EffectiveFrom      *time.Time `json:"effective_from,omitempty"`
+	EffectiveTo        *time.Time `json:"effective_to,omitempty"`
+}
+
+// BackfillObligationParams reconstructs one historical obligation row exactly
+// as a duplicate service (obligation-tracking-svc) recorded it, for the
+// WFC-05 consolidation backfill (cmd/migrate-duplicates). Deliberately NOT
+// routed through CreateObligation/TransitionExtended: those enforce today's
+// live-command evidence rules (e.g. ACTIVE requires trigger_description +
+// calculation_method), and a historical row may predate a rule that did not
+// exist when it was written. A backfill preserves fact, it does not re-certify
+// it. ObligationID must be a caller-supplied, deterministic UUID (derived from
+// the source service name + its own id) so re-running the tool is naturally
+// idempotent on ON CONFLICT (obligation_id) DO NOTHING — no separate dedup
+// table needed.
+type BackfillObligationParams struct {
+	Obligation
+	CorrelationID string
+}
+
+// BackfillFilingRequirementParams reconstructs one historical filing
+// requirement row from filing-tracker-svc. Unlike obligation-tracking-svc,
+// filing-tracker-svc's filing_requirements are flat — not scoped under any
+// obligation — so the backfill synthesizes a parent obligation alongside each
+// one (see cmd/migrate-duplicates); ObligationID here is that synthesized
+// parent's id, not the filing's own.
+type BackfillFilingRequirementParams struct {
+	FilingRequirement
+	CorrelationID string
 }
 
 // ListObligationsFilter holds optional filters for querying obligations.
@@ -171,6 +350,35 @@ type CreateFilingRequirementParams struct {
 	FilingType          string
 	FilingAuthority     string
 	SubmissionChannel   string
+
+	// ── filing-tracker-svc parity (migration 000013) ──────────────────────
+	// All optional: an empty JurisdictionID/PeriodKey or nil DueDate leaves
+	// the corresponding column NULL, same as a caller that predates them.
+	JurisdictionID string
+	PeriodKey      string
+	DueDate        *time.Time
+}
+
+// SubmitFilingParams records a filing submission. SubmissionReference is
+// mandatory evidence, not a bare status flip.
+type SubmitFilingParams struct {
+	ObligationID        string
+	FilingRequirementID string
+	SubmissionReference string
+	ExpectedVersion     int
+	ActorPrincipalID    string
+	CorrelationID       string
+}
+
+// ConfirmFilingParams records confirmation of a filing's receipt/acceptance.
+// ConfirmationReference is mandatory evidence.
+type ConfirmFilingParams struct {
+	ObligationID           string
+	FilingRequirementID    string
+	ConfirmationReference  string
+	ExpectedVersion        int
+	ActorPrincipalID       string
+	CorrelationID          string
 }
 
 // ErrObligationNotFound is returned when an obligation_id does not exist.
@@ -265,6 +473,32 @@ var ErrCreatedByMismatch = errorString("created_by mismatch")
 
 // ErrLegalEntityMismatch is returned when X-Legal-Entity-Id doesn't match body legal_entity_id.
 var ErrLegalEntityMismatch = errorString("legal entity mismatch")
+
+// ── WFC-05 consolidation errors ──────────────────────────────────────────
+
+// ErrWrongLifecycleModel is returned when an EXTENDED-only command targets a
+// LEGACY obligation, or vice versa. The two machines never interoperate.
+var ErrWrongLifecycleModel = errorString("obligation does not use this lifecycle model")
+
+// ErrNotCandidate is returned when ValidateExtractedObligation is called on
+// an obligation not currently CANDIDATE (e.g. already validated, or never
+// AI-extracted).
+var ErrNotCandidate = errorString("obligation is not a candidate awaiting validation")
+
+// ErrAmbiguousDueDateBasis is returned when an obligation is scheduled into
+// ACTIVE without both a trigger description and a calculation method.
+// LEG-07 §9: "trigger/date ambiguity blocks due-date certification."
+var ErrAmbiguousDueDateBasis = errorString("trigger_description and calculation_method are required to certify a due date")
+
+// ErrWaiverEvidenceRequired is returned when WAIVED is requested without
+// both a waiver authority reference and a reason code. Spec §7.1: "Waiver
+// ... requires policy authority, reason code, approver and evidence; cannot
+// be a hidden admin toggle."
+var ErrWaiverEvidenceRequired = errorString("waiver_authority_reference and waiver_reason_code are required")
+
+// ErrNotApplicableEvidenceRequired is returned when NOT_APPLICABLE is
+// requested without a reason. Spec §7.1: "decision evidence mandatory."
+var ErrNotApplicableEvidenceRequired = errorString("not_applicable_reason is required")
 
 type errorString string
 

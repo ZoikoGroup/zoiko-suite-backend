@@ -2,7 +2,7 @@ package events
 
 import (
 	"context"
-	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,9 +16,12 @@ import (
 // service, and payload schema version. domain.TaxRule carries a real
 // JurisdictionID but no legal_entity_id field.
 type Event struct {
-	EventID       string      `json:"event_id"`
-	EventType     string      `json:"event_type"`
-	EventVersion  string      `json:"event_version"`
+	EventID      string `json:"event_id"`
+	EventType    string `json:"event_type"`
+	EventVersion string `json:"event_version"`
+	// SchemaVersion is the field the platform audit consumer (audit-event-store-svc)
+	// requires; EventVersion is kept for existing consumers. Same value.
+	SchemaVersion string      `json:"schema_version"`
 	SourceService string      `json:"source_service"`
 	RuleID        string      `json:"rule_id"`
 	TenantID      string      `json:"tenant_id"`
@@ -39,11 +42,6 @@ type PublishParams struct {
 	ActorID       string
 	CorrelationID string
 	Payload       interface{}
-}
-
-// Publisher is the interface for emitting domain events.
-type Publisher interface {
-	Publish(ctx context.Context, params PublishParams) error
 }
 
 // MessageWriter is the one method KafkaPublisher needs from *kafka.Writer.
@@ -75,13 +73,18 @@ func NewKafkaPublisherWithWriter(writer MessageWriter, topic string, logger *zap
 	return &KafkaPublisher{writer: writer, topic: topic, logger: logger}
 }
 
-func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) error {
-	evt := Event{
-		// A fresh UUID per publish, not a deterministic string — see
+// NewEvent builds the envelope for an event. It is called inside the business
+// transaction and the result is written to the outbox as-is, so the delivered
+// message carries the actor and correlation of the request that caused the
+// change. The shape is unchanged from the former direct publish.
+func NewEvent(params PublishParams) Event {
+	return Event{
+		// A fresh UUID per event, not a deterministic string — see
 		// docs/architecture/known-gaps.md's event_id collision writeup.
 		EventID:       "evt-" + uuid.New().String(),
 		EventType:     params.EventType,
 		EventVersion:  "1.0",
+		SchemaVersion: "1.0",
 		SourceService: "tax-rules-svc",
 		RuleID:        params.RuleID,
 		TenantID:      params.TenantID,
@@ -91,16 +94,22 @@ func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) erro
 		OccurredAt:    time.Now().UTC(),
 		Payload:       params.Payload,
 	}
-	data, err := json.Marshal(evt)
-	if err != nil {
-		return err
-	}
-	err = p.writer.WriteMessages(ctx, kafka.Message{
-		Key:   []byte(params.RuleID),
-		Value: data,
+}
+
+// PublishOutbox delivers one outbox row (an already-built envelope) to the
+// events topic, keyed by the aggregate as before. The stable outbox event id
+// travels as the X-Event-ID header across every retry so consumers can
+// de-duplicate at-least-once delivery. A failure is RETURNED so the relay
+// keeps the row and retries; it is never swallowed.
+func (p *KafkaPublisher) PublishOutbox(ctx context.Context, outboxEventID, aggregateID string, payload []byte) error {
+	err := p.writer.WriteMessages(ctx, kafka.Message{
+		Key:     []byte(aggregateID),
+		Value:   payload,
+		Headers: []kafka.Header{{Key: "X-Event-ID", Value: []byte(outboxEventID)}},
 	})
 	if err != nil {
-		p.logger.Warn("kafka publish failed — event dropped", zap.String("event_type", params.EventType), zap.Error(err))
+		p.logger.Warn("outbox kafka write failed", zap.String("outbox_event_id", outboxEventID), zap.String("topic", p.topic), zap.Error(err))
+		return fmt.Errorf("kafka write: %w", err)
 	}
 	return nil
 }

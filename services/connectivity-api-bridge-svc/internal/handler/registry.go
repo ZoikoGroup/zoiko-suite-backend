@@ -30,6 +30,9 @@ const (
 	ActionContractPublish    = "XIC_CONTRACT_PUBLISH"
 	ActionMappingSimulate    = "XIC_MAPPING_SIMULATE"
 	ActionEvidenceRead       = "XIC_EVIDENCE_READ"
+	// ActionRegistryRead is the action to read registry content (connectors, contract versions, mappings). Unlike
+	// the writes it is asked for the caller's own legal entity: the registry is platform data that tenants read.
+	ActionRegistryRead = "XIC_REGISTRY_READ"
 	// ActionGatePrefix + a gate key is the action to attest that gate, so the person who may attest SECURITY
 	// need not be the person who may attest PRIVACY.
 	ActionGatePrefix = "XIC_GATE_"
@@ -109,6 +112,25 @@ func (h *RegistryHandler) guard(w http.ResponseWriter, r *http.Request, action s
 		return "", false
 	}
 	return middleware.GetTenantID(r.Context()), true
+}
+
+// readGuard resolves the caller and authorizes ActionRegistryRead for the caller's legal entity (X-Legal-Entity-Id,
+// else the tenant), the scope the inbound, outbound and connection read guards use.
+func (h *RegistryHandler) readGuard(w http.ResponseWriter, r *http.Request) bool {
+	principal := r.Header.Get("X-Principal-Id")
+	if principal == "" {
+		writeProblem(w, r, errNoPrincipal)
+		return false
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principal, callerScope(r), ActionRegistryRead); err != nil {
+		if !errors.Is(err, authz.ErrAuthorizationDenied) {
+			h.logger.Error("authorization check failed", zap.Error(err))
+			err = errors.Join(authz.ErrAuthzServiceUnavailable, err)
+		}
+		writeProblem(w, r, err)
+		return false
+	}
+	return true
 }
 
 func isPlatformTenant(r *http.Request) bool {
@@ -221,6 +243,9 @@ func (h *RegistryHandler) CreateConnector(w http.ResponseWriter, r *http.Request
 }
 
 func (h *RegistryHandler) ListConnectors(w http.ResponseWriter, r *http.Request) {
+	if !h.readGuard(w, r) {
+		return
+	}
 	family, lifecycle := strings.ToUpper(r.URL.Query().Get("family")), strings.ToUpper(r.URL.Query().Get("lifecycle"))
 	if family != "" && !contains(registry.Families, family) || lifecycle != "" && !contains([]string{"DRAFT", "REVIEW", "PUBLISHED", "DEPRECATED", "RETIRED"}, lifecycle) {
 		writeRegistryProblem(w, r, &registry.ValidationError{Issues: []registry.Issue{{Path: "query", Rule: "family or lifecycle is not a defined value"}}})
@@ -247,6 +272,9 @@ func contains(l []string, s string) bool {
 }
 
 func (h *RegistryHandler) GetConnector(w http.ResponseWriter, r *http.Request) {
+	if !h.readGuard(w, r) {
+		return
+	}
 	c, err := h.repo.GetConnector(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		writeRegistryProblem(w, r, err)
@@ -289,6 +317,9 @@ func (h *RegistryHandler) ConnectorCommand(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *RegistryHandler) Compatibility(w http.ResponseWriter, r *http.Request) {
+	if !h.readGuard(w, r) {
+		return
+	}
 	out, err := h.svc.Compatibility(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		writeRegistryProblem(w, r, err)
@@ -322,6 +353,9 @@ func (h *RegistryHandler) CreateVersion(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *RegistryHandler) ListVersions(w http.ResponseWriter, r *http.Request) {
+	if !h.readGuard(w, r) {
+		return
+	}
 	vs, err := h.repo.ListVersions(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		writeRegistryProblem(w, r, err)
@@ -338,6 +372,9 @@ func (h *RegistryHandler) ListVersions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *RegistryHandler) GetVersion(w http.ResponseWriter, r *http.Request) {
+	if !h.readGuard(w, r) {
+		return
+	}
 	v, err := h.repo.GetVersion(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		writeRegistryProblem(w, r, err)
@@ -504,6 +541,9 @@ func (h *RegistryHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 // ── mappings ─────────────────────────────────────────────────────────────────
 
 func (h *RegistryHandler) GetMapping(w http.ResponseWriter, r *http.Request) {
+	if !h.readGuard(w, r) {
+		return
+	}
 	m, err := h.repo.GetMapping(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		writeRegistryProblem(w, r, err)

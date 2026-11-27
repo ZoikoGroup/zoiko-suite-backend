@@ -12,8 +12,8 @@ import (
 
 	"zoiko.io/hris-connector-svc/internal/authz"
 	"zoiko.io/hris-connector-svc/internal/domain"
-	"zoiko.io/hris-connector-svc/internal/events"
 	"zoiko.io/hris-connector-svc/internal/middleware"
+	"zoiko.io/hris-connector-svc/internal/provider"
 	"zoiko.io/hris-connector-svc/internal/store"
 )
 
@@ -29,23 +29,28 @@ func newGrantingAuthzServer(t *testing.T) *httptest.Server {
 	return srv
 }
 
-func setupTestRouter(t *testing.T) (chi.Router, *events.MockPublisher) {
+func setupTestRouter(t *testing.T) (chi.Router, *store.MemoryStore) {
 	st := store.NewMemoryStore()
-	pub := events.NewMockPublisher()
 	authzSrv := newGrantingAuthzServer(t)
 	az := authz.NewClient(authzSrv.URL)
 	logger := zap.NewNop()
 
-	h := New(st, pub, az, logger)
+	h := New(st, az, logger)
 
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext)
 	RegisterRoutes(r, h)
-	return r, pub
+	return r, st
 }
 
+// TestHrisFlow: create an integration, then sync it through a provider
+// adapter. The sync used to succeed with a fabricated records_synced=1 and no
+// provider; it now needs a registered adapter, so the flow registers a test
+// double and asserts the job carries the adapter's real count.
 func TestHrisFlow(t *testing.T) {
-	r, _ := setupTestRouter(t)
+	reg := provider.NewRegistry()
+	reg.Register(domain.ProviderWorkday, fixedAdapter{records: 42})
+	r := routerWith(t, newGrantingAuthzServer(t).URL, reg)
 
 	integReq := domain.CreateIntegrationRequest{
 		LegalEntityID: "le-101",
@@ -87,5 +92,10 @@ func TestHrisFlow(t *testing.T) {
 
 	if syncW.Code != http.StatusCreated {
 		t.Fatalf("expected status 201 on trigger sync, got %d: %s", syncW.Code, syncW.Body.String())
+	}
+	var job domain.SyncJob
+	_ = json.Unmarshal(syncW.Body.Bytes(), &job)
+	if job.Status != domain.SyncCompleted || job.RecordsSynced != 42 || job.CompletedAt == nil {
+		t.Fatalf("job must carry the adapter result, got %+v", job)
 	}
 }

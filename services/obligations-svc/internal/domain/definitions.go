@@ -105,13 +105,22 @@ type UpdateObligationParams struct {
 	CorrelationID       string
 }
 
-// FilingStatuses is the FilingRequirement lifecycle (Doc 04 §13.1 filing_status).
+// FilingStatuses is the FilingRequirement lifecycle (Doc 04 §13.1
+// filing_status). SCHEDULED/DRAFT_READY/CONFIRMED/OVERDUE are filing-tracker-
+// svc parity additions (migration 000013, WFC-05 consolidation): its own
+// pre-filing states precede the original PENDING/IN_PREPARATION machine, and
+// CONFIRMED is its own post-acceptance confirmation step, distinct from this
+// service's pre-existing ACCEPTED. Every pre-existing edge is unchanged.
 var FilingStatuses = map[string][]string{
-	"PENDING":        {"IN_PREPARATION", "SUBMITTED", "WITHDRAWN"},
-	"IN_PREPARATION": {"SUBMITTED", "WITHDRAWN"},
-	"SUBMITTED":      {"ACCEPTED", "REJECTED"},
+	"PENDING":        {"IN_PREPARATION", "SUBMITTED", "SCHEDULED", "WITHDRAWN"},
+	"IN_PREPARATION": {"SUBMITTED", "SCHEDULED", "WITHDRAWN"},
+	"SCHEDULED":      {"DRAFT_READY", "SUBMITTED", "OVERDUE", "WITHDRAWN"},
+	"DRAFT_READY":    {"SUBMITTED", "OVERDUE", "WITHDRAWN"},
+	"OVERDUE":        {"DRAFT_READY", "SUBMITTED", "WITHDRAWN"},
+	"SUBMITTED":      {"ACCEPTED", "REJECTED", "CONFIRMED"},
 	"REJECTED":       {"IN_PREPARATION", "SUBMITTED", "WITHDRAWN"},
-	"ACCEPTED":       {},
+	"ACCEPTED":       {"CONFIRMED"},
+	"CONFIRMED":      {},
 	"WITHDRAWN":      {},
 }
 
@@ -138,8 +147,27 @@ type FilingTransition struct {
 	CreatedAt           time.Time `json:"created_at"`
 }
 
-// ObligationStatuses are the values obligation_status may take.
+// ObligationStatuses are the values obligation_status may take on a LEGACY
+// obligation (lifecycle_model = LEGACY).
 var ObligationStatuses = map[string]bool{"OPEN": true, "IN_PROGRESS": true, "OVERDUE": true, "CLOSED": true}
+
+// ExtendedObligationStatuses are the values obligation_status may take on an
+// EXTENDED (WFC-05) obligation. IN_PROGRESS is shared with the LEGACY set by
+// coincidence of naming, not meaning — the two machines never interoperate.
+var ExtendedObligationStatuses = map[string]bool{
+	ExtendedStatusCandidate: true, ExtendedStatusPlanned: true, ExtendedStatusActive: true,
+	ExtendedStatusDueSoon: true, ExtendedStatusDue: true, ExtendedStatusOverdue: true,
+	ExtendedStatusFulfilled: true, ExtendedStatusWaived: true, ExtendedStatusNotApplicable: true,
+	ExtendedStatusSuperseded: true, ExtendedStatusInProgress: true, ExtendedStatusBreached: true,
+	ExtendedStatusDisputed: true,
+}
+
+// AnyObligationStatus reports whether status is valid under either lifecycle
+// model — used where a single query filter (e.g. ListObligations) may name
+// either, since the two coexist in one table.
+func AnyObligationStatus(status string) bool {
+	return ObligationStatuses[status] || ExtendedObligationStatuses[status]
+}
 
 // ApplicabilityDecisionValues are the decisions that may be stored. UNASSESSED
 // is the absence of a decision and is never stored (000006 CHECK).
@@ -157,4 +185,13 @@ var (
 	ErrObligationClosed          = errorString("obligation is closed")
 	ErrLegalEntityNotFound       = errorString("legal entity does not exist in this tenant")
 	ErrRegistryUnavailable       = errorString("tenant-entity-registry-svc unavailable")
+
+	// ErrSubmissionEvidenceRequired is returned when SubmitFiling is called
+	// without a submission_reference — a submission is a governed event, not
+	// a bare status flip (filing-tracker-svc parity).
+	ErrSubmissionEvidenceRequired = errorString("submission_reference is required to submit a filing")
+
+	// ErrConfirmationEvidenceRequired is returned when ConfirmFiling is called
+	// without a confirmation_reference.
+	ErrConfirmationEvidenceRequired = errorString("confirmation_reference is required to confirm a filing")
 )

@@ -25,7 +25,7 @@ func baseTAX03Request() domain.DetermineTaxRequest {
 		GrossAmount:    1000,
 		Currency:       "GBP",
 		EffectiveFrom:  "2026-01-01",
-		EvaluatedBy:    "billing-engine",
+		EvaluatedBy:    "user-test-01",
 
 		SellerPartyID:         "party-seller-1",
 		BuyerPartyID:          "party-buyer-1",

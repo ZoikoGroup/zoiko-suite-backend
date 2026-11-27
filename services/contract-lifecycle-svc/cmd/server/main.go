@@ -23,8 +23,10 @@ import (
 	"zoiko.io/contract-lifecycle-svc/internal/governancelog"
 	"zoiko.io/contract-lifecycle-svc/internal/handler"
 	"zoiko.io/contract-lifecycle-svc/internal/health"
+	"zoiko.io/contract-lifecycle-svc/internal/idempotency"
 	"zoiko.io/contract-lifecycle-svc/internal/middleware"
 	"zoiko.io/contract-lifecycle-svc/internal/mtls"
+	"zoiko.io/contract-lifecycle-svc/internal/outbox"
 	"zoiko.io/contract-lifecycle-svc/internal/store"
 	"zoiko.io/contract-lifecycle-svc/internal/telemetry"
 )
@@ -95,7 +97,15 @@ func main() {
 			zap.String("url", cfg.GovernanceLogURL))
 	}
 
-	h := handler.New(pgStore, publisher, authzClient, governanceLogClient, logger)
+	h := handler.New(pgStore, authzClient, governanceLogClient, logger)
+
+	// Transactional outbox relay: delivers the events each store write
+	// committed into outbox_events, retrying until Kafka accepts them.
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	if pool != nil {
+		go outbox.NewRelay(pool, publisher, 1500*time.Millisecond, 50, logger).Start(relayCtx)
+	}
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -109,6 +119,11 @@ func main() {
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+
+	// Replay protection for material writes: a retried POST/PUT with the same
+	// Idempotency-Key gets the first answer instead of running twice. Placed after
+	// the envelope middleware, which guarantees the key and tenant are present.
+	r.Use(idempotency.Middleware(idempotency.NewPgStore(pool), logger))
 
 	r.Get("/healthz", health.HealthzHandler)
 	r.Get("/readyz", health.ReadyzHandler(pool))
@@ -135,6 +150,7 @@ func main() {
 	<-stop
 
 	logger.Info("shutting down contract-lifecycle-svc gracefully...")
+	stopRelay()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 

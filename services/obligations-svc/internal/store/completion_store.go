@@ -198,6 +198,172 @@ func (s *PgStore) UpdateFilingStatus(ctx context.Context, p domain.UpdateFilingS
 	return updated, moved, nil
 }
 
+// legalFilingTransition reports whether current → next is a legal move in
+// domain.FilingStatuses, true also when current == next (idempotent no-op,
+// decided by the caller, not here).
+func legalFilingTransition(current, next string) bool {
+	for _, n := range domain.FilingStatuses[current] {
+		if n == next {
+			return true
+		}
+	}
+	return false
+}
+
+// SubmitFiling records a filing submission: requires a non-empty
+// SubmissionReference (filing-tracker-svc parity — a submission is a
+// governed event with evidence, not a bare status flip), moves filing_status
+// to SUBMITTED under a row lock and If-Match, and writes obligation.updated
+// in the same transaction as UpdateFilingStatus does.
+func (s *PgStore) SubmitFiling(ctx context.Context, p domain.SubmitFilingParams) (*domain.FilingRequirement, bool, error) {
+	if p.SubmissionReference == "" {
+		return nil, false, domain.ErrSubmissionEvidenceRequired
+	}
+	var updated *domain.FilingRequirement
+	moved := false
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		parent, err := scanObligation(tx.QueryRow(ctx,
+			`SELECT `+obligationColumns+` FROM obligations WHERE obligation_id = $1 AND tenant_id = $2;`,
+			p.ObligationID, tenantID))
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) || errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
+				return domain.ErrObligationNotFound
+			}
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		current, err := scanFilingRequirement(tx.QueryRow(ctx, `
+			SELECT `+filingRequirementColumns+` FROM filing_requirements
+			WHERE filing_requirement_id = $1 AND obligation_id = $2 AND tenant_id = $3
+			FOR UPDATE;`, p.FilingRequirementID, p.ObligationID, tenantID))
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) || errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
+				return domain.ErrFilingRequirementNotFound
+			}
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		if p.ExpectedVersion > 0 && current.RowVersion != p.ExpectedVersion {
+			return domain.ErrVersionMismatch
+		}
+		if current.FilingStatus == "SUBMITTED" {
+			updated = current
+			return nil
+		}
+		if !legalFilingTransition(current.FilingStatus, "SUBMITTED") {
+			return domain.ErrInvalidTransition
+		}
+		updated, err = scanFilingRequirement(tx.QueryRow(ctx, `
+			UPDATE filing_requirements
+			SET filing_status = 'SUBMITTED', submission_reference = $1,
+			    submitted_at = NOW(), submitted_by = $2,
+			    updated_at = NOW(), row_version = row_version + 1
+			WHERE filing_requirement_id = $3 AND tenant_id = $4
+			RETURNING `+filingRequirementColumns+`;`,
+			p.SubmissionReference, p.ActorPrincipalID, p.FilingRequirementID, tenantID))
+		if err != nil {
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO filing_requirement_transitions
+				(tenant_id, filing_requirement_id, from_status, to_status, reason, actor_principal_id, correlation_id)
+			VALUES ($1, $2, $3, 'SUBMITTED', $4, $5, $6);`,
+			tenantID, p.FilingRequirementID, current.FilingStatus, "submitted: "+p.SubmissionReference,
+			p.ActorPrincipalID, p.CorrelationID); err != nil {
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		moved = true
+		return insertOutboxEventTx(ctx, tx, tenantID, "obligation.updated", p.CorrelationID,
+			parent.LegalEntityID, parent.JurisdictionID, p.ActorPrincipalID, map[string]any{
+				"obligation_id":         parent.ObligationID,
+				"obligation_status":     parent.ObligationStatus,
+				"changed_fields":        []string{"filing_requirements.filing_status"},
+				"filing_requirement_id": updated.FilingRequirementID,
+				"filing_status":         updated.FilingStatus,
+				"submission_reference":  updated.SubmissionReference,
+				"updated_at":            updated.UpdatedAt,
+			})
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return updated, moved, nil
+}
+
+// ConfirmFiling records confirmation of a filing's receipt/acceptance:
+// requires a non-empty ConfirmationReference, moves filing_status to
+// CONFIRMED under a row lock and If-Match. Legal only from SUBMITTED or
+// ACCEPTED, per domain.FilingStatuses.
+func (s *PgStore) ConfirmFiling(ctx context.Context, p domain.ConfirmFilingParams) (*domain.FilingRequirement, bool, error) {
+	if p.ConfirmationReference == "" {
+		return nil, false, domain.ErrConfirmationEvidenceRequired
+	}
+	var updated *domain.FilingRequirement
+	moved := false
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		parent, err := scanObligation(tx.QueryRow(ctx,
+			`SELECT `+obligationColumns+` FROM obligations WHERE obligation_id = $1 AND tenant_id = $2;`,
+			p.ObligationID, tenantID))
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) || errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
+				return domain.ErrObligationNotFound
+			}
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		current, err := scanFilingRequirement(tx.QueryRow(ctx, `
+			SELECT `+filingRequirementColumns+` FROM filing_requirements
+			WHERE filing_requirement_id = $1 AND obligation_id = $2 AND tenant_id = $3
+			FOR UPDATE;`, p.FilingRequirementID, p.ObligationID, tenantID))
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) || errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
+				return domain.ErrFilingRequirementNotFound
+			}
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		if p.ExpectedVersion > 0 && current.RowVersion != p.ExpectedVersion {
+			return domain.ErrVersionMismatch
+		}
+		if current.FilingStatus == "CONFIRMED" {
+			updated = current
+			return nil
+		}
+		if !legalFilingTransition(current.FilingStatus, "CONFIRMED") {
+			return domain.ErrInvalidTransition
+		}
+		updated, err = scanFilingRequirement(tx.QueryRow(ctx, `
+			UPDATE filing_requirements
+			SET filing_status = 'CONFIRMED', confirmation_reference = $1, confirmed_at = NOW(),
+			    updated_at = NOW(), row_version = row_version + 1
+			WHERE filing_requirement_id = $2 AND tenant_id = $3
+			RETURNING `+filingRequirementColumns+`;`,
+			p.ConfirmationReference, p.FilingRequirementID, tenantID))
+		if err != nil {
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO filing_requirement_transitions
+				(tenant_id, filing_requirement_id, from_status, to_status, reason, actor_principal_id, correlation_id)
+			VALUES ($1, $2, $3, 'CONFIRMED', $4, $5, $6);`,
+			tenantID, p.FilingRequirementID, current.FilingStatus, "confirmed: "+p.ConfirmationReference,
+			p.ActorPrincipalID, p.CorrelationID); err != nil {
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		moved = true
+		return insertOutboxEventTx(ctx, tx, tenantID, "obligation.updated", p.CorrelationID,
+			parent.LegalEntityID, parent.JurisdictionID, p.ActorPrincipalID, map[string]any{
+				"obligation_id":          parent.ObligationID,
+				"obligation_status":      parent.ObligationStatus,
+				"changed_fields":         []string{"filing_requirements.filing_status"},
+				"filing_requirement_id":  updated.FilingRequirementID,
+				"filing_status":          updated.FilingStatus,
+				"confirmation_reference": updated.ConfirmationReference,
+				"updated_at":             updated.UpdatedAt,
+			})
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return updated, moved, nil
+}
+
 // ListFilingTransitions returns a filing requirement's history, oldest first.
 func (s *PgStore) ListFilingTransitions(ctx context.Context, obligationID, filingRequirementID string) ([]*domain.FilingTransition, error) {
 	if _, err := s.FindFilingRequirement(ctx, obligationID, filingRequirementID); err != nil {

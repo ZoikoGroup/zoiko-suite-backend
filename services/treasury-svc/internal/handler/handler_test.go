@@ -932,6 +932,42 @@ func (m *mockAuthz) CheckAllowed(ctx context.Context, principalID, legalEntityID
 	return nil
 }
 
+// mockCurrency stands in for currency-registry-svc. units, if set, answers
+// for every code regardless of byCode; byCode answers per real ISO 4217
+// code (JPY=0, USD/GBP=2, BHD=3, ...) when units is unset (0) and byCode
+// has an entry, falling back to 2 (USD/GBP's real minor-unit count, what
+// every pre-existing test's currency_code "USD" needs) otherwise —
+// defaultMockCurrency() in place of a nil CurrencyClient therefore changes
+// nothing about what those tests already asserted.
+type mockCurrency struct {
+	units  int
+	byCode map[string]int
+	err    error
+}
+
+func defaultMockCurrency() *mockCurrency { return &mockCurrency{} }
+
+// realISOMinorUnits is used by tests that exercise more than one real
+// currency's precision in the same request (JPY/USD/BHD).
+func realISOMinorUnits() *mockCurrency {
+	return &mockCurrency{byCode: map[string]int{"JPY": 0, "USD": 2, "GBP": 2, "BHD": 3}}
+}
+
+func (m *mockCurrency) MinorUnits(ctx context.Context, code string, asOf time.Time) (int, error) {
+	if m.err != nil {
+		return 0, m.err
+	}
+	if m.units > 0 {
+		return m.units, nil
+	}
+	if m.byCode != nil {
+		if u, ok := m.byCode[code]; ok {
+			return u, nil
+		}
+	}
+	return 2, nil
+}
+
 type mockClients struct {
 	apCommitments domain.Decimal
 	payroll       domain.Decimal
@@ -1021,7 +1057,7 @@ func TestHandler_RegisterBankAccount(t *testing.T) {
 	c := &mockClients{}
 	log := zap.NewNop()
 
-	h := handler.New(s, az, c, &mockTransferClients{}, nil, log)
+	h := handler.New(s, az, c, &mockTransferClients{}, nil, log, defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1063,7 +1099,7 @@ func TestHandler_BankAccountLifecycle_PublishesEveryEvent(t *testing.T) {
 	s := newMockStore()
 	az := &mockAuthz{allowed: true}
 	c := &mockClients{}
-	h := handler.New(s, az, c, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, az, c, &mockTransferClients{}, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1117,7 +1153,7 @@ func TestHandler_VerifyBankAccountOwnership_CreatorCannotSelfVerify(t *testing.T
 		BankAccountID: acctID, LegalEntityID: "ent-123", CurrencyCode: "USD",
 		AccountStatus: domain.BankAccountPendingVerification, CreatedByPrincipalID: "usr-creator",
 	}
-	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1142,7 +1178,7 @@ func TestHandler_VerifyBankAccountOwnership_DifferentPrincipal_Succeeds(t *testi
 		BankAccountID: acctID, LegalEntityID: "ent-123", CurrencyCode: "USD",
 		AccountStatus: domain.BankAccountPendingVerification, CreatedByPrincipalID: "usr-creator",
 	}
-	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1181,7 +1217,7 @@ func TestHandler_GetEffectiveCash(t *testing.T) {
 		AvailableBalance: "1000",
 	}
 
-	h := handler.New(s, az, c, &mockTransferClients{}, nil, log)
+	h := handler.New(s, az, c, &mockTransferClients{}, nil, log, defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1227,7 +1263,7 @@ func TestHandler_GetEffectiveCash_FreshBankBalance_NotFlaggedStale(t *testing.T)
 	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 	s.cashBalances[acctID] = &domain.CashBalance{BankAccountID: acctID, AvailableBalance: "1000", AsOfTimestamp: time.Now().UTC()}
 
-	h := handler.New(s, az, c, &mockTransferClients{}, nil, log)
+	h := handler.New(s, az, c, &mockTransferClients{}, nil, log, defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1253,7 +1289,7 @@ func TestHandler_GetEffectiveCash_FreshBankBalance_NotFlaggedStale(t *testing.T)
 // ── Wave 14: BNK-08 CashPositionSnapshot ─────────────────────────────────────
 
 func newCashPositionRouter(s *mockStore, c *mockClients) chi.Router {
-	h := handler.New(s, &mockAuthz{allowed: true}, c, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, c, &mockTransferClients{}, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 	return r
@@ -1300,7 +1336,7 @@ func TestHandler_CalculateCashPosition_PublishesCalculatedAndStaleEvents(t *test
 	s := newMockStore()
 	s.bankAccounts["acct-1"] = &domain.BankAccount{BankAccountID: "acct-1", LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 	s.cashBalances["acct-1"] = &domain.CashBalance{BankAccountID: "acct-1", AvailableBalance: "500", AsOfTimestamp: time.Now().UTC()}
-	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1368,7 +1404,7 @@ func TestHandler_PublishCashPositionSnapshot_Succeeds(t *testing.T) {
 	s := newMockStore()
 	s.bankAccounts["acct-1"] = &domain.BankAccount{BankAccountID: "acct-1", LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 	s.cashBalances["acct-1"] = &domain.CashBalance{BankAccountID: "acct-1", AvailableBalance: "500", AsOfTimestamp: time.Now().UTC()}
-	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1518,7 +1554,7 @@ func TestHandler_CreateTreasuryTransfer_SuccessAndThreshold(t *testing.T) {
 		MinimumRequiredBalance: "200",
 	}
 
-	h := handler.New(s, az, c, &mockTransferClients{}, nil, log)
+	h := handler.New(s, az, c, &mockTransferClients{}, nil, log, defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1578,7 +1614,7 @@ func TestHandler_CreateTreasuryTransfer_MissingCorrelationID_Rejected(t *testing
 	s.bankAccounts["tgt-2"] = &domain.BankAccount{BankAccountID: "tgt-2", LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 	s.cashBalances["src-1"] = &domain.CashBalance{BankAccountID: "src-1", AvailableBalance: "500"}
 
-	h := handler.New(s, az, c, &mockTransferClients{}, nil, log)
+	h := handler.New(s, az, c, &mockTransferClients{}, nil, log, defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1611,7 +1647,7 @@ func TestHandler_CreateTreasuryTransfer_RetriedCorrelationID_DoesNotCreateASecon
 	s.cashBalances["src-1"] = &domain.CashBalance{BankAccountID: "src-1", AvailableBalance: "500"}
 	s.cashBalances["tgt-2"] = &domain.CashBalance{BankAccountID: "tgt-2", AvailableBalance: "100"}
 
-	h := handler.New(s, az, c, &mockTransferClients{}, nil, log)
+	h := handler.New(s, az, c, &mockTransferClients{}, nil, log, defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1697,7 +1733,7 @@ func withAccounts(s *mockStore, t *domain.TreasuryTransfer) *domain.TreasuryTran
 }
 
 func newWave12Router(s *mockStore) chi.Router {
-	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 	return r
@@ -1945,7 +1981,7 @@ func TestHandler_ExecuteTreasuryTransfer_SendsMatchingFingerprint(t *testing.T) 
 		MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1",
 	})
 	tc := &capturingTransferClients{}
-	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, tc, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, tc, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1997,7 +2033,7 @@ func TestHandler_AuthorizeTreasuryTransfer_ThenExecute_Succeeds(t *testing.T) {
 		MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1",
 	})
 	tc := &capturingTransferClients{}
-	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, tc, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, tc, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2094,7 +2130,7 @@ func TestHandler_ExecuteTreasuryTransfer_SameEntity_PublishesSettled(t *testing.
 		MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1",
 	})
 	tc := &capturingTransferClients{}
-	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, tc, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, tc, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2237,7 +2273,7 @@ func TestHandler_GetForecasts_Endpoint(t *testing.T) {
 		AvailableBalance: "100",
 	}
 
-	h := handler.New(s, az, c, &mockTransferClients{}, nil, log)
+	h := handler.New(s, az, c, &mockTransferClients{}, nil, log, defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2298,7 +2334,7 @@ func TestHandler_GetForecasts_Endpoint(t *testing.T) {
 
 func TestHandler_GetFXExposure_RequiresRecordedRate(t *testing.T) {
 	s := newMockStore()
-	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2320,7 +2356,7 @@ func TestHandler_GetFXExposure_ConvertsAtRecordedRate(t *testing.T) {
 		inflowsData:  []domain.ExpectedCashFlow{{Amount: "1000", DueDate: now.AddDate(0, 0, 10), Category: "RECEIVABLE"}},
 		outflowsData: []domain.ExpectedCashFlow{{Amount: "400", DueDate: now.AddDate(0, 0, 10), Category: "PAYABLE"}},
 	}
-	h := handler.New(s, &mockAuthz{allowed: true}, c, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, c, &mockTransferClients{}, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2372,7 +2408,7 @@ func TestHandler_RunFXScenario_UsesHypotheticalRate(t *testing.T) {
 	c := &mockClients{
 		inflowsData: []domain.ExpectedCashFlow{{Amount: "1000", DueDate: now.AddDate(0, 0, 10), Category: "RECEIVABLE"}},
 	}
-	h := handler.New(s, &mockAuthz{allowed: true}, c, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, c, &mockTransferClients{}, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2499,7 +2535,7 @@ func TestHandler_CalculateFXExposure_PublishesCalculatedAndStaleEvents(t *testin
 	s := newMockStore()
 	s.fxRates = map[string]*domain.FXRate{"EUR/USD": {CurrencyPair: "EUR/USD", Rate: "1.1", RateID: "rate-1", EffectiveAt: time.Now().UTC()}}
 	c := &mockClients{inflowsData: []domain.ExpectedCashFlow{{Amount: "1000", DueDate: time.Now().UTC().AddDate(0, 0, 10), Category: "RECEIVABLE"}}}
-	h := handler.New(s, &mockAuthz{allowed: true}, c, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, c, &mockTransferClients{}, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2535,7 +2571,7 @@ func TestHandler_PublishFXExposureSnapshot_PublishesEvent(t *testing.T) {
 	s := newMockStore()
 	s.fxRates = map[string]*domain.FXRate{"EUR/USD": {CurrencyPair: "EUR/USD", Rate: "1.1", RateID: "rate-1", EffectiveAt: time.Now().UTC()}}
 	c := &mockClients{inflowsData: []domain.ExpectedCashFlow{{Amount: "1000", DueDate: time.Now().UTC().AddDate(0, 0, 10), Category: "RECEIVABLE"}}}
-	h := handler.New(s, &mockAuthz{allowed: true}, c, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, c, &mockTransferClients{}, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2721,7 +2757,7 @@ func TestHandler_GetBankAccountByID_IncludesOwnershipVerified(t *testing.T) {
 	acctID := "acct-1"
 	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 
-	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2750,7 +2786,7 @@ func TestHandler_GetBankAccountByID_UnverifiedAccount_ReturnsFalse(t *testing.T)
 	acctID := "acct-1"
 	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 
-	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2780,7 +2816,7 @@ func TestHandler_GetBankAccountAsOf_ReturnsHistoricalEntry(t *testing.T) {
 	acctID := "acct-1"
 	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, TenantID: "tenant-abc", LegalEntityID: "ent-123", AccountName: "Corporate Checking", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 
-	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2806,7 +2842,7 @@ func TestHandler_GetBankAccountAsOf_InvalidTimestamp_Returns400(t *testing.T) {
 	acctID := "acct-1"
 	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, TenantID: "tenant-abc", LegalEntityID: "ent-123", AccountStatus: "ACTIVE"}
 
-	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2832,7 +2868,7 @@ func TestHandler_GetBankAccountMasked_UsesDistinctPermission(t *testing.T) {
 	}
 	az := &mockAuthz{allowed: true}
 
-	h := handler.New(s, az, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, az, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2864,7 +2900,7 @@ func TestHandler_GetAvailableActions_ActiveAccount_ExcludesReactivate(t *testing
 	acctID := "acct-1"
 	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, LegalEntityID: "ent-123", AccountStatus: "ACTIVE"}
 
-	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2899,7 +2935,7 @@ func TestHandler_GetAvailableActions_ClosedAccount_ReportsNone(t *testing.T) {
 	acctID := "acct-1"
 	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, LegalEntityID: "ent-123", AccountStatus: "CLOSED"}
 
-	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2928,7 +2964,7 @@ func TestHandler_ListConnectionOptions_Success(t *testing.T) {
 	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, TenantID: "tenant-abc", LegalEntityID: "ent-123", AccountStatus: "ACTIVE"}
 	banking := &mockBankingConnector{options: []domain.ConnectionOption{{ConnectionID: "conn-1", Status: "ACTIVE", ProviderRef: "plaid"}}}
 
-	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, banking, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, banking, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2958,7 +2994,7 @@ func TestHandler_ListConnectionOptions_ConnectorUnavailable_FailsClosed(t *testi
 	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, TenantID: "tenant-abc", LegalEntityID: "ent-123", AccountStatus: "ACTIVE"}
 	banking := &mockBankingConnector{err: errors.New("connector down")}
 
-	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, banking, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, banking, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2980,7 +3016,7 @@ func TestHandler_ListConnectionOptions_NotConfigured_Returns503(t *testing.T) {
 	acctID := "acct-1"
 	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, TenantID: "tenant-abc", LegalEntityID: "ent-123", AccountStatus: "ACTIVE"}
 
-	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop(), defaultMockCurrency())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 

@@ -13,7 +13,6 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/exception-escalation-svc/internal/domain"
-	"zoiko.io/exception-escalation-svc/internal/events"
 )
 
 // mockAuthzClient grants every request; used to exercise the happy path in
@@ -143,18 +142,11 @@ func (m *mockStore) ListEscalations(ctx context.Context, role, status string) ([
 	return out, nil
 }
 
-type mockPublisher struct{}
-
-func (p *mockPublisher) Publish(ctx context.Context, params events.PublishParams) error {
-	return nil
-}
-
 func setupTestRouter() (*chi.Mux, *mockStore) {
 	st := newMockStore()
-	pub := &mockPublisher{}
 	az := &mockAuthzClient{}
 	logger, _ := zap.NewDevelopment()
-	h := New(st, pub, az, logger)
+	h := New(st, az, logger)
 
 	r := chi.NewRouter()
 	RegisterRoutes(r, h)
@@ -179,7 +171,7 @@ func TestCreateEscalateAndResolveException(t *testing.T) {
 
 	req := httptest.NewRequest("POST", "/v1/exception-escalation/exceptions", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Principal-Id", "principal-test-01")
+	req.Header.Set("X-Principal-Id", "filing_tracker_svc")
 	w := httptest.NewRecorder()
 
 	r.ServeHTTP(w, req)
@@ -197,7 +189,7 @@ func TestCreateEscalateAndResolveException(t *testing.T) {
 	escReqPayload := domain.EscalateCaseRequest{
 		EscalatedToRole:  "COMPLIANCE_HEAD",
 		EscalationReason: "High severity overdue filing exceeding 7 days",
-		EscalatedBy:      "tax_manager",
+		EscalatedBy:      "principal-test-01", // must be the calling principal
 	}
 	escBody, _ := json.Marshal(escReqPayload)
 
@@ -214,7 +206,7 @@ func TestCreateEscalateAndResolveException(t *testing.T) {
 
 	// Resolve case
 	resReqPayload := domain.ResolveCaseRequest{
-		ClosedBy:      "compliance_head",
+		ClosedBy:      "principal-test-01", // must be the calling principal
 		ClosureReason: "Late filing approved and submitted with penalty waiver",
 	}
 	resBody, _ := json.Marshal(resReqPayload)

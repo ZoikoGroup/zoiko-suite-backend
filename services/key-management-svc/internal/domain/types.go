@@ -72,3 +72,24 @@ func (r *RegisterKeyRequest) Validate() error {
 	}
 	return nil
 }
+
+// KeyVersionStatus is the lifecycle of one version of a key. Exactly one
+// version per key is CURRENT; rotation retires it and makes the next CURRENT
+// in the same transaction.
+type KeyVersionStatus string
+
+const (
+	VersionCurrent KeyVersionStatus = "CURRENT"
+	VersionRetired KeyVersionStatus = "RETIRED"
+)
+
+// KeyVersion is metadata about one version of a customer key. Like
+// CustomerKey it carries no key material: the material, if any, lives in the
+// external KMS named by the key's ExternalKeyARN.
+type KeyVersion struct {
+	KeyID       string           `json:"key_id"`
+	Version     int              `json:"version"`
+	Status      KeyVersionStatus `json:"status"`
+	ActivatedAt time.Time        `json:"activated_at"`
+	RetiredAt   *time.Time       `json:"retired_at,omitempty"`
+}

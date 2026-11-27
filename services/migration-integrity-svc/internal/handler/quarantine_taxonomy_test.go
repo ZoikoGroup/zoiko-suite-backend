@@ -17,9 +17,7 @@ import (
 
 func postValidate(t *testing.T, router http.Handler, req domain.ValidateMigrationRequest) *httptest.ResponseRecorder {
 	t.Helper()
-	body, _ := json.Marshal(req)
-	r := httptest.NewRequest(http.MethodPost, "/v1/migrations/validate", bytes.NewBuffer(body))
-	withEnvelope(r)
+	r := validateRequest(t, req)
 	r.Header.Set("X-Tenant-ID", "tenant-mig-a6")
 	r.Header.Set("X-Principal-Id", "submitter-1")
 	r.Header.Set("Content-Type", "application/json")
@@ -32,6 +30,7 @@ func remediateAs(t *testing.T, router http.Handler, principal, jobID, entryID st
 	t.Helper()
 	r := httptest.NewRequest(http.MethodPost, "/v1/migrations/"+jobID+"/audit/"+entryID+"/remediate",
 		bytes.NewBufferString(`{"remediation_reason":"source corrected","remediation_evidence_ref":"ticket-77"}`))
+	r.Header.Set("X-Legal-Entity-Id", "LE-A6") // the job's entity (blockerRun)
 	withEnvelope(r)
 	r.Header.Set("X-Tenant-ID", "tenant-mig-a6")
 	r.Header.Set("X-Principal-Id", principal)
@@ -129,7 +128,8 @@ func TestRemediate_NonBlockerByAnyAuthorizedPrincipal(t *testing.T) {
 	rec := postValidate(t, router, req)
 	var job domain.MigrationJob
 	_ = json.Unmarshal(rec.Body.Bytes(), &job)
-	if r := remediateAs(t, router, "submitter-1", job.ID, job.AuditEntries[0].ID); r.Code != http.StatusOK {
+	// Neither the owner nor the submitter (who is barred by segregation of duties).
+	if r := remediateAs(t, router, "reviewer-2", job.ID, job.AuditEntries[0].ID); r.Code != http.StatusOK {
 		t.Fatalf("authorized non-owner resolving an MQ1: expected 200, got %d: %s", r.Code, r.Body.String())
 	}
 }

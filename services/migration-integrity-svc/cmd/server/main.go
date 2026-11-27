@@ -20,6 +20,7 @@ import (
 	"zoiko.io/migration-integrity-svc/internal/config"
 	"zoiko.io/migration-integrity-svc/internal/glclient"
 	"zoiko.io/migration-integrity-svc/internal/handler"
+	"zoiko.io/migration-integrity-svc/internal/health"
 	"zoiko.io/migration-integrity-svc/internal/mtls"
 	"zoiko.io/migration-integrity-svc/internal/store"
 	"zoiko.io/migration-integrity-svc/internal/telemetry"
@@ -120,7 +121,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-	mux.Handle("/", handler.NewRouter(h))
+	mux.Handle("/", handler.NewRouterWithReadiness(h, health.ReadyzHandler(pool)))
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,
