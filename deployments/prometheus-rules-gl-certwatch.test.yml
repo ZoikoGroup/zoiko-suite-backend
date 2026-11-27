@@ -1,0 +1,172 @@
+# promtool unit tests for the gl-certification-watch group of prometheus-rules.yml (general-ledger-svc, ZS-SVC-Z-001 RB-05 / DQC-017).
+# Run from the repo root:
+#   promtool test rules deployments/prometheus-rules-gl-certwatch.test.yml
+#
+# They test what the alert text CLAIMS: a stalled sweep pages, freshness is judged on the MAX across replicas (only the replica holding
+# the lock sweeps), a schedule that is off is not a stalled one, a gauge that cannot be read is NaN and fires its own alert but never a
+# reassuring zero, and a flag is a finance ticket, not a fault.
+#
+# A series whose value equals its own timestamp is written '0+60x240' at a 1m interval: it is always "now", i.e. a fresh success.
+rule_files:
+  - prometheus-rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # The last clean pass was at t=1000s and the interval is 15m: stale once time()-1000 > 3*900, i.e. from t=3700s, and it pages after
+  # the 10 minute hold (from about t=4300s).
+  - interval: 1m
+    input_series:
+      - series: 'gl_cert_sweep_interval_seconds{service="general-ledger-svc",pod="a"}'
+        values: '900x240'
+      - series: 'gl_cert_sweep_last_success_timestamp_seconds{service="general-ledger-svc",pod="a"}'
+        values: '1000x240'
+    alert_rule_test:
+      - eval_time: 55m # t=3300s: not yet three intervals stale
+        alertname: GLCertSweepStale
+        exp_alerts: []
+      - eval_time: 65m # t=3900s: stale, but still inside the hold
+        alertname: GLCertSweepStale
+        exp_alerts: []
+      - eval_time: 80m # t=4800s: past the hold
+        alertname: GLCertSweepStale
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: "general-ledger-svc: the certification sweep has not completed cleanly for three intervals"
+              description: "Until it does, a revoked certification is found only if a withdrawal event happens to arrive. Look at gl_cert_sweep_runs_total by outcome: error means the pass could not run (database or lock); partial means every pass is skipping a scope (GLCertSweepScopesUnauthorized) or cannot check a certification (GLCertSweepFailing); no runs at all means the process is down. The schedule being off is reported as an interval of 0 and does not alert."
+
+  # One replica is long stale (it never holds the lock), another sweeps cleanly all the time: the sweep is healthy, so nothing fires.
+  - interval: 1m
+    input_series:
+      - series: 'gl_cert_sweep_interval_seconds{service="general-ledger-svc",pod="a"}'
+        values: '900x240'
+      - series: 'gl_cert_sweep_interval_seconds{service="general-ledger-svc",pod="b"}'
+        values: '900x240'
+      - series: 'gl_cert_sweep_last_success_timestamp_seconds{service="general-ledger-svc",pod="a"}'
+        values: '0x240'
+      - series: 'gl_cert_sweep_last_success_timestamp_seconds{service="general-ledger-svc",pod="b"}'
+        values: '0+60x240'
+    alert_rule_test:
+      - eval_time: 3h
+        alertname: GLCertSweepStale
+        exp_alerts: []
+
+  # A schedule that is OFF reports an interval of 0: that is not a stall, however old the last success.
+  - interval: 1m
+    input_series:
+      - series: 'gl_cert_sweep_interval_seconds{service="general-ledger-svc",pod="a"}'
+        values: '0x300'
+      - series: 'gl_cert_sweep_last_success_timestamp_seconds{service="general-ledger-svc",pod="a"}'
+        values: '0x300'
+    alert_rule_test:
+      - eval_time: 4h
+        alertname: GLCertSweepStale
+        exp_alerts: []
+
+  # A schedule that is ON but has never had a clean pass (the timestamp is still 0) pages: every pass is skipping or failing.
+  - interval: 1m
+    input_series:
+      - series: 'gl_cert_sweep_interval_seconds{service="general-ledger-svc",pod="a"}'
+        values: '900x240'
+      - series: 'gl_cert_sweep_last_success_timestamp_seconds{service="general-ledger-svc",pod="a"}'
+        values: '0x240'
+    alert_rule_test:
+      - eval_time: 1h
+        alertname: GLCertSweepStale
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: "general-ledger-svc: the certification sweep has not completed cleanly for three intervals"
+              description: "Until it does, a revoked certification is found only if a withdrawal event happens to arrive. Look at gl_cert_sweep_runs_total by outcome: error means the pass could not run (database or lock); partial means every pass is skipping a scope (GLCertSweepScopesUnauthorized) or cannot check a certification (GLCertSweepFailing); no runs at all means the process is down. The schedule being off is reported as an interval of 0 and does not alert."
+
+  # A principal that is refused on some entity raises a ticket the hour it happens, and nothing while it does not.
+  - interval: 1m
+    input_series:
+      - series: 'gl_cert_sweep_scopes_total{service="general-ledger-svc",result="unauthorized"}'
+        values: '0x10 3x50'
+      - series: 'gl_cert_sweep_scopes_total{service="general-ledger-svc",result="swept"}'
+        values: '0+5x60'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: GLCertSweepScopesUnauthorized
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: GLCertSweepScopesUnauthorized
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              service: general-ledger-svc
+              result: unauthorized
+            exp_annotations:
+              summary: "general-ledger-svc: the certification sweep principal is not authorized to sweep some legal entities"
+              description: "Those entities are NOT being checked: a revoked certification one of them relied on will go unflagged. Grant CERT_SWEEP_PRINCIPAL_ID's principal GL_CERTIFICATION_WATCH_SWEEP on them (and read on the certifications). The log names each skipped tenant and entity."
+
+  # A flag raised is a finance ticket the moment it appears (whatever route found it), and quiet otherwise.
+  - interval: 1m
+    input_series:
+      - series: 'gl_cert_flags_raised_total{service="general-ledger-svc",trigger="event"}'
+        values: '0x5 2x20'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: GLCertFlagsRaised
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: GLCertFlagsRaised
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              service: general-ledger-svc
+              trigger: event
+            exp_annotations:
+              summary: "general-ledger-svc: journals or postings were flagged because a certification they rest on was revoked"
+              description: "This is a finance matter, not a fault. GET /v1/certification-flags?legal_entity_id=...&status=OPEN lists what is flagged and why; each flag waits for a person to decide (reverse, correct, or accept) and acknowledge it with a reason. Nothing is reversed automatically. The trigger label says how it was found: schedule, event or manual."
+      - eval_time: 40m # the increase has left the 15 minute window
+        alertname: GLCertFlagsRaised
+        exp_alerts: []
+
+  # The oldest open flag crosses seven days: a ticket. Six days: quiet.
+  - interval: 1h
+    input_series:
+      - series: 'gl_cert_flags_oldest_open_age_seconds{service="general-ledger-svc"}'
+        values: '0+3600x400' # the age grows one hour per hour
+    alert_rule_test:
+      - eval_time: 6d
+        alertname: GLCertFlagAwaitingDecisionTooLong
+        exp_alerts: []
+      - eval_time: 8d
+        alertname: GLCertFlagAwaitingDecisionTooLong
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              service: general-ledger-svc
+            exp_annotations:
+              summary: "general-ledger-svc: a flag on a journal resting on a revoked certification has waited over seven days"
+              description: "Seven days is a default, to be set by the owner of the decision. The oldest open flag is the age shown; gl_cert_flags_open is how many are waiting. A flag leaves both only when a person acknowledges it."
+
+  # A gauge that cannot be read is NaN: it fires its OWN alert, and the age alert cannot fire on it (NaN > x is false), so a broken read
+  # is never mistaken for a healthy zero NOR for a long wait.
+  - interval: 1m
+    input_series:
+      - series: 'gl_cert_flags_open{service="general-ledger-svc"}'
+        values: 'NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN'
+      - series: 'gl_cert_flags_oldest_open_age_seconds{service="general-ledger-svc"}'
+        values: 'NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: GLCertFlagStatsUnavailable
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: GLCertFlagStatsUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              service: general-ledger-svc
+            exp_annotations:
+              summary: "general-ledger-svc: the open-flag gauges cannot be read"
+              description: "The gauges report NaN when their database read fails, never a reassuring zero, so GLCertFlagAwaitingDecisionTooLong cannot fire while this does. Check the database; the log says \"certification flag stats unavailable\"."
+      - eval_time: 30m
+        alertname: GLCertFlagAwaitingDecisionTooLong
+        exp_alerts: []

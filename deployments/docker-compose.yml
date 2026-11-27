@@ -2202,6 +2202,17 @@ services:
       EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       EVIDENCE_REQUIREMENTS_URL: "http://evidence-requirements-svc:8130"
+      DATA_QUALITY_SERVICE_URL: "http://data-quality-svc:8178"
+      RECONCILIATION_SERVICE_URL: "http://reconciliation-engine-svc:8182"
+      # The scheduled certification sweep (flags journals and postings resting on a revoked certification) runs only when a principal is
+      # named. That principal must be GRANTED GL_CERTIFICATION_WATCH_SWEEP on the entities it sweeps, and read on the certifications
+      # (DATA_QUALITY_READ / RECONCILIATION_READ); there is deliberately no default identity. CERT_SWEEP_INTERVAL: 1m-24h, or "off".
+      # CERT_SWEEP_PRINCIPAL_ID: "<service principal id>"
+      CERT_SWEEP_INTERVAL: "15m"
+      # With a principal named, GL also listens for the issuing services' reliance-withdrawn events (CERT_WITHDRAWAL_CONSUMER=off to
+      # disable; CERT_WITHDRAWAL_TOPICS, CERT_WITHDRAWAL_GROUP_ID to override) and checks the certification the moment one arrives. An
+      # event is only a trigger: the issuing service is asked, so a lost or forged event cannot cause a false flag, and the schedule
+      # above remains the backstop.
     depends_on:
       postgres:
         condition: service_healthy

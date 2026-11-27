@@ -162,6 +162,15 @@ func (s *Service) PostEvent(ctx context.Context, tenant string, a Actor, req Pos
 		}
 	}
 
+	// After the period gate and before the transaction: an event that rests on a certification must be recorded as relying on it
+	// before anything is written, and is refused if that certification is no longer in force (reliance.go).
+	if err := s.recordReliance(ctx, tenant, a, ev, req.BookID, basis); err != nil {
+		if e, ok := AsException(err); ok && e.Family == FamAuth {
+			return nil, err // an authorization refusal records no execution, like every other one
+		}
+		return fail(err)
+	}
+
 	desc := strings.TrimSpace(req.Description)
 	if desc == "" {
 		desc = fmt.Sprintf("%s %s/%s", ev.EventType, ev.SourceObjectType, ev.SourceObjectID)
