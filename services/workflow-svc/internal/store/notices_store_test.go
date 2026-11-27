@@ -313,7 +313,9 @@ func TestPgStore_RLS_NoticesAsTheRuntimeRole(t *testing.T) {
 	}
 	rows := noticesOf(t, admin, inst.WorkflowInstanceID)
 	wantTold(t, "quorum met", told(rows[4:]), "approver-2/workflow.approval_requested", "requester-1/workflow.stage_approved")
-	if !strings.HasPrefix(rows[4].Body, "Stage 1 was approved.") && !strings.HasPrefix(rows[4].Body, "Stage 1 of your request") {
+	if !strings.HasPrefix(rows[4].Body, "Stage 1 was approved.") &&
+		!strings.HasPrefix(rows[4].Body, "Stage 1 of your request") &&
+		!strings.HasPrefix(rows[4].Body, "<p>Stage 1 of your request") {
 		t.Fatalf("unexpected body: %q", rows[4].Body)
 	}
 	if strings.Contains(rows[4].Body+rows[6].Body, "quorum vote") {

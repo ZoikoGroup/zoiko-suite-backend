@@ -23,7 +23,10 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w -X main.gitSHA=$
 
 FROM alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f
 
-RUN apk --no-cache add ca-certificates && adduser -D -H -u 10001 publicai
+# The pinned alpine digest predates the openssl 3.5.9-r2 fix
+# (CVE-2026-124709, QUIC memory-leak DoS). Upgrade the base packages before
+# adding anything so the image ships the fixed libcrypto3/libssl3.
+RUN apk --no-cache upgrade && apk --no-cache add ca-certificates && adduser -D -H -u 10001 publicai
 
 WORKDIR /app
 COPY --from=builder /out/server /out/healthcheck /out/kbctl /app/

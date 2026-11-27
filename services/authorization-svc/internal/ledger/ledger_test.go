@@ -15,7 +15,8 @@ const platformEntity = "00000000-0000-0000-0000-00000000f001"
 func decision(v, outcome string) domain.AccessDecisionLog {
 	tenant := "11111111-1111-1111-1111-111111111111"
 	return domain.AccessDecisionLog{
-		AccessDecisionID: "5f0c7a52-0d0b-4c55-9a4e-2b1f8d0e6a11", PrincipalID: "a1000000-0000-4000-8000-000000000002",
+		AccessDecisionID: "5f0c7a52-0d0b-4c55-9a4e-2b1f8d0e6a11", // gitleaks:allow -- test fixture UUID, not a secret
+		PrincipalID: "a1000000-0000-4000-8000-000000000002",
 		LegalEntityID: "22222222-2222-2222-2222-222222222222", ActionType: "zt.payment.release",
 		DecisionOutcome: outcome, DecisionBasis: "no_grant", TenantID: &tenant, CorrelationID: "corr-1",
 		DecidedAt: time.Date(2026, 11, 25, 9, 0, 0, 0, time.UTC), Decision: v, PolicySetVersion: "cfg.42",
