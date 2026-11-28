@@ -50,6 +50,8 @@ const exceptionCaseColumns = `
 	linked_object_type,
 	linked_object_id,
 	case_status,
+	assigned_to_role,
+	assigned_to_user,
 	escalated_at,
 	created_at,
 	created_by_principal_id,
@@ -67,6 +69,8 @@ func scanExceptionCase(row pgx.Row) (*domain.ExceptionCase, error) {
 		&ec.LinkedObjectType,
 		&ec.LinkedObjectID,
 		&ec.CaseStatus,
+		&ec.AssignedToRole,
+		&ec.AssignedToUser,
 		&ec.EscalatedAt,
 		&ec.CreatedAt,
 		&ec.CreatedByPrincipalID,
@@ -82,18 +86,31 @@ func (s *PgStore) CreateExceptionCase(ctx context.Context, params domain.CreateE
 		exceptionCaseID = uuid.New().String()
 	}
 
-	_, err := s.pool.Exec(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := s.setRLS(ctx, tx); err != nil {
+		return nil, err
+	}
+
+	_, err = tx.Exec(ctx, `
 		INSERT INTO exception_cases (
 			exception_case_id, tenant_id, legal_entity_id, exception_type,
 			severity_level, linked_object_type, linked_object_id, case_status,
-			created_by_principal_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, 'OPEN', $8)`,
+			assigned_to_role, assigned_to_user, created_by_principal_id
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, 'OPEN', $8, $9, $10)`,
 		exceptionCaseID, params.TenantID, params.LegalEntityID, params.ExceptionType,
 		params.SeverityLevel, params.LinkedObjectType, params.LinkedObjectID,
-		params.CreatedByPrincipalID,
+		params.AssignedToRole, params.AssignedToUser, params.CreatedByPrincipalID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("insert exception case: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
 	}
 
 	return s.FindExceptionCaseByID(ctx, exceptionCaseID)
@@ -118,7 +135,8 @@ func (s *PgStore) FindExceptionCaseByID(ctx context.Context, exceptionCaseID str
 	).Scan(
 		&ec.ExceptionCaseID, &ec.TenantID, &ec.LegalEntityID, &ec.ExceptionType,
 		&ec.SeverityLevel, &ec.LinkedObjectType, &ec.LinkedObjectID, &ec.CaseStatus,
-		&ec.EscalatedAt, &ec.CreatedAt, &ec.CreatedByPrincipalID, &ec.UpdatedAt, &ec.Version,
+		&ec.AssignedToRole, &ec.AssignedToUser, &ec.EscalatedAt, &ec.CreatedAt,
+		&ec.CreatedByPrincipalID, &ec.UpdatedAt, &ec.Version,
 	)
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -152,6 +170,7 @@ func (s *PgStore) ListExceptionCases(ctx context.Context, filter domain.ListExce
 	addFilter("exception_type", string(filter.ExceptionType))
 	addFilter("case_status", string(filter.CaseStatus))
 	addFilter("severity_level", string(filter.SeverityLevel))
+	addFilter("assigned_to_user", filter.AssignedToUser)
 
 	query += " ORDER BY created_at DESC, exception_case_id DESC"
 
@@ -170,21 +189,40 @@ func (s *PgStore) ListExceptionCases(ctx context.Context, filter domain.ListExce
 	query += fmt.Sprintf(" OFFSET $%d", argIdx)
 	args = append(args, filter.Offset)
 
-	rows, err := s.pool.Query(ctx, query, args...)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := s.setRLS(ctx, tx); err != nil {
+		return nil, err
+	}
+
+	rows, err := tx.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
 
 	var results []*domain.ExceptionCase
 	for rows.Next() {
 		ec, err := scanExceptionCase(rows)
 		if err != nil {
+			rows.Close()
 			return nil, err
 		}
 		results = append(results, ec)
 	}
-	return results, rows.Err()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return results, nil
 }
 
 func (s *PgStore) UpdateExceptionCaseStatus(ctx context.Context, exceptionCaseID string, params domain.UpdateExceptionCaseStatusParams, actorID, correlationID string) (*domain.ExceptionCase, error) {

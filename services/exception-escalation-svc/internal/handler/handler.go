@@ -79,6 +79,8 @@ type createExceptionCaseRequest struct {
 	SeverityLevel        string `json:"severity_level"`
 	LinkedObjectType     string `json:"linked_object_type"`
 	LinkedObjectID       string `json:"linked_object_id"`
+	AssignedToRole       string `json:"assigned_to_role,omitempty"`
+	AssignedToUser       string `json:"assigned_to_user,omitempty"`
 	CreatedByPrincipalID string `json:"created_by_principal_id"`
 }
 
@@ -143,6 +145,8 @@ func (h *Handler) CreateExceptionCase(w http.ResponseWriter, r *http.Request) {
 		SeverityLevel:        domain.SeverityLevel(req.SeverityLevel),
 		LinkedObjectType:     domain.LinkedObjectType(req.LinkedObjectType),
 		LinkedObjectID:       req.LinkedObjectID,
+		AssignedToRole:       req.AssignedToRole,
+		AssignedToUser:       req.AssignedToUser,
 		CreatedByPrincipalID: req.CreatedByPrincipalID,
 		CorrelationID:        r.Header.Get("X-Correlation-ID"),
 	})
@@ -190,6 +194,7 @@ func (h *Handler) ListExceptionCases(w http.ResponseWriter, r *http.Request) {
 	exceptionType := r.URL.Query().Get("exception_type")
 	caseStatus := r.URL.Query().Get("case_status")
 	severityLevel := r.URL.Query().Get("severity_level")
+	assignedToUser := r.URL.Query().Get("assigned_to_user")
 	limitStr := r.URL.Query().Get("limit")
 	offsetStr := r.URL.Query().Get("offset")
 
@@ -211,6 +216,7 @@ func (h *Handler) ListExceptionCases(w http.ResponseWriter, r *http.Request) {
 		ExceptionType:  domain.ExceptionType(exceptionType),
 		CaseStatus:     domain.CaseStatus(caseStatus),
 		SeverityLevel:  domain.SeverityLevel(severityLevel),
+		AssignedToUser: assignedToUser,
 		Limit:          limit,
 		Offset:         offset,
 	}

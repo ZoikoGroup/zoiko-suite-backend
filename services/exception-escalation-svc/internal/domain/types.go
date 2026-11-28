@@ -78,6 +78,8 @@ type ExceptionCase struct {
 	LinkedObjectType  LinkedObjectType `json:"linked_object_type"`
 	LinkedObjectID    string        `json:"linked_object_id"`
 	CaseStatus        CaseStatus    `json:"case_status"`
+	AssignedToRole    string        `json:"assigned_to_role,omitempty"`
+	AssignedToUser    string        `json:"assigned_to_user,omitempty"`
 	EscalatedAt       *time.Time    `json:"escalated_at,omitempty"`
 	CreatedAt         time.Time     `json:"created_at"`
 	CreatedByPrincipalID string     `json:"created_by_principal_id"`
@@ -106,6 +108,8 @@ type CreateExceptionCaseParams struct {
 	SeverityLevel          SeverityLevel
 	LinkedObjectType       LinkedObjectType
 	LinkedObjectID         string
+	AssignedToRole         string
+	AssignedToUser         string
 	CreatedByPrincipalID   string
 	CorrelationID          string
 }
@@ -133,6 +137,7 @@ type ListExceptionCasesFilter struct {
 	ExceptionType  ExceptionType
 	CaseStatus     CaseStatus
 	SeverityLevel  SeverityLevel
+	AssignedToUser string
 	Limit          int
 	Offset         int
 }

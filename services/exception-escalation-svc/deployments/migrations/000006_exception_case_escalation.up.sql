@@ -28,6 +28,7 @@ DROP TABLE IF EXISTS escalation_records CASCADE;
 
 CREATE TABLE IF NOT EXISTS escalation_records (
     escalation_record_id   UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id              UUID        NOT NULL,
     exception_case_id      UUID        NOT NULL REFERENCES exception_cases(exception_case_id),
     escalated_to_role      VARCHAR(64) NOT NULL,
     escalation_reason      TEXT        NOT NULL,
