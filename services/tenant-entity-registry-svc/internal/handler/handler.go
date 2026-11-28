@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -42,10 +43,10 @@ type Service interface {
 	// Entity
 	CreateEntity(ctx context.Context, req domain.CreateEntityRequest) (*domain.LegalEntity, error)
 	GetEntity(ctx context.Context, legalEntityID string) (*domain.LegalEntity, error)
-	ListEntities(ctx context.Context, tenantID string) ([]*domain.LegalEntity, error)
+	ListEntities(ctx context.Context, tenantID string, limit int, cursor string) ([]*domain.LegalEntity, string, error)
 	CreateWorkspace(ctx context.Context, req domain.CreateWorkspaceRequest) (*domain.Workspace, error)
 	GetWorkspace(ctx context.Context, workspaceID string) (*domain.Workspace, error)
-	ListWorkspaces(ctx context.Context, tenantID string) ([]*domain.Workspace, error)
+	ListWorkspaces(ctx context.Context, tenantID string, limit int, cursor string) ([]*domain.Workspace, string, error)
 	UpdateWorkspace(ctx context.Context, workspaceID string, req domain.UpdateWorkspaceRequest) (*domain.Workspace, error)
 	TransitionWorkspaceStatus(ctx context.Context, workspaceID string, req domain.TransitionWorkspaceStatusRequest) error
 	UpdateEntity(ctx context.Context, legalEntityID string, req domain.UpdateEntityRequest) (*domain.LegalEntity, error)
@@ -55,12 +56,12 @@ type Service interface {
 	// Hierarchy
 	CreateHierarchy(ctx context.Context, req domain.CreateHierarchyRequest) (*domain.EntityHierarchy, error)
 	EndDateHierarchy(ctx context.Context, hierarchyID string, endDate time.Time, correlationID string) error
-	ListHierarchies(ctx context.Context, legalEntityID string) ([]*domain.EntityHierarchy, error)
+	ListHierarchies(ctx context.Context, legalEntityID string, limit int, cursor string) ([]*domain.EntityHierarchy, string, error)
 	GetHierarchyByID(ctx context.Context, hierarchyID string) (*domain.EntityHierarchy, error)
 
 	// Jurisdiction assignment
 	AssignJurisdiction(ctx context.Context, legalEntityID string, req domain.AssignJurisdictionRequest) (*domain.EntityJurisdictionAssignment, error)
-	ListJurisdictions(ctx context.Context, legalEntityID string) ([]*domain.EntityJurisdictionAssignment, error)
+	ListJurisdictions(ctx context.Context, legalEntityID string, limit int, cursor string) ([]*domain.EntityJurisdictionAssignment, string, error)
 	EndDateJurisdictionAssignment(ctx context.Context, assignmentID string, endDate time.Time, correlationID string) error
 	GetJurisdictionAssignmentByID(ctx context.Context, assignmentID string) (*domain.EntityJurisdictionAssignment, error)
 
@@ -70,7 +71,7 @@ type Service interface {
 
 	// ResidencyRegion — read-only (IaC-managed)
 	GetResidencyRegion(ctx context.Context, regionID string) (*domain.ResidencyRegion, error)
-	ListResidencyRegions(ctx context.Context) ([]*domain.ResidencyRegion, error)
+	ListResidencyRegions(ctx context.Context, limit int, cursor string) ([]*domain.ResidencyRegion, string, error)
 
 	// ResolveTenantRegion is the real tenant->region lookup consumed by
 	// the Global Traffic & Residency Manager's ingress layer.
@@ -79,8 +80,11 @@ type Service interface {
 	// TaxIdentityBundle
 	CreateTaxIdentityBundle(ctx context.Context, legalEntityID string, req domain.CreateTaxIdentityBundleRequest) (*domain.TaxIdentityBundle, error)
 	GetTaxIdentityBundle(ctx context.Context, bundleID string) (*domain.TaxIdentityBundle, error)
-	ListTaxIdentityBundles(ctx context.Context, legalEntityID string) ([]*domain.TaxIdentityBundle, error)
+	ListTaxIdentityBundles(ctx context.Context, legalEntityID string, limit int, cursor string) ([]*domain.TaxIdentityBundle, string, error)
 	TransitionTaxIdentityBundleStatus(ctx context.Context, bundleID string, req domain.TransitionTaxIdentityBundleStatusRequest) error
+
+	// TER-FE-1: Registry Summary for console header KPIs
+	GetRegistrySummary(ctx context.Context, tenantID string) (*domain.RegistrySummary, error)
 
 	// ORG-02/ORG-03 named commands and read surfaces — see org_handler.go.
 	ORGService
@@ -284,12 +288,13 @@ func (h *Handler) GetEntity(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListEntities(w http.ResponseWriter, r *http.Request) {
-	entities, err := h.svc.ListEntities(r.Context(), chi.URLParam(r, "tenantID"))
+	limit, cursor := parseLimitCursor(r)
+	entities, next, err := h.svc.ListEntities(r.Context(), chi.URLParam(r, "tenantID"), limit, cursor)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, entities)
+	writePaginated(w, entities, next)
 }
 
 func (h *Handler) CreateWorkspace(w http.ResponseWriter, r *http.Request) {
@@ -320,12 +325,13 @@ func (h *Handler) GetWorkspace(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListWorkspaces(w http.ResponseWriter, r *http.Request) {
-	workspaces, err := h.svc.ListWorkspaces(r.Context(), chi.URLParam(r, "tenantID"))
+	limit, cursor := parseLimitCursor(r)
+	workspaces, next, err := h.svc.ListWorkspaces(r.Context(), chi.URLParam(r, "tenantID"), limit, cursor)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, workspaces)
+	writePaginated(w, workspaces, next)
 }
 
 // UpdateWorkspace — PATCH /v1/workspaces/{workspaceID}
@@ -468,12 +474,13 @@ func (h *Handler) CreateHierarchy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListHierarchies(w http.ResponseWriter, r *http.Request) {
-	list, err := h.svc.ListHierarchies(r.Context(), chi.URLParam(r, "entityID"))
+	limit, cursor := parseLimitCursor(r)
+	list, next, err := h.svc.ListHierarchies(r.Context(), chi.URLParam(r, "entityID"), limit, cursor)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, list)
+	writePaginated(w, list, next)
 }
 
 // EndDateHierarchy — DELETE is used as "end-date" semantics (no hard-delete per doctrine).
@@ -525,12 +532,13 @@ func (h *Handler) AssignJurisdiction(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListJurisdictions(w http.ResponseWriter, r *http.Request) {
-	list, err := h.svc.ListJurisdictions(r.Context(), chi.URLParam(r, "entityID"))
+	limit, cursor := parseLimitCursor(r)
+	list, next, err := h.svc.ListJurisdictions(r.Context(), chi.URLParam(r, "entityID"), limit, cursor)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, list)
+	writePaginated(w, list, next)
 }
 
 // EndDateJurisdictionAssignment
@@ -587,12 +595,13 @@ func (h *Handler) GetResidencyPolicy(w http.ResponseWriter, r *http.Request) {
 // ── ResidencyRegion handlers — read-only (IaC-managed) ──────────────────────
 
 func (h *Handler) ListResidencyRegions(w http.ResponseWriter, r *http.Request) {
-	list, err := h.svc.ListResidencyRegions(r.Context())
+	limit, cursor := parseLimitCursor(r)
+	list, next, err := h.svc.ListResidencyRegions(r.Context(), limit, cursor)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, list)
+	writePaginated(w, list, next)
 }
 
 func (h *Handler) GetResidencyRegion(w http.ResponseWriter, r *http.Request) {
@@ -629,12 +638,13 @@ func (h *Handler) GetTaxIdentityBundle(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListTaxIdentityBundles(w http.ResponseWriter, r *http.Request) {
-	list, err := h.svc.ListTaxIdentityBundles(r.Context(), chi.URLParam(r, "entityID"))
+	limit, cursor := parseLimitCursor(r)
+	list, next, err := h.svc.ListTaxIdentityBundles(r.Context(), chi.URLParam(r, "entityID"), limit, cursor)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, list)
+	writePaginated(w, list, next)
 }
 
 func (h *Handler) TransitionTaxIdentityBundleStatus(w http.ResponseWriter, r *http.Request) {
@@ -787,4 +797,41 @@ func parseEndDate(w http.ResponseWriter, r *http.Request) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return t, true
+}
+
+// GetRegistrySummary returns KPIs for the console header.
+// TER-FE-1: Summary route for the Tenants & Entities console page.
+func (h *Handler) GetRegistrySummary(w http.ResponseWriter, r *http.Request) {
+	tenantID := chi.URLParam(r, "tenantID")
+	summary, err := h.svc.GetRegistrySummary(r.Context(), tenantID)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, summary)
+}
+
+// parseLimitCursor parses the limit and cursor query parameters for pagination.
+// Returns limit (default 50, max 200) and cursor (empty string if not provided).
+func parseLimitCursor(r *http.Request) (int, string) {
+	q := r.URL.Query()
+	limit := 0
+	if raw := q.Get("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= 200 {
+			limit = n
+		}
+	}
+	if limit == 0 {
+		limit = 50
+	}
+	cursor := q.Get("cursor")
+	return limit, cursor
+}
+
+// writePaginated writes a paginated list response with items and next_cursor.
+func writePaginated(w http.ResponseWriter, items any, nextCursor string) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items":        items,
+		"next_cursor":  nextCursor,
+	})
 }

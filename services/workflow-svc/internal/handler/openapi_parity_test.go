@@ -16,7 +16,7 @@ import (
 )
 
 // TestOpenAPIMatchesTheRouter keeps openapi.yaml and the router in step for
-// the governed approval surface (/v1/workflows, /v1/workflow-definitions):
+// the governed approval surface (/v1/workflows, /v1/workflow-definitions, /v1/work-items):
 // every routed operation is documented and every documented operation is
 // routed. The audit and form modules have their own contracts. (Validity of
 // the document is checked with kin-openapi; route parity alone once passed
@@ -51,7 +51,7 @@ func TestOpenAPIMatchesTheRouter(t *testing.T) {
 	routed := map[string]bool{}
 	_ = chi.Walk(r, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
 		route = strings.TrimSuffix(route, "/")
-		if strings.HasPrefix(route, "/v1/workflows") || strings.HasPrefix(route, "/v1/workflow-definitions") {
+		if strings.HasPrefix(route, "/v1/workflows") || strings.HasPrefix(route, "/v1/workflow-definitions") || strings.HasPrefix(route, "/v1/work-items") {
 			routed[method+" "+route] = true
 		}
 		return nil

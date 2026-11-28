@@ -3,9 +3,12 @@
 -- registered (they are 000008's). A role already instantiated from one of these
 -- template versions keeps its own copy of the actions.
 
+-- role_template_versions is append-only by trigger (000009); a down is the one sanctioned removal.
+ALTER TABLE role_template_versions DISABLE TRIGGER role_template_versions_no_update;
 DELETE FROM role_template_versions WHERE template_code = 'EVIDENCE_REQUEST_MANAGER' AND template_version = 1 AND published_by = 'migration:000046';
 DELETE FROM role_template_versions WHERE template_code = 'OBLIGATION_MANAGER' AND template_version = 2 AND published_by = 'migration:000046';
 DELETE FROM role_template_versions WHERE template_code = 'COMPLIANCE_CATALOGUE_ADMINISTRATOR' AND template_version = 2 AND published_by = 'migration:000046';
+ALTER TABLE role_template_versions ENABLE TRIGGER role_template_versions_no_update;
 DELETE FROM role_templates WHERE template_code = 'EVIDENCE_REQUEST_MANAGER'
    AND NOT EXISTS (SELECT 1 FROM role_template_versions WHERE template_code = 'EVIDENCE_REQUEST_MANAGER');
 

@@ -43,6 +43,29 @@ type Config struct {
 	// ledger deliverer writes as. Empty leaves decision_log events pending.
 	LedgerPrincipalID string
 
+	// NotificationServiceURL is notification-svc. When set, every transition
+	// writes approver and requester notices to the outbox and a relay sends
+	// them to POST /v1/notifications as NotifyPrincipalID (which needs
+	// NOTIFICATION_SEND). Empty turns notices off: none are written.
+	NotificationServiceURL string
+	NotifyPrincipalID      string
+	// ConsoleBaseURL prefixes the link a notice carries to the workflow
+	// (CONSOLE_BASE_URL, e.g. https://console.example.com). Empty gives a
+	// relative /admin/workflows?id=… link.
+	ConsoleBaseURL string
+
+	// PolicyServiceURL is policy-svc, which issues the signatory decisions a
+	// signature workflow is created from (ZS-GOV-INT-002 §4.2).
+	// PolicyServiceMTLSURL, when set (https://policy-svc:8449), sends those
+	// reads to policy-svc's peer listener with workflow-svc's own certificate.
+	PolicyServiceURL     string
+	PolicyServiceMTLSURL string
+	// RegistryMTLSURL, when set (https://tenant-entity-registry-svc:8449),
+	// is where a legal-entity check with no caller identity goes, with this
+	// service's certificate: an escalation case opened by obligations-svc's
+	// relay carries no envelope to forward.
+	RegistryMTLSURL string
+
 	// RegistryServiceURL is tenant-entity-registry-svc, the owner of the
 	// legal-entity fact a workflow binds to. Empty disables the check (local
 	// only); the handler then admits any entity in the caller's tenant.
@@ -116,8 +139,14 @@ func Load() (*Config, error) {
 		MTLSManagementServiceURL:        env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 		MTLSBootstrapTokenPath:          env("MTLS_BOOTSTRAP_TOKEN_PATH", ""),
 		LedgerPrincipalID:               env("WORKFLOW_LEDGER_PRINCIPAL_ID", ""),
+		NotificationServiceURL:          env("NOTIFICATION_SERVICE_URL", ""),
+		NotifyPrincipalID:               env("WORKFLOW_NOTIFY_PRINCIPAL_ID", "svc-workflow"),
+		ConsoleBaseURL:                  env("CONSOLE_BASE_URL", ""),
+		PolicyServiceURL:                env("POLICY_SERVICE_URL", "http://policy-svc:8085"),
+		PolicyServiceMTLSURL:            env("POLICY_SERVICE_MTLS_URL", ""),
 		ReadAuthzMode:                   env("WORKFLOW_READ_AUTHZ", "enforce"),
 		RegistryServiceURL:              env("TENANT_ENTITY_REGISTRY_SERVICE_URL", "http://tenant-entity-registry-svc:8081"),
+		RegistryMTLSURL:                 env("TENANT_REGISTRY_MTLS_URL", ""),
 		ConsumerGroupID:                 env("KAFKA_CONSUMER_GROUP_ID", "workflow-svc-recheck"),
 		ConsumerTopics: envList("KAFKA_CONSUMED_TOPICS",
 			"zoiko.policy.events,zoiko.delegated-authority.events,zoiko.authorization.events"),

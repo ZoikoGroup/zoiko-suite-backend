@@ -129,11 +129,22 @@ func TestAC2_PlatformServiceIdentitiesProvisionedWithATenantsFirstRole(t *testin
 	}
 
 	// Once per tenant: a revoked writer is not re-granted by later roles.
+	// svc-workflow also holds the 000048 notifier role; the ledger writer is
+	// the one 000043 assigned.
 	assignments, err := f.s.ListRoleAssignments(f.ctx, f.tenant, "svc-workflow", "", true)
-	if err != nil || len(assignments) != 1 {
-		t.Fatalf("expected one svc-workflow assignment, got %d (%v)", len(assignments), err)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := f.s.RevokeRoleAssignment(f.ctx, assignments[0].PrincipalRoleAssignmentID, f.tenant); err != nil {
+	var ledger []string
+	for _, a := range assignments {
+		if a.AssignedBy == "migration:000043" {
+			ledger = append(ledger, a.PrincipalRoleAssignmentID)
+		}
+	}
+	if len(ledger) != 1 {
+		t.Fatalf("expected one 000043 svc-workflow assignment, got %d of %d", len(ledger), len(assignments))
+	}
+	if _, err := f.s.RevokeRoleAssignment(f.ctx, ledger[0], f.tenant); err != nil {
 		t.Fatal(err)
 	}
 	f.role(t)
@@ -142,5 +153,120 @@ func TestAC2_PlatformServiceIdentitiesProvisionedWithATenantsFirstRole(t *testin
 	}
 	if !f.granted(t, "svc-policy", entity, actionDecisionRecord) {
 		t.Fatal("the other writer's grant must be untouched")
+	}
+}
+
+// OB-S8 / OB-S11: migration 000044 provisions obligations-svc's clock worker
+// identity: it may ask jurisdiction-rules-svc for a calculation and open an
+// escalation case. Since 000046 (DL-1) it also appends its own decisions to
+// the governance ledger; nothing more.
+func TestOBS8_ObligationsServiceIdentityProvisionedWithATenantsFirstRole(t *testing.T) {
+	f := newFixture(t)
+	entity := uuid.NewString()
+	if f.granted(t, "svc-obligations", entity, "OBLIGATION_CALCULATION_CALCULATE") {
+		t.Fatal("precondition: svc-obligations holds a grant in a tenant that has no role yet")
+	}
+	f.role(t)
+	for _, a := range []string{"OBLIGATION_CALCULATION_CALCULATE", "CASE_OPEN", actionDecisionRecord} {
+		if !f.granted(t, "svc-obligations", entity, a) {
+			t.Fatalf("svc-obligations must hold %s on any entity of the tenant", a)
+		}
+	}
+	for _, a := range []string{actionDecisionRead, "OBLIGATION_CLOCK_WAIVE", "CASE_CLOSE"} {
+		if f.granted(t, "svc-obligations", entity, a) {
+			t.Fatalf("svc-obligations must not hold %s", a)
+		}
+	}
+}
+
+// DL-1 (25 Nov 2026): migration 000046 provisions the four new decision-log
+// writers with GOVERNANCE_DECISION_RECORD only, in a tenant from its first
+// role on, and an administrator's revocation stands.
+func TestDL1_DecisionLogWritersProvisionedWithATenantsFirstRole(t *testing.T) {
+	writers := []string{"svc-authorization", "svc-jurisdiction-rules", "svc-obligations", "svc-evidence-requirements"}
+	f := newFixture(t)
+	entity := uuid.NewString()
+	for _, p := range writers {
+		if f.granted(t, p, entity, actionDecisionRecord) {
+			t.Fatalf("precondition: %s holds RECORD in a tenant that has no role yet", p)
+		}
+	}
+	f.role(t)
+	for _, p := range writers {
+		if !f.granted(t, p, entity, actionDecisionRecord) {
+			t.Fatalf("%s must hold %s on any entity of a provisioned tenant", p, actionDecisionRecord)
+		}
+		if f.granted(t, p, entity, actionDecisionRead) {
+			t.Fatalf("%s is a writer: it must not read the ledger", p)
+		}
+	}
+	if f.granted(t, "someone-else", entity, actionDecisionRecord) {
+		t.Fatal("only service identities are provisioned")
+	}
+
+	assignments, err := f.s.ListRoleAssignments(f.ctx, f.tenant, "svc-evidence-requirements", "", true)
+	if err != nil || len(assignments) != 1 {
+		t.Fatalf("svc-evidence-requirements assignments: %d %v", len(assignments), err)
+	}
+	if _, err := f.s.RevokeRoleAssignment(f.ctx, assignments[0].PrincipalRoleAssignmentID, f.tenant); err != nil {
+		t.Fatal(err)
+	}
+	f.role(t)
+	if f.granted(t, "svc-evidence-requirements", entity, actionDecisionRecord) {
+		t.Fatal("creating another role re-granted a writer an administrator had revoked")
+	}
+}
+
+// Workflow notices (26 Nov 2026): migration 000048 gives svc-workflow
+// NOTIFICATION_SEND and IDENTITY_PRINCIPAL_READ, as a role of its own, in a
+// tenant from its first role on, so its outbox relay can send approver and
+// requester notices to notification-svc (which resolves email recipients as
+// the sender). Nobody else receives it, and a revocation stands.
+func TestWN_WorkflowNotifierProvisionedWithATenantsFirstRole(t *testing.T) {
+	const actionNotificationSend = "NOTIFICATION_SEND"
+	f := newFixture(t)
+	entity := uuid.NewString()
+	if f.granted(t, "svc-workflow", entity, actionNotificationSend) {
+		t.Fatal("precondition: svc-workflow holds NOTIFICATION_SEND in a tenant that has no role yet")
+	}
+	f.role(t)
+	// notification-svc resolves an email recipient AS the sender, and
+	// identity-context-svc guards that read with IDENTITY_PRINCIPAL_READ.
+	for _, a := range []string{actionNotificationSend, "IDENTITY_PRINCIPAL_READ"} {
+		if !f.granted(t, "svc-workflow", entity, a) {
+			t.Fatalf("svc-workflow must hold %s on any entity of a provisioned tenant", a)
+		}
+	}
+	if !f.granted(t, "svc-workflow", entity, actionDecisionRecord) {
+		t.Fatal("the notifier role is added beside the ledger writer role, not instead of it")
+	}
+	for _, p := range []string{"svc-policy", "svc-obligations", "someone-else"} {
+		if f.granted(t, p, entity, actionNotificationSend) {
+			t.Fatalf("%s must not hold %s", p, actionNotificationSend)
+		}
+	}
+
+	assignments, err := f.s.ListRoleAssignments(f.ctx, f.tenant, "svc-workflow", "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revoked := false
+	for _, a := range assignments {
+		if a.AssignedBy == "migration:000048" {
+			if _, err := f.s.RevokeRoleAssignment(f.ctx, a.PrincipalRoleAssignmentID, f.tenant); err != nil {
+				t.Fatal(err)
+			}
+			revoked = true
+		}
+	}
+	if !revoked {
+		t.Fatalf("no SVC_WORKFLOW_NOTIFIER assignment among %d for svc-workflow", len(assignments))
+	}
+	f.role(t)
+	if f.granted(t, "svc-workflow", entity, actionNotificationSend) {
+		t.Fatal("creating another role re-granted the notifier an administrator had revoked")
+	}
+	if !f.granted(t, "svc-workflow", entity, actionDecisionRecord) {
+		t.Fatal("revoking the notifier must leave the ledger writer role alone")
 	}
 }

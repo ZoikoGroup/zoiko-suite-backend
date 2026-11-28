@@ -47,6 +47,33 @@ type Policy struct {
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
 	// RecordVersion is the optimistic-concurrency token (migration 000009).
 	RecordVersion int64 `json:"record_version"`
+
+	// Retirement evidence (migration 000011): who retired the family, when
+	// and why. A retired family takes no new versions; its history stays.
+	RetiredByPrincipalID *string    `json:"retired_by_principal_id,omitempty"`
+	RetiredAt            *time.Time `json:"retired_at,omitempty"`
+	RetirementReason     *string    `json:"retirement_reason,omitempty"`
+}
+
+// PolicyStatusRetired is a family that takes no new versions (final).
+const PolicyStatusRetired = "RETIRED"
+
+// RetirePolicyParams retires a policy family.
+type RetirePolicyParams struct {
+	PolicyID        string
+	ExpectedVersion int64
+	ActorID         string
+	Reason          string
+	Meta            EventMeta
+}
+
+// EvidenceRedeliveryParams re-queues one evaluation's evidence for the ledger.
+type EvidenceRedeliveryParams struct {
+	TenantID     string
+	EvaluationID string
+	ActorID      string
+	Reason       string
+	Meta         EventMeta
 }
 
 // PolicyVersion is an effective-dated, state-machined rule-content record
@@ -334,6 +361,17 @@ type Evaluation struct {
 	// LedgerStatus is PENDING until governance-decision-log-svc has the
 	// record, then RECORDED; FAILED if that service refused it for good.
 	LedgerStatus string `json:"ledger_status"`
+
+	// ZS-GOV-INT-002 canonical decision (migration 000013): the contract
+	// version, the outcome of the shared vocabulary, its reason codes and
+	// validity, and the signed envelope exactly as it was answered. Absent on
+	// evaluations recorded before the contract (and on the legacy evaluate
+	// route's rows, which carry the outcome only).
+	ContractVersion  string          `json:"contract_version,omitempty"`
+	DecisionOutcome  string          `json:"decision_outcome,omitempty"`
+	ReasonCodes      []string        `json:"reason_codes,omitempty"`
+	ValidUntil       *time.Time      `json:"valid_until,omitempty"`
+	DecisionEnvelope json.RawMessage `json:"decision_envelope,omitempty"`
 }
 
 // Ledger delivery states reported on an Evaluation.
@@ -345,6 +383,18 @@ const (
 
 // ErrPolicyNotFound is returned when a policy_id does not exist.
 var ErrPolicyNotFound = errorString("policy not found")
+
+// ErrPolicyRetired is returned when a retired family is asked to take a new
+// version, or a family is retired while a version of it governs.
+var ErrPolicyRetired = errorString("policy family is retired")
+
+// ErrPolicyInUse is returned when a family is retired while one of its
+// versions is ACTIVE or SCHEDULED: retire or supersede those first.
+var ErrPolicyInUse = errorString("policy family has an ACTIVE or SCHEDULED version")
+
+// ErrEvidenceAlreadyRecorded is returned when a redelivery is asked for
+// evidence the ledger already holds.
+var ErrEvidenceAlreadyRecorded = errorString("evidence already recorded in the ledger")
 
 // ErrPolicyVersionNotFound is returned when a policy_version_id does not exist.
 var ErrPolicyVersionNotFound = errorString("policy version not found")

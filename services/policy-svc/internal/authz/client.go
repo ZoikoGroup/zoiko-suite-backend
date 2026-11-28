@@ -90,6 +90,19 @@ const (
 	ActionPolicyRead     = "POLICY_READ"
 	ActionPolicyEvaluate = "POLICY_EVALUATE"
 
+	// ActionPolicyEvidenceRedeliver puts evidence the governance ledger
+	// refused back on the relay's queue: an operator's act, apart from reads.
+	ActionPolicyEvidenceRedeliver = "POLICY_EVIDENCE_REDELIVER"
+
+	// V-001 PDC-05: maintaining a family's test suite, running it, asking for
+	// and approving a waiver, and simulating are separate acts (§25: authoring,
+	// certification and release are separated capabilities).
+	ActionPolicyTestManage    = "POLICY_TEST_MANAGE"
+	ActionPolicyTestRun       = "POLICY_TEST_RUN"
+	ActionPolicyWaiverRequest = "POLICY_WAIVER_REQUEST"
+	ActionPolicyWaiverApprove = "POLICY_WAIVER_APPROVE"
+	ActionPolicySimulate      = "POLICY_SIMULATE"
+
 	ActionControlTestDefinitionCreate = "CONTROL_TEST_DEFINITION_CREATE"
 	ActionControlTestExecutionRecord  = "CONTROL_TEST_EXECUTION_RECORD"
 	ActionAttestationCreate           = "ATTESTATION_CREATE"

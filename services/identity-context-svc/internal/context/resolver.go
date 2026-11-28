@@ -753,7 +753,7 @@ func (r *Resolver) InvalidateSession(
 	}
 
 	now := time.Now().UTC()
-	if err := r.sessions.Invalidate(ctx, sessionContextID, tenantID, reason, now); err != nil {
+	if err := r.sessions.Invalidate(ctx, sessionContextID, tenantID, reason, now, existing.PrincipalID, correlationID); err != nil {
 		return fmt.Errorf("invalidate session context: %w", err)
 	}
 	if err := r.sessions.Evict(ctx, sessionContextID); err != nil {

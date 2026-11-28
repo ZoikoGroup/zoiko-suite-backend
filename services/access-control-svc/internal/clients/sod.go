@@ -44,7 +44,13 @@ type SoDClient struct {
 }
 
 func NewSoDClient(baseURL string) *SoDClient {
-	return &SoDClient{baseURL: baseURL, http: &http.Client{Timeout: 3 * time.Second}}
+	return NewSoDClientWithHTTP(baseURL, &http.Client{Timeout: 3 * time.Second})
+}
+
+// NewSoDClientWithHTTP uses the provided HTTP client (e.g., an mTLS client)
+// for calls to authorization-svc's SoD validation endpoint.
+func NewSoDClientWithHTTP(baseURL string, httpClient *http.Client) *SoDClient {
+	return &SoDClient{baseURL: baseURL, http: httpClient}
 }
 
 type sodValidateRequest struct {

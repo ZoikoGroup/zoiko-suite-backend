@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -210,9 +211,9 @@ type Store interface {
 	CreateFilingRequirement(ctx context.Context, params domain.CreateFilingRequirementParams) (*domain.FilingRequirement, error)
 
 	// ListFilingRequirements returns an obligation's filing requirements,
-	// newest first, at most limit. Fails with domain.ErrObligationNotFound if
+	// newest first, matching the filter. Fails with domain.ErrObligationNotFound if
 	// obligation_id does not exist.
-	ListFilingRequirements(ctx context.Context, obligationID string, limit int) ([]*domain.FilingRequirement, error)
+	ListFilingRequirements(ctx context.Context, filter domain.ListFilingRequirementsFilter) ([]*domain.FilingRequirement, error)
 
 	// FindOverdueObligations returns obligations that are OPEN or IN_PROGRESS
 	// and whose due_date has passed. Used by the overdue scheduler.
@@ -244,6 +245,9 @@ type Store interface {
 type PgStore struct {
 	pool *pgxpool.Pool
 	log  *zap.Logger
+	// ledgerOn queues governance-ledger records with evaluate and waive
+	// decisions (DL-5, SetDecisionLedger).
+	ledgerOn bool
 }
 
 // New returns an open PgStore. Caller must call pool.Close() when done.
@@ -669,15 +673,8 @@ func (s *PgStore) ListObligations(ctx context.Context, filter domain.ListObligat
 	return results, nil
 }
 
-// legalTransitions enumerates the obligation_status state machine.
-// CLOSED is terminal — never a key in this map. Enforced here in
-// application code (like policy-svc's version_status transitions), not a
-// DB CHECK constraint.
-var legalTransitions = map[string][]string{
-	"OPEN":        {"IN_PROGRESS", "OVERDUE", "CLOSED"},
-	"IN_PROGRESS": {"OVERDUE", "CLOSED"},
-	"OVERDUE":     {"CLOSED"},
-}
+// legalTransitions is the obligation_status state machine (domain.ObligationTransitions).
+var legalTransitions = domain.ObligationTransitions
 
 // UpdateObligationStatus transitions an obligation's status. Idempotent:
 // requesting the status the obligation is already in returns the unchanged
@@ -1198,24 +1195,42 @@ func (s *PgStore) CreateFilingRequirement(ctx context.Context, params domain.Cre
 }
 
 // ListFilingRequirements returns all filing requirements for an obligation.
-func (s *PgStore) ListFilingRequirements(ctx context.Context, obligationID string, limit int) ([]*domain.FilingRequirement, error) {
+func (s *PgStore) ListFilingRequirements(ctx context.Context, filter domain.ListFilingRequirementsFilter) ([]*domain.FilingRequirement, error) {
+	obligationID := filter.ObligationID
 	if _, err := s.FindObligationByID(ctx, obligationID); err != nil {
 		return nil, err
 	}
+	limit := filter.Limit
 	if limit <= 0 {
 		limit = defaultListLimit
 	}
+	offset := filter.Offset
 
-	const query = `
+	var queryBuilder strings.Builder
+	queryBuilder.WriteString(`
 		SELECT ` + filingRequirementColumns + `
 		FROM filing_requirements
-		WHERE obligation_id = $1 AND tenant_id = $2
-		ORDER BY created_at DESC, filing_requirement_id DESC
-		LIMIT $3;`
+		WHERE obligation_id = $1 AND tenant_id = $2`)
+
+	args := []any{obligationID, nil} // $2 is the tenant, bound inside the transaction
+	argIdx := 3
+
+	// Keyset continuation on the (created_at, id) pair the list is ordered by:
+	// two separate "<" predicates skipped every row that was newer on one
+	// column and older on the other.
+	if filter.AfterCreatedAt != nil {
+		queryBuilder.WriteString(fmt.Sprintf(" AND (created_at, filing_requirement_id) < ($%d, $%d::uuid)", argIdx, argIdx+1))
+		args = append(args, *filter.AfterCreatedAt, filter.AfterID)
+		argIdx += 2
+	}
+
+	queryBuilder.WriteString(fmt.Sprintf(" ORDER BY created_at DESC, filing_requirement_id DESC LIMIT $%d OFFSET $%d;", argIdx, argIdx+1))
+	args = append(args, limit, offset)
 
 	var results []*domain.FilingRequirement
 	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
-		rows, qErr := tx.Query(ctx, query, obligationID, tenantID, limit)
+		args[1] = tenantID
+		rows, qErr := tx.Query(ctx, queryBuilder.String(), args...)
 		if qErr != nil {
 			s.log.Error("pg ListFilingRequirements failed", zap.String("obligation_id", obligationID), zap.Error(qErr))
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, qErr)
@@ -1358,6 +1373,12 @@ const OutboxMaxAttempts = 200
 // publish and the commit). A failed publish is retried with exponential
 // backoff; only OutboxMaxAttempts consecutive failures park it.
 func (s *PgStore) RelayOutbox(ctx context.Context, limit int, publish func(ctx context.Context, e OutboxEvent) error) (published, failed int, err error) {
+	return s.relay(ctx, DestinationKafka, limit, publish)
+}
+
+// relay claims due rows of one outbox destination (000016: KAFKA for events,
+// WORKFLOW_CASE for escalation case requests) and records each outcome.
+func (s *PgStore) relay(ctx context.Context, destination string, limit int, publish func(ctx context.Context, e OutboxEvent) error) (published, failed int, err error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -1365,11 +1386,11 @@ func (s *PgStore) RelayOutbox(ctx context.Context, limit int, publish func(ctx c
 		const claim = `
 			SELECT outbox_id, tenant_id, event_type, event_payload, correlation_id, status, attempts, created_at
 			FROM event_outbox
-			WHERE status = 'PENDING' AND next_attempt_at <= NOW()
+			WHERE status = 'PENDING' AND next_attempt_at <= NOW() AND destination = $2
 			ORDER BY created_at ASC
 			LIMIT $1
 			FOR UPDATE SKIP LOCKED;`
-		rows, qErr := tx.Query(ctx, claim, limit)
+		rows, qErr := tx.Query(ctx, claim, limit, destination)
 		if qErr != nil {
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, qErr)
 		}

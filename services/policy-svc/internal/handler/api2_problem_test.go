@@ -105,6 +105,11 @@ func TestOpenAPI_MatchesTheRouter(t *testing.T) {
 	h := handler.New(&stubStore{}, &stubCandidates{}, &stubAuthz{}, handler.Options{PlatformScopeID: testAuthzScopeID}, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	handler.RegisterControlTestRoutes(r, h)
+	handler.RegisterListRoutes(r, h)
+	handler.RegisterOperationRoutes(r, h)
+	handler.RegisterCertificationRoutes(r, h)
+	handler.RegisterSignatoryRoutes(r, h)
+	handler.RegisterPolicyTypeRoutes(r, h)
 	served := map[string]bool{"GET /healthz": true, "GET /readyz": true}
 	_ = chi.Walk(r, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
 		served[method+" "+strings.TrimSuffix(route, "/")] = true
@@ -127,6 +132,78 @@ func TestOpenAPI_MatchesTheRouter(t *testing.T) {
 		t.Fatalf("openapi.yaml out of step with the router - undocumented: %v, unserved: %v", missing, extra)
 	}
 }
+
+// EST-7 (named-operation parity, G-05): every GOV-05 operation, every Doc 03
+// §8.1 inbound API, every REF-07 operation and every doc7 §E3/§E6 command
+// names the spec operation it realises in x-spec-operation. A route that
+// realises a named operation and loses its tag, or a renamed operationId,
+// fails here.
+func TestOpenAPI_NamedSpecOperationsAreTagged(t *testing.T) {
+	want := map[string]string{
+		"createPolicy":                     "GOV-05 CreatePolicyDraft",
+		"createPolicyVersion":              "GOV-05 CreatePolicyDraft",
+		"submitPolicyVersionForReview":     "GOV-05 SubmitPolicyReview",
+		"approvePolicyVersion":             "GOV-05 ApprovePolicy",
+		"activatePolicyVersion":            "GOV-05 ActivatePolicy",
+		"schedulePolicyVersion":            "GOV-05 ScheduleActivation",
+		"suspendPolicyVersion":             "GOV-05 EmergencySuspendPolicy",
+		"reviewPolicyVersionSuspension":    "GOV-05 negative path 3",
+		"retirePolicyVersion":              "GOV-05 RetirePolicy",
+		"retirePolicyFamily":               "GOV-05 RetirePolicy",
+		"resolveEffectivePolicy":           "GOV-05 ResolveEffectivePolicy",
+		"explainPolicyResolution":          "GOV-05 ExplainPolicyResolution",
+		"getPolicyVersion":                 "GOV-05 GetPolicyVersion",
+		"comparePolicyVersions":            "GOV-05 ComparePolicyVersions",
+		"listPolicyVersionTransitions":     "GOV-05 lifecycle evidence",
+		"listApplicablePolicyVersions":     "Doc 03 8.1 get applicable policy set",
+		"evaluatePolicy":                   "Doc 03 8.1 evaluate policy",
+		"listVersionHistory":               "Doc 03 8.1 retrieve policy version history",
+		"getPolicyEvaluation":              "Doc 03 8.1 preserve evaluation basis",
+		"draftAccountingPolicy":            "REF-07",
+		"listApplicableAccountingPolicies": "REF-07",
+		"resolveAccountingPolicy":          "REF-07",
+		"explainAccountingResolution":      "REF-07",
+		"getAccountingPolicyVersion":       "REF-07",
+		"submitAccountingPolicy":           "REF-07",
+		"approveAccountingPolicyVersion":   "REF-07",
+		"activateAccountingPolicyVersion":  "REF-07",
+		"supersedeAccountingPolicyVersion": "REF-07",
+		"emergencySuspendAccountingPolicy": "REF-07",
+		"reviewAccountingPolicySuspension": "REF-07",
+		"getAccountingPolicyImpact":        "REF-07",
+		"createControlTestDefinition":      "doc7 E3",
+		"getControlTestDefinition":         "doc7 E3",
+		"createControlTestExecution":       "doc7 E3",
+		"listControlTestExecutions":        "doc7 E3",
+		"getControlEffectiveness":          "doc7 E3",
+		"createAttestation":                "doc7 E6",
+		"getAttestation":                   "doc7 E6",
+		"revokeAttestation":                "doc7 E6",
+	}
+	got := map[string]string{}
+	for _, item := range loadOpenAPI(t).Paths.Map() {
+		for _, op := range item.Operations() {
+			tag, _ := op.Extensions["x-spec-operation"].(string)
+			got[op.OperationID] = tag
+		}
+	}
+	var bad []string
+	for id, prefix := range want {
+		tag, ok := got[id]
+		switch {
+		case !ok:
+			bad = append(bad, id+": operation not in openapi.yaml")
+		case !strings.HasPrefix(tag, prefix):
+			bad = append(bad, id+": x-spec-operation "+strconvQuote(tag)+", want prefix "+strconvQuote(prefix))
+		}
+	}
+	sort.Strings(bad)
+	if len(bad) > 0 {
+		t.Fatalf("named spec operations without their tag:\n%s", strings.Join(bad, "\n"))
+	}
+}
+
+func strconvQuote(s string) string { return `"` + s + `"` }
 
 // Errors are problem documents (ZS-API-001 §12); requests and successes are not.
 func TestOpenAPI_ProblemJSONOnlyOnErrors(t *testing.T) {

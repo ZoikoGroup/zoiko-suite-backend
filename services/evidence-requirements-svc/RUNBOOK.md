@@ -20,9 +20,9 @@ Port 8130. Decides whether the evidence required before an action may complete e
 | `ESIGNATURE_SERVICE_URL` | outside local | `http://host.docker.internal:8148` | SIGNATURE verification (phase7 stack); unset locally = 503 |
 | `TENANT_REGISTRY_URL` | outside local | `http://tenant-entity-registry-svc:8081` | Legal entity of every evaluation/requirement |
 | `CURSOR_SIGNING_KEY_HEX` | outside local | random per process | ≥ 32 bytes, hex. Signs list cursors; shared by every replica |
-| `EVIDENCE_EVALUATE_AUTHZ` | — | `enforce` (compose: `warn`) | Gate mode for EVIDENCE_EVALUATE (D-ER-6) |
+| `EVIDENCE_EVALUATE_AUTHZ` | — | `enforce` (compose: `warn` → `require` after caller retrofits) | Gate mode for EVIDENCE_EVALUATE (D-ER-6, D-ER-34) |
 | `EVIDENCE_READ_AUTHZ` | — | `enforce` | Gate mode for the reads and lists |
-| `IDENTITY_VERIFY` | — | `require` (compose: `warn`) | identity-envelope gate; an invalid envelope is 401 in both modes |
+| `IDENTITY_VERIFY` | — | `require` (compose: `warn` → `require` after caller retrofits) | identity-envelope gate; an invalid envelope is 401 in both modes |
 | `IDENTITY_JWKS_URL` `IDENTITY_INTROSPECT_URL` `IDENTITY_ISSUER` | yes | identity-context-svc | Envelope keys and session revocation (TTL 5 s) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | `http://otel-collector:4318` | Traces |
 
@@ -40,7 +40,7 @@ docker compose -p deployments build evidence-requirements-svc          # root co
 docker images | grep evidence-requirements                               # check the timestamp
 python3.14 migrate.py up --db evidence_requirements                      # 000001–000011
 docker compose -p deployments up -d --no-deps --no-build --force-recreate evidence-requirements-svc
-powershell -File scripts/seed-demo-rbac.ps1                              # EVIDENCE_FULL bundle
+powershell -File scripts/seed-demo-rbac.ps1                              # EVIDENCE_FULL bundle (includes EVIDENCE_MANIFEST_READ)
 ```
 
 Verify: `bash services/evidence-requirements-svc/scripts/audit.sh` (service behaviour) and
@@ -64,9 +64,12 @@ A requirement is data, never code: `POST /v1/admin/evidence-requirements` with
 The evaluation was refused and **nothing was recorded**; the caller retries with the same
 Idempotency-Key. Metric: `evidence_owner_unavailable_total{owner}`; alert
 `EvidenceOwnerUnavailable`. Restore the owner. A 403 from the owner is treated the same
-way (the service cannot confirm the artifact): EVIDENCE_MANIFEST references currently
-always land here because evidence-manifest-svc's `EVIDENCE_MANIFEST_READ` is not
-registered in access-control.
+way (the service cannot confirm the artifact).
+
+### ClamAV down (document-vault upload fails with 503 `scan_unavailable`)
+document-vault-svc requires ClamAV for uploads. The clamav service runs under the `scan`
+profile. Check `docker ps --filter "name=zoiko-clamav"` and its logs. Metric:
+`evidence_owner_unavailable_total{owner=document-vault}`.
 
 ### Outbox backlog
 `evidence_outbox_unpublished` > 0 for 10 minutes (alert `EvidenceOutboxBacklog`):
@@ -81,7 +84,7 @@ row-level security policy for table "outbox"`, migration 000011 is not applied.
 Compose runs evaluate and identity in `warn` (D-ER-6). A refusal in warn is logged
 (`authorization gate (warn mode): would be refused; admitted`) and recorded in
 authorization-svc's decision log. Switch to `enforce`/`require` once the calling services
-send the envelope and their principals hold EVIDENCE_EVALUATE.
+send the envelope and their principals hold EVIDENCE_EVALUATE (D-ER-34).
 
 ### 412 / 428
 428: the client sent no If-Match. 412: the record changed since the client read it; the

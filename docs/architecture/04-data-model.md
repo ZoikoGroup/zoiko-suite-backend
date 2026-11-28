@@ -1029,6 +1029,8 @@ EvidenceRequirement
 
 ## **7.3 Modeling Rules**
 
+*Decision capture (recorded 25 Nov 2026, tracker "Assignment 25 Nov 2026"): every writer of GovernanceDecision is a governance engine acting as its service principal (svc-policy, svc-workflow, svc-authorization, svc-jurisdiction-rules, svc-obligations, svc-evidence-requirements); the principal whose request caused the decision is `evaluation_context.on_behalf_of`. Each writer keeps a `decision_log_outbox` table (decision_id, tenant_id, record JSONB, attempts, next_attempt_at, delivered_at, parked_at, last_error; RLS on the tenant or the relay marker `app.decision_log_relay`) written in the decision's own transaction: authorization-svc 000047, jurisdiction-rules-svc 000038, obligations-svc 000017, evidence-requirements-svc 000013 (policy-svc keeps `policy_evidence_outbox`, workflow-svc `outbox_events` destination `decision_log`). `causation_id` links a workflow approval to the escalated decision it resolves (workflow_instances.causation_decision_id, workflow-svc 000027). A decision not scoped to one legal entity (jurisdiction reference data, tenant- or platform-scope access checks) is filed under legal entity `PLATFORM`. Outcome words of the new writers and their domain keywords: governance-decision-log-svc 000020.*
+
 - policies are versioned, never overwritten
 
 - jurisdiction rules are effective-dated

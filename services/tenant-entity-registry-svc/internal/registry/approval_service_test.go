@@ -109,7 +109,7 @@ func TestMakerChecker_BodyApproverIsRefusedOnEveryCommand(t *testing.T) {
 		RegisteredOffice: `{"line1":"x"}`, ApprovedByPrincipalID: "a-colleague",
 	})
 	require.ErrorIs(t, err, registry.ErrApprovalRequired)
-	versions, _ := svc.ListEntityVersions(tenantCtx(orgTenant), "e0000000-0000-4000-8000-00000000001a")
+	versions, _, _ := svc.ListEntityVersions(tenantCtx(orgTenant), "e0000000-0000-4000-8000-00000000001a", 50, "")
 	assert.Len(t, versions, 1, "no version was written")
 }
 
@@ -168,7 +168,7 @@ func TestMakerChecker_ApprovalIsSpentOnce(t *testing.T) {
 	_, err := svc.ApproveRequest(approverCtx(orgTenant), a.ApprovalRequestID,
 		domain.ApproveRequestBody{PayloadFingerprint: a.PayloadFingerprint})
 	require.ErrorIs(t, err, registry.ErrApprovalNotPending)
-	history, _ := svc.ListTenantLifecycleHistory(tenantCtx(orgTenant), orgTenant)
+	history, _, _ := svc.ListTenantLifecycleHistory(tenantCtx(orgTenant), orgTenant, 50, "")
 	assert.Len(t, history, 1, "the command ran exactly once")
 }
 

@@ -1,6 +1,0 @@
-# Build context is services/ (see Dockerfile). Send only what the build reads.
-*
-!exception-escalation-svc
-!eventing
-exception-escalation-svc/deployments
-**/*_test.go

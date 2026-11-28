@@ -186,7 +186,7 @@ func TestCreateEntity_InitialProfileRecordsTheSourceInputs(t *testing.T) {
 	}
 	require.NoError(t, f.s.CreateEntity(withEntityCreated(f.ctx), e))
 
-	vs, err := f.s.ListEntityProfileVersions(f.ctx, e.LegalEntityID)
+	vs, _, err := f.s.ListEntityProfileVersions(f.ctx, e.LegalEntityID, 50, "")
 	require.NoError(t, err)
 	require.Len(t, vs, 1)
 	v := vs[0]

@@ -73,6 +73,14 @@ const (
 	ActionObligationDefinitionRead   = "OBLIGATION_DEFINITION_READ"
 	ActionObligationMappingManage    = "OBLIGATION_ENTITY_MAPPING_MANAGE"
 
+	// R-001 WFC-05 deadline clocks (registered by access-control 000062).
+	ActionClockCreate            = "OBLIGATION_CLOCK_CREATE"
+	ActionClockSatisfy           = "OBLIGATION_CLOCK_SATISFY"
+	ActionClockRecalculate       = "OBLIGATION_CLOCK_RECALCULATE"
+	ActionClockWaive             = "OBLIGATION_CLOCK_WAIVE"
+	ActionClockNotApplicable     = "OBLIGATION_CLOCK_NOT_APPLICABLE"
+	ActionEscalationPolicyManage = "OBLIGATION_ESCALATION_POLICY_MANAGE"
+
 	// PlatformScope is the legal-entity scope for tenant-wide actions (the
 	// definition catalogue has no entity); authorization-svc resolves it to
 	// the configured platform entity, within the caller's tenant.

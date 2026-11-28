@@ -55,7 +55,10 @@ type SessionCache interface {
 	PersistSessionContextWithEvent(ctx context.Context, sc domain.SessionContext, ev domain.ContextResolvedEvent) error
 
 	GetSessionContext(ctx context.Context, sessionContextID, tenantID string) (*domain.SessionContext, error)
-	Invalidate(ctx context.Context, sessionContextID, tenantID string, reason domain.InvalidationReason, at time.Time) error
+	// Invalidate appends the invalidation to both stores. Idempotent: an
+	// already-invalidated session is a no-op in each. actorID and correlationID
+	// are used for per-session revocation events (IC-16).
+	Invalidate(ctx context.Context, sessionContextID, tenantID string, reason domain.InvalidationReason, at time.Time, actorID, correlationID string) error
 
 	// EvictAllForPrincipal revokes every live session for a principal and
 	// returns how many were revoked. reason is recorded on each SessionContext
@@ -63,6 +66,12 @@ type SessionCache interface {
 	// logout; a bare eviction would leave every revoked session looking as
 	// though it had simply expired.
 	EvictAllForPrincipal(ctx context.Context, principalID, tenantID string, reason domain.InvalidationReason) (int, error)
+	// EvictAllForPrincipalWithIDs revokes every live session for a principal,
+	// returns the list of revoked session context IDs, and includes actor and
+	// correlation ID for per-session revocation events (IC-16).
+	EvictAllForPrincipalWithIDs(ctx context.Context, principalID, tenantID string, reason domain.InvalidationReason, actorID, correlationID string) ([]string, error)
+	// EvictAllForEntity revokes every live session scoped to a legal entity.
+	EvictAllForEntity(ctx context.Context, legalEntityID, tenantID string, reason domain.InvalidationReason, actorID, correlationID string) (int, error)
 }
 
 // RiskSignalCache provides READ-ONLY access to asynchronously-populated

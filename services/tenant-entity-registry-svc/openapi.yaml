@@ -1297,6 +1297,32 @@ paths:
                   $ref: "#/components/schemas/LegalEntity"
         "400": { $ref: "#/components/responses/BadRequest" }
 
+  # ── TER-FE-1: Registry Summary for console KPIs ──────────────────────────────
+
+  /v1/registry/summary:
+    get:
+      operationId: getRegistrySummary
+      summary: Get registry KPIs for the Tenants & Entities console header
+      description: |
+        Returns the five KPIs displayed in the console header:
+        - Active tenants (lifecycle_state = ACTIVE)
+        - Active legal entities (entity_status = ACTIVE)
+        - Approvals awaiting decision (PENDING and not expired)
+        - Open registry conflicts (status = OPEN)
+        - Open party resolution cases (status = OPEN)
+      tags: [Tenants]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Registry summary KPIs
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegistrySummary"
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   # ── ORG-03 §8 NP5: registry conflict quarantine ────────────────────────────
 
   /v1/registry-conflicts:
@@ -7491,6 +7517,34 @@ components:
       properties:
         new_status:     { type: string, enum: [ACTIVE, ARCHIVED] }
         correlation_id: { type: string }
+
+    # ── TER-FE-1: Registry Summary for console KPIs ──────────────────────────────
+    RegistrySummary:
+      type: object
+      description: |
+        KPIs for the Tenants & Entities console header.
+        Returned by GET /v1/registry/summary.
+      properties:
+        active_tenants:
+          type: integer
+          format: int64
+          description: Tenants in lifecycle_state = ACTIVE
+        active_legal_entities:
+          type: integer
+          format: int64
+          description: Legal entities in entity_status = ACTIVE
+        approvals_awaiting_decision:
+          type: integer
+          format: int64
+          description: Approval requests in PENDING with expires_at in the future
+        open_registry_conflicts:
+          type: integer
+          format: int64
+          description: Registry conflicts in status = OPEN
+        open_party_resolution_cases:
+          type: integer
+          format: int64
+          description: Resolution cases in status = OPEN
 
   responses:
     BadRequest:

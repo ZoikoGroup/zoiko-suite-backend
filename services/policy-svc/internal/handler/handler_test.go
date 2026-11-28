@@ -162,7 +162,9 @@ func (s *stubStore) SaveEvaluation(_ context.Context, ev *domain.Evaluation) (*d
 		return nil, false, s.saveErr
 	}
 	cp := *ev
-	cp.EvaluationID = evidenceID
+	if cp.EvaluationID == "" {
+		cp.EvaluationID = evidenceID
+	}
 	cp.LedgerStatus = domain.LedgerPending
 	s.saved = &cp
 	return &cp, true, nil
@@ -264,7 +266,7 @@ func (s *stubStore) FindAttestationByID(_ context.Context, _ string) (*domain.At
 	return s.attestation, s.attestationErr
 }
 
-func (s *stubStore) RevokeAttestation(_ context.Context, _, _ string) (*domain.Attestation, error) {
+func (s *stubStore) RevokeAttestation(_ context.Context, _, _ string, _ domain.EventMeta) (*domain.Attestation, error) {
 	return s.revoked, s.revokeErr
 }
 
@@ -333,7 +335,7 @@ func newRig(s *stubStore, c *stubCandidates, az *stubAuthz, opts ...rigOption) *
 	if az == nil {
 		az = &stubAuthz{}
 	}
-	o := handler.Options{PlatformScopeID: testAuthzScopeID, Now: func() time.Time { return fixedNow }}
+	o := handler.Options{PlatformScopeID: testAuthzScopeID, Now: func() time.Time { return fixedNow }, DecisionSigner: testSigner}
 	for _, f := range opts {
 		f(&o)
 	}
@@ -343,6 +345,11 @@ func newRig(s *stubStore, c *stubCandidates, az *stubAuthz, opts ...rigOption) *
 	h := handler.New(s, c, az, o, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	handler.RegisterControlTestRoutes(r, h)
+	handler.RegisterListRoutes(r, h)
+	handler.RegisterOperationRoutes(r, h)
+	handler.RegisterCertificationRoutes(r, h)
+	handler.RegisterSignatoryRoutes(r, h)
+	handler.RegisterPolicyTypeRoutes(r, h)
 	return &rig{store: s, cands: c, az: az, r: r}
 }
 
@@ -650,9 +657,46 @@ func TestLifecycle_ExpectedVersionFromBodyOrIfMatch(t *testing.T) {
 		t.Fatalf("approval needs POLICY_VERSION_APPROVE, got %s", g.az.actionType)
 	}
 
+	// expected_version alone carries the version, as If-Match does.
 	g = newRig(lifecycleStore(nil), nil, nil)
-	expect(t, g.do(http.MethodPost, lifecyclePath("approve"), `{"expected_version":2}`, header("If-Match", `"v3"`)), http.StatusPreconditionFailed, "stale_version")
+	expect(t, g.do(http.MethodPost, lifecyclePath("approve"), `{"expected_version":3}`), http.StatusOK, "")
+	if ev := g.store.transitionCmd.ExpectedVersion; ev == nil || *ev != 3 {
+		t.Fatalf("expected_version must reach the store as 3, got %v", ev)
+	}
+
+	g = newRig(lifecycleStore(nil), nil, nil)
+	// The two carriers disagree: a malformed request, not a stale one.
+	expect(t, g.do(http.MethodPost, lifecyclePath("approve"), `{"expected_version":2}`, header("If-Match", `"v3"`)), http.StatusBadRequest, "INVALID_REQUEST")
 	expect(t, g.do(http.MethodPost, lifecyclePath("approve"), "", header("If-Match", "abc")), http.StatusBadRequest, "invalid_if_match")
+	// A wildcard names no version.
+	expect(t, g.do(http.MethodPost, lifecyclePath("approve"), "", header("If-Match", "*")), http.StatusBadRequest, "invalid_if_match")
+	expect(t, g.do(http.MethodPost, lifecyclePath("approve"), `{"expected_version":0}`), http.StatusBadRequest, "INVALID_REQUEST")
+	// Stale by either carrier is 412 with the current ETag.
+	for _, w := range []*httptest.ResponseRecorder{
+		g.do(http.MethodPost, lifecyclePath("approve"), `{"expected_version":2}`),
+		g.do(http.MethodPost, lifecyclePath("approve"), "", header("If-Match", `"v2"`)),
+	} {
+		p := expect(t, w, http.StatusPreconditionFailed, "stale_version")
+		if p["current_version"] != float64(3) || w.Header().Get("ETag") != `"v3"` {
+			t.Fatalf("a stale command must name the current version: %v, ETag %q", p, w.Header().Get("ETag"))
+		}
+	}
+	if g.store.transitionCalls != 0 {
+		t.Fatal("a refused precondition reached the store")
+	}
+}
+
+// Every GOV-05 command asks authorization-svc exactly once: a second check
+// doubled the latency and wrote a second access decision for one act.
+func TestLifecycle_AuthorizesOncePerCommand(t *testing.T) {
+	for _, cmd := range []string{"submit-review", "approve", "activate", "schedule", "suspend", "retire", "review-suspension"} {
+		az := &stubAuthz{}
+		g := newRig(lifecycleStore(nil), nil, az)
+		expect(t, g.do(http.MethodPost, lifecyclePath(cmd), `{"reason_code":"X","outcome":"UPHELD"}`, ifm), http.StatusOK, "")
+		if az.calls != 1 {
+			t.Errorf("%s: want 1 authorization call, got %d (%v)", cmd, az.calls, az.actions)
+		}
+	}
 }
 
 // GCP §16: reason_code is required for privileged or destructive commands.
@@ -889,7 +933,11 @@ func TestEvaluate_ExactDecimalBoundaries(t *testing.T) {
 		`5000.00`:                  "WITHIN_THRESHOLD",
 		`5000.0000000000000000001`: "APPROVAL_REQUIRED",
 		`4999.99`:                  "WITHIN_THRESHOLD",
+		`0`:                        "WITHIN_THRESHOLD",
 		`"7500"`:                   "",
+		// A negative amount would pass any threshold: refused.
+		`-1`:         "",
+		`-0.0000001`: "",
 	}
 	for amount, want := range cases {
 		g := evalRig(nil)
@@ -1040,8 +1088,8 @@ func TestListVersionHistory(t *testing.T) {
 	g := newRig(&stubStore{}, nil, nil)
 	w := g.do(http.MethodGet, "/v1/policies/"+policyID+"/versions", "")
 	expect(t, w, http.StatusOK, "")
-	if strings.TrimSpace(w.Body.String()) != "[]" {
-		t.Fatalf("an empty history is [], got %s", w.Body.String())
+	if strings.TrimSpace(w.Body.String()) != `{"items":[],"page_size":50}` {
+		t.Fatalf("an empty history is an empty page, got %s", w.Body.String())
 	}
 	g = newRig(&stubStore{historyErr: domain.ErrPolicyNotFound}, nil, nil)
 	expect(t, g.do(http.MethodGet, "/v1/policies/"+policyID+"/versions", ""), http.StatusNotFound, "NOT_FOUND")

@@ -36,6 +36,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/identity-envelope/decisionledger"
+
 	"zoiko.io/evidence-requirements-svc/internal/domain"
 	svcmiddleware "zoiko.io/evidence-requirements-svc/internal/middleware"
 )
@@ -43,6 +45,9 @@ import (
 type PgStore struct {
 	pool *pgxpool.Pool
 	log  *zap.Logger
+	// ledgerOn queues each new evaluation's governance-ledger record in its
+	// transaction (DL-6, SetDecisionLedger).
+	ledgerOn bool
 }
 
 func New(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
@@ -58,6 +63,14 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) 
 
 	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
 		return fmt.Errorf("set_config app.tenant_id: %w", err)
+	}
+	// The PBC history trigger (000012) records who ran which command; the
+	// handler puts both on the context (WithCommand).
+	if c, ok := domain.CommandFrom(ctx); ok {
+		if _, err := tx.Exec(ctx, "SELECT set_config('app.actor_id', $1, true), set_config('app.command', $2, true), set_config('app.correlation_id', $3, true)",
+			c.Actor, c.Name, c.CorrelationID); err != nil {
+			return fmt.Errorf("set_config app.command: %w", err)
+		}
 	}
 	if err := fn(tx); err != nil {
 		return err
@@ -402,6 +415,13 @@ func (s *PgStore) RecordEvaluation(ctx context.Context, e *domain.EvidenceEvalua
 					INSERT INTO outbox (outbox_id, aggregate_type, aggregate_id, event_type, payload)
 					VALUES (gen_random_uuid(), $1, $2, $3, $4)
 				`, outboxEvent.AggregateType, outboxEvent.AggregateID, outboxEvent.EventType, outboxEvent.Payload); err != nil {
+					return err
+				}
+			}
+			// DL-6: the evaluation is a governance decision; its ledger
+			// record commits with it or not at all.
+			if s.ledgerOn {
+				if err := decisionledger.Enqueue(ctx, tx, evaluationRecord(e)); err != nil {
 					return err
 				}
 			}

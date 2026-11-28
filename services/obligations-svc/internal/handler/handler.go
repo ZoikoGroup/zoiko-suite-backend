@@ -20,6 +20,7 @@ import (
 	"zoiko.io/obligations-svc/internal/domain"
 	"zoiko.io/obligations-svc/internal/envelope"
 	svcerrors "zoiko.io/obligations-svc/internal/errors"
+	"zoiko.io/obligations-svc/internal/evidencereq"
 	"zoiko.io/obligations-svc/internal/jurisdiction"
 	"zoiko.io/obligations-svc/internal/middleware"
 	"zoiko.io/obligations-svc/internal/registry"
@@ -40,7 +41,7 @@ type ObligationStore interface {
 	UpdateObligationWorkflow(ctx context.Context, obligationID, workflowID, actorID, correlationID string) (*domain.Obligation, error)
 	UpdateObligation(ctx context.Context, params domain.UpdateObligationParams) (*domain.Obligation, bool, error)
 	CreateFilingRequirement(ctx context.Context, params domain.CreateFilingRequirementParams) (*domain.FilingRequirement, error)
-	ListFilingRequirements(ctx context.Context, obligationID string, limit int) ([]*domain.FilingRequirement, error)
+	ListFilingRequirements(ctx context.Context, filter domain.ListFilingRequirementsFilter) ([]*domain.FilingRequirement, error)
 	FindFilingRequirement(ctx context.Context, obligationID, filingRequirementID string) (*domain.FilingRequirement, error)
 	UpdateFilingStatus(ctx context.Context, params domain.UpdateFilingStatusParams) (*domain.FilingRequirement, bool, error)
 	SubmitFiling(ctx context.Context, params domain.SubmitFilingParams) (*domain.FilingRequirement, bool, error)
@@ -74,8 +75,10 @@ type Handler struct {
 	store                 ObligationStore
 	jurisdictionValidator jurisdiction.Validator
 	authz                 authz.Client
+	evidenceReq           evidencereq.Client
 	registry              registry.Checker
 	log                   *zap.Logger
+	clocks                *clockDeps
 }
 
 // New constructs a Handler. The legal-entity registry check is off until
@@ -85,9 +88,16 @@ func New(store ObligationStore, jurisdictionValidator jurisdiction.Validator, au
 		store:                 store,
 		jurisdictionValidator: jurisdictionValidator,
 		authz:                 authzClient,
+		evidenceReq:           evidencereq.Unconfigured{},
 		registry:              registry.Noop{},
 		log:                   log,
 	}
+}
+
+// WithEvidenceRequirementsClient sets the evidence-requirements-svc client.
+func (h *Handler) WithEvidenceRequirementsClient(c evidencereq.Client) *Handler {
+	h.evidenceReq = c
+	return h
 }
 
 // WithRegistry confirms every legal entity a write names against
@@ -308,6 +318,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/obligations/{obligation_id}/filing-requirements", h.CreateFilingRequirement)
 	r.Get("/v1/obligations/{obligation_id}/filing-requirements", h.ListFilingRequirements)
 	registerCompletionRoutes(r, h)
+	registerClockRoutes(r, h)
 }
 
 func correlationIDMiddleware(next http.Handler) http.Handler {
@@ -949,6 +960,55 @@ func (h *Handler) UpdateObligationStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Evidence sufficiency check before CLOSED transition (Doc 03 §8.5, §8.6)
+	// "No finalization path may skip required evidence states"
+	if req.ObligationStatus == "CLOSED" && existing.ObligationStatus != "CLOSED" {
+		// Map obligation_type to domain_code and action_type for evidence evaluation
+		domainCode, actionType := mapObligationToEvidence(existing.ObligationType)
+		if domainCode != "" && actionType != "" {
+			evalResult, err := h.evidenceReq.Evaluate(r.Context(), evidencereq.EvaluateParams{
+				LegalEntityID:    existing.LegalEntityID,
+				DomainCode:       domainCode,
+				ActionType:       actionType,
+				CorrelationID:    correlationID,
+				PresentArtifacts: nil, // Caller must provide artifacts via separate mechanism if needed
+			})
+			if err != nil {
+				h.log.Error("evidence evaluation failed before CLOSED transition",
+					zap.String("obligation_id", obligationID),
+					zap.String("legal_entity_id", existing.LegalEntityID),
+					zap.Error(err))
+				writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{
+					"error":  "evidence_evaluation_failed",
+					"detail": "evidence-requirements-svc unavailable; cannot verify evidence sufficiency",
+				})
+				return
+			}
+			// Block CLOSED if evidence is MISSING; allow if SATISFIED or NO_REQUIREMENTS_DEFINED
+			if evalResult.Outcome == "MISSING" {
+				h.log.Info("CLOSED transition blocked: evidence insufficient",
+					zap.String("obligation_id", obligationID),
+					zap.String("evaluation_id", evalResult.EvaluationID),
+					zap.Strings("unmet", unmetToStrings(evalResult.Unmet)))
+				writeJSON(w, r, http.StatusConflict, map[string]any{
+					"error":         "evidence_insufficient",
+					"detail":        "required evidence not satisfied; cannot close obligation",
+					"evaluation_id": evalResult.EvaluationID,
+					"unmet":         evalResult.Unmet,
+					"domain_code":   evalResult.DomainCode,
+					"action_type":   evalResult.ActionType,
+				})
+				return
+			}
+			// Record evidence evaluation result in the obligation closure event payload
+			// This is done in the store's transaction, but we log it here for visibility
+			h.log.Info("evidence evaluation passed for CLOSED transition",
+				zap.String("obligation_id", obligationID),
+				zap.String("evaluation_id", evalResult.EvaluationID),
+				zap.String("outcome", evalResult.Outcome))
+		}
+	}
+
 	updated, transitioned, err := h.store.UpdateObligationStatus(r.Context(), obligationID, req.ObligationStatus, expectedVersion, principalID, correlationID)
 	if err != nil {
 		h.writeStoreErr(w, r, "UpdateObligationStatus: store unavailable", err)
@@ -1388,6 +1448,7 @@ func (h *Handler) CreateFilingRequirement(w http.ResponseWriter, r *http.Request
 
 // ListFilingRequirements handles
 // GET /v1/obligations/{obligation_id}/filing-requirements.
+// Supports cursor paging (API-4).
 //
 // Response:
 //
@@ -1415,12 +1476,28 @@ func (h *Handler) ListFilingRequirements(w http.ResponseWriter, r *http.Request)
 	if !h.authorize(w, r, principalID, parent.LegalEntityID, authz.ActionFilingRequirementRead) {
 		return
 	}
-	limit, _, ok := parsePaging(w, r)
+	limit, offset, ok := parsePaging(w, r)
 	if !ok {
 		return
 	}
 
-	results, err := h.store.ListFilingRequirements(r.Context(), obligationID, limit)
+	filter := domain.ListFilingRequirementsFilter{
+		ObligationID: obligationID,
+		Limit:        limit,
+		Offset:       offset,
+	}
+
+	if c := r.URL.Query().Get("cursor"); c != "" {
+		at, id, ok := decodeCursor(c)
+		if !ok || offset != 0 {
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "cursor",
+				"detail": "cursor must be a next_cursor this endpoint returned, and cannot be combined with offset"})
+			return
+		}
+		filter.AfterCreatedAt, filter.AfterID = &at, id
+	}
+
+	results, err := h.store.ListFilingRequirements(r.Context(), filter)
 	if err != nil {
 		h.writeStoreErr(w, r, "ListFilingRequirements: store unavailable", err)
 		return
@@ -1428,6 +1505,15 @@ func (h *Handler) ListFilingRequirements(w http.ResponseWriter, r *http.Request)
 
 	if results == nil {
 		results = []*domain.FilingRequirement{}
+	}
+	if len(results) == limit {
+		last := results[len(results)-1]
+		next := encodeCursor(last.CreatedAt, last.FilingRequirementID)
+		nq := r.URL.Query()
+		nq.Set("cursor", next)
+		nq.Del("offset")
+		w.Header().Set("X-Next-Cursor", next)
+		w.Header().Set("Link", "<"+r.URL.Path+"?"+nq.Encode()+`>; rel="next"`)
 	}
 	writeJSON(w, r, http.StatusOK, results)
 }
@@ -1472,4 +1558,40 @@ func writeJSON(w http.ResponseWriter, r *http.Request, status int, v any) {
 	}
 }
 
+// mapObligationToEvidence maps an obligation_type to evidence-requirements-svc
+// domain_code and action_type. This is a configurable mapping that should
+// eventually be data-driven, but for now uses a simple hardcoded map.
+func mapObligationToEvidence(obligationType string) (domainCode, actionType string) {
+	// Mapping from obligation_type to (domain_code, action_type)
+	// These should match the evidence-requirements-svc catalogue
+	switch obligationType {
+	case "FILING":
+		return "TAX", "FILING_SUBMIT"
+	case "TAX_PAYMENT":
+		return "TAX", "TAX_PAYMENT_POST"
+	case "REGULATORY_REPORT":
+		return "LEGAL", "REGULATORY_REPORT_FILE"
+	case "PAYROLL_FILING":
+		return "WORKFORCE", "PAYROLL_FILING_SUBMIT"
+	case "HR_COMPLIANCE":
+		return "WORKFORCE", "HR_COMPLIANCE_CERTIFY"
+	case "FINANCIAL_STATEMENT":
+		return "FINANCE", "FINANCIAL_STATEMENT_APPROVE"
+	case "AUDIT_COMPLIANCE":
+		return "FINANCE", "AUDIT_COMPLIANCE_COMPLETE"
+	case "CONTRACT_OBLIGATION":
+		return "COMMERCIAL", "CONTRACT_OBLIGATION_FULFILL"
+	default:
+		// Unknown obligation type - skip evidence check
+		return "", ""
+	}
+}
 
+// unmetToStrings converts unmet evidence items to string slice for logging.
+func unmetToStrings(unmet []evidencereq.Unmet) []string {
+	result := make([]string, len(unmet))
+	for i, u := range unmet {
+		result[i] = u.EvidenceType + ": " + u.Reason
+	}
+	return result
+}

@@ -26,6 +26,7 @@ import (
 	"zoiko.io/workflow-svc/internal/evidence"
 	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
 	"zoiko.io/workflow-svc/internal/registry"
+	"zoiko.io/workflow-svc/internal/signatory"
 	"zoiko.io/workflow-svc/internal/store"
 )
 
@@ -38,6 +39,7 @@ type WorkflowStore interface {
 	IsCurrentStageApprover(ctx context.Context, workflowInstanceID, principalID string) (bool, error)
 	SubmitAction(ctx context.Context, params domain.SubmitActionParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error)
 	SubmitQuorumVote(ctx context.Context, params domain.SubmitQuorumVoteParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error)
+	FindCommandReplay(ctx context.Context, workflowInstanceID string, meta domain.CommandMeta) (*domain.CommandReplay, error)
 	EscalateWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string, cmd ...domain.LifecycleCommand) (*domain.WorkflowInstance, bool, error)
 	CancelWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string, cmd ...domain.LifecycleCommand) (*domain.WorkflowInstance, bool, error)
 	ExpireWorkflow(ctx context.Context, workflowInstanceID string, cmd ...domain.LifecycleCommand) (*domain.WorkflowInstance, bool, error)
@@ -47,15 +49,35 @@ type WorkflowStore interface {
 	RequestChanges(ctx context.Context, workflowInstanceID, actorPrincipalID, rationale string, causationID *string, cmd ...domain.LifecycleCommand) error
 	ListPendingApprovals(ctx context.Context, tenantID string, params domain.ListPendingApprovalsParams) ([]*domain.WorkflowInstance, *domain.PaginationCursor, error)
 	GetApprovalEvidence(ctx context.Context, workflowInstanceID string) ([]*domain.WorkflowTransition, error)
+	ListWorkflows(ctx context.Context, tenantID string, params domain.ListWorkflowsParams) ([]*domain.WorkflowInstance, *domain.PaginationCursor, error)
+	GetInstanceSummary(ctx context.Context, workflowInstanceID string) (*domain.InstanceSummary, error)
+
+	// WFC-04: Cases (WF-2)
+	CreateCase(ctx context.Context, params domain.CreateCaseParams) (*domain.Case, bool, error)
+	FindCaseByID(ctx context.Context, caseID string) (*domain.Case, error)
+	ListCases(ctx context.Context, filter domain.ListCasesFilter) ([]*domain.Case, error)
+	TransitionCase(ctx context.Context, params domain.TransitionCaseParams) (*domain.Case, bool, error)
+	FindCasesByWorkflowInstance(ctx context.Context, workflowInstanceID string) ([]*domain.Case, error)
+
+	// Quorum helper
+	IsQuorumApprover(ctx context.Context, workflowStageID, principalID string) (bool, error)
 
 	// Workflow definitions (WFC-02) — see internal/store/pg_store.go.
 	CreateWorkflowDefinition(ctx context.Context, params domain.CreateWorkflowDefinitionParams) (*domain.WorkflowDefinition, error)
 	GetWorkflowDefinition(ctx context.Context, params domain.GetWorkflowDefinitionParams) (*domain.WorkflowDefinition, error)
-	ListWorkflowDefinitions(ctx context.Context, params domain.ListWorkflowDefinitionsParams) ([]*domain.WorkflowDefinition, error)
+	ListWorkflowDefinitions(ctx context.Context, params domain.ListWorkflowDefinitionsParams) ([]*domain.WorkflowDefinition, *domain.PaginationCursor, error)
 	SupersedeWorkflowDefinition(ctx context.Context, oldDefID, newDefID string) error
 	ActivateWorkflowDefinition(ctx context.Context, workflowDefinitionID string) error
 	SuspendWorkflowDefinition(ctx context.Context, workflowDefinitionID string) error
 	RetireWorkflowDefinition(ctx context.Context, workflowDefinitionID string) error
+
+	// WFC-01 definition publication lifecycle (WF-S22)
+	ValidateDefinition(ctx context.Context, params domain.ValidateDefinitionParams) (*domain.WorkflowDefinition, error)
+	SubmitDefinitionApproval(ctx context.Context, params domain.SubmitDefinitionApprovalParams) (*domain.WorkflowDefinition, error)
+	ApproveDefinition(ctx context.Context, params domain.ApproveDefinitionParams) (*domain.WorkflowDefinition, error)
+	RejectDefinition(ctx context.Context, params domain.RejectDefinitionParams) (*domain.WorkflowDefinition, error)
+	PublishDefinition(ctx context.Context, params domain.PublishDefinitionParams) (*domain.WorkflowDefinition, error)
+
 	CreateAuditEngagement(ctx context.Context, params domain.CreateAuditEngagementParams) (*domain.AuditEngagement, bool, error)
 	GetAuditEngagement(ctx context.Context, tenantID, engagementID string) (*domain.AuditEngagement, error)
 	SubmitAuditEngagementAcceptance(ctx context.Context, params domain.SubmitAuditEngagementAcceptanceParams) (*domain.AuditEngagement, bool, error)
@@ -76,6 +98,7 @@ type WorkflowStore interface {
 	DesignAuditResponse(ctx context.Context, params domain.DesignAuditResponseParams) error
 	AssessRisk(ctx context.Context, params domain.AssessRiskParams) (*domain.RiskAssessment, bool, error)
 	MarkSignificantRisk(ctx context.Context, params domain.MarkSignificantRiskParams) (*domain.RiskAssessment, error)
+	RecordRiskCoverage(ctx context.Context, params domain.RecordRiskCoverageParams) (*domain.RiskAssessment, bool, error)
 	ApprovePlan(ctx context.Context, params domain.ApprovePlanParams) (*domain.AuditPlan, bool, error)
 	GetAuditEngagementFieldworkGates(ctx context.Context, tenantID, engagementID string) (planApproved bool, noUnresolvedHighRisk bool, err error)
 
@@ -124,6 +147,33 @@ type WorkflowStore interface {
 	GetSubmissionVersion(ctx context.Context, tenantID, submissionID string) (*domain.FormSubmissionVersionInfo, error)
 	GetValidationResult(ctx context.Context, tenantID, submissionID string) (*domain.ValidationResult, error)
 	ListPendingSubmissions(ctx context.Context, tenantID, formID string, params domain.ListPendingSubmissionsParams) ([]*domain.FormSubmission, *domain.PaginationCursor, error)
+
+	// WFC-02: Work Items (WF-S23)
+	CreateWorkItem(ctx context.Context, params domain.CreateWorkItemParams) (*domain.WorkItem, error)
+	GetWorkItem(ctx context.Context, workItemID string) (*domain.WorkItem, error)
+	ListWorkItems(ctx context.Context, tenantID string, filter domain.ListWorkItemsFilter) ([]*domain.WorkItem, *domain.PaginationCursor, error)
+	ClaimWorkItem(ctx context.Context, workItemID string, expectedVersion int, assigneePrincipalID string, actorPrincipalID string, correlationID string) (*domain.WorkItem, bool, error)
+	ReleaseWorkItem(ctx context.Context, workItemID string, expectedVersion int, actorPrincipalID string, correlationID string) (*domain.WorkItem, bool, error)
+	SatisfyWorkItem(ctx context.Context, params domain.SatisfyWorkItemParams) (*domain.WorkItem, bool, error)
+	WaiveWorkItem(ctx context.Context, params domain.WaiveWorkItemParams) (*domain.WorkItem, bool, error)
+	TransferWorkItem(ctx context.Context, params domain.TransferWorkItemParams) (*domain.WorkItem, bool, error)
+	CancelWorkItem(ctx context.Context, workItemID string, expectedVersion int, actorPrincipalID string, correlationID string) (*domain.WorkItem, bool, error)
+	EscalateWorkItem(ctx context.Context, workItemID string, expectedVersion int, actorPrincipalID string, correlationID string) (*domain.WorkItem, bool, error)
+	ReassignWorkItem(ctx context.Context, workItemID string, expectedVersion int, newAssigneePrincipalID string, actorPrincipalID string, correlationID string) (*domain.WorkItem, bool, error)
+	BulkCompleteWorkItems(ctx context.Context, params domain.BulkCompleteWorkItemsParams) ([]*domain.WorkItem, []*domain.WorkItemResult, error)
+
+	// WF-S24: Operator Repair (F30)
+	CreateOperatorAction(ctx context.Context, params domain.CreateOperatorActionParams) (*domain.OperatorAction, error)
+	GetOperatorAction(ctx context.Context, operatorActionID string) (*domain.OperatorAction, error)
+	ListOperatorActions(ctx context.Context, tenantID string, filter domain.ListOperatorActionsFilter) ([]*domain.OperatorAction, *domain.PaginationCursor, error)
+	ApproveOperatorAction(ctx context.Context, params domain.ApproveOperatorActionParams) (*domain.OperatorAction, error)
+	ExecuteOperatorAction(ctx context.Context, params domain.ExecuteOperatorActionParams) (*domain.OperatorAction, error)
+
+	// WF-S25: Emergency Approval (F31)
+	CreateEmergencyApproval(ctx context.Context, params domain.CreateEmergencyApprovalParams) (*domain.EmergencyApproval, error)
+	GetEmergencyApproval(ctx context.Context, emergencyApprovalID string) (*domain.EmergencyApproval, error)
+	ListEmergencyApprovals(ctx context.Context, tenantID string, filter domain.ListEmergencyApprovalsFilter) ([]*domain.EmergencyApproval, *domain.PaginationCursor, error)
+	CheckBreakGlassSession(ctx context.Context, sessionID string) (bool, error)
 }
 
 // EventPublisher is the narrow interface the handler depends on. actorID on
@@ -169,6 +219,8 @@ type Handler struct {
 	evidence  EvidenceClient
 	registry  registry.Checker
 	readAuthz string
+	// signatory verifies policy-svc signatory decisions (ZS-GOV-INT-002 §4.2).
+	signatory signatory.Verifier
 	log       *zap.Logger
 }
 
@@ -220,10 +272,19 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{workflow_definition_id}/activate", h.ActivateWorkflowDefinition)
 		r.Post("/{workflow_definition_id}/suspend", h.SuspendWorkflowDefinition)
 		r.Post("/{workflow_definition_id}/retire", h.RetireWorkflowDefinition)
+
+		// WFC-01 definition publication lifecycle (WF-S22)
+		r.Post("/{workflow_definition_id}/validate", h.ValidateDefinition)
+		r.Post("/{workflow_definition_id}/submit-approval", h.SubmitDefinitionApproval)
+		r.Post("/{workflow_definition_id}/approve", h.ApproveDefinition)
+		r.Post("/{workflow_definition_id}/reject", h.RejectDefinition)
+		r.Post("/{workflow_definition_id}/publish", h.PublishDefinition)
 	})
 
 	// List endpoints
+	r.Get("/v1/workflows", h.ListWorkflows)
 	r.Get("/v1/workflows/pending", h.ListPendingApprovals)
+	r.Get("/v1/workflows/{workflow_instance_id}/summary", h.GetInstanceSummary)
 	r.Get("/v1/workflows/{workflow_instance_id}/evidence", h.GetApprovalEvidence)
 	r.Post("/v1/workflows/{workflow_instance_id}/request-changes", h.RequestChanges)
 	r.Route("/v1/audit/engagements", func(r chi.Router) {
@@ -238,6 +299,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{engagement_id}/mark-fieldwork-complete", h.MarkFieldworkComplete)
 		r.Post("/{engagement_id}/enter-completion-review", h.EnterCompletionReview)
 		r.Post("/{engagement_id}/mark-report-ready", h.MarkReportReady)
+		r.Post("/{engagement_id}/release", h.ReleaseEngagement)
 		r.Post("/{engagement_id}/close", h.CloseEngagement)
 		r.Post("/{engagement_id}/plan", h.CreateAuditPlan)
 		r.Get("/{engagement_id}/plan", h.GetAuditPlan)
@@ -253,6 +315,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{risk_id}/response", h.DesignAuditResponse)
 		r.Post("/{risk_id}/assess", h.AssessRisk)
 		r.Post("/{risk_id}/mark-significant", h.MarkSignificantRisk)
+		r.Post("/{risk_id}/coverage", h.RecordRiskCoverage)
 	})
 	r.Route("/v1/audit/engagements/{engagement_id}/workpapers", func(r chi.Router) {
 		r.Post("/", h.CreateWorkpaper)
@@ -303,6 +366,36 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{submission_id}/supersede", h.SupersedeSubmission)
 		r.Post("/{submission_id}/route", h.RouteToDomain)
 	})
+
+	// WFC-02: Work Items (WF-S23)
+	r.Route("/v1/work-items", func(r chi.Router) {
+		r.Post("/", h.CreateWorkItem)
+		r.Get("/", h.ListWorkItems)
+		r.Get("/{work_item_id}", h.GetWorkItem)
+		r.Post("/{work_item_id}/claim", h.ClaimWorkItem)
+		r.Post("/{work_item_id}/release", h.ReleaseWorkItem)
+		r.Post("/{work_item_id}/complete", h.CompleteWorkItem)
+		r.Post("/{work_item_id}/reassign", h.ReassignWorkItem)
+		r.Post("/{work_item_id}/cancel", h.CancelWorkItem)
+		r.Post("/{work_item_id}/escalate", h.EscalateWorkItem)
+	})
+	r.Post("/v1/work-items/bulk-complete", h.BulkCompleteWorkItems)
+
+	// WFC-04: Cases (WF-2)
+	r.Route("/v1/cases", func(r chi.Router) {
+		r.Post("/", h.CreateCase)
+		r.Get("/", h.ListCases)
+		r.Get("/{case_id}", h.GetCase)
+		r.Post("/{case_id}/status", h.TransitionCase)
+		r.Get("/{case_id}/workflow", h.GetCaseWorkflow)
+	})
+
+	// ST-1/2/3: State Machine Registry
+	r.Route("/v1/state-machines", func(r chi.Router) {
+		r.Get("/{workflow_type}", h.GetStateMachine)
+	})
+	r.Get("/v1/workflows/{workflow_instance_id}/available-actions", h.GetAvailableActions)
+	r.Get("/v1/workflows/{workflow_instance_id}/transition-history", h.GetTransitionHistory)
 }
 
 // requireTenant reads the caller's verified tenant scope, set into
@@ -437,7 +530,7 @@ func (h *Handler) requireCorrelationID(w http.ResponseWriter, r *http.Request) (
 // carry the same id. bodyParts is the command's canonical body: an
 // Idempotency-Key replayed with different bodyParts is
 // ErrIdempotencyMismatch, while a retry of the same command replays.
-func commandMeta(r *http.Request, correlationID string, bodyParts ...string) domain.CommandMeta {
+func (h *Handler) commandMeta(r *http.Request, correlationID string, bodyParts ...string) domain.CommandMeta {
 	meta := domain.CommandMeta{
 		IdempotencyKey: strings.TrimSpace(r.Header.Get("Idempotency-Key")),
 		CorrelationID:  correlationID,
@@ -490,6 +583,43 @@ type createWorkflowRequest struct {
 	WorkflowDefinitionID      string                            `json:"workflow_definition_id,omitempty"`
 	WorkflowDefinitionVersion int                               `json:"workflow_definition_version,omitempty"`
 	Stages                    []domain.CreateWorkflowStageInput `json:"stages"`
+	// SignatoryDecisionID names a policy-svc SIGNATORY_MATRIX decision
+	// (SIGNATURE_REQUIRED) this workflow collects the signatures for. It is
+	// fetched from policy-svc and verified, never taken on the caller's word.
+	SignatoryDecisionID string `json:"signatory_decision_id,omitempty"`
+	// CausationID names the governance decision this workflow resolves (an
+	// escalated policy or authorization decision in the decision log). It
+	// defaults to the X-Causation-Id header and, failing both, to the bound
+	// signatory decision; when the header and the body both name one they
+	// must agree. Every ledger record of the workflow carries it as
+	// causation_id (DL-2).
+	CausationID string `json:"causation_id,omitempty"`
+}
+
+// maxCausationIDLen is the decision log's causation_id limit.
+const maxCausationIDLen = 128
+
+// causationDecision resolves the governance decision a new workflow resolves:
+// the body's causation_id or the X-Causation-Id header (which must agree when
+// both are sent), else the bound signatory decision. It answers the problem
+// with the request, or "".
+func causationDecision(r *http.Request, req createWorkflowRequest, binding *domain.SignatoryBinding) (string, string) {
+	body := strings.TrimSpace(req.CausationID)
+	header := strings.TrimSpace(r.Header.Get("X-Causation-Id"))
+	if body != "" && header != "" && body != header {
+		return "", "causation_id disagrees with X-Causation-Id"
+	}
+	id := body
+	if id == "" {
+		id = header
+	}
+	if id == "" && binding != nil {
+		id = binding.DecisionID
+	}
+	if len(id) > maxCausationIDLen {
+		return "", "causation_id must be at most 128 characters"
+	}
+	return id, ""
 }
 
 func (req createWorkflowRequest) missingField() string {
@@ -508,6 +638,9 @@ func (req createWorkflowRequest) missingField() string {
 type workflowResponse struct {
 	*domain.WorkflowInstance
 	Stages []*domain.WorkflowStage `json:"stages"`
+	// SignatoryBinding is the policy-svc decision a signature workflow was
+	// created from; absent for every other workflow.
+	SignatoryBinding *domain.SignatoryBinding `json:"signatory_binding,omitempty"`
 	// DecisionID is the governance-ledger record written with a decision
 	// (row 39: evidence_id returned). It is empty on an idempotent replay that
 	// made no new transition.
@@ -788,6 +921,19 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	var binding *domain.SignatoryBinding
+	if req.SignatoryDecisionID != "" {
+		b, ok := h.bindSignatoryDecision(w, r, &req, principalID, correlationID)
+		if !ok {
+			return
+		}
+		binding = b
+	}
+	causation, problem := causationDecision(r, req, binding)
+	if problem != "" {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "causation_id", "message": problem})
+		return
+	}
 	instance, stages, created, err := h.store.CreateWorkflow(r.Context(), domain.CreateWorkflowParams{
 		// initiated_by is always the verified caller, never the request
 		// body �?" see requirePrincipal's doc comment.
@@ -800,6 +946,8 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		WorkflowDefinitionID:      req.WorkflowDefinitionID,
 		WorkflowDefinitionVersion: req.WorkflowDefinitionVersion,
 		DueAt:                     instanceDueAt,
+		Signatory:                 binding,
+		CausationDecisionID:       causation,
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrNoStages) {
@@ -869,7 +1017,13 @@ func (h *Handler) GetWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, r, h.log, err, correlationID, "GetWorkflow")
 		return
 	}
-	writeJSONWithETag(w, r, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: stages}, instance.RowVersion)
+	resp := workflowResponse{WorkflowInstance: instance, Stages: stages}
+	if ss, ok := h.signatoryStore(); ok {
+		if b, err := ss.FindSignatoryBinding(r.Context(), instance.WorkflowInstanceID); err == nil {
+			resp.SignatoryBinding = b
+		}
+	}
+	writeJSONWithETag(w, r, http.StatusOK, resp, instance.RowVersion)
 }
 
 // ── GET /v1/workflows/{id}/next-approver ─────────────────────────────────────
@@ -926,6 +1080,9 @@ type submitQuorumVoteRequest struct {
 	Action      string  `json:"action"`
 	Rationale   *string `json:"rationale,omitempty"`
 	CausationID *string `json:"causation_id,omitempty"`
+	// DocumentHash is the document signed; on a signature-bound workflow an
+	// APPROVE must name exactly the bound hash.
+	DocumentHash string `json:"document_hash,omitempty"`
 }
 
 // SubmitAction handles POST /v1/workflows/{workflow_instance_id}/actions.
@@ -985,6 +1142,14 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 	instanceForAuthzCheck, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
 	if err != nil {
 		writeStoreErr(w, r, h.log, err, correlationID, "SubmitAction")
+		return
+	}
+
+	// A retry of a decision that already committed replays its result. It
+	// carries the If-Match of its first attempt, stale by now, so the replay
+	// is recognised before the version check.
+	meta := h.commandMeta(r, correlationID, req.Action, derefString(req.Rationale), derefString(req.CausationID), workflowInstanceID)
+	if h.replayDecision(w, r, instanceForAuthzCheck, principalID, meta, correlationID, "SubmitAction") {
 		return
 	}
 
@@ -1082,7 +1247,6 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	meta := commandMeta(r, correlationID, req.Action, derefString(req.Rationale), derefString(req.CausationID), workflowInstanceID)
 	instance, stage, transitioned, err := h.store.SubmitAction(r.Context(), domain.SubmitActionParams{
 		WorkflowInstanceID: workflowInstanceID, ActorPrincipalID: principalID, AssignedApproverID: assignedApproverID,
 		Action: req.Action, Rationale: req.Rationale, CausationID: req.CausationID,
@@ -1116,6 +1280,40 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 		zap.String("correlation_id", correlationID),
 	)
 	writeJSONWithETag(w, r, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: []*domain.WorkflowStage{stage}, DecisionID: decisionIDFor(meta, transitioned)}, instance.RowVersion)
+}
+
+// replayDecision answers a retried decision from what it committed the first
+// time: 200 with the instance as it is now, the stage that was decided and the
+// original ledger decision id, marked Idempotent-Replayed. The key used with
+// another body, or by another principal, is 409 idempotency_mismatch. It
+// returns false when the key committed nothing yet (the caller goes on).
+func (h *Handler) replayDecision(w http.ResponseWriter, r *http.Request, instance *domain.WorkflowInstance, principalID string, meta domain.CommandMeta, correlationID, op string) bool {
+	replay, err := h.store.FindCommandReplay(r.Context(), instance.WorkflowInstanceID, meta)
+	if err != nil {
+		writeStoreErr(w, r, h.log, err, correlationID, op)
+		return true
+	}
+	if replay == nil {
+		return false
+	}
+	if replay.ActedBy != principalID {
+		writeStoreErr(w, r, h.log, domain.ErrIdempotencyMismatch, correlationID, op)
+		return true
+	}
+	stages, err := h.store.FindStagesByWorkflowID(r.Context(), instance.WorkflowInstanceID)
+	if err != nil {
+		writeStoreErr(w, r, h.log, err, correlationID, op)
+		return true
+	}
+	decided := []*domain.WorkflowStage{}
+	for _, st := range stages {
+		if replay.StageOrder != nil && st.StageOrder == *replay.StageOrder {
+			decided = append(decided, st)
+		}
+	}
+	w.Header().Set("Idempotent-Replayed", "true")
+	writeJSONWithETag(w, r, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: decided, DecisionID: derefString(replay.DecisionID)}, instance.RowVersion)
+	return true
 }
 
 // ── POST /v1/workflows/{id}/quorum-votes ─────────────────────────────────────
@@ -1162,6 +1360,12 @@ func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A retried vote that already committed replays (see SubmitAction).
+	meta := h.commandMeta(r, correlationID, req.Action, derefString(req.Rationale), derefString(req.CausationID), workflowInstanceID)
+	if h.replayDecision(w, r, instanceForAuthzCheck, principalID, meta, correlationID, "SubmitQuorumVote") {
+		return
+	}
+
 	// API-3: optimistic concurrency via If-Match header
 	if !requireIfMatch(w, r, instanceForAuthzCheck.RowVersion) {
 		return
@@ -1198,10 +1402,40 @@ func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	meta := commandMeta(r, correlationID, req.Action, derefString(req.Rationale), derefString(req.CausationID), workflowInstanceID)
+	// A signature on a signature-bound workflow: Authorization says, now,
+	// which accepted offices the signer holds (Doc 02 §4.2).
+	var offices []string
+	if ss, ok := h.signatoryStore(); ok && req.Action == "APPROVE" {
+		binding, err := ss.FindSignatoryBinding(r.Context(), workflowInstanceID)
+		if err != nil {
+			writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		if binding != nil {
+			requirement, err := domain.ParseSignatureRequirement(binding.Requirement)
+			if err != nil {
+				writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+				return
+			}
+			offices, err = h.signerOffices(r.Context(), principalID, instanceForAuthzCheck.LegalEntityID, instanceForAuthzCheck.InitiatedBy, requirement)
+			if err != nil {
+				h.log.Error("SubmitQuorumVote: authorization-svc unavailable for signer offices — failing closed",
+					zap.String("correlation_id", correlationID), zap.Error(err))
+				writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "authorization_service_unavailable"})
+				return
+			}
+			if len(offices) == 0 {
+				writeJSON(w, r, http.StatusForbidden, map[string]any{"error": "signer_not_eligible",
+					"message": domain.ErrSignerNotEligible.Error(), "accepted_offices": requirement.AcceptedOffices()})
+				return
+			}
+		}
+	}
+
 	instance, stage, transitioned, err := h.store.SubmitQuorumVote(r.Context(), domain.SubmitQuorumVoteParams{
 		WorkflowInstanceID: workflowInstanceID, ActorPrincipalID: principalID, Action: req.Action,
 		Rationale: req.Rationale, CausationID: req.CausationID, Authority: authority, Meta: meta,
+		SignerOffices: offices, DocumentHash: strings.TrimSpace(req.DocumentHash),
 	})
 	if err != nil {
 		switch {
@@ -1211,6 +1445,13 @@ func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, r, http.StatusConflict, map[string]string{"error": "not_quorum_stage"})
 		case errors.Is(err, domain.ErrNotEligibleQuorumApprover):
 			writeJSON(w, r, http.StatusForbidden, map[string]string{"error": "not_eligible_quorum_approver"})
+		case errors.Is(err, domain.ErrSignatureDocumentChanged):
+			writeJSON(w, r, http.StatusConflict, map[string]string{"error": "signature_document_changed",
+				"reason_code": "SIGNATURE_DOCUMENT_CHANGED", "message": err.Error()})
+		case errors.Is(err, domain.ErrSignatureOutOfOrder):
+			writeJSON(w, r, http.StatusConflict, map[string]string{"error": "signature_out_of_order", "message": err.Error()})
+		case errors.Is(err, domain.ErrSignerNotEligible):
+			writeJSON(w, r, http.StatusForbidden, map[string]string{"error": "signer_not_eligible", "message": err.Error()})
 		case errors.Is(err, domain.ErrInvalidTransition):
 			writeJSON(w, r, http.StatusConflict, map[string]any{
 				"error":           "invalid_transition",
@@ -1423,7 +1664,7 @@ func (h *Handler) EscalateWorkflow(w http.ResponseWriter, r *http.Request) {
 	}
 
 	instance, _, err := h.store.EscalateWorkflow(r.Context(), workflowInstanceID, principalID,
-		domain.LifecycleCommand{Authority: authority, Meta: commandMeta(r, correlationID, "ESCALATE", workflowInstanceID)})
+		domain.LifecycleCommand{Authority: authority, Meta: h.commandMeta(r, correlationID, "ESCALATE", workflowInstanceID)})
 	if err != nil {
 		writeStoreErr(w, r, h.log, err, correlationID, "EscalateWorkflow")
 		return
@@ -1477,7 +1718,7 @@ func (h *Handler) CancelWorkflow(w http.ResponseWriter, r *http.Request) {
 	}
 
 	instance, _, err := h.store.CancelWorkflow(r.Context(), workflowInstanceID, principalID,
-		domain.LifecycleCommand{Authority: authority, Meta: commandMeta(r, correlationID, "CANCEL", workflowInstanceID)})
+		domain.LifecycleCommand{Authority: authority, Meta: h.commandMeta(r, correlationID, "CANCEL", workflowInstanceID)})
 	if err != nil {
 		writeStoreErr(w, r, h.log, err, correlationID, "CancelWorkflow")
 		return
@@ -1646,7 +1887,7 @@ func (h *Handler) InvalidateWorkflow(w http.ResponseWriter, r *http.Request) {
 		CausationID:        req.CausationID,
 		ExpectedVersion:    &cmd.ExpectedObjectVersion,
 		Authority:          authority,
-		Meta: commandMeta(r, correlationID, canonicalReason, derefString(req.Narrative),
+		Meta: h.commandMeta(r, correlationID, canonicalReason, derefString(req.Narrative),
 			derefString(req.CausationID), strings.Join(req.EvidenceRefs, ","), workflowInstanceID),
 	})
 	if err != nil {
@@ -1693,6 +1934,9 @@ func (h *Handler) InvalidateWorkflow(w http.ResponseWriter, r *http.Request) {
 type verifyReleaseRequest struct {
 	ExpectedSubjectVersion    *int   `json:"expected_subject_version,omitempty"`
 	CurrentSubjectFingerprint string `json:"current_subject_fingerprint"`
+	// CurrentSignatoryDecisionID is a fresh policy-svc decision for the same
+	// resource and document; required to release a signature-bound workflow.
+	CurrentSignatoryDecisionID string `json:"current_signatory_decision_id,omitempty"`
 }
 
 // VerifyRelease handles POST /v1/workflows/{workflow_instance_id}/verify-release.
@@ -1725,28 +1969,33 @@ func (h *Handler) VerifyRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Release verification is an approval authority, not an unauthenticated
-	// status check. Resolve the workflow first so authorization is evaluated
-	// against its legal entity and initiator.
+	// Resolve the workflow first so authorization is evaluated against its
+	// legal entity and initiator.
 	instanceForAuthz, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
 	if err != nil {
 		writeStoreErr(w, r, h.log, err, correlationID, "VerifyRelease")
 		return
 	}
 
-	// API-3: optimistic concurrency via If-Match header
-	if !requireIfMatch(w, r, instanceForAuthz.RowVersion) {
+	// verify-release evaluates; it changes nothing, so If-Match (API-3, for
+	// mutations) is optional here. A caller that sends one binds the answer to
+	// the version it read, and a stale one is still 412. Requiring it (428)
+	// broke every caller that only asks the question: obligations-svc's
+	// waiver and exemption checks (workflowclient.VerifyApproval) send none,
+	// so each one failed closed (found by the live test of 26 Nov 2026).
+	if r.Header.Get("If-Match") != "" && !requireIfMatch(w, r, instanceForAuthz.RowVersion) {
 		return
 	}
 
-	if _, err := h.authz.CheckApprovalAllowed(r.Context(), principalID, instanceForAuthz.LegalEntityID, instanceForAuthz.InitiatedBy,
-		map[string]string{authz.AttrWorkflowType: instanceForAuthz.WorkflowType}); err != nil {
-		switch {
-		case errors.Is(err, domain.ErrAuthorizationDenied):
-			writeJSON(w, r, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
-		default:
-			writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "authorization_service_unavailable"})
-		}
+	// Who may ask is who may read the workflow: its requester, its current
+	// approver, or a WORKFLOW_READ holder on its legal entity (authorizeRead,
+	// fail closed). The answer tells them nothing a GET of the workflow does
+	// not (status, bound subject fingerprint). It used to need the APPROVAL
+	// authority, which the requester never holds over their own request (the
+	// own-object rule), so obligations-svc — which asks as the person waiving
+	// a clock, normally the one who requested the waiver — was refused 403 on
+	// every waiver (found by the live test of 26 Nov 2026).
+	if !h.authorizeRead(w, r, instanceForAuthz, principalID, correlationID, "VerifyRelease") {
 		return
 	}
 
@@ -1785,6 +2034,26 @@ func (h *Handler) VerifyRelease(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeStoreErr(w, r, h.log, err, correlationID, "VerifyRelease")
 		return
+	}
+
+	// A signature-bound workflow is released only if the signature
+	// requirement in force NOW is still met by the signatures given
+	// (Doc 02 §8.4: none waived because an earlier decision said PERMIT).
+	if ss, ok := h.signatoryStore(); ok && res.CanRelease {
+		binding, err := ss.FindSignatoryBinding(r.Context(), workflowInstanceID)
+		if err != nil {
+			writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		if binding != nil {
+			reason, ok := h.signatureReleaseCheck(w, r, instanceForAuthz, binding, strings.TrimSpace(req.CurrentSignatoryDecisionID), principalID, correlationID)
+			if !ok {
+				return
+			}
+			if reason != "" {
+				res.CanRelease, res.Status, res.Reason = false, "INVALID", &reason
+			}
+		}
 	}
 
 	if !res.CanRelease {
@@ -1868,6 +2137,7 @@ func (h *Handler) CreateWorkflowDefinition(w http.ResponseWriter, r *http.Reques
 }
 
 // ListWorkflowDefinitions handles GET /v1/workflow-definitions.
+// Supports cursor paging (API-4).
 func (h *Handler) ListWorkflowDefinitions(w http.ResponseWriter, r *http.Request) {
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -1881,12 +2151,30 @@ func (h *Handler) ListWorkflowDefinitions(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	definitions, err := h.store.ListWorkflowDefinitions(r.Context(), domain.ListWorkflowDefinitionsParams{
+	limit := getIntQuery(r, "limit", 50)
+	if limit > 200 {
+		limit = 200
+	}
+
+	var cursor *domain.PaginationCursor
+	if cursorStr := r.URL.Query().Get("cursor"); cursorStr != "" {
+		c, err := domain.DecodePaginationCursor(cursorStr)
+		if err != nil {
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{
+				"error":   "invalid_cursor",
+				"message": "cursor is not valid",
+			})
+			return
+		}
+		cursor = c
+	}
+
+	definitions, nextCursor, err := h.store.ListWorkflowDefinitions(r.Context(), domain.ListWorkflowDefinitionsParams{
 		TenantID:     tenantScope,
 		WorkflowType: getOptionalQuery(r, "workflow_type"),
 		IsActive:     getOptionalBoolQuery(r, "is_active"),
-		Limit:        getIntQuery(r, "limit", 50),
-		Offset:       getIntQuery(r, "offset", 0),
+		Limit:        limit,
+		Cursor:       cursor,
 	})
 	if err != nil {
 		h.log.Error("ListWorkflowDefinitions: store unavailable", zap.Error(err))
@@ -1896,7 +2184,22 @@ func (h *Handler) ListWorkflowDefinitions(w http.ResponseWriter, r *http.Request
 	if definitions == nil {
 		definitions = []*domain.WorkflowDefinition{}
 	}
-	writeJSON(w, r, http.StatusOK, definitions)
+
+	type listResponse struct {
+		Records    []*domain.WorkflowDefinition `json:"records"`
+		NextCursor string                       `json:"next_cursor,omitempty"`
+	}
+
+	resp := listResponse{
+		Records: definitions,
+	}
+	if nextCursor != nil {
+		if encoded, err := domain.EncodePaginationCursor(nextCursor); err == nil {
+			resp.NextCursor = encoded
+		}
+	}
+
+	writeJSON(w, r, http.StatusOK, resp)
 }
 
 // GetWorkflowDefinition handles GET /v1/workflow-definitions/{workflow_definition_id}.
@@ -2157,6 +2460,326 @@ func (h *Handler) RetireWorkflowDefinition(w http.ResponseWriter, r *http.Reques
 	writeJSONWithETag(w, r, http.StatusOK, map[string]string{"status": "retired"}, def.RowVersion)
 }
 
+// ValidateDefinition handles POST /v1/workflow-definitions/{workflow_definition_id}/validate.
+func (h *Handler) ValidateDefinition(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if !h.authorizeLifecycle(w, r, nil, principalID, actionWorkflowDefine, correlationID, "ValidateDefinition") {
+		return
+	}
+
+	workflowDefinitionID := chi.URLParam(r, "workflow_definition_id")
+	if !isValidUUID(workflowDefinitionID) {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_definition_id"})
+		return
+	}
+
+	def, err := h.store.GetWorkflowDefinition(r.Context(), domain.GetWorkflowDefinitionParams{
+		TenantID:             tenantScope,
+		WorkflowDefinitionID: &workflowDefinitionID,
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrWorkflowNotFound) {
+			writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "workflow_definition_not_found"})
+		} else {
+			writeStoreErr(w, r, h.log, err, correlationID, "ValidateDefinition")
+		}
+		return
+	}
+
+	// API-3: optimistic concurrency via If-Match header
+	if !requireIfMatch(w, r, def.RowVersion) {
+		return
+	}
+
+	definition, err := h.store.ValidateDefinition(r.Context(), domain.ValidateDefinitionParams{
+		WorkflowDefinitionID: workflowDefinitionID,
+		ActorPrincipalID:     principalID,
+		CorrelationID:        correlationID,
+		Meta:                 h.commandMeta(r, correlationID, "VALIDATE"),
+	})
+	if err != nil {
+		writeStoreErr(w, r, h.log, err, correlationID, "ValidateDefinition")
+		return
+	}
+	writeJSONWithETag(w, r, http.StatusOK, definition, definition.RowVersion)
+}
+
+// SubmitDefinitionApproval handles POST /v1/workflow-definitions/{workflow_definition_id}/submit-approval.
+func (h *Handler) SubmitDefinitionApproval(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if !h.authorizeLifecycle(w, r, nil, principalID, actionWorkflowDefine, correlationID, "SubmitDefinitionApproval") {
+		return
+	}
+
+	workflowDefinitionID := chi.URLParam(r, "workflow_definition_id")
+	if !isValidUUID(workflowDefinitionID) {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_definition_id"})
+		return
+	}
+
+	def, err := h.store.GetWorkflowDefinition(r.Context(), domain.GetWorkflowDefinitionParams{
+		TenantID:             tenantScope,
+		WorkflowDefinitionID: &workflowDefinitionID,
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrWorkflowNotFound) {
+			writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "workflow_definition_not_found"})
+		} else {
+			writeStoreErr(w, r, h.log, err, correlationID, "SubmitDefinitionApproval")
+		}
+		return
+	}
+
+	// API-3: optimistic concurrency via If-Match header
+	if !requireIfMatch(w, r, def.RowVersion) {
+		return
+	}
+
+	definition, err := h.store.SubmitDefinitionApproval(r.Context(), domain.SubmitDefinitionApprovalParams{
+		WorkflowDefinitionID: workflowDefinitionID,
+		ActorPrincipalID:     principalID,
+		CorrelationID:        correlationID,
+		Meta:                 h.commandMeta(r, correlationID, "SUBMIT_APPROVAL"),
+	})
+	if err != nil {
+		writeStoreErr(w, r, h.log, err, correlationID, "SubmitDefinitionApproval")
+		return
+	}
+	writeJSONWithETag(w, r, http.StatusOK, definition, definition.RowVersion)
+}
+
+// ApproveDefinition handles POST /v1/workflow-definitions/{workflow_definition_id}/approve.
+func (h *Handler) ApproveDefinition(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if !h.authorizeLifecycle(w, r, nil, principalID, actionWorkflowDefine, correlationID, "ApproveDefinition") {
+		return
+	}
+
+	workflowDefinitionID := chi.URLParam(r, "workflow_definition_id")
+	if !isValidUUID(workflowDefinitionID) {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_definition_id"})
+		return
+	}
+
+	def, err := h.store.GetWorkflowDefinition(r.Context(), domain.GetWorkflowDefinitionParams{
+		TenantID:             tenantScope,
+		WorkflowDefinitionID: &workflowDefinitionID,
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrWorkflowNotFound) {
+			writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "workflow_definition_not_found"})
+		} else {
+			writeStoreErr(w, r, h.log, err, correlationID, "ApproveDefinition")
+		}
+		return
+	}
+
+	// API-3: optimistic concurrency via If-Match header
+	if !requireIfMatch(w, r, def.RowVersion) {
+		return
+	}
+
+	var req struct {
+		ReasonCode string  `json:"reason_code"`
+		Narrative  *string `json:"narrative,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		return
+	}
+	if req.ReasonCode == "" {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "reason_code"})
+		return
+	}
+
+	definition, err := h.store.ApproveDefinition(r.Context(), domain.ApproveDefinitionParams{
+		WorkflowDefinitionID: workflowDefinitionID,
+		ActorPrincipalID:     principalID,
+		CorrelationID:        correlationID,
+		ReasonCode:           req.ReasonCode,
+		Narrative:            req.Narrative,
+		Authority:            domain.ActionAuthority{},
+		Meta:                 h.commandMeta(r, correlationID, "APPROVE", req.ReasonCode),
+	})
+	if err != nil {
+		writeStoreErr(w, r, h.log, err, correlationID, "ApproveDefinition")
+		return
+	}
+	writeJSONWithETag(w, r, http.StatusOK, definition, definition.RowVersion)
+}
+
+// RejectDefinition handles POST /v1/workflow-definitions/{workflow_definition_id}/reject.
+func (h *Handler) RejectDefinition(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if !h.authorizeLifecycle(w, r, nil, principalID, actionWorkflowDefine, correlationID, "RejectDefinition") {
+		return
+	}
+
+	workflowDefinitionID := chi.URLParam(r, "workflow_definition_id")
+	if !isValidUUID(workflowDefinitionID) {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_definition_id"})
+		return
+	}
+
+	def, err := h.store.GetWorkflowDefinition(r.Context(), domain.GetWorkflowDefinitionParams{
+		TenantID:             tenantScope,
+		WorkflowDefinitionID: &workflowDefinitionID,
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrWorkflowNotFound) {
+			writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "workflow_definition_not_found"})
+		} else {
+			writeStoreErr(w, r, h.log, err, correlationID, "RejectDefinition")
+		}
+		return
+	}
+
+	// API-3: optimistic concurrency via If-Match header
+	if !requireIfMatch(w, r, def.RowVersion) {
+		return
+	}
+
+	var req struct {
+		ReasonCode string  `json:"reason_code"`
+		Narrative  *string `json:"narrative,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		return
+	}
+	if req.ReasonCode == "" {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "reason_code"})
+		return
+	}
+
+	definition, err := h.store.RejectDefinition(r.Context(), domain.RejectDefinitionParams{
+		WorkflowDefinitionID: workflowDefinitionID,
+		ActorPrincipalID:     principalID,
+		CorrelationID:        correlationID,
+		ReasonCode:           req.ReasonCode,
+		Narrative:            req.Narrative,
+		Authority:            domain.ActionAuthority{},
+		Meta:                 h.commandMeta(r, correlationID, "REJECT", req.ReasonCode),
+	})
+	if err != nil {
+		writeStoreErr(w, r, h.log, err, correlationID, "RejectDefinition")
+		return
+	}
+	writeJSONWithETag(w, r, http.StatusOK, definition, definition.RowVersion)
+}
+
+// PublishDefinition handles POST /v1/workflow-definitions/{workflow_definition_id}/publish.
+func (h *Handler) PublishDefinition(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if !h.authorizeLifecycle(w, r, nil, principalID, actionWorkflowDefine, correlationID, "PublishDefinition") {
+		return
+	}
+
+	workflowDefinitionID := chi.URLParam(r, "workflow_definition_id")
+	if !isValidUUID(workflowDefinitionID) {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workflow_definition_id"})
+		return
+	}
+
+	def, err := h.store.GetWorkflowDefinition(r.Context(), domain.GetWorkflowDefinitionParams{
+		TenantID:             tenantScope,
+		WorkflowDefinitionID: &workflowDefinitionID,
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrWorkflowNotFound) {
+			writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "workflow_definition_not_found"})
+		} else {
+			writeStoreErr(w, r, h.log, err, correlationID, "PublishDefinition")
+		}
+		return
+	}
+
+	// API-3: optimistic concurrency via If-Match header
+	if !requireIfMatch(w, r, def.RowVersion) {
+		return
+	}
+
+	var req struct {
+		EffectiveFrom *string `json:"effective_from,omitempty"`
+		EffectiveTo   *string `json:"effective_to,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		return
+	}
+
+	var effectiveFrom, effectiveTo *time.Time
+	if req.EffectiveFrom != nil {
+		if t, err := time.Parse(time.RFC3339, *req.EffectiveFrom); err == nil {
+			effectiveFrom = &t
+		}
+	}
+	if req.EffectiveTo != nil {
+		if t, err := time.Parse(time.RFC3339, *req.EffectiveTo); err == nil {
+			effectiveTo = &t
+		}
+	}
+
+	definition, err := h.store.PublishDefinition(r.Context(), domain.PublishDefinitionParams{
+		WorkflowDefinitionID: workflowDefinitionID,
+		ActorPrincipalID:     principalID,
+		CorrelationID:        correlationID,
+		EffectiveFrom:        effectiveFrom,
+		EffectiveTo:          effectiveTo,
+		Meta:                 h.commandMeta(r, correlationID, "PUBLISH"),
+	})
+	if err != nil {
+		writeStoreErr(w, r, h.log, err, correlationID, "PublishDefinition")
+		return
+	}
+	writeJSONWithETag(w, r, http.StatusOK, definition, definition.RowVersion)
+}
+
 // EscalateToWorkflow handles POST /v1/workflows/{workflow_instance_id}/escalate-to.
 func (h *Handler) EscalateToWorkflow(w http.ResponseWriter, r *http.Request) {
 	principalID, ok := h.requirePrincipal(w, r)
@@ -2224,7 +2847,7 @@ func (h *Handler) EscalateToWorkflow(w http.ResponseWriter, r *http.Request) {
 		Narrative:          req.Narrative,
 		CorrelationID:      correlationID,
 		Authority:          authority,
-		Meta: commandMeta(r, correlationID, req.EscalationTarget, req.ReasonCode,
+		Meta: h.commandMeta(r, correlationID, req.EscalationTarget, req.ReasonCode,
 			derefString(req.Narrative), workflowInstanceID),
 	})
 	if err != nil {
@@ -2304,6 +2927,105 @@ func (h *Handler) ListPendingApprovals(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, r, http.StatusOK, resp)
+}
+
+// ListWorkflows handles GET /v1/workflows.
+func (h *Handler) ListWorkflows(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	correlationID := r.Header.Get("X-Correlation-ID")
+	if !h.authorizeRead(w, r, nil, principalID, correlationID, "ListWorkflows") {
+		return
+	}
+
+	limit := getIntQuery(r, "limit", 50)
+	if limit > 200 {
+		limit = 200
+	}
+
+	var cursor *domain.PaginationCursor
+	if cursorStr := r.URL.Query().Get("cursor"); cursorStr != "" {
+		c, err := domain.DecodePaginationCursor(cursorStr)
+		if err != nil {
+			writeJSON(w, r, http.StatusBadRequest, map[string]string{
+				"error":   "invalid_cursor",
+				"message": "cursor is not valid",
+			})
+			return
+		}
+		cursor = c
+	}
+
+	params := domain.ListWorkflowsParams{
+		TenantID:             tenantScope,
+		LegalEntityID:        r.URL.Query().Get("legal_entity_id"),
+		WorkflowType:         r.URL.Query().Get("workflow_type"),
+		WorkflowStatus:       r.URL.Query().Get("workflow_status"),
+		SubjectType:          r.URL.Query().Get("subject_type"),
+		SubjectID:            r.URL.Query().Get("subject_id"),
+		WorkflowDefinitionID: r.URL.Query().Get("workflow_definition_id"),
+		Limit:                limit,
+		Cursor:               cursor,
+	}
+
+	instances, nextCursor, err := h.store.ListWorkflows(r.Context(), tenantScope, params)
+	if err != nil {
+		writeStoreErr(w, r, h.log, err, correlationID, "ListWorkflows")
+		return
+	}
+	if instances == nil {
+		instances = []*domain.WorkflowInstance{}
+	}
+
+	type listResponse struct {
+		Records    []*domain.WorkflowInstance `json:"records"`
+		NextCursor string                     `json:"next_cursor,omitempty"`
+		Watermark  string                     `json:"watermark,omitempty"`
+	}
+
+	resp := listResponse{
+		Records: instances,
+	}
+	if nextCursor != nil {
+		if encoded, err := domain.EncodePaginationCursor(nextCursor); err == nil {
+			resp.NextCursor = encoded
+		}
+	}
+
+	writeJSON(w, r, http.StatusOK, resp)
+}
+
+// GetInstanceSummary handles GET /v1/workflows/{workflow_instance_id}/summary.
+func (h *Handler) GetInstanceSummary(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	workflowInstanceID := chi.URLParam(r, "workflow_instance_id")
+
+	correlationID := r.Header.Get("X-Correlation-ID")
+	if !h.authorizeRead(w, r, nil, principalID, correlationID, "GetInstanceSummary") {
+		return
+	}
+
+	summary, err := h.store.GetInstanceSummary(r.Context(), workflowInstanceID)
+	if err != nil {
+		writeStoreErr(w, r, h.log, err, correlationID, "GetInstanceSummary")
+		return
+	}
+
+	writeJSON(w, r, http.StatusOK, summary)
 }
 
 // GetApprovalEvidence handles GET /v1/workflows/{workflow_instance_id}/evidence.
@@ -2398,7 +3120,7 @@ func (h *Handler) RequestChanges(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.RequestChanges(r.Context(), workflowInstanceID, principalID, rationale, req.CausationID,
-		domain.LifecycleCommand{Authority: authority, Meta: commandMeta(r, correlationID, "REQUEST_CHANGES", rationale, workflowInstanceID)}); err != nil {
+		domain.LifecycleCommand{Authority: authority, Meta: h.commandMeta(r, correlationID, "REQUEST_CHANGES", rationale, workflowInstanceID)}); err != nil {
 		writeStoreErr(w, r, h.log, err, correlationID, "RequestChanges")
 		return
 	}
@@ -2496,6 +3218,20 @@ func writeStoreErr(w http.ResponseWriter, r *http.Request, log *zap.Logger, err 
 		writeError(w, r, http.StatusNotFound, "legal_entity_not_found", "legal entity not found in the caller's tenant", correlationID, nil)
 	case errors.Is(err, domain.ErrRegistryUnavailable):
 		writeError(w, r, http.StatusServiceUnavailable, "registry_unavailable", "tenant-entity-registry-svc unavailable", correlationID, map[string]any{"retryable": true})
+	case errors.Is(err, domain.ErrDefinitionInvalid):
+		writeError(w, r, http.StatusUnprocessableEntity, "definition_invalid", err.Error(), correlationID, nil)
+	// Until 26 Nov 2026 these fell through to 503 store_unavailable (with
+	// retryable=true), so a client retried a mistake that can never succeed.
+	case errors.Is(err, domain.ErrCaseNotFound):
+		writeError(w, r, http.StatusNotFound, "case_not_found", "case not found", correlationID, nil)
+	case errors.Is(err, domain.ErrWorkItemNotFound):
+		writeError(w, r, http.StatusNotFound, "work_item_not_found", "work item not found", correlationID, nil)
+	case errors.Is(err, domain.ErrInvalidCaseTransition), errors.Is(err, domain.ErrInvalidWorkItemTransition):
+		writeError(w, r, http.StatusConflict, "invalid_transition", err.Error(), correlationID, nil)
+	case errors.Is(err, domain.ErrInvalidIdentifier):
+		writeError(w, r, http.StatusBadRequest, "invalid_identifier", "an identifier in the request is not a valid UUID", correlationID, nil)
+	case errors.Is(err, domain.ErrTenantMissing):
+		writeError(w, r, http.StatusForbidden, "tenant_scope_mismatch", "the request names another tenant than the caller's", correlationID, nil)
 	default:
 		log.Error(op+": store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
 		writeError(w, r, http.StatusServiceUnavailable, "store_unavailable", "workflow store temporarily unavailable", correlationID, map[string]any{

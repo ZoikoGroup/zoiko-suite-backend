@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -30,6 +32,10 @@ const (
 // ── stub store ────────────────────────────────────────────────────────────────
 
 type stubStore struct {
+	// commandReplay is what FindCommandReplay answers (nil: no replay).
+	commandReplay    *domain.CommandReplay
+	commandReplayErr error
+
 	// createdParams / submitParams record what the handler passed the store.
 	createdParams domain.CreateWorkflowParams
 	submitParams  domain.SubmitActionParams
@@ -180,6 +186,33 @@ type stubStore struct {
 	listPendingApprovalsErr error
 	approvalTransitions     []*domain.WorkflowTransition
 	approvalEvidenceErr     error
+
+	// WFC-04: Cases
+	caseCreated       *domain.Case
+	caseFindErr       error
+	caseList          []*domain.Case
+	caseTransitioned  *domain.Case
+	caseTransitionErr error
+
+	// For API-4 cursor paging tests
+	pendingApprovals       []*domain.WorkflowInstance
+	pendingNextCursor      *domain.PaginationCursor
+	pendingSubmissionsList []*domain.FormSubmission
+	pendingSubNextCursor   *domain.PaginationCursor
+
+	// WFC-02: Work Items (WF-S23)
+	workItem    *domain.WorkItem
+	workItemErr error
+
+	// WF-S24: Operator Repair
+	operatorAction    *domain.OperatorAction
+	operatorActionErr error
+
+	// WF-S25: Emergency Approval
+	emergencyApproval      *domain.EmergencyApproval
+	emergencyApprovalErr   error
+	breakGlassSessionValid bool
+	breakGlassSessionErr   error
 }
 
 func (s *stubStore) CreateForm(_ context.Context, _ domain.CreateFormParams) (*domain.FormDefinition, bool, error) {
@@ -218,8 +251,32 @@ func (s *stubStore) GetSubmissionVersion(_ context.Context, _, _ string) (*domai
 func (s *stubStore) GetValidationResult(_ context.Context, _, _ string) (*domain.ValidationResult, error) {
 	return s.validationResult, s.getValidationResultErr
 }
-func (s *stubStore) ListPendingSubmissions(_ context.Context, _, _ string, _ domain.ListPendingSubmissionsParams) ([]*domain.FormSubmission, *domain.PaginationCursor, error) {
-	return s.pendingSubmissions, nil, s.listPendingErr
+func (s *stubStore) ListPendingSubmissions(_ context.Context, _, _ string, p domain.ListPendingSubmissionsParams) ([]*domain.FormSubmission, *domain.PaginationCursor, error) {
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 2
+	}
+	start := 0
+	if p.Cursor != nil {
+		for i, sub := range s.pendingSubmissionsList {
+			if sub.SubmissionID == p.Cursor.InstanceID {
+				start = i + 1
+				break
+			}
+		}
+	}
+	end := start + limit
+	if end > len(s.pendingSubmissionsList) {
+		end = len(s.pendingSubmissionsList)
+	}
+	if start >= len(s.pendingSubmissionsList) {
+		return []*domain.FormSubmission{}, nil, s.listPendingErr
+	}
+	var nextCursor *domain.PaginationCursor
+	if end < len(s.pendingSubmissionsList) {
+		nextCursor = &domain.PaginationCursor{StartedAt: "2024-01-01T00:00:00Z", InstanceID: s.pendingSubmissionsList[end-1].SubmissionID}
+	}
+	return s.pendingSubmissionsList[start:end], nextCursor, s.listPendingErr
 }
 func (s *stubStore) EscalateToWorkflow(_ context.Context, _ domain.EscalateToWorkflowParams) (*domain.WorkflowInstance, bool, error) {
 	return s.escalateToInstance, s.escalateToTransitioned, s.escalateToErr
@@ -227,20 +284,122 @@ func (s *stubStore) EscalateToWorkflow(_ context.Context, _ domain.EscalateToWor
 func (s *stubStore) RequestChanges(_ context.Context, _, _, _ string, _ *string, _ ...domain.LifecycleCommand) error {
 	return s.requestChangesErr
 }
-func (s *stubStore) ListPendingApprovals(_ context.Context, _ string, _ domain.ListPendingApprovalsParams) ([]*domain.WorkflowInstance, *domain.PaginationCursor, error) {
-	return s.pendingInstances, nil, s.listPendingApprovalsErr
+func (s *stubStore) ListPendingApprovals(_ context.Context, _ string, p domain.ListPendingApprovalsParams) ([]*domain.WorkflowInstance, *domain.PaginationCursor, error) {
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 2
+	}
+	start := 0
+	if p.Cursor != nil {
+		// Find the index after the cursor
+		for i, inst := range s.pendingApprovals {
+			if inst.WorkflowInstanceID == p.Cursor.InstanceID {
+				start = i + 1
+				break
+			}
+		}
+	}
+	end := start + limit
+	if end > len(s.pendingApprovals) {
+		end = len(s.pendingApprovals)
+	}
+	if start >= len(s.pendingApprovals) {
+		return []*domain.WorkflowInstance{}, nil, s.listPendingApprovalsErr
+	}
+	var nextCursor *domain.PaginationCursor
+	if end < len(s.pendingApprovals) {
+		nextCursor = &domain.PaginationCursor{StartedAt: "2024-01-01T00:00:00Z", InstanceID: s.pendingApprovals[end-1].WorkflowInstanceID}
+	}
+	return s.pendingApprovals[start:end], nextCursor, s.listPendingApprovalsErr
 }
 func (s *stubStore) GetApprovalEvidence(_ context.Context, _ string) ([]*domain.WorkflowTransition, error) {
 	return s.approvalTransitions, s.approvalEvidenceErr
 }
-func (s *stubStore) CreateWorkflowDefinition(_ context.Context, _ domain.CreateWorkflowDefinitionParams) (*domain.WorkflowDefinition, error) {
-	return s.workflowDefinition, s.definitionErr
+func (s *stubStore) ListWorkflows(_ context.Context, _ string, p domain.ListWorkflowsParams) ([]*domain.WorkflowInstance, *domain.PaginationCursor, error) {
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 2
+	}
+	start := 0
+	if p.Cursor != nil {
+		for i, inst := range s.pendingApprovals {
+			if inst.WorkflowInstanceID == p.Cursor.InstanceID {
+				start = i + 1
+				break
+			}
+		}
+	}
+	end := start + limit
+	if end > len(s.pendingApprovals) {
+		end = len(s.pendingApprovals)
+	}
+	if start >= len(s.pendingApprovals) {
+		return []*domain.WorkflowInstance{}, nil, s.listPendingApprovalsErr
+	}
+	var nextCursor *domain.PaginationCursor
+	if end < len(s.pendingApprovals) {
+		nextCursor = &domain.PaginationCursor{StartedAt: "2024-01-01T00:00:00Z", InstanceID: s.pendingApprovals[end-1].WorkflowInstanceID}
+	}
+	return s.pendingApprovals[start:end], nextCursor, s.listPendingApprovalsErr
 }
-func (s *stubStore) GetWorkflowDefinition(_ context.Context, _ domain.GetWorkflowDefinitionParams) (*domain.WorkflowDefinition, error) {
-	return s.workflowDefinition, s.definitionErr
+func (s *stubStore) GetInstanceSummary(_ context.Context, workflowInstanceID string) (*domain.InstanceSummary, error) {
+	if s.instance == nil || s.instance.WorkflowInstanceID != workflowInstanceID {
+		return nil, domain.ErrWorkflowNotFound
+	}
+	return &domain.InstanceSummary{
+		WorkflowInstanceID: s.instance.WorkflowInstanceID,
+		WorkflowType:       s.instance.WorkflowType,
+		WorkflowStatus:     s.instance.WorkflowStatus,
+		CurrentStage:       s.instance.CurrentStage,
+		InitiatedBy:        s.instance.InitiatedBy,
+		SubjectType:        s.instance.SubjectType,
+		SubjectID:          s.instance.SubjectID,
+		SubjectVersion:     s.instance.SubjectVersion,
+		StartedAt:          s.instance.StartedAt,
+		CompletedAt:        s.instance.CompletedAt,
+		DueAt:              s.instance.DueAt,
+		NextActionAt:       s.instance.NextActionAt,
+		EscalationTarget:   s.instance.EscalationTarget,
+		ReviewCycle:        s.instance.ReviewCycle,
+		StagesSummary:      []domain.StageSummary{},
+	}, nil
 }
-func (s *stubStore) ListWorkflowDefinitions(_ context.Context, _ domain.ListWorkflowDefinitionsParams) ([]*domain.WorkflowDefinition, error) {
-	return s.workflowDefinitions, s.definitionErr
+func (s *stubStore) ListWorkflowDefinitions(_ context.Context, p domain.ListWorkflowDefinitionsParams) ([]*domain.WorkflowDefinition, *domain.PaginationCursor, error) {
+	// Sort by workflow_type DESC, version DESC to match the real store
+	defs := make([]*domain.WorkflowDefinition, len(s.workflowDefinitions))
+	copy(defs, s.workflowDefinitions)
+	sort.Slice(defs, func(i, j int) bool {
+		if defs[i].WorkflowType != defs[j].WorkflowType {
+			return defs[i].WorkflowType > defs[j].WorkflowType
+		}
+		return defs[i].Version > defs[j].Version
+	})
+
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 2
+	}
+	start := 0
+	if p.Cursor != nil {
+		for i, def := range defs {
+			if def.WorkflowDefinitionID == p.Cursor.InstanceID {
+				start = i + 1
+				break
+			}
+		}
+	}
+	end := start + limit
+	if end > len(defs) {
+		end = len(defs)
+	}
+	if start >= len(defs) {
+		return []*domain.WorkflowDefinition{}, nil, s.definitionErr
+	}
+	var nextCursor *domain.PaginationCursor
+	if end < len(defs) {
+		nextCursor = &domain.PaginationCursor{StartedAt: "2024-01-01T00:00:00Z", InstanceID: defs[end-1].WorkflowDefinitionID}
+	}
+	return defs[start:end], nextCursor, s.definitionErr
 }
 func (s *stubStore) SupersedeWorkflowDefinition(_ context.Context, _, _ string) error {
 	return s.definitionErr
@@ -253,6 +412,79 @@ func (s *stubStore) SuspendWorkflowDefinition(_ context.Context, _ string) error
 }
 func (s *stubStore) RetireWorkflowDefinition(_ context.Context, _ string) error {
 	return s.definitionErr
+}
+func (s *stubStore) ValidateDefinition(_ context.Context, p domain.ValidateDefinitionParams) (*domain.WorkflowDefinition, error) {
+	return s.workflowDefinition, s.definitionErr
+}
+func (s *stubStore) SubmitDefinitionApproval(_ context.Context, p domain.SubmitDefinitionApprovalParams) (*domain.WorkflowDefinition, error) {
+	return s.workflowDefinition, s.definitionErr
+}
+func (s *stubStore) ApproveDefinition(_ context.Context, p domain.ApproveDefinitionParams) (*domain.WorkflowDefinition, error) {
+	return s.workflowDefinition, s.definitionErr
+}
+func (s *stubStore) RejectDefinition(_ context.Context, p domain.RejectDefinitionParams) (*domain.WorkflowDefinition, error) {
+	return s.workflowDefinition, s.definitionErr
+}
+func (s *stubStore) PublishDefinition(_ context.Context, p domain.PublishDefinitionParams) (*domain.WorkflowDefinition, error) {
+	return s.workflowDefinition, s.definitionErr
+}
+func (s *stubStore) CreateWorkItem(_ context.Context, _ domain.CreateWorkItemParams) (*domain.WorkItem, error) {
+	return s.workItem, s.workItemErr
+}
+func (s *stubStore) GetWorkItem(_ context.Context, _ string) (*domain.WorkItem, error) {
+	return s.workItem, s.workItemErr
+}
+func (s *stubStore) ListWorkItems(_ context.Context, _ string, _ domain.ListWorkItemsFilter) ([]*domain.WorkItem, *domain.PaginationCursor, error) {
+	return []*domain.WorkItem{s.workItem}, nil, s.workItemErr
+}
+func (s *stubStore) ClaimWorkItem(_ context.Context, _ string, _ int, _ string, _ string, _ string) (*domain.WorkItem, bool, error) {
+	return s.workItem, true, s.workItemErr
+}
+func (s *stubStore) ReleaseWorkItem(_ context.Context, _ string, _ int, _ string, _ string) (*domain.WorkItem, bool, error) {
+	return s.workItem, true, s.workItemErr
+}
+func (s *stubStore) SatisfyWorkItem(_ context.Context, _ domain.SatisfyWorkItemParams) (*domain.WorkItem, bool, error) {
+	return s.workItem, true, s.workItemErr
+}
+func (s *stubStore) WaiveWorkItem(_ context.Context, _ domain.WaiveWorkItemParams) (*domain.WorkItem, bool, error) {
+	return s.workItem, true, s.workItemErr
+}
+func (s *stubStore) TransferWorkItem(_ context.Context, _ domain.TransferWorkItemParams) (*domain.WorkItem, bool, error) {
+	return s.workItem, true, s.workItemErr
+}
+func (s *stubStore) CancelWorkItem(_ context.Context, _ string, _ int, _ string, _ string) (*domain.WorkItem, bool, error) {
+	return s.workItem, true, s.workItemErr
+}
+func (s *stubStore) EscalateWorkItem(_ context.Context, _ string, _ int, _ string, _ string) (*domain.WorkItem, bool, error) {
+	return s.workItem, true, s.workItemErr
+}
+func (s *stubStore) ReassignWorkItem(_ context.Context, _ string, _ int, _ string, _ string, _ string) (*domain.WorkItem, bool, error) {
+	return s.workItem, true, s.workItemErr
+}
+func (s *stubStore) BulkCompleteWorkItems(_ context.Context, _ domain.BulkCompleteWorkItemsParams) ([]*domain.WorkItem, []*domain.WorkItemResult, error) {
+	return []*domain.WorkItem{s.workItem}, []*domain.WorkItemResult{{WorkItemID: "wi-1", Success: true}}, s.workItemErr
+}
+func (s *stubStore) CreateWorkflowDefinition(_ context.Context, p domain.CreateWorkflowDefinitionParams) (*domain.WorkflowDefinition, error) {
+	return s.workflowDefinition, s.definitionErr
+}
+func (s *stubStore) GetWorkflowDefinition(_ context.Context, p domain.GetWorkflowDefinitionParams) (*domain.WorkflowDefinition, error) {
+	return s.workflowDefinition, s.definitionErr
+}
+
+func (s *stubStore) CreateCase(_ context.Context, _ domain.CreateCaseParams) (*domain.Case, bool, error) {
+	return s.caseCreated, s.caseCreated != nil, s.caseFindErr
+}
+func (s *stubStore) FindCaseByID(_ context.Context, _ string) (*domain.Case, error) {
+	return s.caseCreated, s.caseFindErr
+}
+func (s *stubStore) ListCases(_ context.Context, _ domain.ListCasesFilter) ([]*domain.Case, error) {
+	return s.caseList, s.caseFindErr
+}
+func (s *stubStore) TransitionCase(_ context.Context, _ domain.TransitionCaseParams) (*domain.Case, bool, error) {
+	return s.caseTransitioned, true, s.caseTransitionErr
+}
+func (s *stubStore) FindCasesByWorkflowInstance(_ context.Context, _ string) ([]*domain.Case, error) {
+	return s.caseList, s.caseFindErr
 }
 
 func (s *stubStore) CreateWorkflow(_ context.Context, p domain.CreateWorkflowParams) (*domain.WorkflowInstance, []*domain.WorkflowStage, bool, error) {
@@ -275,6 +507,12 @@ func (s *stubStore) FindCurrentStage(_ context.Context, _ string) (*domain.Workf
 func (s *stubStore) IsCurrentStageApprover(_ context.Context, _, _ string) (bool, error) {
 	return s.currentStageApprover, s.currentStageApproverErr
 }
+func (s *stubStore) IsQuorumApprover(_ context.Context, _, _ string) (bool, error) {
+	return s.currentStageApprover, s.currentStageApproverErr
+}
+func (s *stubStore) FindCommandReplay(_ context.Context, _ string, _ domain.CommandMeta) (*domain.CommandReplay, error) {
+	return s.commandReplay, s.commandReplayErr
+}
 func (s *stubStore) SubmitAction(_ context.Context, p domain.SubmitActionParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error) {
 	s.submitParams = p
 	return s.submitInstance, s.submitStage, s.submitTransitioned, s.submitErr
@@ -296,6 +534,33 @@ func (s *stubStore) InvalidateWorkflow(_ context.Context, _ domain.InvalidateWor
 }
 func (s *stubStore) VerifyRelease(_ context.Context, _ domain.VerifyReleaseParams) (*domain.ReleaseVerificationResult, error) {
 	return s.verifyReleaseResult, s.verifyReleaseErr
+}
+func (s *stubStore) CreateOperatorAction(_ context.Context, _ domain.CreateOperatorActionParams) (*domain.OperatorAction, error) {
+	return s.operatorAction, s.operatorActionErr
+}
+func (s *stubStore) GetOperatorAction(_ context.Context, _ string) (*domain.OperatorAction, error) {
+	return s.operatorAction, s.operatorActionErr
+}
+func (s *stubStore) ListOperatorActions(_ context.Context, _ string, _ domain.ListOperatorActionsFilter) ([]*domain.OperatorAction, *domain.PaginationCursor, error) {
+	return []*domain.OperatorAction{s.operatorAction}, nil, s.operatorActionErr
+}
+func (s *stubStore) ApproveOperatorAction(_ context.Context, _ domain.ApproveOperatorActionParams) (*domain.OperatorAction, error) {
+	return s.operatorAction, s.operatorActionErr
+}
+func (s *stubStore) ExecuteOperatorAction(_ context.Context, _ domain.ExecuteOperatorActionParams) (*domain.OperatorAction, error) {
+	return s.operatorAction, s.operatorActionErr
+}
+func (s *stubStore) CreateEmergencyApproval(_ context.Context, _ domain.CreateEmergencyApprovalParams) (*domain.EmergencyApproval, error) {
+	return s.emergencyApproval, s.emergencyApprovalErr
+}
+func (s *stubStore) GetEmergencyApproval(_ context.Context, _ string) (*domain.EmergencyApproval, error) {
+	return s.emergencyApproval, s.emergencyApprovalErr
+}
+func (s *stubStore) ListEmergencyApprovals(_ context.Context, _ string, _ domain.ListEmergencyApprovalsFilter) ([]*domain.EmergencyApproval, *domain.PaginationCursor, error) {
+	return []*domain.EmergencyApproval{s.emergencyApproval}, nil, s.emergencyApprovalErr
+}
+func (s *stubStore) CheckBreakGlassSession(_ context.Context, _ string) (bool, error) {
+	return s.breakGlassSessionValid, s.breakGlassSessionErr
 }
 func (s *stubStore) CreateAuditEngagement(_ context.Context, _ domain.CreateAuditEngagementParams) (*domain.AuditEngagement, bool, error) {
 	return s.auditEngagement, s.auditCreateCreated, s.auditCreateErr
@@ -347,6 +612,9 @@ func (s *stubStore) AssessRisk(_ context.Context, _ domain.AssessRiskParams) (*d
 }
 func (s *stubStore) MarkSignificantRisk(_ context.Context, _ domain.MarkSignificantRiskParams) (*domain.RiskAssessment, error) {
 	return s.riskAssessment, s.markSigErr
+}
+func (s *stubStore) RecordRiskCoverage(_ context.Context, _ domain.RecordRiskCoverageParams) (*domain.RiskAssessment, bool, error) {
+	return s.riskAssessment, true, nil
 }
 func (s *stubStore) ApprovePlan(_ context.Context, _ domain.ApprovePlanParams) (*domain.AuditPlan, bool, error) {
 	return s.auditPlan, s.approveChanged, s.approvePlanErr
@@ -835,7 +1103,7 @@ func TestSubmitAction_IllegalTransitionEdge_NegativeControl(t *testing.T) {
 			WorkflowInstanceID: testCancelledID,
 			LegalEntityID:      "22222222-2222-4222-8222-222222222222",
 			WorkflowStatus:     "CANCELLED",
-			RowVersion:      1,
+			RowVersion:         1,
 		},
 		currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"},
 	}
@@ -939,7 +1207,7 @@ func TestGetNextApprover_NotFound(t *testing.T) {
 }
 
 func TestGetNextApprover_Found(t *testing.T) {
-	store := &stubStore{		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "PENDING", InitiatedBy: "requester-1", RowVersion: 1}, currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"}}
+	store := &stubStore{findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "PENDING", InitiatedBy: "requester-1", RowVersion: 1}, currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"}}
 	r := newTestRouter(store)
 
 	req := scopedAs(httptest.NewRequest(http.MethodGet, "/v1/workflows/"+testWorkflowID+"/next-approver", nil), "reader-1")
@@ -1017,7 +1285,7 @@ func TestCreateWorkflow_WithSubjectBinding_Success(t *testing.T) {
 			SubjectID:          &subjID,
 			SubjectVersion:     &subjVer,
 			SubjectFingerprint: &fp,
-			RowVersion:      1,
+			RowVersion:         1,
 		},
 		stages: []*domain.WorkflowStage{{WorkflowStageID: "s-1", StageOrder: 1}},
 	}
@@ -1362,5 +1630,240 @@ func TestVerifyRelease_InvalidFingerprintFormat_BadRequest(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for bad fingerprint, got %d", w.Code)
+	}
+}
+
+// TestListWorkflowDefinitions_API4Cursor proves cursor paging works.
+func TestListWorkflowDefinitions_API4Cursor(t *testing.T) {
+	defs := make([]*domain.WorkflowDefinition, 3)
+	for i := 0; i < 3; i++ {
+		defs[i] = &domain.WorkflowDefinition{
+			WorkflowDefinitionID: fmt.Sprintf("def-%d", i),
+			WorkflowType:         fmt.Sprintf("TYPE-%d", i),
+			Version:              i + 1,
+			IsActive:             true,
+			RowVersion:           1,
+		}
+	}
+
+	store := &stubStore{workflowDefinitions: defs, definitionErr: nil}
+	r := newTestRouter(store)
+
+	// Page 1
+	req := scopedAs(httptest.NewRequest(http.MethodGet, "/v1/workflow-definitions?limit=2", nil), "reader-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp1 struct {
+		Records    []*domain.WorkflowDefinition `json:"records"`
+		NextCursor string                       `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp1); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp1.Records) != 2 {
+		t.Fatalf("expected 2 records, got %d", len(resp1.Records))
+	}
+	if resp1.NextCursor == "" {
+		t.Fatalf("expected next_cursor on page 1")
+	}
+
+	// Page 2
+	req = scopedAs(httptest.NewRequest(http.MethodGet, "/v1/workflow-definitions?limit=2&cursor="+resp1.NextCursor, nil), "reader-1")
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 on page 2, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp2 struct {
+		Records    []*domain.WorkflowDefinition `json:"records"`
+		NextCursor string                       `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp2); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp2.Records) != 1 {
+		t.Fatalf("expected 1 record on page 2, got %d", len(resp2.Records))
+	}
+	if resp2.NextCursor != "" {
+		t.Fatalf("expected no next_cursor on last page")
+	}
+
+	// Verify ordering
+	if resp1.Records[0].WorkflowType != "TYPE-2" || resp1.Records[1].WorkflowType != "TYPE-1" {
+		t.Fatalf("expected DESC ordering by type, version")
+	}
+}
+
+// TestListPendingApprovals_API4Cursor proves cursor paging works for pending approvals.
+func TestListPendingApprovals_API4Cursor(t *testing.T) {
+	insts := make([]*domain.WorkflowInstance, 3)
+	for i := 0; i < 3; i++ {
+		insts[i] = &domain.WorkflowInstance{
+			WorkflowInstanceID: fmt.Sprintf("inst-%d", i),
+			WorkflowStatus:     "PENDING",
+			CurrentStage:       1,
+			RowVersion:         1,
+		}
+	}
+
+	store := &stubStore{
+		pendingApprovals:  insts,
+		pendingNextCursor: &domain.PaginationCursor{StartedAt: "2024-01-01T00:00:00Z", InstanceID: "inst-1"},
+	}
+	r := newTestRouter(store)
+
+	// Page 1
+	req := scopedAs(httptest.NewRequest(http.MethodGet, "/v1/workflows/pending?limit=2", nil), "reader-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp1 struct {
+		Records    []*domain.WorkflowInstance `json:"records"`
+		NextCursor string                     `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp1); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp1.Records) != 2 {
+		t.Fatalf("expected 2 records, got %d", len(resp1.Records))
+	}
+	if resp1.NextCursor == "" {
+		t.Fatalf("expected next_cursor on page 1")
+	}
+
+	// Page 2
+	req = scopedAs(httptest.NewRequest(http.MethodGet, "/v1/workflows/pending?limit=2&cursor="+resp1.NextCursor, nil), "reader-1")
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 on page 2, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp2 struct {
+		Records    []*domain.WorkflowInstance `json:"records"`
+		NextCursor string                     `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp2); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp2.Records) != 1 {
+		t.Fatalf("expected 1 record on page 2, got %d", len(resp2.Records))
+	}
+	if resp2.NextCursor != "" {
+		t.Fatalf("expected no next_cursor on last page")
+	}
+}
+
+// TestListPendingSubmissions_API4Cursor proves cursor paging works for form submissions.
+func TestListPendingSubmissions_API4Cursor(t *testing.T) {
+	subs := make([]*domain.FormSubmission, 3)
+	for i := 0; i < 3; i++ {
+		subs[i] = &domain.FormSubmission{
+			SubmissionID: fmt.Sprintf("sub-%d", i),
+			FormID:       "form-1",
+			Status:       "PENDING",
+		}
+	}
+
+	form := &domain.FormDefinition{
+		FormID:        "form-1",
+		TenantID:      "11111111-1111-4111-8111-111111111111",
+		LegalEntityID: "22222222-2222-4222-8222-222222222222",
+		Status:        "PUBLISHED",
+	}
+
+	store := &stubStore{
+		form:                   form,
+		pendingSubmissionsList: subs,
+	}
+	r := newTestRouter(store)
+
+	// Page 1
+	req := scopedAs(httptest.NewRequest(http.MethodGet, "/v1/forms/form-1/pending-submissions?limit=2", nil), "reader-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp1 struct {
+		Records    []*domain.FormSubmission `json:"records"`
+		NextCursor string                   `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp1); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp1.Records) != 2 {
+		t.Fatalf("expected 2 records, got %d", len(resp1.Records))
+	}
+	if resp1.NextCursor == "" {
+		t.Fatalf("expected next_cursor on page 1")
+	}
+
+	// Page 2
+	req = scopedAs(httptest.NewRequest(http.MethodGet, "/v1/forms/form-1/pending-submissions?limit=2&cursor="+resp1.NextCursor, nil), "reader-1")
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 on page 2, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp2 struct {
+		Records    []*domain.FormSubmission `json:"records"`
+		NextCursor string                   `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp2); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp2.Records) != 1 {
+		t.Fatalf("expected 1 record on page 2, got %d", len(resp2.Records))
+	}
+	if resp2.NextCursor != "" {
+		t.Fatalf("expected no next_cursor on last page")
+	}
+}
+
+// DL-2: the governance decision a workflow resolves comes from the body's
+// causation_id or X-Causation-Id; the two must agree when both are sent.
+func TestCreateWorkflow_DL2_CausationDecision(t *testing.T) {
+	withCausation := strings.Replace(validCreateBody(), `"stages"`, `"causation_id":"policy-dec-1","stages"`, 1)
+	cases := []struct {
+		name, body, header string
+		status             int
+		want               string
+	}{
+		{"header", validCreateBody(), "policy-dec-1", http.StatusCreated, "policy-dec-1"},
+		{"body", withCausation, "", http.StatusCreated, "policy-dec-1"},
+		{"both agree", withCausation, "policy-dec-1", http.StatusCreated, "policy-dec-1"},
+		{"none", validCreateBody(), "", http.StatusCreated, ""},
+		{"disagree", withCausation, "other-dec", http.StatusBadRequest, ""},
+		{"too long", validCreateBody(), strings.Repeat("x", 129), http.StatusBadRequest, ""},
+	}
+	for _, c := range cases {
+		store := &stubStore{
+			instance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "PENDING", RowVersion: 1},
+			stages:   []*domain.WorkflowStage{{WorkflowStageID: "s-1", StageOrder: 1}},
+		}
+		r := newTestRouterFull(store, &stubPublisher{}, &stubAuthz{})
+		req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows", bytes.NewBufferString(c.body)), "requester-1")
+		if c.header != "" {
+			req.Header.Set("X-Causation-Id", c.header)
+		}
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != c.status {
+			t.Fatalf("%s: status %d, want %d: %s", c.name, w.Code, c.status, w.Body.String())
+		}
+		if c.status == http.StatusCreated && store.createdParams.CausationDecisionID != c.want {
+			t.Fatalf("%s: causation %q, want %q", c.name, store.createdParams.CausationDecisionID, c.want)
+		}
 	}
 }

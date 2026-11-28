@@ -34,11 +34,11 @@ type ORGService interface {
 	// ORG-02
 	ExecuteTenantCommand(ctx context.Context, tenantID string, command domain.TenantCommand, req domain.ExecuteTenantCommandRequest) (*registry.TenantCommandResult, error)
 	ChangeDefaultLocale(ctx context.Context, tenantID string, req domain.ChangeDefaultLocaleRequest) (*domain.Tenant, error)
-	ListTenantLifecycleHistory(ctx context.Context, tenantID string) ([]*domain.TenantLifecycleEvent, error)
+	ListTenantLifecycleHistory(ctx context.Context, tenantID string, limit int, cursor string) ([]*domain.TenantLifecycleEvent, string, error)
 	GetTenantDefaults(ctx context.Context, tenantID string) (*domain.TenantDefaults, error)
 	BindTenantHost(ctx context.Context, tenantID string, req domain.BindTenantHostRequest) (*domain.TenantHostBinding, error)
 	ChangeHomeRegion(ctx context.Context, tenantID string, req domain.ChangeHomeRegionRequest) error
-	ListTenantHostBindings(ctx context.Context, tenantID string) ([]*domain.TenantHostBinding, error)
+	ListTenantHostBindings(ctx context.Context, tenantID string, limit int, cursor string) ([]*domain.TenantHostBinding, string, error)
 	ResolveTenantByHost(ctx context.Context, hostname string) (*domain.ResolvedTenantByHost, error)
 	VerifyHostTenant(ctx context.Context, hostname, claimedTenantID string) error
 
@@ -46,14 +46,14 @@ type ORGService interface {
 	AmendLegalProfile(ctx context.Context, legalEntityID string, req domain.AmendLegalProfileRequest) (*domain.LegalEntityProfileVersion, error)
 	ChangeLegalName(ctx context.Context, legalEntityID string, req domain.ChangeLegalNameRequest) (*domain.LegalEntityProfileVersion, error)
 	ChangeRegisteredOffice(ctx context.Context, legalEntityID string, req domain.ChangeRegisteredOfficeRequest) (*domain.LegalEntityProfileVersion, error)
-	ListEntityVersions(ctx context.Context, legalEntityID string) ([]*domain.LegalEntityProfileVersion, error)
+	ListEntityVersions(ctx context.Context, legalEntityID string, limit int, cursor string) ([]*domain.LegalEntityProfileVersion, string, error)
 	GetLegalEntityAsOf(ctx context.Context, legalEntityID string, asOf time.Time) (*domain.EntityAsOf, error)
 	FindByRegistryNumber(ctx context.Context, registrationNumber, jurisdictionID string) ([]*domain.LegalEntity, error)
-	ListRegistryConflicts(ctx context.Context, openOnly bool) ([]*domain.EntityRegistryConflict, error)
+	ListRegistryConflicts(ctx context.Context, openOnly bool, limit int, cursor string) ([]*domain.EntityRegistryConflict, string, error)
 	ResolveRegistryConflict(ctx context.Context, conflictID string, req domain.ResolveRegistryConflictRequest) error
 
 	// Verified maker-checker (ORG-02 §4.2, ORG-03 §4.3)
-	ListApprovalRequests(ctx context.Context, pendingOnly bool) ([]*domain.ApprovalRequest, error)
+	ListApprovalRequests(ctx context.Context, pendingOnly bool, limit int, cursor string) ([]*domain.ApprovalRequest, string, error)
 	GetApprovalRequest(ctx context.Context, id string) (*domain.ApprovalRequest, error)
 	ApproveRequest(ctx context.Context, id string, body domain.ApproveRequestBody) (*domain.ApprovalOutcome, error)
 	RejectRequest(ctx context.Context, id string, body domain.RejectRequestBody) (*domain.ApprovalRequest, error)
@@ -87,6 +87,9 @@ func registerORGRoutes(r chi.Router, h *Handler) {
 		// ── ORG-02: tenant read surfaces ────────────────────────────────────
 		r.Get("/tenants/{tenantID}/lifecycle-history", h.ListTenantLifecycleHistory)
 		r.Get("/tenants/{tenantID}/defaults", h.GetTenantDefaults)
+
+		// TER-FE-1: summary route for the console header KPIs
+		r.Get("/registry/summary", h.GetRegistrySummary)
 
 		// ── ORG-02: host bindings ───────────────────────────────────────────
 		r.Post("/tenants/{tenantID}/host-bindings", h.BindTenantHost)
@@ -184,12 +187,13 @@ func (h *Handler) ChangeDefaultLocale(w http.ResponseWriter, r *http.Request) {
 
 // ListTenantLifecycleHistory is the ORG-02 read surface of the same name.
 func (h *Handler) ListTenantLifecycleHistory(w http.ResponseWriter, r *http.Request) {
-	out, err := h.svc.ListTenantLifecycleHistory(r.Context(), chi.URLParam(r, "tenantID"))
+	limit, cursor := parseLimitCursor(r)
+	out, next, err := h.svc.ListTenantLifecycleHistory(r.Context(), chi.URLParam(r, "tenantID"), limit, cursor)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, out)
+	writePaginated(w, out, next)
 }
 
 // GetTenantDefaults is the ORG-02 read surface of the same name.
@@ -221,12 +225,13 @@ func (h *Handler) BindTenantHost(w http.ResponseWriter, r *http.Request) {
 
 // ListTenantHostBindings returns a tenant's hostnames.
 func (h *Handler) ListTenantHostBindings(w http.ResponseWriter, r *http.Request) {
-	out, err := h.svc.ListTenantHostBindings(r.Context(), chi.URLParam(r, "tenantID"))
+	limit, cursor := parseLimitCursor(r)
+	out, next, err := h.svc.ListTenantHostBindings(r.Context(), chi.URLParam(r, "tenantID"), limit, cursor)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, out)
+	writePaginated(w, out, next)
 }
 
 // ResolveTenantByHost is the ORG-02 read surface of the same name.
@@ -307,12 +312,13 @@ func (h *Handler) ChangeRegisteredOffice(w http.ResponseWriter, r *http.Request)
 
 // ListEntityVersions is the ORG-03 read surface of the same name.
 func (h *Handler) ListEntityVersions(w http.ResponseWriter, r *http.Request) {
-	out, err := h.svc.ListEntityVersions(r.Context(), chi.URLParam(r, "entityID"))
+	limit, cursor := parseLimitCursor(r)
+	out, next, err := h.svc.ListEntityVersions(r.Context(), chi.URLParam(r, "entityID"), limit, cursor)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, out)
+	writePaginated(w, out, next)
 }
 
 // GetLegalEntityAsOf is the ORG-03 read surface of the same name.
@@ -373,12 +379,13 @@ func (h *Handler) FindByRegistryNumber(w http.ResponseWriter, r *http.Request) {
 // ask with ?status=all.
 func (h *Handler) ListRegistryConflicts(w http.ResponseWriter, r *http.Request) {
 	openOnly := !strings.EqualFold(r.URL.Query().Get("status"), "all")
-	out, err := h.svc.ListRegistryConflicts(r.Context(), openOnly)
+	limit, cursor := parseLimitCursor(r)
+	out, next, err := h.svc.ListRegistryConflicts(r.Context(), openOnly, limit, cursor)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, out)
+	writePaginated(w, out, next)
 }
 
 // ResolveRegistryConflict records a human's conclusion about a conflict.
@@ -405,12 +412,13 @@ func (h *Handler) ResolveRegistryConflict(w http.ResponseWriter, r *http.Request
 // pending ones by default, everything with ?status=all.
 func (h *Handler) ListApprovalRequests(w http.ResponseWriter, r *http.Request) {
 	pendingOnly := !strings.EqualFold(r.URL.Query().Get("status"), "all")
-	out, err := h.svc.ListApprovalRequests(r.Context(), pendingOnly)
+	limit, cursor := parseLimitCursor(r)
+	out, next, err := h.svc.ListApprovalRequests(r.Context(), pendingOnly, limit, cursor)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, out)
+	writePaginated(w, out, next)
 }
 
 // GetApprovalRequest returns one approval request, including the payload and

@@ -43,9 +43,49 @@ type Config struct {
 	// local/dev/test allows.
 	TenantRegistryURL string
 
+	// EvidenceRequirementsURL is evidence-requirements-svc's base URL. Called
+	// before CLOSED transition to verify evidence sufficiency (Doc 03 §8.6).
+	// Empty disables the check, which only ENV local/dev/test allows.
+	EvidenceRequirementsURL string
+
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
+
+	// WorkflowURL is workflow-svc's base URL: waiver / not-applicable
+	// approvals are verified there and escalation cases are opened there
+	// (R-001 WFC-05, OB-S10/OB-S11). Empty refuses every waiver and leaves
+	// case requests queued in the outbox; only local/dev allows it.
+	WorkflowURL string
+
+	// CalendarTopic carries jurisdiction-rules-svc's calendar events
+	// (business-calendar.updated, jurisdiction.calendar.changed); a published
+	// correction recalculates the clocks on the older version (OB-S8). Empty
+	// disables the consumer.
+	CalendarTopic string
+
+	// ClockSweepInterval is how often the clock sweep persists computed
+	// moves and fires due milestones. Reads never wait for it (R-INV-26).
+	ClockSweepIntervalSeconds int
+
+	// ServicePrincipal is the principal system workers act as (calendar
+	// recalculation, escalation case relay); it needs the grants those calls
+	// check, by migration (rule R5).
+	ServicePrincipal string
+
+	// Decision capture (DL-5, 25 Nov 2026): evaluate and waive decisions are
+	// queued in decision_log_outbox (000017) and relayed to
+	// governance-decision-log-svc (GOVERNANCE_DECISION_LOG_MTLS_URL) as
+	// LedgerPrincipalID with this service's own workload certificate. An
+	// empty URL leaves records waiting; an empty principal queues nothing.
+	DecisionLogMTLSURL       string
+	LedgerPrincipalID        string
+	MTLSManagementServiceURL string
+	MTLSBootstrapTokenPath   string
+	LedgerRelayIntervalMS    int
+	// LedgerRelayMaxPerSecond caps deliveries (decisionledger.SetMaxPerSecond).
+	LedgerRelayMaxPerSecond int
+	LedgerRetentionHours    int
 }
 
 // DBConfig holds PostgreSQL connection parameters.
@@ -97,10 +137,22 @@ func Load() (*Config, error) {
 			GroupID: env("KAFKA_GROUP_ID", "obligations-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.obligations.events"),
 		},
-		JurisdictionRulesURL: env("JURISDICTION_RULES_URL", "http://jurisdiction-rules-svc:8082"),
-		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
-		TenantRegistryURL:    os.Getenv("TENANT_REGISTRY_URL"),
-		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		JurisdictionRulesURL:      env("JURISDICTION_RULES_URL", "http://jurisdiction-rules-svc:8082"),
+		AuthZServiceURL:           env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		TenantRegistryURL:         os.Getenv("TENANT_REGISTRY_URL"),
+		EvidenceRequirementsURL:   os.Getenv("EVIDENCE_REQUIREMENTS_URL"),
+		OTELExporterEndpoint:      env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		WorkflowURL:               os.Getenv("WORKFLOW_SERVICE_URL"),
+		CalendarTopic:             os.Getenv("KAFKA_CALENDAR_TOPIC"),
+		ClockSweepIntervalSeconds: envInt("CLOCK_SWEEP_INTERVAL_SECONDS", 60),
+		ServicePrincipal:          env("SERVICE_PRINCIPAL_ID", "svc-obligations"),
+		DecisionLogMTLSURL:        env("GOVERNANCE_DECISION_LOG_MTLS_URL", ""),
+		LedgerPrincipalID:         env("LEDGER_PRINCIPAL_ID", "svc-obligations"),
+		MTLSManagementServiceURL:  env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+		MTLSBootstrapTokenPath:    env("MTLS_BOOTSTRAP_TOKEN_PATH", ""),
+		LedgerRelayIntervalMS:     envInt("LEDGER_RELAY_INTERVAL_MS", 2000),
+		LedgerRelayMaxPerSecond:   envInt("LEDGER_RELAY_MAX_PER_SECOND", 20),
+		LedgerRetentionHours:      envInt("LEDGER_RETENTION_HOURS", 168),
 	}, nil
 }
 

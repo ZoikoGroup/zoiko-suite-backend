@@ -150,12 +150,14 @@ func (s *PgStore) RecordMateriality(ctx context.Context, p domain.RecordMaterial
 }
 
 const riskColumns = `risk_id, plan_id, engagement_id, tenant_id, description, risk_level, is_significant, status, coverage_status,
-	assessed_by_principal_id, assessed_at, created_by_principal_id, created_at, effective_from, effective_to`
+	assessed_by_principal_id, assessed_at, covered_by_workpaper_id, covered_by_principal_id, covered_at,
+	created_by_principal_id, created_at, effective_from, effective_to`
 
 func scanRisk(row pgx.Row) (*domain.RiskAssessment, error) {
 	r := &domain.RiskAssessment{}
 	err := row.Scan(&r.RiskID, &r.PlanID, &r.EngagementID, &r.TenantID, &r.Description, &r.RiskLevel, &r.IsSignificant, &r.Status, &r.CoverageStatus,
-		&r.AssessedByPrincipalID, &r.AssessedAt, &r.CreatedByPrincipalID, &r.CreatedAt, &r.EffectiveFrom, &r.EffectiveTo)
+		&r.AssessedByPrincipalID, &r.AssessedAt, &r.CoveredByWorkpaperID, &r.CoveredByPrincipalID, &r.CoveredAt,
+		&r.CreatedByPrincipalID, &r.CreatedAt, &r.EffectiveFrom, &r.EffectiveTo)
 	return r, err
 }
 
@@ -360,6 +362,60 @@ func (s *PgStore) MarkSignificantRisk(ctx context.Context, p domain.MarkSignific
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return out, nil
+}
+
+// RecordRiskCoverage marks an assessed risk COVERED by a workpaper of the same
+// engagement whose procedures executed the response (AUD-CTRL-005). The
+// workpaper must be prepared or later: a DRAFT has no executed procedures.
+// Recording the same workpaper again is a no-op; a materiality change sends
+// COVERED back to PENDING_REASSESSMENT and coverage is recorded again.
+func (s *PgStore) RecordRiskCoverage(ctx context.Context, p domain.RecordRiskCoverageParams) (*domain.RiskAssessment, bool, error) {
+	var out *domain.RiskAssessment
+	changed := false
+	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
+		risk, err := scanRisk(tx.QueryRow(ctx, `SELECT `+riskColumns+` FROM risk_assessments WHERE risk_id=$1 AND effective_to IS NULL FOR UPDATE`, p.RiskID))
+		if errors.Is(err, pgx.ErrNoRows) || errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
+			return domain.ErrAuditRiskNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if risk.CoverageStatus == domain.RiskCoverageCovered && risk.CoveredByWorkpaperID != nil && *risk.CoveredByWorkpaperID == p.WorkpaperID {
+			out = risk
+			return nil
+		}
+		if risk.Status != domain.RiskStatusAssessed || risk.CoverageStatus == domain.RiskCoverageCovered {
+			return domain.ErrAuditRiskInvalidState
+		}
+		var wpEngagement, wpStatus string
+		err = tx.QueryRow(ctx, `SELECT engagement_id, status FROM workpapers WHERE workpaper_id=$1`, p.WorkpaperID).Scan(&wpEngagement, &wpStatus)
+		if errors.Is(err, pgx.ErrNoRows) || errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
+			return domain.ErrWorkpaperNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if wpEngagement != risk.EngagementID || (wpStatus != domain.WorkpaperPrepared && wpStatus != domain.WorkpaperReviewed && wpStatus != domain.WorkpaperLocked) {
+			return domain.ErrAuditRiskCoverageWorkpaperInvalid
+		}
+		out, err = scanRisk(tx.QueryRow(ctx, `UPDATE risk_assessments
+			SET coverage_status=$1, covered_by_workpaper_id=$2, covered_by_principal_id=$3, covered_at=NOW()
+			WHERE risk_id=$4 AND effective_to IS NULL RETURNING `+riskColumns,
+			domain.RiskCoverageCovered, p.WorkpaperID, p.ActorPrincipalID, p.RiskID))
+		if err != nil {
+			return err
+		}
+		changed = true
+		return nil
+	})
+	if errors.Is(err, domain.ErrAuditRiskNotFound) || errors.Is(err, domain.ErrAuditRiskInvalidState) ||
+		errors.Is(err, domain.ErrWorkpaperNotFound) || errors.Is(err, domain.ErrAuditRiskCoverageWorkpaperInvalid) {
+		return nil, false, err
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return out, changed, nil
 }
 
 // ApprovePlan collapses the doc's own Draft→Prepared→Reviewed step into

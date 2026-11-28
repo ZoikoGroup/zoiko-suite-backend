@@ -27,14 +27,14 @@ func TestMergeRoutes_ASubjectsMergeHoldsForTheIdentitiesRoute(t *testing.T) {
 	_, err := s.MergeSubjects(ctx, "t-1", "p-a", "p-b", "p-admin", "duplicate HR import", "c1", 1)
 	require.NoError(t, err)
 
-	m, created, err := s.MergeIdentities(ctx, "t-1", "p-a", "p-b", "duplicate HR import", "p-admin", "c2", eventFn)
+	m, created, err := s.MergeIdentities(ctx, "t-1", "p-a", "p-b", "duplicate HR import", "p-admin", "c2", 1, eventFn)
 	require.NoError(t, err, "the same merge asked again by the other route is a replay")
 	assert.False(t, created)
 	assert.Equal(t, "p-a", m.SurvivorID)
 	assert.Equal(t, "p-b", m.DuplicateID)
 	assert.Empty(t, m.LinkOutcomes)
 
-	_, _, err = s.MergeIdentities(ctx, "t-1", "p-c", "p-b", "again", "p-admin", "c3", eventFn)
+	_, _, err = s.MergeIdentities(ctx, "t-1", "p-c", "p-b", "again", "p-admin", "c3", 1, eventFn)
 	assert.ErrorIs(t, err, store.ErrMergeConflict, "p-b was merged into p-a already")
 
 	into, err := s.MergedInto(ctx, "t-1", "p-b")
@@ -57,7 +57,7 @@ func TestMergeRoutes_AnIdentitiesMergeHoldsForTheSubjectsRoute(t *testing.T) {
 	for _, id := range []string{"p-a", "p-b", "p-c"} {
 		insertPrincipal(t, ctx, pool, id, "t-1", "idp|"+id, "ACTIVE")
 	}
-	_, created, err := s.MergeIdentities(ctx, "t-1", "p-a", "p-b", "duplicate HR import", "p-admin", "c1", eventFn)
+	_, created, err := s.MergeIdentities(ctx, "t-1", "p-a", "p-b", "duplicate HR import", "p-admin", "c1", 1, eventFn)
 	require.NoError(t, err)
 	require.True(t, created)
 

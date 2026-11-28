@@ -33,6 +33,9 @@ func baseEnv(t *testing.T) {
 	t.Setenv("OIDC_ISSUER", "https://auth.example.com")
 	t.Setenv("CURSOR_SIGNING_KEY_HEX", "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
 	t.Setenv("COMMERCIAL_ACCOUNT_URL", "http://commercial-account-svc:8144")
+	t.Setenv("IDP_CLIENT_AUTH", "required")
+	t.Setenv("IDP_CLIENT_SECRETS_FILE", "/fake/secrets.json")
+	t.Setenv("IDP_CLIENT_CHANNELS", "zoiko-console=web")
 }
 
 func TestAuthzEnvDefaultsToTheDeploymentEnvironment(t *testing.T) {

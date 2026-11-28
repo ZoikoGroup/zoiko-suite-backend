@@ -6,118 +6,198 @@ import (
 )
 
 var (
-	ErrExceptionCaseNotFound = errors.New("exception case not found")
-	ErrCaseAlreadyClosed     = errors.New("exception case is already closed")
-	ErrEscalationNotFound    = errors.New("escalation record not found")
+	ErrExceptionCaseNotFound   = errors.New("exception_case not found")
+	ErrEscalationRecordNotFound = errors.New("escalation_record not found")
+	ErrTenantMissing           = errors.New("tenant scope missing")
+	ErrVersionMismatch         = errors.New("version mismatch")
+	ErrCaseAlreadyClosed       = errors.New("exception case is already closed")
 
-	// ErrTenantMissing means the request carried no X-Tenant-Id. It is an
-	// unauthenticated request, not an empty tenant named "default".
-	ErrTenantMissing = errors.New("tenant scope missing")
-
-	// ErrSelfApprovalNotAllowed enforces the platform's Segregation of Duties
-	// doctrine (docs/original_doc/zoiko_suite_doc1.txt §12.3): the principal
-	// who created a record may not be the same principal who approves,
-	// executes, or resolves it.
+	// ErrSelfApprovalNotAllowed enforces Segregation of Duties
 	ErrSelfApprovalNotAllowed = errors.New("principal may not approve or decide on their own submission")
-
-	// ErrActorRequired is a write that reached the store without the
-	// gateway-verified principal that performs it.
-	ErrActorRequired = errors.New("acting principal is required")
 )
 
+// ExceptionType represents the exception type per Doc 04 §13.1
+type ExceptionType string
+
+const (
+	ExceptionTypeMissedDeadline     ExceptionType = "MISSED_DEADLINE"
+	ExceptionTypeInsufficientEvidence ExceptionType = "INSUFFICIENT_EVIDENCE"
+	ExceptionTypeRuleConflict       ExceptionType = "RULE_CONFLICT"
+	ExceptionTypeJurisdictionChange ExceptionType = "JURISDICTION_CHANGE"
+	ExceptionTypeDataQuality        ExceptionType = "DATA_QUALITY"
+)
+
+// SeverityLevel represents the severity level per Doc 04 §13.1
 type SeverityLevel string
 
 const (
-	SeverityLow      SeverityLevel = "LOW"
-	SeverityMedium   SeverityLevel = "MEDIUM"
-	SeverityHigh     SeverityLevel = "HIGH"
 	SeverityCritical SeverityLevel = "CRITICAL"
+	SeverityHigh     SeverityLevel = "HIGH"
+	SeverityMedium   SeverityLevel = "MEDIUM"
+	SeverityLow      SeverityLevel = "LOW"
 )
 
+// LinkedObjectType represents the linked object type per Doc 04 §13.1
+type LinkedObjectType string
+
+const (
+	LinkedObjectObligation  LinkedObjectType = "OBLIGATION"
+	LinkedObjectFiling      LinkedObjectType = "FILING"
+	LinkedObjectPolicy      LinkedObjectType = "POLICY"
+	LinkedObjectContract    LinkedObjectType = "CONTRACT"
+)
+
+// CaseStatus represents the case status per Doc 04 §13.1
 type CaseStatus string
 
 const (
-	CaseOpen               CaseStatus = "OPEN"
-	CaseUnderInvestigation CaseStatus = "UNDER_INVESTIGATION"
-	CaseEscalated          CaseStatus = "ESCALATED"
-	CaseResolved           CaseStatus = "RESOLVED"
-	CaseClosed             CaseStatus = "CLOSED"
+	CaseStatusOpen         CaseStatus = "OPEN"
+	CaseStatusInvestigating CaseStatus = "INVESTIGATING"
+	CaseStatusResolved     CaseStatus = "RESOLVED"
+	CaseStatusEscalated    CaseStatus = "ESCALATED"
+	CaseStatusClosed       CaseStatus = "CLOSED"
 )
 
+// EscalationStatus represents the escalation status per Doc 04 §13.1
 type EscalationStatus string
 
 const (
-	EscalationPending  EscalationStatus = "PENDING"
-	EscalationAccepted EscalationStatus = "ACCEPTED"
-	EscalationActioned EscalationStatus = "ACTIONED"
-	EscalationRejected EscalationStatus = "REJECTED"
+	EscalationStatusPending      EscalationStatus = "PENDING"
+	EscalationStatusAcknowledged EscalationStatus = "ACKNOWLEDGED"
+	EscalationStatusResolved     EscalationStatus = "RESOLVED"
+	EscalationStatusExpired      EscalationStatus = "EXPIRED"
 )
 
-// ExceptionCase represents a governed compliance exception linked to a material object.
+// ExceptionCase represents the exception case per Doc 04 §13.1
 type ExceptionCase struct {
-	ExceptionCaseID  string        `json:"exception_case_id"`
-	TenantID         string        `json:"tenant_id"`
-	LegalEntityID    string        `json:"legal_entity_id"`
-	JurisdictionID   string        `json:"jurisdiction_id"`
-	ExceptionType    string        `json:"exception_type"`
-	SeverityLevel    SeverityLevel `json:"severity_level"`
-	LinkedObjectType string        `json:"linked_object_type"`
-	LinkedObjectID   string        `json:"linked_object_id"`
-	Description      string        `json:"description"`
-	CaseStatus       CaseStatus    `json:"case_status"`
-	AssignedToRole   string        `json:"assigned_to_role,omitempty"`
-	AssignedToUser   string        `json:"assigned_to_user,omitempty"`
-	EscalatedAt      *time.Time    `json:"escalated_at,omitempty"`
-	ClosedAt         *time.Time    `json:"closed_at,omitempty"`
-	ClosedBy         string        `json:"closed_by,omitempty"`
-	ClosureReason    string        `json:"closure_reason,omitempty"`
-	CreatedBy        string        `json:"created_by"`
-	CreatedAt        time.Time     `json:"created_at"`
-	UpdatedAt        time.Time     `json:"updated_at"`
-
-	Escalations []EscalationRecord `json:"escalations,omitempty"`
+	ExceptionCaseID   string        `json:"exception_case_id"`
+	TenantID          string        `json:"tenant_id"`
+	LegalEntityID     string        `json:"legal_entity_id"`
+	ExceptionType     ExceptionType `json:"exception_type"`
+	SeverityLevel     SeverityLevel `json:"severity_level"`
+	LinkedObjectType  LinkedObjectType `json:"linked_object_type"`
+	LinkedObjectID    string        `json:"linked_object_id"`
+	CaseStatus        CaseStatus    `json:"case_status"`
+	AssignedToRole    string        `json:"assigned_to_role,omitempty"`
+	AssignedToUser    string        `json:"assigned_to_user,omitempty"`
+	EscalatedAt       *time.Time    `json:"escalated_at,omitempty"`
+	CreatedAt         time.Time     `json:"created_at"`
+	CreatedByPrincipalID string     `json:"created_by_principal_id"`
+	UpdatedAt         time.Time     `json:"updated_at"`
+	Version           int           `json:"version"`
 }
 
-// EscalationRecord represents a specific escalation action step taken on an exception case.
+// EscalationRecord represents the escalation record per Doc 04 §13.1
 type EscalationRecord struct {
-	EscalationRecordID string           `json:"escalation_record_id"`
-	TenantID           string           `json:"tenant_id"`
-	ExceptionCaseID    string           `json:"exception_case_id"`
-	EscalatedToRole    string           `json:"escalated_to_role"`
-	EscalatedToUser    string           `json:"escalated_to_user,omitempty"`
-	EscalationReason   string           `json:"escalation_reason"`
-	EscalationStatus   EscalationStatus `json:"escalation_status"`
-	EscalatedBy        string           `json:"escalated_by"`
-	EscalatedAt        time.Time        `json:"escalated_at"`
-	ResolvedAt         *time.Time       `json:"resolved_at,omitempty"`
-	ResponseNotes      string           `json:"response_notes,omitempty"`
-	CreatedAt          time.Time        `json:"created_at"`
-	UpdatedAt          time.Time        `json:"updated_at"`
+	EscalationRecordID  string           `json:"escalation_record_id"`
+	ExceptionCaseID     string           `json:"exception_case_id"`
+	EscalatedToRole     string           `json:"escalated_to_role"`
+	EscalationReason    string           `json:"escalation_reason"`
+	EscalationStatus    EscalationStatus `json:"escalation_status"`
+	EscalatedAt         time.Time        `json:"escalated_at"`
+	CreatedAt           time.Time        `json:"created_at"`
+	CreatedByPrincipalID string          `json:"created_by_principal_id"`
 }
 
-// CreateExceptionRequest is the payload to open a new exception case.
-type CreateExceptionRequest struct {
-	LegalEntityID    string        `json:"legal_entity_id"`
-	JurisdictionID   string        `json:"jurisdiction_id"`
-	ExceptionType    string        `json:"exception_type"`
-	SeverityLevel    SeverityLevel `json:"severity_level"`
-	LinkedObjectType string        `json:"linked_object_type"`
-	LinkedObjectID   string        `json:"linked_object_id"`
-	Description      string        `json:"description"`
-	AssignedToRole   string        `json:"assigned_to_role,omitempty"`
-	CreatedBy        string        `json:"created_by"`
+// CreateExceptionCaseParams holds input parameters for creating an exception case
+type CreateExceptionCaseParams struct {
+	ExceptionCaseID        string
+	TenantID               string
+	LegalEntityID          string
+	ExceptionType          ExceptionType
+	SeverityLevel          SeverityLevel
+	LinkedObjectType       LinkedObjectType
+	LinkedObjectID         string
+	AssignedToRole         string
+	AssignedToUser         string
+	CreatedByPrincipalID   string
+	CorrelationID          string
 }
 
-// EscalateCaseRequest is the payload to escalate an exception case.
-type EscalateCaseRequest struct {
-	EscalatedToRole  string `json:"escalated_to_role"`
-	EscalatedToUser  string `json:"escalated_to_user,omitempty"`
-	EscalationReason string `json:"escalation_reason"`
-	EscalatedBy      string `json:"escalated_by"`
+// UpdateExceptionCaseStatusParams holds input parameters for updating exception case status
+type UpdateExceptionCaseStatusParams struct {
+	CaseStatus     CaseStatus
+	ExpectedVersion int
 }
 
-// ResolveCaseRequest is the payload to resolve and close an exception case.
-type ResolveCaseRequest struct {
-	ClosedBy      string `json:"closed_by"`
-	ClosureReason string `json:"closure_reason"`
+// CreateEscalationRecordParams holds input parameters for creating an escalation record
+type CreateEscalationRecordParams struct {
+	EscalationRecordID     string
+	ExceptionCaseID        string
+	EscalatedToRole        string
+	EscalationReason       string
+	CreatedByPrincipalID   string
+	CorrelationID          string
+}
+
+// ListExceptionCasesFilter holds optional filters for querying exception cases
+type ListExceptionCasesFilter struct {
+	TenantID       string
+	LegalEntityID  string
+	ExceptionType  ExceptionType
+	CaseStatus     CaseStatus
+	SeverityLevel  SeverityLevel
+	AssignedToUser string
+	Limit          int
+	Offset         int
+}
+
+// ListEscalationRecordsFilter holds optional filters for querying escalation records
+type ListEscalationRecordsFilter struct {
+	ExceptionCaseID string
+	EscalatedToRole string
+	EscalationStatus EscalationStatus
+	Limit           int
+	Offset          int
+}
+
+// IsValidExceptionType checks if the exception type is valid
+func IsValidExceptionType(t ExceptionType) bool {
+	switch t {
+	case ExceptionTypeMissedDeadline, ExceptionTypeInsufficientEvidence, ExceptionTypeRuleConflict,
+		ExceptionTypeJurisdictionChange, ExceptionTypeDataQuality:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsValidSeverityLevel checks if the severity level is valid
+func IsValidSeverityLevel(s SeverityLevel) bool {
+	switch s {
+	case SeverityCritical, SeverityHigh, SeverityMedium, SeverityLow:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsValidLinkedObjectType checks if the linked object type is valid
+func IsValidLinkedObjectType(t LinkedObjectType) bool {
+	switch t {
+	case LinkedObjectObligation, LinkedObjectFiling, LinkedObjectPolicy, LinkedObjectContract:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsValidCaseStatus checks if the case status is valid
+func IsValidCaseStatus(s CaseStatus) bool {
+	switch s {
+	case CaseStatusOpen, CaseStatusInvestigating, CaseStatusResolved, CaseStatusEscalated, CaseStatusClosed:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsValidEscalationStatus checks if the escalation status is valid
+func IsValidEscalationStatus(s EscalationStatus) bool {
+	switch s {
+	case EscalationStatusPending, EscalationStatusAcknowledged, EscalationStatusResolved, EscalationStatusExpired:
+		return true
+	default:
+		return false
+	}
 }

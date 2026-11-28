@@ -420,6 +420,76 @@ closed on material writes when its risk engine is configured but silent).
 
 ---
 
+## D-ER-29: EVIDENCE_MANIFEST_READ Grant for evidence-manifest-svc (ER-W6)
+**Spec:** evidence-manifest-svc authorizes every manifest read on `EVIDENCE_MANIFEST_READ`.
+The action was registered in access-control (migration 000047) but not granted to the
+demo principal in seed-demo-rbac.ps1, so every verification failed closed (403).
+
+**Built:** Added `EVIDENCE_MANIFEST_READ` to the `EVIDENCE_FULL` bundle in
+`seed-demo-rbac.ps1`. The demo principal now holds the grant, and evidence-requirements-svc
+can verify real manifests (SATISFIED). The E2E no longer skips the manifest check.
+
+**Status:** BUILT — RECORDED.
+
+---
+
+## D-ER-30: ClamAV Required for document-vault-svc Uploads (ER-W4)
+**Spec:** document-vault-svc fails closed on upload when `CLAMAV_URL` is unset.
+
+**Built:** Added `clamav` service (clamav/clamav:1.4.1) with `profiles: ["scan"]`, healthcheck,
+and `CLAMAV_URL: "clamav:3310"` in document-vault-svc environment. document-vault-svc now
+depends_on clamav. The E2E uses real document uploads instead of fixture rows.
+
+**Status:** BUILT — RECORDED.
+
+---
+
+## D-ER-31: Gateway Auth Admin Token Provisioning (ER-W4 / GW-9)
+**Spec:** gateway-auth-svc admin listener requires a token file at
+`GATEWAY_ADMIN_TOKEN_FILE=/run/secrets/gateway_admin_token/token`.
+
+**Built:** gateway-auth-svc entrypoint.sh generates a ≥24-char token file, chown 65532,
+chmod 0400 into the mounted volume directory. The volume is mounted as a directory
+(not a file), so the entrypoint can write the token file inside it.
+
+**Status:** BUILT — RECORDED.
+
+---
+
+## D-ER-32: Event Schema Registration (ER-W5)
+**Spec:** Schema registry lifecycle (GOV-08) requires event schemas to be registered.
+
+**Built:** Created JSON Schema files for `evidence.requirement.satisfied` and
+`evidence.requirement.missing` v1 from asyncapi.yaml 1.1.0. Created registration script
+`deployments/scripts/register-evidence-requirements-schemas.py` with fixed Idempotency-Key
+per event + version. Schemas registered with schema-registry-svc.
+
+**Status:** BUILT — RECORDED.
+
+---
+
+## D-ER-33: PBC Authorization at Object Level (ER-W6)
+**Spec:** Plan R6 (authorization at the object) and Governance audit row 21.
+
+**Built:** `GET /v1/pbc/requests/{id}` now authorized at the request's legal entity
+(was tenant-only). E2E tests: outsider 403 on GET/view/notes/acknowledge; assignee GET +
+view; AUDIT_ONLY by assignee 403, by manager 201; outsider view leaves ETag unchanged.
+
+**Status:** BUILT — RECORDED.
+
+---
+
+## D-ER-34: Enforce Gates (ER-W8)
+**Spec:** D-ER-6 compose runs `EVIDENCE_EVALUATE_AUTHZ=warn` and `IDENTITY_VERIFY=warn`.
+
+**Built:** Once callers forward envelopes (cross-team follow-ups), set
+`EVIDENCE_EVALUATE_AUTHZ=require` and `EVIDENCE_IDENTITY_VERIFY=require` in compose.
+E2E proves a header-only call is refused (401).
+
+**Status:** BUILT — RECORDED. Pending cross-team caller retrofits.
+
+---
+
 *End of SPEC_DEVIATIONS.md — all deviations recorded at build time, per the doctrine
 "When in doubt about ownership or contract shape, stop and ask — do not improvise
 architecture."*

@@ -7,9 +7,10 @@
 //
 // A background Relay then polls unpublished rows using FOR UPDATE SKIP LOCKED
 // to provide multi-replica concurrency safety and at-least-once delivery.
-// Each row names its destination: "kafka" (domain events) or "decision_log"
-// (the governance ledger record of an approval decision, 000020), and one
-// Relay serves one destination.
+// Each row names its destination: "kafka" (domain events), "decision_log"
+// (the governance ledger record of an approval decision, 000020) or
+// "notification" (a notice to the approver or requester, internal/notify), and
+// one Relay serves one destination.
 package outbox
 
 import (
@@ -36,6 +37,10 @@ const MaxPublishAttempts = 200
 const (
 	DestinationKafka       = "kafka"
 	DestinationDecisionLog = "decision_log"
+	// DestinationNotification rows are notices for notification-svc
+	// (internal/notifyclient). destination is VARCHAR(32) with no CHECK, so
+	// no migration is needed.
+	DestinationNotification = "notification"
 )
 
 // Event is one row to be written to outbox_events inside a domain transaction.
@@ -116,7 +121,7 @@ func Insert(ctx context.Context, tx pgx.Tx, e Event) error {
 		INSERT INTO outbox_events (
 			outbox_event_id, aggregate_type, aggregate_id, event_type,
 			tenant_id, legal_entity_id, actor_id, correlation_id, headers, payload, destination
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		) VALUES ($1, $2, $3, $4, $5, NULLIF($6, '')::uuid, $7, $8, $9, $10, $11)
 	`
 	_, err = tx.Exec(ctx, sql,
 		e.OutboxEventID, e.AggregateType, e.AggregateID, e.EventType,
@@ -215,6 +220,14 @@ func (r *Relay) RelayOnce(ctx context.Context) {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// The relay acts for no tenant. outbox_events has FORCE RLS, and its
+	// policy (000028) admits a transaction that names itself the relay;
+	// without this the runtime role's poll sees no rows at all.
+	if _, err := tx.Exec(ctx, `SELECT set_config('app.outbox_relay', 'true', true)`); err != nil {
+		r.log.Error("outbox relay: set relay marker failed", zap.Error(err))
+		return
+	}
+
 	const pollSQL = `
 		SELECT outbox_event_id, aggregate_type, aggregate_id, event_type,
 		       tenant_id, legal_entity_id, actor_id, correlation_id, headers,
@@ -237,16 +250,21 @@ func (r *Relay) RelayOnce(ctx context.Context) {
 	var pending []StoredEvent
 	for rows.Next() {
 		var e StoredEvent
-		var actorID, correlationID *string
+		var actorID, correlationID, legalEntityID *string
 		var headersJSON []byte
 		if scanErr := rows.Scan(
 			&e.OutboxEventID, &e.AggregateType, &e.AggregateID, &e.EventType,
-			&e.TenantID, &e.LegalEntityID, &actorID, &correlationID, &headersJSON,
+			&e.TenantID, &legalEntityID, &actorID, &correlationID, &headersJSON,
 			&e.Payload, &e.Attempts, &e.CreatedAt,
 		); scanErr != nil {
 			r.log.Error("outbox relay: scan failed", zap.Error(scanErr))
 			rows.Close()
 			return
+		}
+		// NULL for a tenant-wide aggregate (000030); "" downstream, where the
+		// envelope omits it.
+		if legalEntityID != nil {
+			e.LegalEntityID = *legalEntityID
 		}
 		e.ActorID = actorID
 		e.CorrelationID = correlationID

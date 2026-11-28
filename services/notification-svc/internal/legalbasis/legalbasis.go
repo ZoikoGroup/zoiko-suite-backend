@@ -63,6 +63,19 @@ func NewClient(baseURL, principal string, timeout time.Duration, log *zap.Logger
 	return &Client{baseURL: strings.TrimRight(baseURL, "/"), principal: principal, http: &http.Client{Timeout: timeout}, log: log}
 }
 
+// NewClientWithHTTPClient is NewClient over a given HTTP client: the mTLS
+// client that presents this service's workload certificate to policy-svc's
+// peer listener (:8449). A system caller has no person's signed envelope to
+// forward, so once policy-svc enforces identity (POLICY_IDENTITY_VERIFY) the
+// certificate is what vouches for X-Principal-Id; bare headers are refused.
+func NewClientWithHTTPClient(baseURL, principal string, hc *http.Client, log *zap.Logger) *Client {
+	c := NewClient(baseURL, principal, 0, log)
+	if hc != nil {
+		c.http = hc
+	}
+	return c
+}
+
 func (c *Client) get(ctx context.Context, tenantID, correlationID, path string, out any) (int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
 	if err != nil {

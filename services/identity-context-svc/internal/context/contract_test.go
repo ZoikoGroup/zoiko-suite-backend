@@ -142,8 +142,16 @@ func TestEveryRouteIsInThePublishedContract(t *testing.T) {
 	require.GreaterOrEqual(t, len(routes), 12,
 		"the route walk found too few routes to be checking anything")
 
+	// Internal endpoints not published in openapi.yaml (service-to-service only).
+	internalOnly := map[string]bool{
+		"POST /v1/internal/revocation/verify": true, // IAM-8: gateway-auth-svc calls this
+	}
+
 	var undocumented []string
 	for route := range routes {
+		if internalOnly[route] {
+			continue
+		}
 		if !specPaths[normaliseParams(route)] {
 			undocumented = append(undocumented, route)
 		}
@@ -190,6 +198,8 @@ func TestEveryContractPathIsServed(t *testing.T) {
 		"POST /oauth2/logout":                         true,
 		"POST /v1/logout":                             true,
 		"POST /v1/context/session/introspect":         true,
+		// Internal: revocation SLO (IAM-8) — called by gateway-auth-svc /verify.
+		"POST /v1/internal/revocation/verify":       true,
 	}
 
 	var unserved []string

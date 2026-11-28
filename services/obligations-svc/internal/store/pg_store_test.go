@@ -116,15 +116,15 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 		}
 	}
 
-	// Every table any migration creates must be dropped first, or the second
-	// test in a run replays a CREATE TABLE against one that already exists.
-	// The list is discovered from the migrations for the same reason they are:
-	// a hand-kept list missed applicability_decisions, and later
-	// idempotency_keys and event_outbox (000009/000010), failing every test
-	// after the first.
-	if _, err := pool.Exec(ctx, "DROP TABLE IF EXISTS "+strings.Join(tables, ", ")+" CASCADE;"); err != nil {
-		t.Fatalf("failed to drop tables %v: %v", tables, err)
+	// Start from an empty schema: dropping the whole public schema (not a
+	// list of tables) also removes the functions, triggers and policies
+	// migrations create, so every test replays the migrations against the
+	// schema a fresh database has (WF-S0a lesson: a hand-kept list missed
+	// tables and failed every test after the first).
+	if _, err := pool.Exec(ctx, "DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO public;"); err != nil {
+		t.Fatalf("failed to reset schema: %v", err)
 	}
+	_ = tables
 
 	for i, path := range migrations {
 		if _, err := pool.Exec(ctx, scripts[i]); err != nil {
@@ -370,7 +370,7 @@ func TestPgStore_FilingRequirement_CreateAndList(t *testing.T) {
 		t.Errorf("expected default filing_status PENDING, got %s", f.FilingStatus)
 	}
 
-	list, err := s.ListFilingRequirements(ctx, o.ObligationID, 0)
+	list, err := s.ListFilingRequirements(ctx, domain.ListFilingRequirementsFilter{ObligationID: o.ObligationID})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

@@ -320,7 +320,7 @@ func (s *Service) readGraph(ctx context.Context, entityID string, asOf time.Time
 	if err != nil {
 		return nil, false, err
 	}
-	rels, err := s.store.ListOwnershipInForceAt(ctx, asOf)
+	rels, _, err := s.store.ListOwnershipInForceAt(ctx, asOf, 1000, "")
 	if err != nil {
 		return nil, false, fmt.Errorf("store.ListOwnershipInForceAt: %w", err)
 	}

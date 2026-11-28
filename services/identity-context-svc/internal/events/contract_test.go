@@ -112,12 +112,16 @@ func producedEventTypes() []string {
 		// and DecideReset).
 		events.EventPasswordResetRequest,
 		events.EventPasswordResetDecided,
-		// Not listed: EventSubjectInvited, EventIdPRegistered,
-		// EventIdPStatusChanged, EventFederatedLogin, EventGroupMappingProposed,
-		// EventGroupMappingDecided, EventGroupMembershipChange and
-		// EventSCIMConnectionCreated are declared in publisher.go but nothing
-		// emits them (federation emits FederationEventTypes instead). Add each
-		// here, with its asyncapi.yaml message, when code starts emitting it.
+		events.EventPasswordResetExpired,
+		// D1-1.F22 (23 Nov 2026): identity.subject.invited, identity.idp.registered,
+		// identity.idp.status_changed, identity.federation.login and
+		// identity.group_role_mapping.proposed were declared "reserved" with no
+		// producer, which let TestEveryPublishedContractEventIsProduced pass for
+		// events nothing emits. They are out of the contract until a producer exists.
+		// EventSubjectInvited, EventIdPRegistered, EventIdPStatusChanged,
+		// EventFederatedLogin, EventGroupMappingProposed, EventGroupMappingDecided,
+		// EventGroupMembershipChange, EventSCIMConnectionCreated,
+		// EventSCIMSyncCompleted were declared but never emitted — removed.
 	}, events.FederationEventTypes()...)
 }
 

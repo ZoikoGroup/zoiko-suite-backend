@@ -14,7 +14,7 @@ A certificate listing only successes certifies nothing, so the last sections say
 | Queries: GetTask, ListQueue, GetCase, GetSLAState, GetLinkedObjectStatus, GetHistory | All routed | same |
 | Lifecycle New -> Assigned -> In Progress -> Blocked/Escalated -> Completed -> Closed; Reopened governed | State edges enforced in the store; the database CHECK constrains status *values* only, not edges | `internal/store/task_store.go`, migration 000003 |
 | Append-only history | `task_transitions` rows written in the same transaction as each change; update/delete refused by trigger | migration 000003 |
-| Events (6) | `task.created`, `task.assigned`, `task.escalated`, `task.completed`, `task.reopened` and `case.closed` are written to the shared eventing outbox in the same transaction as the change, as `com.zoikosuite.business.task.created`, `assigned`, `escalated`, `completed`, `reopened` and `com.zoikosuite.business.case.closed`, with payload schemas in `contracts/events` enforced by the store tests. Catalogue: `task.created`, `task.completed` and `case.closed` were already section 19 entries with the unowned producers "Task Service" and "Case Service", now mapped to this service; `assigned`, `escalated` and `reopened` are new extension entries. Starting, blocking and cancelling a task write no event, as before | `internal/store/task_events.go`, `contracts/events` |
+| Events (6) | `task.created`, `task.assigned`, `task.escalated`, `task.completed`, `task.reopened`, `case.closed` | handler |
 | Failure: SLA clock failure never silently closes/escalates | SLA state is computed at read time; nothing auto-transitions | `GetSLAState` |
 | Failure: linked-domain failure surfaced distinctly | `GetLinkedObjectStatus` is a passthrough that reports `tracked: false`; no live lookup | `GetLinkedObjectStatus` |
 | Authorization / SoD: assignee/team + supervisor | **Not implemented** — any holder of `TASK_MANAGE` can assign/start/block/escalate any task in the entity; `TASK_CLOSE` gates complete and case close; no assignee check | handler |
@@ -56,12 +56,6 @@ new BIZ-05 tests                 3/3 pass as a NOSUPERUSER NOBYPASSRLS role
 - No real authorization-svc, Kafka or docker-compose stack.
 - Events are published **after** the database commit and a failure is only logged (not via a transactional outbox), so an event can be lost on a crash between commit and publish. Not changed here.
 
-## Event migration (after the audit)
-
-- The handler used to publish these six events after the commit and only log a failure, so a broker problem lost them silently. They are now enqueued in the same transaction as the change and the transition row, on the same shared eventing outbox, relay, region setting and Docker context the BIZ-08 deadline events already use. A refused command writes no event; a failed enqueue rolls the change back (tested). The handler no longer publishes them.
-- Verified: full suite passes against Postgres 16; a deliberately broken schema fails the store test. Not verified: delivery through a real Kafka broker.
-- The exception-case and audit-finding events of this service still use the direct publisher.
-
 ## Open items
 
 1. Assignee/supervisor separation of duties and sensitive-purpose restrictions: policy decisions.
@@ -69,5 +63,5 @@ new BIZ-05 tests                 3/3 pass as a NOSUPERUSER NOBYPASSRLS role
 3. Add this service to CI (build, vet and database tests) so these tests stop being invisible.
 4. OpenAPI contract and event contract for BIZ-05.
 5. Database trigger for task status edges (the CHECK allows any value-to-value change by direct SQL).
-6. ~~Move task and case events to the transactional outbox.~~ Done (see "Event migration"). Still to do: the section 19 entry `business.case.opened` (producer "Case Service") has no emitter, because `CreateCase` publishes nothing.
+6. Move task and case events to the transactional outbox.
 7. Classification / retention policy for tasks and cases.

@@ -163,7 +163,12 @@ func (m *mockRows) Scan(dest ...any) error {
 	*(dest[2].(*string)) = row.aggID
 	*(dest[3].(*string)) = row.eventType
 	*(dest[4].(*string)) = row.tenantID
-	*(dest[5].(*string)) = row.entityID
+	if row.entityID == "" {
+		*(dest[5].(**string)) = nil
+	} else {
+		entityID := row.entityID
+		*(dest[5].(**string)) = &entityID
+	}
 	*(dest[6].(**string)) = row.actorID
 	*(dest[7].(**string)) = row.corrID
 	*(dest[8].(*[]byte)) = row.headersJSON

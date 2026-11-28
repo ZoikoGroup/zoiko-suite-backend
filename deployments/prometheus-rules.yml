@@ -1126,6 +1126,44 @@ groups:
             Determinations are recorded but their evidence.requirement.* events are waiting in the outbox. Check Kafka and the
             outbox worker's log (outbox: failed to publish). Rows are retried every 5 seconds; nothing is lost.
 
+  # obligations-svc WFC-05 deadline clocks (R-001 s12.1; tracker OB-S13). The
+  # metrics are emitted by internal/telemetry; a clock's state is computed at
+  # read time, so a stalled sweep never hides an overdue clock from a reader.
+  - name: obligations
+    rules:
+      - alert: ObligationClocksOverdue
+        expr: sum by (clock_class, jurisdiction) (obligation_clocks_overdue{service="obligations-svc", clock_class=~"HARD_LEGAL|REGULATORY"}) > 0
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "obligations-svc: {{ $value }} {{ $labels.clock_class }} clocks in {{ $labels.jurisdiction }} are past due"
+          description: >-
+            Statutory or regulatory deadlines have passed without fulfilment, waiver or a not-applicable decision. Open the
+            Obligations console (Deadline clocks, filter OVERDUE) and work the escalation cases opened for them.
+
+      - alert: ObligationClockSweepLagging
+        expr: obligation_clock_sweep_lag_seconds{service="obligations-svc"} > 900
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "obligations-svc: the clock sweep is {{ $value }}s behind"
+          description: >-
+            Overdue clocks read OVERDUE (state is computed at read time) but their obligation.clock.overdue events and
+            escalation milestones wait for the sweep. Check the clock worker's log ("clock sweep") and the database.
+
+      - alert: ObligationEscalationFailures
+        expr: increase(obligation_escalation_failures_total{service="obligations-svc"}[15m]) > 0
+        for: 0m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "obligations-svc: {{ $value }} escalation actions failed ({{ $labels.action }})"
+          description: >-
+            An OPEN_CASE request was refused by workflow-svc or a milestone failed to fire. Case requests stay in the outbox
+            (destination WORKFLOW_CASE) and are retried with backoff; check workflow-svc and the svc-obligations grants.
+
   # authorization-svc (ZS-IAM-001 §26). Every metric below is emitted by
   # internal/telemetry/authz.go; none of it is authority — alerts point at
   # something to look at, the decision path never reads them.

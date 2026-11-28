@@ -25,6 +25,9 @@ import (
 // stubStore implements handler.ConfigStore for unit testing.
 // No DB, no network — purely in-memory.
 type stubStore struct {
+	// gotPrecondition is the API-3 precondition the handler handed the store
+	// on the request context (nil: none).
+	gotPrecondition *domain.Precondition
 	configEntry        *domain.ConfigEntry
 	configEntryCreated bool
 	configEntryErr     error
@@ -153,7 +156,8 @@ func (s *stubStore) RetireFlag(_ context.Context, params domain.RetireFlagParams
 	return s.retirement, s.retireErr
 }
 
-func (s *stubStore) MarkFlagRemoved(_ context.Context, params store.MarkFlagRemovedParams) (*domain.FlagRetirement, error) {
+func (s *stubStore) MarkFlagRemoved(ctx context.Context, params store.MarkFlagRemovedParams) (*domain.FlagRetirement, error) {
+	s.capturePrecondition(ctx)
 	s.gotRemoval = params
 	return s.retirement, s.retireErr
 }
@@ -167,7 +171,8 @@ func (s *stubStore) CreateKillSwitch(_ context.Context, params domain.CreateKill
 	return s.killSwitch, s.killSwitchErr
 }
 
-func (s *stubStore) RollbackChange(_ context.Context, changeID, _, _, _ string) (*domain.ConfigChange, error) {
+func (s *stubStore) RollbackChange(ctx context.Context, changeID, _, _, _ string) (*domain.ConfigChange, error) {
+	s.capturePrecondition(ctx)
 	s.rollbackOf = changeID
 	return s.rollback, s.rollbackErr
 }
@@ -211,7 +216,8 @@ func (s *stubStore) CreateChange(_ context.Context, params domain.CreateChangePa
 	return s.change, s.changeErr
 }
 
-func (s *stubStore) ApproveChange(_ context.Context, changeID string, approval domain.ChangeApproval, _ string) (*domain.ConfigChange, error) {
+func (s *stubStore) ApproveChange(ctx context.Context, changeID string, approval domain.ChangeApproval, _ string) (*domain.ConfigChange, error) {
+	s.capturePrecondition(ctx)
 	s.approveChangeID = changeID
 	s.gotApproval = approval
 	return s.approvedChange, s.approveErr
@@ -237,7 +243,14 @@ func (s *stubStore) RecordAttestation(_ context.Context, params domain.RecordAtt
 	return s.attestation, s.attestationErr
 }
 
-func (s *stubStore) CreateReleasePlan(_ context.Context, params domain.CreateReleasePlanParams) (*domain.ReleasePlan, error) {
+func (s *stubStore) capturePrecondition(ctx context.Context) {
+	if p, ok := domain.PreconditionFrom(ctx); ok {
+		s.gotPrecondition = &p
+	}
+}
+
+func (s *stubStore) CreateReleasePlan(ctx context.Context, params domain.CreateReleasePlanParams) (*domain.ReleasePlan, error) {
+	s.capturePrecondition(ctx)
 	s.gotReleasePlan = params
 	return s.releasePlan, s.releasePlanErr
 }
@@ -1246,6 +1259,7 @@ func TestApproveChange_NotFound(t *testing.T) {
 	s := &stubStore{approveErr: domain.ErrChangeNotFound}
 	r := newTestRouter(s)
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/config/changes/c-1/approve", strings.NewReader(`{}`)))
+	req.Header.Set("If-Match", `"v1"`)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
@@ -1257,6 +1271,7 @@ func TestApproveChange_ApproverIsVerifiedPrincipal(t *testing.T) {
 	s := &stubStore{approvedChange: &domain.ConfigChange{ChangeID: "c-1", Status: domain.ChangeStatusApproved}}
 	r := newTestRouter(s)
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/config/changes/c-1/approve", strings.NewReader(`{}`)))
+	req.Header.Set("If-Match", `"v1"`)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -1418,6 +1433,7 @@ func TestCreateReleasePlan_Success(t *testing.T) {
 	r := newTestRouter(s)
 	body := `{"environment":"production","strategy":"ALL_OR_NOTHING"}`
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/flags/new_ui/release-plans", strings.NewReader(body)))
+	req.Header.Set("If-None-Match", "*")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {

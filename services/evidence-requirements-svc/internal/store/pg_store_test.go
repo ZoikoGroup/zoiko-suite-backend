@@ -49,20 +49,12 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS outbox CASCADE;`)
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS evidence_request_receipts CASCADE;`)
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS evidence_request_notes CASCADE;`)
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS evidence_request_responses CASCADE;`)
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS evidence_requests CASCADE;`)
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS evidence_evaluations CASCADE;`)
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS evidence_requirements CASCADE;`)
-	// Migration 000008 is not covered by the table list above and is not
-	// idempotent, so without these drops only the first test in the package
-	// could apply the schema.
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS outbox CASCADE;`)
-	_, _ = pool.Exec(ctx, `DROP FUNCTION IF EXISTS claim_outbox_events(INT);`)
-	_, _ = pool.Exec(ctx, `DROP FUNCTION IF EXISTS mark_outbox_published(UUID[]);`)
-	_, _ = pool.Exec(ctx, `DROP FUNCTION IF EXISTS mark_outbox_failed(UUID[], TEXT);`)
+	// An empty schema, not a list of tables: a hand-kept list fell behind the
+	// migrations twice (000008's functions, 000012's history table) and failed
+	// every test after the first.
+	if _, err := pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO public;`); err != nil {
+		t.Fatalf("reset schema: %v", err)
+	}
 
 	// Every *.up.sql, sorted, rather than a list written out here.
 	//

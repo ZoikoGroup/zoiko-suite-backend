@@ -1,0 +1,1172 @@
+{
+  "info": {
+    "name": "tenant-entity-registry-svc API",
+    "description": "Postman collection for tenant-entity-registry-svc (D1-2) — ORG-02/03/04/05/07/08/09, GOV-02 surfaces",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "version": "1.0.0"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8081",
+      "type": "string"
+    },
+    {
+      "key": "tenantId",
+      "value": "tenant-001",
+      "type": "string"
+    },
+    {
+      "key": "entityId",
+      "value": "e0000000-0000-4000-8000-000000000001",
+      "type": "string"
+    },
+    {
+      "key": "correlationId",
+      "value": "corr-001",
+      "type": "string"
+    },
+    {
+      "key": "authToken",
+      "value": "Bearer <identity-envelope-jwt>",
+      "type": "string"
+    }
+  ],
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{authToken}}",
+        "type": "string"
+      }
+    ]
+  },
+  "item": [
+    {
+      "name": "Tenants",
+      "item": [
+        {
+          "name": "Provision Tenant",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/tenants",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_code\": \"TNT001\",\n  \"tenant_name\": \"Acme Corp\",\n  \"external_customer_key\": \"cust-123\",\n  \"default_currency_code\": \"USD\",\n  \"primary_timezone\": \"America/New_York\",\n  \"primary_locale\": \"en-US\",\n  \"onboarding_key\": \"onboard-abc123\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Get Tenant",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/tenants/{{tenantId}}"
+          }
+        },
+        {
+          "name": "List Tenant Entities",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/tenants/{{tenantId}}/entities",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ]
+          }
+        },
+        {
+          "name": "List Tenant Entities (with cursor)",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/tenants/{{tenantId}}/entities?limit=50&cursor=",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ]
+          }
+        },
+        {
+          "name": "Transition Tenant Lifecycle",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/tenants/{{tenantId}}/lifecycle",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"target_state\": \"ACTIVE\",\n  \"reason\": \"onboarding complete\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Execute Tenant Command (Suspend)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/tenants/{{tenantId}}/commands/suspend",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"sanctions screening hit\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Get Tenant Defaults",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/tenants/{{tenantId}}/defaults"
+          }
+        },
+        {
+          "name": "Change Home Region",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/tenants/{{tenantId}}/home-region",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"residency_region_id\": \"eu-west-1\",\n  \"reason\": \"customer relocated\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Change Default Locale",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/tenants/{{tenantId}}/defaults",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"primary_locale\": \"fr-FR\",\n  \"primary_timezone\": \"Europe/Paris\",\n  \"reason\": \"customer relocated\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Bind Tenant Host",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/tenants/{{tenantId}}/host-bindings",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"hostname\": \"acme.example.com\",\n  \"is_primary\": true,\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "List Tenant Host Bindings",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/tenants/{{tenantId}}/host-bindings?limit=50&cursor="
+          }
+        },
+        {
+          "name": "Resolve Tenant By Host",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/resolve-tenant?hostname=acme.example.com"
+          }
+        },
+        {
+          "name": "List Tenant Lifecycle History",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/tenants/{{tenantId}}/lifecycle-history?limit=50&cursor="
+          }
+        }
+      ]
+    },
+    {
+      "name": "Legal Entities",
+      "item": [
+        {
+          "name": "Create Legal Entity",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/entities",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"{{tenantId}}\",\n  \"entity_code\": \"ENT001\",\n  \"legal_name\": \"Acme Holdings Ltd\",\n  \"entity_type\": \"SUBSIDIARY\",\n  \"default_currency_code\": \"USD\",\n  \"fiscal_calendar_id\": \"0f000000-0000-4000-8000-000000000001\",\n  \"primary_jurisdiction_id\": \"JUR-US\",\n  \"data_residency_policy_id\": \"drp-001\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Get Legal Entity",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/entities/{{entityId}}"
+          }
+        },
+        {
+          "name": "Update Entity (non-governed fields)",
+          "request": {
+            "method": "PATCH",
+            "url": "{{baseUrl}}/v1/entities/{{entityId}}",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" },
+              { "key": "If-Match", "value": "1" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"trading_name\": \"Acme Trading\",\n  \"default_currency_code\": \"EUR\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Get Entity Status",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/entities/{{entityId}}/status"
+          }
+        },
+        {
+          "name": "Transition Entity Status (Verify)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/entities/{{entityId}}/status",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"target_status\": \"VERIFIED\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Request Entity Verification (maker-checker)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/entities/{{entityId}}/verification:request",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"evidence_ref\": \"evidence-123\",\n  \"reason\": \"financial statements filed\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Activate Legal Entity",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/entities/{{entityId}}/activate",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Change Legal Name (maker-checker)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/entities/{{entityId}}/legal-name",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"legal_name\": \"Acme Global Holdings Ltd\",\n  \"reason\": \"rebranding\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Change Registered Office",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/entities/{{entityId}}/registered-office",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"registered_office\": \"{\\\"line1\\\":\\\"2 New St\\\",\\\"country\\\":\\\"GB\\\"}\",\n  \"reason\": \"office move\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Amend Legal Profile",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/entities/{{entityId}}/profile:amend",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"legal_name\": \"Amended Name Ltd\",\n  \"trading_name\": \"Amended Trading\",\n  \"change_reason\": \"AMENDMENT\",\n  \"effective_from\": \"2026-01-01T00:00:00Z\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Get Entity As Of (as-of reconstruction)",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/entities/{{entityId}}/as-of?as_of=2025-12-31T23:59:59Z"
+          }
+        },
+        {
+          "name": "List Entity Versions",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/entities/{{entityId}}/versions?limit=50&cursor="
+          }
+        },
+        {
+          "name": "Find Entities By Registry Number",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/entities/by-registry-number?registration_number=RC-12345&jurisdiction_id=JUR-US"
+          }
+        },
+        {
+          "name": "Merge Duplicate Candidate (maker-checker)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/entities/{{entityId}}/merge",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"duplicate_id\": \"e0000000-0000-4000-8000-000000000002\",\n  \"reason\": \"same legal entity\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Unmerge Entity",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/entities/{{entityId}}/unmerge",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"duplicate_id\": \"e0000000-0000-4000-8000-000000000002\",\n  \"reason\": \"was separate entity\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "List Entity Merge Records",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/entities/{{entityId}}/merge-records"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Workspaces",
+      "item": [
+        {
+          "name": "Create Workspace",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/workspaces",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"{{tenantId}}\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"name\": \"Acme Workspace\",\n  \"business_unit\": \"ACME-BU\",\n  \"billing_classification\": \"STANDARD\",\n  \"billing_source\": \"DIRECT\",\n  \"commercial_account_id\": \"acc-123\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Get Workspace",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/workspaces/{{workspaceId}}"
+          }
+        },
+        {
+          "name": "List Workspaces",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/tenants/{{tenantId}}/workspaces?limit=50&cursor="
+          }
+        },
+        {
+          "name": "Update Workspace",
+          "request": {
+            "method": "PATCH",
+            "url": "{{baseUrl}}/v1/workspaces/{{workspaceId}}",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" },
+              { "key": "If-Match", "value": "1" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Updated Workspace\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Transition Workspace Status",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/workspaces/{{workspaceId}}/status",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"target_status\": \"ARCHIVED\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Hierarchies",
+      "item": [
+        {
+          "name": "Create Hierarchy",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/entity-hierarchies",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"parent_legal_entity_id\": \"{{entityId}}\",\n  \"child_legal_entity_id\": \"e0000000-0000-4000-8000-000000000002\",\n  \"relationship_type\": \"LEGAL\",\n  \"effective_from\": \"2026-01-01T00:00:00Z\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "List Hierarchies",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/entities/{{entityId}}/hierarchies?limit=50&cursor="
+          }
+        },
+        {
+          "name": "End Date Hierarchy",
+          "request": {
+            "method": "DELETE",
+            "url": "{{baseUrl}}/v1/entity-hierarchies/{{hierarchyId}}?end_date=2026-12-31T23:59:59Z"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Jurisdiction Assignments",
+      "item": [
+        {
+          "name": "Assign Jurisdiction",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/entities/{{entityId}}/jurisdictions",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jurisdiction_id\": \"JUR-EU\",\n  \"assignment_type\": \"TAX_RESIDENCY\",\n  \"effective_from\": \"2026-01-01T00:00:00Z\",\n  \"source_basis\": \"INCORPORATION\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "List Jurisdictions",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/entities/{{entityId}}/jurisdictions?limit=50&cursor="
+          }
+        },
+        {
+          "name": "End Date Jurisdiction Assignment",
+          "request": {
+            "method": "DELETE",
+            "url": "{{baseUrl}}/v1/entity-jurisdictions/{{assignmentId}}?end_date=2026-12-31T23:59:59Z"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Data Residency",
+      "item": [
+        {
+          "name": "Create Residency Policy",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/residency-policies",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"{{tenantId}}\",\n  \"policy_name\": \"EU Data Residency\",\n  \"policy_code\": \"EU-RESIDENCY\",\n  \"residency_mode\": \"STRICT\",\n  \"conflict_resolution_mode\": \"REJECT\",\n  \"residency_region_id\": \"eu-west-1\",\n  \"active_flag\": true,\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Get Residency Policy",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/residency-policies/{{policyId}}"
+          }
+        },
+        {
+          "name": "List Residency Regions",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/residency-regions?limit=50&cursor="
+          }
+        },
+        {
+          "name": "Get Residency Region",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/residency-regions/{{regionId}}"
+          }
+        },
+        {
+          "name": "Resolve Tenant Region",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/tenants/{{tenantId}}/residency-region"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Tax Identity Bundles",
+      "item": [
+        {
+          "name": "Create Tax Identity Bundle",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/entities/{{entityId}}/tax-identity-bundles",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jurisdiction_id\": \"JUR-US\",\n  \"status\": \"PENDING\",\n  \"effective_from\": \"2026-01-01T00:00:00Z\",\n  \"data_classification\": \"RESTRICTED\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Get Tax Identity Bundle",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/tax-identity-bundles/{{bundleId}}"
+          }
+        },
+        {
+          "name": "List Tax Identity Bundles",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/entities/{{entityId}}/tax-identity-bundles?limit=50&cursor="
+          }
+        },
+        {
+          "name": "Transition Tax Identity Bundle Status",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/tax-identity-bundles/{{bundleId}}/status",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"new_status\": \"VERIFIED\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Approval Requests (Maker-Checker)",
+      "item": [
+        {
+          "name": "List Approval Requests",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/approval-requests?status=all&limit=50&cursor="
+          }
+        },
+        {
+          "name": "Get Approval Request",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/approval-requests/{{approvalRequestId}}"
+          }
+        },
+        {
+          "name": "Approve Request",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/approval-requests/{{approvalRequestId}}/approve",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"payload_fingerprint\": \"a1b2c3d4e5f6...\",\n  \"decision_note\": \"approved by CFO\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Reject Request",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/approval-requests/{{approvalRequestId}}/reject",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"payload_fingerprint\": \"a1b2c3d4e5f6...\",\n  \"decision_note\": \"insufficient evidence\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Registry Conflicts",
+      "item": [
+        {
+          "name": "List Registry Conflicts",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/registry-conflicts?status=open&limit=50&cursor="
+          }
+        },
+        {
+          "name": "Get Registry Conflict",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/registry-conflicts/{{conflictId}}"
+          }
+        },
+        {
+          "name": "Resolve Registry Conflict",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/registry-conflicts/{{conflictId}}/resolve",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"status\": \"RESOLVED_DISTINCT\",\n  \"resolution_note\": \"different registrars\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Ownership & Control (ORG-04)",
+      "item": [
+        {
+          "name": "Propose Ownership Relationship",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/ownership-relationships",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"parent_legal_entity_id\": \"{{entityId}}\",\n  \"child_legal_entity_id\": \"e0000000-0000-4000-8000-000000000002\",\n  \"relationship_kind\": \"OWNERSHIP\",\n  \"ownership_pct\": 60,\n  \"voting_pct\": 60,\n  \"control_type\": \"SOLE\",\n  \"valid_from\": \"2026-01-01T00:00:00Z\",\n  \"evidence_ref\": \"evidence-123\",\n  \"reason\": \"acquisition\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Get Ownership Relationship",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/ownership-relationships/{{relationshipId}}"
+          }
+        },
+        {
+          "name": "Approve Ownership Relationship",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/ownership-relationships/{{relationshipId}}/approve",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"expected_version\": 1,\n  \"decision_note\": \"approved by board\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Reject Ownership Relationship",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/ownership-relationships/{{relationshipId}}/reject",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"expected_version\": 1,\n  \"decision_note\": \"rejected by board\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Supersede Ownership Relationship",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/ownership-relationships/{{relationshipId}}/supersede",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"ownership_pct\": 80,\n  \"voting_pct\": 80,\n  \"valid_from\": \"2026-07-01T00:00:00Z\",\n  \"expected_version\": 1,\n  \"evidence_ref\": \"evidence-456\",\n  \"reason\": \"additional stake acquired\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "End Ownership Relationship",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/ownership-relationships/{{relationshipId}}/end",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"end_date\": \"2026-12-31T23:59:59Z\",\n  \"expected_version\": 1,\n  \"reason\": \"divestiture\",\n  \"evidence_ref\": \"evidence-789\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Get Ownership Graph",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/ownership-graph?as_of=2026-06-15T00:00:00Z&root={{entityId}}"
+          }
+        },
+        {
+          "name": "Get Group As Of",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/entities/{{entityId}}/group?as_of=2026-06-15T00:00:00Z"
+          }
+        },
+        {
+          "name": "List Entity Parents",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/entities/{{entityId}}/parents?as_of=2026-06-15T00:00:00Z"
+          }
+        },
+        {
+          "name": "Explain Control Chain",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/entities/{{entityId}}/control-chain?as_of=2026-06-15T00:00:00Z"
+          }
+        },
+        {
+          "name": "Validate SoD",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/sod/validate",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"parent_legal_entity_id\": \"{{entityId}}\",\n  \"child_legal_entity_id\": \"e0000000-0000-4000-8000-000000000002\",\n  \"relationship_kind\": \"OWNERSHIP\",\n  \"ownership_pct\": 60,\n  \"voting_pct\": 60\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Parties & Golden Record (ORG-07/MDM-05)",
+      "item": [
+        {
+          "name": "Create Party (match-first)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/parties",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"party_kind\": \"LEGAL_ENTITY\",\n  \"source_class\": \"AUTHORITY_REGISTRY\",\n  \"legal_name\": \"John Smith\",\n  \"create_request_id\": \"req-123\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Match Parties",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/identifiers:find",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"identifiers\": [\n    { \"scheme\": \"LEI\", \"value\": \"5493001KJTIIGC8Y1R12\" }\n  ]\n}"
+            }
+          }
+        },
+        {
+          "name": "Propose Party Fact",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/parties/{{partyId}}/facts:propose",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fact_type\": \"LEGAL_NAME\",\n  \"value\": \"John A. Smith\",\n  \"evidence_ref\": \"evidence-123\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Link Party Identifier",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/parties/{{partyId}}/identifiers",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"scheme\": \"NATIONAL_ID\",\n  \"value\": \"123456789\",\n  \"issuer\": \"GOV-UK\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Add Party Role",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/parties/{{partyId}}/roles",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"role_type\": \"DIRECTOR\",\n  \"entity_id\": \"{{entityId}}\",\n  \"effective_from\": \"2026-01-01T00:00:00Z\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "List Parties",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/parties?limit=50&cursor="
+          }
+        },
+        {
+          "name": "Get Party",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/parties/{{partyId}}?as_of=2026-06-15T00:00:00Z&known_at=2026-06-15T00:00:00Z&reveal_sensitive=false"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Party Resolution (ORG-07)",
+      "item": [
+        {
+          "name": "List Resolution Cases",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/resolution-cases?status=open&case_type=duplicate_review&limit=50&cursor="
+          }
+        },
+        {
+          "name": "Decide Resolution Case (Merge)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/resolution-cases/{{caseId}}/decide",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"decision\": \"MERGE\",\n  \"survivor_party_id\": \"party-1\",\n  \"reason\": \"same legal entity\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Merge Parties",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/resolution/{{caseId}}:merge",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"survivor_party_id\": \"party-1\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Split Parties",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/resolution/{{caseId}}:split",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"new_party_ids\": [\"party-3\", \"party-4\"],\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Explain Merge History",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/parties/{{partyId}}/merge-history"
+          }
+        }
+      ]
+    },
+    {
+      "name": "FX Rates (REF-03)",
+      "item": [
+        {
+          "name": "Create FX Source",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/fx/sources",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"source_name\": \"ECB\",\n  \"source_code\": \"ECB\",\n  \"base_currency\": \"EUR\",\n  \"quote_currencies\": [\"USD\", \"GBP\", \"JPY\"],\n  \"schedule\": \"daily\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "List FX Sources",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/fx/sources"
+          }
+        },
+        {
+          "name": "Ingest FX Rate Set",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/fx/rate-sets",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"source_id\": \"{{sourceId}}\",\n  \"market_date\": \"2026-06-15\",\n  \"rates\": [\n    { \"base\": \"EUR\", \"quote\": \"USD\", \"rate\": 1.085, \"rate_type\": \"SPOT\" },\n    { \"base\": \"EUR\", \"quote\": \"GBP\", \"rate\": 0.852, \"rate_type\": \"SPOT\" }\n  ],\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "List FX Rates By Source",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/fx/sources/{{sourceId}}/rates?from=2026-06-01&to=2026-06-30&limit=50&cursor="
+          }
+        },
+        {
+          "name": "Get FX Rate",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/fx/rates?base=EUR&quote=USD&rate_type=SPOT&set_name=ECB&market_date=2026-06-15"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Reference Sets (REF-06/08/09)",
+      "item": [
+        {
+          "name": "List Reference Sets",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/reference-sets"
+          }
+        },
+        {
+          "name": "List Books",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/books?limit=50&cursor="
+          }
+        },
+        {
+          "name": "Create Dimension Type",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/dimension-types",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type_code\": \"DEPARTMENT\",\n  \"type_name\": \"Department\",\n  \"hierarchy_type\": \"MULTI_LEVEL\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "List Dimension Types",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/dimension-types"
+          }
+        },
+        {
+          "name": "List Units",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/units?limit=50&cursor="
+          }
+        }
+      ]
+    },
+    {
+      "name": "Master Imports (ORG-09)",
+      "item": [
+        {
+          "name": "Create Master Import",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/master-imports",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"import_type\": \"LEGAL_ENTITIES\",\n  \"source_format\": \"CSV\",\n  \"source_uri\": \"s3://bucket/imports/2026-06-15.csv\",\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "List Master Imports",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/master-imports?limit=50&cursor="
+          }
+        },
+        {
+          "name": "Get Master Import",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/master-imports/{{importId}}"
+          }
+        },
+        {
+          "name": "Approve Master Import",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/master-imports/{{importId}}/approve",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"correlation_id\": \"{{correlationId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Cancel Master Import",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/v1/operations/{{operationId}}/cancel",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Correlation-ID", "value": "{{correlationId}}" }
+            ]
+          }
+        },
+        {
+          "name": "Get Operation Status",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/operations/{{operationId}}"
+          }
+        },
+        {
+          "name": "List Import Rows",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/master-imports/{{importId}}/rows?limit=50&cursor="
+          }
+        }
+      ]
+    }
+  ]
+}

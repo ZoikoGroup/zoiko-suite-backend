@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config holds all runtime configuration for jurisdiction-rules-svc.
@@ -54,6 +55,20 @@ type Config struct {
 	AuthzMTLSEnabled         bool
 	AuthzMTLSURL             string
 	MTLSManagementServiceURL string
+
+	// Decision capture (DL-4, 25 Nov 2026): governed decisions are queued in
+	// decision_log_outbox (000038) and relayed to governance-decision-log-svc
+	// (GOVERNANCE_DECISION_LOG_MTLS_URL) as LedgerPrincipalID with this
+	// service's own workload certificate (MTLS_BOOTSTRAP_TOKEN_PATH). An empty
+	// URL leaves records waiting in the outbox; an empty principal queues
+	// nothing.
+	DecisionLogMTLSURL     string
+	LedgerPrincipalID      string
+	MTLSBootstrapTokenPath string
+	LedgerRelayInterval    time.Duration
+	// LedgerRelayMaxPerSecond caps deliveries (decisionledger.SetMaxPerSecond).
+	LedgerRelayMaxPerSecond int
+	LedgerRetention         time.Duration
 
 	// PackSigningKeyRef and PackSigningKeyFile configure the key that signs
 	// compiled jurisdiction-pack artifacts (ZS-JUR-001 s21, s28). The key is
@@ -199,6 +214,12 @@ func Load() (*Config, error) {
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
 		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+		DecisionLogMTLSURL:       env("GOVERNANCE_DECISION_LOG_MTLS_URL", ""),
+		LedgerPrincipalID:        env("LEDGER_PRINCIPAL_ID", "svc-jurisdiction-rules"),
+		MTLSBootstrapTokenPath:   env("MTLS_BOOTSTRAP_TOKEN_PATH", ""),
+		LedgerRelayInterval:      time.Duration(envInt("LEDGER_RELAY_INTERVAL_MS", 2000)) * time.Millisecond,
+		LedgerRelayMaxPerSecond:  envInt("LEDGER_RELAY_MAX_PER_SECOND", 20),
+		LedgerRetention:          time.Duration(envInt("LEDGER_RETENTION_HOURS", 168)) * time.Hour,
 
 		PackSigningKeyRef:  env("PACK_SIGNING_KEY_REF", ""),
 		PackSigningKeyFile: env("PACK_SIGNING_KEY_FILE", ""),

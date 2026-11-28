@@ -87,6 +87,12 @@ type WorkflowInstance struct {
 	// decided again (000020); EscalatedAt is when it was last escalated.
 	ReviewCycle int        `json:"review_cycle"`
 	EscalatedAt *time.Time `json:"escalated_at,omitempty"`
+
+	// CausationDecisionID is the governance decision this workflow resolves
+	// (an escalated policy, signatory or authorization decision), set when
+	// it starts (000027). Its governance-ledger records carry it as
+	// causation_id.
+	CausationDecisionID *string `json:"causation_decision_id,omitempty"`
 }
 
 // WorkflowStage is one approval gate in a workflow's ordered chain,
@@ -115,6 +121,8 @@ type WorkflowStage struct {
 	ApproverPrincipalID string `json:"approver_principal_id,omitempty"`
 	// RequiredApprovals is set only for a QUORUM stage — the N in N-of-M.
 	RequiredApprovals *int `json:"required_approvals,omitempty"`
+	// QuorumApprovers lists the eligible approvers for a QUORUM stage.
+	QuorumApprovers []string `json:"quorum_approvers,omitempty"`
 
 	// StageStatus: PENDING | APPROVED | REJECTED | SKIPPED.
 	StageStatus string `json:"stage_status"`
@@ -209,7 +217,23 @@ type CreateWorkflowParams struct {
 	Stages                    []CreateWorkflowStageInput
 	// DueAt is when the whole approval expires (R-001 Expire): past it, a
 	// PENDING or ESCALATED instance becomes EXPIRED. nil = no expiry.
-	DueAt *time.Time
+	DueAt        *time.Time
+	NextActionAt *time.Time
+	// Signatory, when set, binds the workflow to a verified policy-svc
+	// SIGNATORY_MATRIX decision (ZS-GOV-INT-002 §4.2); it is stored in the
+	// same transaction as the instance.
+	Signatory *SignatoryBinding
+	// ExpiryHours: an instance started from this definition expires this
+	// long after it starts (000020).
+	ExpiryHours *int
+	// CausationDecisionID: the governance decision this workflow resolves
+	// ("" = none), stored on the instance (000027).
+	CausationDecisionID string
+	// R-001 §9.1 common columns
+	CreatedBy       string
+	Plane           string
+	DataClass       string
+	ResidencyRegion string
 }
 
 // SubmitActionParams holds input for approving or rejecting the current stage.
@@ -310,6 +334,21 @@ type WorkflowDefinition struct {
 	// escalated to when a stage deadline passes.
 	ExpiryHours      *int    `json:"expiry_hours,omitempty"`
 	EscalationTarget *string `json:"escalation_target,omitempty"`
+
+	// Publication lifecycle fields (WF-S22)
+	Status        *string    `json:"status,omitempty"` // DRAFT, VALIDATION_PENDING, VALIDATED, APPROVAL_PENDING, PUBLISHED, REJECTED, SUSPENDED, SUPERSEDED, RETIRED
+	EffectiveFrom *time.Time `json:"effective_from,omitempty"`
+	EffectiveTo   *time.Time `json:"effective_to,omitempty"`
+	ValidatedBy   *string    `json:"validated_by,omitempty"`
+	ValidatedAt   *time.Time `json:"validated_at,omitempty"`
+	ApprovedBy    *string    `json:"approved_by,omitempty"`
+	ApprovedAt    *time.Time `json:"approved_at,omitempty"`
+	PublishedBy   *string    `json:"published_by,omitempty"`
+	PublishedAt   *time.Time `json:"published_at,omitempty"`
+	Checksum      *string    `json:"checksum,omitempty"` // sha256 of canonical stages+settings
+
+	// Parsed stages (not stored in DB)
+	Stages []CreateWorkflowStageInput `json:"stages,omitempty"`
 }
 
 // CreateWorkflowDefinitionParams holds input for creating a workflow definition.
@@ -333,13 +372,13 @@ type GetWorkflowDefinitionParams struct {
 	WorkflowDefinitionID *string
 }
 
-// ListWorkflowDefinitionsParams holds input for listing workflow definitions.
+// ListWorkflowDefinitionsParams holds input for listing workflow definitions with cursor paging (API-4).
 type ListWorkflowDefinitionsParams struct {
 	TenantID     string
 	WorkflowType *string
 	IsActive     *bool
 	Limit        int
-	Offset       int
+	Cursor       *PaginationCursor
 }
 
 // ListPendingApprovalsParams holds input for listing pending approvals with cursor paging (API-4).
@@ -357,10 +396,141 @@ type ListPendingSubmissionsParams struct {
 	Cursor   *PaginationCursor
 }
 
+// ListWorkflowsParams holds input for listing workflow instances with cursor paging (API-4).
+type ListWorkflowsParams struct {
+	TenantID             string
+	LegalEntityID        string
+	WorkflowType         string
+	WorkflowStatus       string
+	SubjectType          string
+	SubjectID            string
+	WorkflowDefinitionID string
+	Limit                int
+	Cursor               *PaginationCursor
+}
+
+// ValidateDefinitionParams holds input for validating a workflow definition.
+type ValidateDefinitionParams struct {
+	WorkflowDefinitionID string
+	ActorPrincipalID     string
+	CorrelationID        string
+	Meta                 CommandMeta
+}
+
+// SubmitDefinitionApprovalParams holds input for submitting a definition for approval.
+type SubmitDefinitionApprovalParams struct {
+	WorkflowDefinitionID string
+	ActorPrincipalID     string
+	CorrelationID        string
+	Meta                 CommandMeta
+}
+
+// ApproveDefinitionParams holds input for approving a definition (maker ≠ checker).
+type ApproveDefinitionParams struct {
+	WorkflowDefinitionID string
+	ActorPrincipalID     string
+	CorrelationID        string
+	ReasonCode           string
+	Narrative            *string
+	Authority            ActionAuthority
+	Meta                 CommandMeta
+}
+
+// RejectDefinitionParams holds input for rejecting a definition.
+type RejectDefinitionParams struct {
+	WorkflowDefinitionID string
+	ActorPrincipalID     string
+	CorrelationID        string
+	ReasonCode           string
+	Narrative            *string
+	Authority            ActionAuthority
+	Meta                 CommandMeta
+}
+
+// PublishDefinitionParams holds input for publishing a validated & approved definition.
+type PublishDefinitionParams struct {
+	WorkflowDefinitionID string
+	ActorPrincipalID     string
+	CorrelationID        string
+	EffectiveFrom        *time.Time
+	EffectiveTo          *time.Time
+	Meta                 CommandMeta
+}
+
+// SuspendDefinitionParams holds input for suspending a published definition.
+type SuspendDefinitionParams struct {
+	WorkflowDefinitionID string
+	ActorPrincipalID     string
+	CorrelationID        string
+	ReasonCode           string
+	Narrative            *string
+	Authority            ActionAuthority
+	Meta                 CommandMeta
+}
+
+// RetireDefinitionParams holds input for retiring a definition.
+type RetireDefinitionParams struct {
+	WorkflowDefinitionID string
+	ActorPrincipalID     string
+	CorrelationID        string
+	ReasonCode           string
+	Narrative            *string
+	Authority            ActionAuthority
+	Meta                 CommandMeta
+}
+
+// EmergencyApproveParams holds input for emergency approval (WF-S25).
+type EmergencyApproveParams struct {
+	WorkflowInstanceID  string
+	ActorPrincipalID    string
+	CorrelationID       string
+	BreakGlassSessionID string
+	ReasonCode          string
+	IncidentRef         *string
+	Scope               *string
+	MaxImpact           *string
+	Meta                CommandMeta
+}
+
+// InstanceSummary holds a summary view of a workflow instance.
+type InstanceSummary struct {
+	WorkflowInstanceID string         `json:"workflow_instance_id"`
+	WorkflowType       string         `json:"workflow_type"`
+	WorkflowStatus     string         `json:"workflow_status"`
+	CurrentStage       int            `json:"current_stage"`
+	InitiatedBy        string         `json:"initiated_by"`
+	SubjectType        *string        `json:"subject_type,omitempty"`
+	SubjectID          *string        `json:"subject_id,omitempty"`
+	SubjectVersion     *int           `json:"subject_version,omitempty"`
+	StartedAt          time.Time      `json:"started_at"`
+	CompletedAt        *time.Time     `json:"completed_at,omitempty"`
+	DueAt              *time.Time     `json:"due_at,omitempty"`
+	NextActionAt       *time.Time     `json:"next_action_at,omitempty"`
+	EscalationTarget   *string        `json:"escalation_target,omitempty"`
+	ReviewCycle        int            `json:"review_cycle"`
+	StagesSummary      []StageSummary `json:"stages_summary"`
+}
+
+type StageSummary struct {
+	StageOrder          int        `json:"stage_order"`
+	StageType           string     `json:"stage_type"`
+	StageStatus         string     `json:"stage_status"`
+	ApproverPrincipalID string     `json:"approver_principal_id,omitempty"`
+	RequiredApprovals   *int       `json:"required_approvals,omitempty"`
+	QuorumApprovers     []string   `json:"quorum_approvers,omitempty"`
+	ActedAt             *time.Time `json:"acted_at,omitempty"`
+	ActedBy             *string    `json:"acted_by,omitempty"`
+	Rationale           *string    `json:"rationale,omitempty"`
+}
+
 // ── errors ───────────────────────────────────────────────────────────────────
 
 var ErrWorkflowNotFound = errorString("workflow not found")
 var ErrNoStages = errorString("workflow must have at least one stage")
+
+// ErrDefinitionInvalid is a workflow definition that fails its validation
+// gates (R-001 §3.3); the message names the failing stage.
+var ErrDefinitionInvalid = errorString("workflow definition failed validation")
 var ErrInvalidTransition = errorString("invalid workflow status transition")
 var ErrWrongApprover = errorString("actor is not the approver for the current stage")
 var ErrStoreUnavailable = errorString("workflow store unavailable")
@@ -388,6 +558,17 @@ var ErrInitiatorCannotBeApprover = errorString("initiated_by may not appear as a
 // current stage.
 var ErrSelfApprovalNotAllowed = errorString("principal may not approve or decide on their own submission")
 
+// ErrTenantMissing is returned when a tenant-scoped operation is attempted
+// without a valid tenant ID in the context.
+var ErrTenantMissing = errorString("tenant ID missing from context")
+
+// ErrInvalidIdentifier is returned when a database identifier (UUID, etc.)
+// cannot be parsed from the request.
+var ErrInvalidIdentifier = errorString("invalid identifier")
+
+// ErrInvalidField is returned when a request field has an invalid value.
+var ErrInvalidField = errorString("invalid field")
+
 // Subject binding, invalidation & release gate errors per ZS-STATE-001.
 var ErrInvalidSubjectFingerprint = errorString("invalid subject fingerprint format")
 var ErrInvalidSubjectVersion = errorString("subject version must be non-negative")
@@ -411,8 +592,8 @@ var ErrNotEligibleQuorumApprover = errorString("actor is not an eligible approve
 // It encodes the sort key of the last item returned (started_at DESC, workflow_instance_id DESC).
 // The cursor is base64.RawURLEncoding encoded JSON.
 type PaginationCursor struct {
-	StartedAt  string `json:"started_at"`   // RFC3339 timestamp
-	InstanceID string `json:"instance_id"`  // workflow_instance_id
+	StartedAt  string `json:"started_at"`  // RFC3339 timestamp
+	InstanceID string `json:"instance_id"` // workflow_instance_id
 }
 
 // EncodePaginationCursor encodes a cursor for transport.
@@ -446,3 +627,717 @@ func DecodePaginationCursor(s string) (*PaginationCursor, error) {
 type errorString string
 
 func (e errorString) Error() string { return string(e) }
+
+// =============================================================================
+// WFC-04: Cases (WF-2)
+// =============================================================================
+// A Case is a distinct business object from a workflow instance. It represents
+// a matter under review (e.g., an investigation, dispute, or exception) that
+// may link to one or more workflows for approval steps. Cases have their own
+// lifecycle and can exist independently of workflows.
+//
+// Case families: FINANCIAL, PAYROLL_HR, LEGAL_COMPLIANCE, SECURITY_PRIVACY, OPERATIONAL
+// Case states: OPEN → TRIAGED → IN_PROGRESS → WAITING_INTERNAL / WAITING_EXTERNAL → RESOLVED / CLOSED / REOPENED
+// Terminal states: RESOLVED, CLOSED
+// Confidentiality: INTERNAL, RESTRICTED, PRIVILEGED
+// Severity: LOW, MEDIUM, HIGH, CRITICAL
+
+type CaseFamily string
+
+const (
+	CaseFamilyFinancial       CaseFamily = "FINANCIAL"
+	CaseFamilyPayrollHR       CaseFamily = "PAYROLL_HR"
+	CaseFamilyLegalCompliance CaseFamily = "LEGAL_COMPLIANCE"
+	CaseFamilySecurityPrivacy CaseFamily = "SECURITY_PRIVACY"
+	CaseFamilyOperational     CaseFamily = "OPERATIONAL"
+)
+
+type CaseState string
+
+const (
+	CaseStateOpen            CaseState = "OPEN"
+	CaseStateTriaged         CaseState = "TRIAGED"
+	CaseStateInProgress      CaseState = "IN_PROGRESS"
+	CaseStateWaitingInternal CaseState = "WAITING_INTERNAL"
+	CaseStateWaitingExternal CaseState = "WAITING_EXTERNAL"
+	CaseStateResolved        CaseState = "RESOLVED"
+	CaseStateClosed          CaseState = "CLOSED"
+	CaseStateReopened        CaseState = "REOPENED"
+)
+
+var CaseStates = map[CaseState]bool{
+	CaseStateOpen: true, CaseStateTriaged: true, CaseStateInProgress: true,
+	CaseStateWaitingInternal: true, CaseStateWaitingExternal: true,
+	CaseStateResolved: true, CaseStateClosed: true, CaseStateReopened: true,
+}
+
+type CaseConfidentiality string
+
+const (
+	CaseConfidentialityInternal   CaseConfidentiality = "INTERNAL"
+	CaseConfidentialityRestricted CaseConfidentiality = "RESTRICTED"
+	CaseConfidentialityPrivileged CaseConfidentiality = "PRIVILEGED"
+)
+
+type CaseSeverity string
+
+const (
+	CaseSeverityLow      CaseSeverity = "LOW"
+	CaseSeverityMedium   CaseSeverity = "MEDIUM"
+	CaseSeverityHigh     CaseSeverity = "HIGH"
+	CaseSeverityCritical CaseSeverity = "CRITICAL"
+)
+
+type Case struct {
+	CaseID               string              `json:"case_id"`
+	TenantID             string              `json:"tenant_id"`
+	LegalEntityID        string              `json:"legal_entity_id"`
+	WorkflowInstanceID   *string             `json:"workflow_instance_id,omitempty"` // optional link
+	CaseFamily           CaseFamily          `json:"case_family"`
+	CaseType             string              `json:"case_type"` // INVESTIGATION, DISPUTE, EXCEPTION, etc.
+	CaseState            CaseState           `json:"case_state"`
+	Severity             CaseSeverity        `json:"severity"`
+	Confidentiality      CaseConfidentiality `json:"confidentiality"`
+	Title                string              `json:"title"`
+	Description          string              `json:"description"`
+	AssignedToPrincipal  *string             `json:"assigned_to_principal,omitempty"`
+	CreatedByPrincipalID string              `json:"created_by_principal_id"`
+	CanonicalCaseID      *string             `json:"canonical_case_id,omitempty"`  // for merge lineage
+	SplitFromCaseID      *string             `json:"split_from_case_id,omitempty"` // for split lineage
+	// SourceType / SourceID / Milestone: what opened the case (000032), e.g.
+	// OBLIGATION_CLOCK / <clock id> / <escalation milestone>.
+	SourceType *string    `json:"source_type,omitempty"`
+	SourceID   *string    `json:"source_id,omitempty"`
+	Milestone  *string    `json:"milestone,omitempty"`
+	OpenedAt   time.Time  `json:"opened_at"`
+	TriagedAt  *time.Time `json:"triaged_at,omitempty"`
+	ResolvedAt *time.Time `json:"resolved_at,omitempty"`
+	ClosedAt   *time.Time `json:"closed_at,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
+	RowVersion int        `json:"row_version"`
+}
+
+type CreateCaseParams struct {
+	TenantID             string
+	LegalEntityID        string
+	WorkflowInstanceID   *string
+	CaseFamily           CaseFamily
+	CaseType             string
+	Severity             CaseSeverity
+	Confidentiality      CaseConfidentiality
+	Title                string
+	Description          string
+	AssignedToPrincipal  *string
+	CreatedByPrincipalID string
+	CorrelationID        string
+	// Source reference (000032). One source milestone opens one case.
+	SourceType, SourceID, Milestone string
+}
+
+type TransitionCaseParams struct {
+	CaseID           string
+	NewState         CaseState
+	ExpectedVersion  int
+	ActorPrincipalID string
+	CorrelationID    string
+	Reason           *string // for transitions
+}
+
+type ListCasesFilter struct {
+	TenantID            string
+	LegalEntityID       string
+	WorkflowInstanceID  *string
+	CaseFamily          CaseFamily
+	CaseType            string
+	CaseState           CaseState
+	Confidentiality     CaseConfidentiality
+	AssignedToPrincipal *string
+	Limit               int
+	Offset              int
+	AfterCreatedAt      *time.Time
+	AfterID             string
+}
+
+var ErrCaseNotFound = errorString("case not found")
+var ErrWorkItemNotFound = errorString("work item not found")
+var ErrInvalidWorkItemTransition = errorString("invalid work item state transition")
+var ErrInvalidCaseTransition = errorString("invalid case state transition")
+
+// Case state transitions per R-001 §6.3
+var CaseStateTransitions = map[CaseState][]CaseState{
+	CaseStateOpen:            {CaseStateTriaged, CaseStateClosed},
+	CaseStateTriaged:         {CaseStateInProgress, CaseStateWaitingInternal, CaseStateWaitingExternal, CaseStateClosed},
+	CaseStateInProgress:      {CaseStateWaitingInternal, CaseStateWaitingExternal, CaseStateResolved, CaseStateClosed},
+	CaseStateWaitingInternal: {CaseStateInProgress, CaseStateResolved, CaseStateClosed},
+	CaseStateWaitingExternal: {CaseStateInProgress, CaseStateResolved, CaseStateClosed},
+	CaseStateResolved:        {CaseStateClosed, CaseStateReopened},
+	CaseStateClosed:          {CaseStateReopened},
+	CaseStateReopened:        {CaseStateTriaged, CaseStateInProgress, CaseStateWaitingInternal, CaseStateWaitingExternal, CaseStateClosed},
+}
+
+// CaseMember represents a member of a case with a role
+type CaseMember struct {
+	CaseMemberID         string     `json:"case_member_id"`
+	CaseID               string     `json:"case_id"`
+	PrincipalID          string     `json:"principal_id"`
+	Role                 string     `json:"role"` // OWNER, ASSIGNEE, OBSERVER
+	AddedAt              time.Time  `json:"added_at"`
+	AddedByPrincipalID   string     `json:"added_by_principal_id"`
+	RemovedAt            *time.Time `json:"removed_at,omitempty"`
+	RemovedByPrincipalID *string    `json:"removed_by_principal_id,omitempty"`
+}
+
+// CaseNote represents an append-only versioned note on a case
+type CaseNote struct {
+	CaseNoteID     string    `json:"case_note_id"`
+	TenantID       string    `json:"tenant_id"`
+	CaseID         string    `json:"case_id"`
+	PrincipalID    string    `json:"principal_id"`
+	Content        string    `json:"content"`
+	Visibility     string    `json:"visibility"` // INTERNAL, RESTRICTED, PRIVILEGED
+	EvidenceRefs   []string  `json:"evidence_refs"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+	Version        int       `json:"version"`
+	PreviousNoteID *string   `json:"previous_note_id,omitempty"`
+}
+
+// CaseLink represents a read-only link to a domain object
+type CaseLink struct {
+	CaseLinkID          string    `json:"case_link_id"`
+	TenantID            string    `json:"tenant_id"`
+	CaseID              string    `json:"case_id"`
+	DomainObjectType    string    `json:"domain_object_type"`
+	DomainObjectID      string    `json:"domain_object_id"`
+	LinkedAt            time.Time `json:"linked_at"`
+	LinkedByPrincipalID string    `json:"linked_by_principal_id"`
+}
+
+// CaseTransition represents an append-only transition log entry
+type CaseTransition struct {
+	CaseTransitionID string     `json:"case_transition_id"`
+	CaseID           string     `json:"case_id"`
+	FromState        *CaseState `json:"from_state,omitempty"`
+	ToState          CaseState  `json:"to_state"`
+	ActorPrincipalID string     `json:"actor_principal_id"`
+	Reason           *string    `json:"reason,omitempty"`
+	TriggeredBy      string     `json:"triggered_by"` // TRIAGE, START, WAIT_INTERNAL, WAIT_EXTERNAL, RESOLVE, CLOSE, REOPEN, MERGE, SPLIT
+	CorrelationID    *string    `json:"correlation_id,omitempty"`
+	CausationID      *string    `json:"causation_id,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+}
+
+// CaseAlias represents a merge alias (source case merged into canonical)
+type CaseAlias struct {
+	AliasID             string    `json:"alias_id"`
+	CanonicalCaseID     string    `json:"canonical_case_id"`
+	AliasCaseID         string    `json:"alias_case_id"`
+	MergedAt            time.Time `json:"merged_at"`
+	MergedByPrincipalID string    `json:"merged_by_principal_id"`
+}
+
+// =============================================================================
+// WFC-04: Case Commands (WF-S2)
+// =============================================================================
+
+// TriageCaseParams holds input for triaging a case (OPEN → TRIAGED).
+type TriageCaseParams struct {
+	CaseID           string
+	ExpectedVersion  int
+	ActorPrincipalID string
+	CorrelationID    string
+	Assignee         *string // optional assignee for the case
+	Meta             CommandMeta
+}
+
+// StartCaseParams holds input for starting a case (TRIAGED → IN_PROGRESS).
+type StartCaseParams struct {
+	CaseID           string
+	ExpectedVersion  int
+	ActorPrincipalID string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+// WaitCaseParams holds input for waiting a case (IN_PROGRESS → WAITING_INTERNAL/EXTERNAL).
+type WaitCaseParams struct {
+	CaseID           string
+	ExpectedVersion  int
+	ActorPrincipalID string
+	CorrelationID    string
+	WaitType         string // "internal" or "external"
+	Reason           string
+	Meta             CommandMeta
+}
+
+// ResumeCaseParams holds input for resuming a case (WAITING_* → IN_PROGRESS).
+type ResumeCaseParams struct {
+	CaseID           string
+	ExpectedVersion  int
+	ActorPrincipalID string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+// ResolveCaseParams holds input for resolving a case (IN_PROGRESS/WAITING_* → RESOLVED).
+type ResolveCaseParams struct {
+	CaseID           string
+	ExpectedVersion  int
+	ActorPrincipalID string
+	CorrelationID    string
+	OutcomeCode      string // mandatory per closure gate (WF-S3)
+	EvidenceRefs     []string
+	Meta             CommandMeta
+}
+
+// CloseCaseParams holds input for closing a case (RESOLVED → CLOSED).
+type CloseCaseParams struct {
+	CaseID           string
+	ExpectedVersion  int
+	ActorPrincipalID string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+// ReopenCaseParams holds input for reopening a case (CLOSED/RESOLVED → REOPENED).
+type ReopenCaseParams struct {
+	CaseID           string
+	ExpectedVersion  int
+	ActorPrincipalID string
+	CorrelationID    string
+	Reason           string // mandatory per WF-S3
+	Meta             CommandMeta
+}
+
+// MergeCaseParams holds input for merging cases into a canonical case.
+type MergeCaseParams struct {
+	CanonicalCaseID  string
+	AliasCaseID      string
+	ActorPrincipalID string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+// SplitCaseParams holds input for splitting a case into a new case.
+type SplitCaseParams struct {
+	SourceCaseID     string
+	NewCaseFamily    CaseFamily
+	NewCaseType      string
+	Title            string
+	Description      string
+	ActorPrincipalID string
+	CorrelationID    string
+	EvidenceScope    []string // subset of evidence refs to carry over
+	Meta             CommandMeta
+}
+
+// AddCaseMemberParams holds input for adding a member to a case.
+type AddCaseMemberParams struct {
+	CaseID           string
+	PrincipalID      string
+	Role             string // OWNER, ASSIGNEE, OBSERVER
+	ActorPrincipalID string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+// RemoveCaseMemberParams holds input for removing a member from a case.
+type RemoveCaseMemberParams struct {
+	CaseID           string
+	PrincipalID      string
+	Role             string
+	ActorPrincipalID string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+// CreateCaseNoteParams holds input for creating a case note.
+type CreateCaseNoteParams struct {
+	CaseID        string
+	PrincipalID   string
+	Content       string
+	Visibility    string // INTERNAL, RESTRICTED, PRIVILEGED
+	EvidenceRefs  []string
+	CorrelationID string
+	Meta          CommandMeta
+}
+
+// UpdateCaseNoteParams holds input for updating a case note (creates new version).
+type UpdateCaseNoteParams struct {
+	CaseNoteID      string
+	PrincipalID     string
+	Content         string
+	Visibility      string
+	EvidenceRefs    []string
+	ExpectedVersion int
+	CorrelationID   string
+	Meta            CommandMeta
+}
+
+// CreateCaseLinkParams holds input for linking a domain object to a case.
+type CreateCaseLinkParams struct {
+	CaseID           string
+	DomainObjectType string
+	DomainObjectID   string
+	ActorPrincipalID string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+// CreateWorkItemParams holds input for creating a work item on a case.
+type CreateWorkItemParams struct {
+	TenantID            string
+	LegalEntityID       string
+	CaseID              *string
+	WorkflowInstanceID  *string
+	ItemType            string
+	Queue               *string
+	Role                *string
+	AssigneePrincipalID *string
+	Mandatory           bool
+	CompletionSchema    map[string]any
+	DueAt               *time.Time
+	ActorPrincipalID    string
+	CorrelationID       string
+	Meta                CommandMeta
+}
+
+// SatisfyWorkItemParams holds input for satisfying a work item.
+type SatisfyWorkItemParams struct {
+	WorkItemID       string
+	ExpectedVersion  int
+	ActorPrincipalID string
+	CompletionData   map[string]any
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+// WaiveWorkItemParams holds input for waiving a mandatory work item.
+type WaiveWorkItemParams struct {
+	WorkItemID       string
+	ExpectedVersion  int
+	ActorPrincipalID string
+	Reason           string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+// TransferWorkItemParams holds input for transferring a work item to another case/workflow.
+type TransferWorkItemParams struct {
+	WorkItemID       string
+	ExpectedVersion  int
+	NewCaseID        *string
+	NewWorkflowID    *string
+	ActorPrincipalID string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+// OpenCaseFromObligationParams holds input for opening a case from an obligation milestone (WF-S7).
+type OpenCaseFromObligationParams struct {
+	SourceType       string // "obligation"
+	SourceID         string
+	Milestone        string
+	TenantID         string
+	LegalEntityID    string
+	CaseFamily       CaseFamily
+	CaseType         string
+	Title            string
+	Description      string
+	ActorPrincipalID string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+// WorkItem represents a generic work item for cases and workflows (WFC-02).
+type WorkItem struct {
+	WorkItemID          string         `json:"work_item_id"`
+	TenantID            string         `json:"tenant_id"`
+	LegalEntityID       string         `json:"legal_entity_id"`
+	CaseID              *string        `json:"case_id,omitempty"`
+	WorkflowInstanceID  *string        `json:"workflow_instance_id,omitempty"`
+	ItemType            string         `json:"item_type"` // APPROVAL, REVIEW, INVESTIGATION, etc.
+	Queue               *string        `json:"queue,omitempty"`
+	Role                *string        `json:"role,omitempty"`
+	AssigneePrincipalID *string        `json:"assignee_principal_id,omitempty"`
+	State               string         `json:"state"` // UNASSIGNED, CLAIMED, COMPLETED, CANCELLED
+	Mandatory           bool           `json:"mandatory"`
+	CompletionSchema    map[string]any `json:"completion_schema,omitempty"`
+	DueAt               *time.Time     `json:"due_at,omitempty"`
+	CreatedAt           time.Time      `json:"created_at"`
+	UpdatedAt           time.Time      `json:"updated_at"`
+	RowVersion          int            `json:"row_version"`
+}
+
+// WorkItemAssignment represents the assignment history of a work item.
+type WorkItemAssignment struct {
+	WorkItemAssignmentID string    `json:"work_item_assignment_id"`
+	WorkItemID           string    `json:"work_item_id"`
+	PreviousAssigneeID   *string   `json:"previous_assignee_id,omitempty"`
+	NewAssigneeID        string    `json:"new_assignee_id"`
+	ActorPrincipalID     string    `json:"actor_principal_id"`
+	Reason               *string   `json:"reason,omitempty"`
+	AssignedAt           time.Time `json:"assigned_at"`
+}
+
+type ListWorkItemsFilter struct {
+	TenantID            string
+	LegalEntityID       string
+	CaseID              *string
+	WorkflowInstanceID  *string
+	ItemType            string
+	Queue               *string
+	AssigneePrincipalID *string
+	State               string
+	Mandatory           *bool
+	Limit               int
+	Cursor              *PaginationCursor
+}
+
+type BulkCompleteWorkItemsParams struct {
+	TenantID         string
+	WorkItemIDs      []string
+	ActorPrincipalID string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+type WorkItemResult struct {
+	WorkItemID string `json:"work_item_id"`
+	Success    bool   `json:"success"`
+	Error      string `json:"error,omitempty"`
+}
+
+// =============================================================================
+// ST-1/2/3: State Machine Registry
+// =============================================================================
+
+// StateMachineRegistry holds the allowed states and transitions for each
+// workflow type. This is loaded from workflow definitions.
+type StateMachineRegistry struct {
+	// Maps workflow_type -> state machine definition
+	definitions map[string]*StateMachineDef
+}
+
+type StateMachineDef struct {
+	WorkflowType   string
+	States         []string
+	Transitions    map[string][]string // from_state -> []to_state
+	InitialState   string
+	TerminalStates []string
+	RequiresHuman  bool // whether approvals require human (not service account)
+}
+
+// GetStateMachine returns the state machine for a workflow type.
+// Returns nil if not found.
+func (r *StateMachineRegistry) GetStateMachine(workflowType string) *StateMachineDef {
+	return r.definitions[workflowType]
+}
+
+// RegisterStateMachine registers a state machine for a workflow type.
+func (r *StateMachineRegistry) RegisterStateMachine(def *StateMachineDef) {
+	if r.definitions == nil {
+		r.definitions = make(map[string]*StateMachineDef)
+	}
+	r.definitions[def.WorkflowType] = def
+}
+
+// IsValidTransition checks if a transition is allowed for a workflow type.
+func (r *StateMachineRegistry) IsValidTransition(workflowType, fromState, toState string) bool {
+	def := r.GetStateMachine(workflowType)
+	if def == nil {
+		return false
+	}
+	allowed, ok := def.Transitions[fromState]
+	if !ok {
+		return false
+	}
+	for _, s := range allowed {
+		if s == toState {
+			return true
+		}
+	}
+	return false
+}
+
+// AvailableActions returns the actions available for a principal at a given stage.
+// This is the ST-2 endpoint: GET /v1/workflows/{id}/available-actions
+type AvailableActions struct {
+	WorkflowInstanceID string   `json:"workflow_instance_id"`
+	CurrentStage       int      `json:"current_stage"`
+	CurrentStatus      string   `json:"current_status"`
+	Actions            []string `json:"actions"` // APPROVE, REJECT, REQUEST_CHANGES, ESCALATE, CANCEL, INVALIDATE, etc.
+	PrincipalID        string   `json:"principal_id"`
+	CanAct             bool     `json:"can_act"`
+	Reason             string   `json:"reason,omitempty"` // why can_act is false
+}
+
+// TransitionHistoryEntry is one entry in the transition history.
+// This is the ST-3 endpoint: GET /v1/workflows/{id}/transition-history
+type TransitionHistoryEntry struct {
+	TransitionID       string    `json:"transition_id"`
+	WorkflowInstanceID string    `json:"workflow_instance_id"`
+	FromStage          int       `json:"from_stage"`
+	ToStage            int       `json:"to_stage"`
+	FromStatus         string    `json:"from_status"`
+	ToStatus           string    `json:"to_status"`
+	ActorPrincipalID   string    `json:"actor_principal_id"`
+	ActionType         string    `json:"action_type"` // APPROVE, REJECT, REQUEST_CHANGES, ESCALATE, etc.
+	Rationale          *string   `json:"rationale,omitempty"`
+	DecisionID         *string   `json:"decision_id,omitempty"`
+	Quorum             any       `json:"quorum,omitempty"`
+	OccurredAt         time.Time `json:"occurred_at"`
+}
+
+// ErrNoStateMachine is returned when no state machine is registered for a workflow type.
+var ErrNoStateMachine = errorString("no state machine registered for workflow type")
+
+// =============================================================================
+// WF-S24: Operator Repair (F30)
+// =============================================================================
+
+// OperatorActionKind represents the type of operator repair action.
+type OperatorActionKind string
+
+const (
+	OperatorActionRetryTimer          OperatorActionKind = "RETRY_TIMER"
+	OperatorActionRecomputeNextAction OperatorActionKind = "RECOMPUTE_NEXT_ACTION"
+	OperatorActionForceEscalate       OperatorActionKind = "FORCE_ESCALATE"
+	OperatorActionForceExpire         OperatorActionKind = "FORCE_EXPIRE"
+	OperatorActionRequeueParkedEvent  OperatorActionKind = "REQUEUE_PARKED_EVENT"
+	OperatorActionReleaseClaim        OperatorActionKind = "RELEASE_CLAIM"
+)
+
+// OperatorActionStatus represents the status of an operator action.
+type OperatorActionStatus string
+
+const (
+	OperatorActionStatusPending  OperatorActionStatus = "PENDING"
+	OperatorActionStatusApproved OperatorActionStatus = "APPROVED"
+	OperatorActionStatusRejected OperatorActionStatus = "REJECTED"
+	OperatorActionStatusExecuted OperatorActionStatus = "EXECUTED"
+	OperatorActionStatusExpired  OperatorActionStatus = "EXPIRED"
+)
+
+// OperatorAction represents an operator repair action.
+type OperatorAction struct {
+	OperatorActionID   string               `json:"operator_action_id"`
+	TenantID           string               `json:"tenant_id"`
+	WorkflowInstanceID string               `json:"workflow_instance_id"`
+	Kind               OperatorActionKind   `json:"kind"`
+	Status             OperatorActionStatus `json:"status"`
+	Reason             string               `json:"reason"`
+	Scope              *string              `json:"scope,omitempty"`
+	EvidenceRefs       []string             `json:"evidence_refs"`
+	RequestedBy        string               `json:"requested_by"`
+	RequestedAt        time.Time            `json:"requested_at"`
+	ApprovedBy         *string              `json:"approved_by,omitempty"`
+	ApprovedAt         *time.Time           `json:"approved_at,omitempty"`
+	ExecutedAt         *time.Time           `json:"executed_at,omitempty"`
+	ExecutionResult    *string              `json:"execution_result,omitempty"`
+	CreatedAt          time.Time            `json:"created_at"`
+	UpdatedAt          time.Time            `json:"updated_at"`
+	RowVersion         int                  `json:"row_version"`
+}
+
+type CreateOperatorActionParams struct {
+	WorkflowInstanceID string
+	Kind               OperatorActionKind
+	Reason             string
+	Scope              *string
+	EvidenceRefs       []string
+	ActorPrincipalID   string
+	CorrelationID      string
+	Meta               CommandMeta
+}
+
+type ApproveOperatorActionParams struct {
+	OperatorActionID string
+	ActorPrincipalID string
+	CorrelationID    string
+	Meta             CommandMeta
+}
+
+type ExecuteOperatorActionParams struct {
+	OperatorActionID string
+	ActorPrincipalID string
+	CorrelationID    string
+	ExecutionResult  string
+	Meta             CommandMeta
+}
+
+type ListOperatorActionsFilter struct {
+	TenantID           string
+	WorkflowInstanceID *string
+	Status             OperatorActionStatus
+	Kind               OperatorActionKind
+	Limit              int
+	Cursor             *PaginationCursor
+}
+
+var ErrOperatorActionNotFound = errorString("operator action not found")
+var ErrOperatorActionRequiresApproval = errorString("operator action requires second-person approval")
+var ErrOperatorActionRequesterCannotApprove = errorString("requester cannot approve their own operator action")
+
+// =============================================================================
+// WF-S25: Emergency Approval (F31)
+// =============================================================================
+
+// EmergencyCondition represents the condition an emergency approval bypasses.
+type EmergencyCondition string
+
+const (
+	EmergencyConditionQuorum EmergencyCondition = "QUORUM"
+	EmergencyConditionTiming EmergencyCondition = "TIMING"
+)
+
+// EmergencyApproval represents an emergency approval.
+type EmergencyApproval struct {
+	EmergencyApprovalID string               `json:"emergency_approval_id"`
+	TenantID            string               `json:"tenant_id"`
+	LegalEntityID       string               `json:"legal_entity_id"`
+	WorkflowInstanceID  string               `json:"workflow_instance_id"`
+	BreakGlassSessionID string               `json:"break_glass_session_id"`
+	WindowStart         time.Time            `json:"window_start"`
+	WindowEnd           time.Time            `json:"window_end"`
+	ReasonCode          string               `json:"reason_code"`
+	IncidentRef         *string              `json:"incident_ref,omitempty"`
+	Scope               *string              `json:"scope,omitempty"`
+	MaxImpact           *string              `json:"max_impact,omitempty"`
+	Conditions          []EmergencyCondition `json:"conditions"`
+	ApprovedBy          string               `json:"approved_by"`
+	ApprovedAt          time.Time            `json:"approved_at"`
+	ReviewWorkItemID    *string              `json:"review_work_item_id,omitempty"`
+	CreatedAt           time.Time            `json:"created_at"`
+	UpdatedAt           time.Time            `json:"updated_at"`
+	RowVersion          int                  `json:"row_version"`
+}
+
+type CreateEmergencyApprovalParams struct {
+	WorkflowInstanceID  string
+	BreakGlassSessionID string
+	WindowStart         time.Time
+	WindowEnd           time.Time
+	ReasonCode          string
+	IncidentRef         *string
+	Scope               *string
+	MaxImpact           *string
+	Conditions          []EmergencyCondition
+	ActorPrincipalID    string
+	CorrelationID       string
+	Meta                CommandMeta
+}
+
+type ListEmergencyApprovalsFilter struct {
+	TenantID            string
+	WorkflowInstanceID  *string
+	BreakGlassSessionID *string
+	Limit               int
+	Cursor              *PaginationCursor
+}
+
+var ErrEmergencyApprovalNotFound = errorString("emergency approval not found")
+var ErrBreakGlassSessionInvalid = errorString("break-glass session invalid or expired")
+var ErrProtectedTypeRefused = errorString("protected type refused emergency approval")
+var ErrActorCannotCompleteReview = errorString("actor cannot complete their own review work item")

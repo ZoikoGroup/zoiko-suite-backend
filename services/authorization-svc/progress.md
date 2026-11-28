@@ -2623,3 +2623,52 @@ together (If-Match is now required by one and sent by the other); apply access-c
 - `seed-demo-rbac.ps1` no longer grants any service identity; it verifies them
   (svc-access-control from the store: /v1/authorize refuses the tenant id as a
   legal entity, which is the scope the admin gate checks).
+
+## 18 Nov: VC-1, the console's missing commands (AZ-FE-1/2), AZ-2 trial
+
+- **Image rebuilt** from the branch (host binaries over the 10 Nov image; it predated the
+  10 Nov afternoon and 11 Nov changes). Migrations 45/45.
+- **Suites:** 903 pass / 0 fail / 1 by-design skip (`TEST_DATABASE_URL` legacy owner suite
+  and `AUTHZ_IT_DSN` as NOBYPASSRLS). Mutants killed: a holder resuming their own grant
+  (`TestResumeRoleAssignment_NotOnOwnAssignment`) and a mutation accepted without If-Match
+  (`TestRevokeRoleAssignment_IfMatchRequired`, `TestExpectedVersion_*`).
+- **Live:** `e2e-authorization-deps.py` 33/33 with siem-integration-svc, otel-collector and
+  Jaeger up (the 10 Nov run left those 4 unrun); `e2e-authorization-scenarios.py` 78/78;
+  `scripts/audit.sh` 49/0.
+- **Console (AZ-FE-1/2, frontend `18cf64c`, `4ac9cd1`):** suspend / resume, suspension
+  history, as-of, session activity, and a Roles register (role and permission-set retire /
+  reactivate). `tests/e2e/console/authorization.spec.ts` 11/11 live, including a stale page's
+  412, the break-glass step-up gate, empty states and this service stopped. Found: RFC 9457
+  refusals carry their code only as `code`, so the console read a 412 as unknown; fixed there.
+- **Demo seed (`24bcab06`):** IAM_ADMIN_FULL gains `iam.assignment.suspend` / `.resume`. The
+  seed added every demo grant again on each re-run (this service stores a repeated grant
+  twice); the admin's 34 copies made the console's session cookie exceed 4096 bytes. It now
+  grants only what is not already held; 5 duplicates from today were revoked through the
+  console (legal counsel revoked the admin's, the admin revoked legal counsel's).
+- **AZ-2 trial** (`AUTHZ_IDENTITY_ASSERTION=require` on a recreate): identity e2e 61/61 and the
+  console pass; access-control-svc's role provisioning fails (plaintext admin calls; its
+  `internal/mtls` client requests a certificate with no bootstrap token; compose never sets
+  `AUTHZ_MTLS_ENABLED`), as do the dev seed (synthetic seed administrator) and the persona
+  harness. Compose stays `warn`; SPEC_DEVIATIONS records the blockers.
+
+## Decision capture (DL-3, 25 Nov 2026)
+
+Doc 01 §7 / Doc 03 §8.3, decision D-DL-1: every `DENY` and `REQUIRE_APPROVAL` (and a denied admin-gate check)
+is relayed to governance-decision-log-svc as `svc-authorization` (`GOVERNANCE_DECISION_RECORD`, migration 000046).
+`PERMIT` and `STEP_UP` stay only in `access_decision_log`. Not relayed either: a decision with no tenant (the
+ledger is tenant-scoped) and a decision about `svc-authorization` itself (the ledger's own append check; relaying
+its denial would loop). Tenant-scope and platform-scope checks are filed under the ledger's `PLATFORM` scope.
+
+- Record: `internal/ledger` (`decision_id` = access decision id, `action_type` `ACCESS_<action>`, domain
+  `ORGANIZATION_ACCESS`, `rule_basis` `<policy_set_version> reasons:<codes> basis:<basis>`, the attributes digest
+  only, the evaluated principal in `evaluation_context.on_behalf_of`).
+- Store: `PgStore.SetDecisionLedger`, migration 000047 `decision_log_outbox` (RLS: own tenant or the relay marker).
+- Metrics: `authz_decision_log_outbox_pending`, `_parked`, `_oldest_pending_seconds`,
+  `authz_decision_log_relay_deliveries_total{result}`, `authz_decision_log_outbox_purged_total`.
+- Tests: `TestBuilder_*`, `TestRecord_CarriesBasisActorAndNoAttributeValues` (unit);
+  `TestDL3_OnlyDenyAndRequireApprovalAreQueuedForTheLedger`, `TestDL3_TheLedgerRecordCommitsWithTheDecision`,
+  `TestDL1_DecisionLogWritersProvisionedWithATenantsFirstRole` (AUTHZ_IT_DSN, NOBYPASSRLS).
+- Load (c=50, 30 s, DENY ≈ 40 % of the mix): the in-transaction enqueue alone adds ~7 % to p95; unpaced delivery
+  during the run added 16–29 %, hence the delivery cap.
+
+The record is written to `decision_log_outbox` in the transaction of the decision it records and delivered by `identity-envelope/decisionledger`'s relay (lease-based claim, backoff to 10 minutes, a 409 parks the row for an operator, delivered rows purged after `LEDGER_RETENTION_HOURS`, default 168) to `GOVERNANCE_DECISION_LOG_MTLS_URL` with this service's own workload certificate (`mtlsclient`, bootstrap token `MTLS_BOOTSTRAP_TOKEN_PATH`). Deliveries are capped at `LEDGER_RELAY_MAX_PER_SECOND` (default 20): a ledger outage or a burst delays the evidence, it never fails or slows the decision. Status: 🔵 built, not verified (tracker "Assignment 25 Nov 2026").

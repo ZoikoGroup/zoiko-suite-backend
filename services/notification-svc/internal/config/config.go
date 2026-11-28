@@ -44,6 +44,10 @@ type Config struct {
 	AuthzMTLSURL             string
 	MTLSManagementServiceURL string
 
+	// LegalBasisPolicyMTLSURL is policy-svc's mTLS peer listener for the
+	// legal-basis reads (S7-C2); see Load.
+	LegalBasisPolicyMTLSURL string
+
 	OTELExporterEndpoint string
 
 	// ActionTokenSecret is the HMAC-SHA256 signing key for action link tokens
@@ -358,7 +362,11 @@ func Load() (*Config, error) {
 		PartyContactsPrincipal: env("PARTY_CONTACTS_PRINCIPAL", "notification-svc"),
 
 		LegalBasisPolicyURL: env("LEGAL_BASIS_POLICY_URL", ""),
-		LegalBasisPrincipal: env("LEGAL_BASIS_PRINCIPAL", "notification-svc"),
+		// LEGAL_BASIS_POLICY_MTLS_URL (e.g. https://policy-svc:8449) sends the
+		// legal-basis reads to policy-svc's mTLS peer listener with this
+		// service's certificate; it takes precedence over the plain URL.
+		LegalBasisPolicyMTLSURL: env("LEGAL_BASIS_POLICY_MTLS_URL", ""),
+		LegalBasisPrincipal:     env("LEGAL_BASIS_PRINCIPAL", "notification-svc"),
 
 		QuotaEnabled: env("NOTIFICATION_QUOTA_ENABLED", "false") == "true",
 		QuotaLimits: quota.Limits{

@@ -56,7 +56,7 @@ type fakeTenantRevoker struct {
 	n       int
 }
 
-func (f *fakeTenantRevoker) EvictAllForTenant(_ context.Context, tenantID string, reason domain.InvalidationReason) (int, error) {
+func (f *fakeTenantRevoker) EvictAllForTenant(_ context.Context, tenantID string, reason domain.InvalidationReason, _, _ string) (int, error) {
 	if f.revoked == nil {
 		f.revoked = map[string]domain.InvalidationReason{}
 	}

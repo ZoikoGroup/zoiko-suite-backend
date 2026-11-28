@@ -151,6 +151,14 @@ type FilingTransition struct {
 // obligation (lifecycle_model = LEGACY).
 var ObligationStatuses = map[string]bool{"OPEN": true, "IN_PROGRESS": true, "OVERDUE": true, "CLOSED": true}
 
+// ObligationTransitions enumerates the obligation_status state machine.
+// CLOSED is terminal: never a key. Enforced in the store under a row lock.
+var ObligationTransitions = map[string][]string{
+	"OPEN":        {"IN_PROGRESS", "OVERDUE", "CLOSED"},
+	"IN_PROGRESS": {"OVERDUE", "CLOSED"},
+	"OVERDUE":     {"CLOSED"},
+}
+
 // ExtendedObligationStatuses are the values obligation_status may take on an
 // EXTENDED (WFC-05) obligation. IN_PROGRESS is shared with the LEGACY set by
 // coincidence of naming, not meaning — the two machines never interoperate.

@@ -20,10 +20,10 @@ import (
 	"errors"
 	"net/http"
 	"sort"
-	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	apicontract "zoiko.io/identity-envelope/apicontract"
 
 	"zoiko.io/policy-svc/internal/authz"
 	"zoiko.io/policy-svc/internal/domain"
@@ -181,6 +181,9 @@ func (h *Handler) DraftAccountingPolicy(w http.ResponseWriter, r *http.Request) 
 		case errors.Is(err, domain.ErrConflict):
 			writeError(w, r, http.StatusConflict, codeIdempotencyMismatch, "accounting_policy_conflict",
 				"a policy already exists for this applicability with a different framework", nil)
+		case errors.Is(err, domain.ErrPolicyRetired):
+			writeError(w, r, http.StatusConflict, codePolicyRetired, "policy_retired",
+				"the accounting policy family for this applicability is retired and takes no new versions", nil)
 		default:
 			h.storeUnavailable(w, r, "DraftAccountingPolicy", err)
 		}
@@ -190,7 +193,7 @@ func (h *Handler) DraftAccountingPolicy(w http.ResponseWriter, r *http.Request) 
 	if created {
 		status = http.StatusCreated
 	}
-	w.Header().Set("ETag", `"`+strconv.Itoa(v.RowVersion)+`"`)
+	apicontract.WriteETag(w, int64(v.RowVersion))
 	writeJSON(w, status, v)
 }
 
@@ -222,7 +225,7 @@ func (h *Handler) GetAccountingPolicyVersion(w http.ResponseWriter, r *http.Requ
 		h.storeUnavailable(w, r, "GetAccountingPolicyVersion", err)
 		return
 	}
-	w.Header().Set("ETag", `"`+strconv.Itoa(v.RowVersion)+`"`)
+	apicontract.WriteETag(w, int64(v.RowVersion))
 	writeJSON(w, http.StatusOK, v)
 }
 

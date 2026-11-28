@@ -13,10 +13,9 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/exception-escalation-svc/internal/domain"
+	"zoiko.io/exception-escalation-svc/internal/events"
 )
 
-// mockAuthzClient grants every request; used to exercise the happy path in
-// tests that are not specifically testing authz denial/unavailability.
 type mockAuthzClient struct {
 	err error
 }
@@ -37,141 +36,156 @@ func newMockStore() *mockStore {
 	}
 }
 
-func (m *mockStore) CreateException(ctx context.Context, c *domain.ExceptionCase) error {
-	if c.ExceptionCaseID == "" {
-		c.ExceptionCaseID = "excase-test-01"
+func (m *mockStore) CreateExceptionCase(ctx context.Context, params domain.CreateExceptionCaseParams) (*domain.ExceptionCase, error) {
+	id := params.ExceptionCaseID
+	if id == "" {
+		id = "excase-test-01"
 	}
-	c.CreatedAt = time.Now().UTC()
-	c.UpdatedAt = time.Now().UTC()
-	if c.CaseStatus == "" {
-		c.CaseStatus = domain.CaseOpen
+	now := time.Now().UTC()
+	c := &domain.ExceptionCase{
+		ExceptionCaseID:        id,
+		TenantID:               params.TenantID,
+		LegalEntityID:          params.LegalEntityID,
+		ExceptionType:          params.ExceptionType,
+		SeverityLevel:          params.SeverityLevel,
+		LinkedObjectType:       params.LinkedObjectType,
+		LinkedObjectID:         params.LinkedObjectID,
+		CaseStatus:             domain.CaseStatusOpen,
+		CreatedAt:              now,
+		CreatedByPrincipalID:   params.CreatedByPrincipalID,
+		UpdatedAt:              now,
+		Version:                1,
 	}
-	m.cases[c.ExceptionCaseID] = c
-	return nil
+	m.cases[id] = c
+	return c, nil
 }
 
-func (m *mockStore) GetExceptionByID(ctx context.Context, id string) (*domain.ExceptionCase, error) {
-	c, ok := m.cases[id]
+func (m *mockStore) FindExceptionCaseByID(ctx context.Context, exceptionCaseID string) (*domain.ExceptionCase, error) {
+	c, ok := m.cases[exceptionCaseID]
 	if !ok {
 		return nil, domain.ErrExceptionCaseNotFound
 	}
 	return c, nil
 }
 
-func (m *mockStore) ListExceptions(ctx context.Context, legalEntityID, caseStatus, severityLevel, exceptionType string) ([]domain.ExceptionCase, error) {
-	var out []domain.ExceptionCase
+func (m *mockStore) ListExceptionCases(ctx context.Context, filter domain.ListExceptionCasesFilter) ([]*domain.ExceptionCase, error) {
+	var out []*domain.ExceptionCase
 	for _, item := range m.cases {
-		if legalEntityID != "" && item.LegalEntityID != legalEntityID {
+		if filter.LegalEntityID != "" && item.LegalEntityID != filter.LegalEntityID {
 			continue
 		}
-		if caseStatus != "" && string(item.CaseStatus) != caseStatus {
+		if filter.ExceptionType != "" && item.ExceptionType != filter.ExceptionType {
 			continue
 		}
-		if severityLevel != "" && string(item.SeverityLevel) != severityLevel {
+		if filter.CaseStatus != "" && item.CaseStatus != filter.CaseStatus {
 			continue
 		}
-		if exceptionType != "" && item.ExceptionType != exceptionType {
+		if filter.SeverityLevel != "" && item.SeverityLevel != filter.SeverityLevel {
 			continue
 		}
-		out = append(out, *item)
+		out = append(out, item)
 	}
 	return out, nil
 }
 
-func (m *mockStore) EscalateException(ctx context.Context, id string, req *domain.EscalateCaseRequest) (*domain.EscalationRecord, *domain.ExceptionCase, error) {
-	c, ok := m.cases[id]
-	if !ok {
-		return nil, nil, domain.ErrExceptionCaseNotFound
-	}
-	if c.CaseStatus == domain.CaseClosed || c.CaseStatus == domain.CaseResolved {
-		return nil, nil, domain.ErrCaseAlreadyClosed
-	}
-
-	now := time.Now().UTC()
-	escRecord := domain.EscalationRecord{
-		EscalationRecordID: "escrec-test-01",
-		ExceptionCaseID:    id,
-		EscalatedToRole:    req.EscalatedToRole,
-		EscalatedToUser:    req.EscalatedToUser,
-		EscalationReason:   req.EscalationReason,
-		EscalationStatus:   domain.EscalationPending,
-		EscalatedBy:        req.EscalatedBy,
-		EscalatedAt:        now,
-		CreatedAt:          now,
-		UpdatedAt:          now,
-	}
-	m.escalations[escRecord.EscalationRecordID] = &escRecord
-
-	c.CaseStatus = domain.CaseEscalated
-	c.EscalatedAt = &now
-	c.AssignedToRole = req.EscalatedToRole
-	c.UpdatedAt = now
-	c.Escalations = append(c.Escalations, escRecord)
-
-	return &escRecord, c, nil
-}
-
-func (m *mockStore) ResolveException(ctx context.Context, id string, req *domain.ResolveCaseRequest) (*domain.ExceptionCase, error) {
-	c, ok := m.cases[id]
+func (m *mockStore) UpdateExceptionCaseStatus(ctx context.Context, exceptionCaseID string, params domain.UpdateExceptionCaseStatusParams, actorID, correlationID string) (*domain.ExceptionCase, error) {
+	c, ok := m.cases[exceptionCaseID]
 	if !ok {
 		return nil, domain.ErrExceptionCaseNotFound
 	}
-	if c.CaseStatus == domain.CaseClosed {
-		return nil, domain.ErrCaseAlreadyClosed
+	if params.ExpectedVersion > 0 && c.Version != params.ExpectedVersion {
+		return nil, domain.ErrVersionMismatch
 	}
-	now := time.Now().UTC()
-	c.CaseStatus = domain.CaseClosed
-	c.ClosedAt = &now
-	c.ClosedBy = req.ClosedBy
-	c.ClosureReason = req.ClosureReason
-	c.UpdatedAt = now
+	c.CaseStatus = params.CaseStatus
+	if params.CaseStatus == domain.CaseStatusEscalated && c.EscalatedAt == nil {
+		now := time.Now().UTC()
+		c.EscalatedAt = &now
+	}
+	c.UpdatedAt = time.Now().UTC()
+	c.Version++
 	return c, nil
 }
 
-func (m *mockStore) ListEscalations(ctx context.Context, role, status string) ([]domain.EscalationRecord, error) {
-	var out []domain.EscalationRecord
+func (m *mockStore) CreateEscalationRecord(ctx context.Context, params domain.CreateEscalationRecordParams) (*domain.EscalationRecord, error) {
+	id := params.EscalationRecordID
+	if id == "" {
+		id = "escrec-test-01"
+	}
+	now := time.Now().UTC()
+	er := &domain.EscalationRecord{
+		EscalationRecordID:     id,
+		ExceptionCaseID:        params.ExceptionCaseID,
+		EscalatedToRole:        params.EscalatedToRole,
+		EscalationReason:       params.EscalationReason,
+		EscalationStatus:       domain.EscalationStatusPending,
+		EscalatedAt:            now,
+		CreatedAt:              now,
+		CreatedByPrincipalID:   params.CreatedByPrincipalID,
+	}
+	m.escalations[id] = er
+	return er, nil
+}
+
+func (m *mockStore) FindEscalationRecordByID(ctx context.Context, escalationRecordID string) (*domain.EscalationRecord, error) {
+	er, ok := m.escalations[escalationRecordID]
+	if !ok {
+		return nil, domain.ErrEscalationRecordNotFound
+	}
+	return er, nil
+}
+
+func (m *mockStore) ListEscalationRecords(ctx context.Context, filter domain.ListEscalationRecordsFilter) ([]*domain.EscalationRecord, error) {
+	var out []*domain.EscalationRecord
 	for _, item := range m.escalations {
-		if role != "" && item.EscalatedToRole != role {
+		if filter.ExceptionCaseID != "" && item.ExceptionCaseID != filter.ExceptionCaseID {
 			continue
 		}
-		if status != "" && string(item.EscalationStatus) != status {
+		if filter.EscalatedToRole != "" && item.EscalatedToRole != filter.EscalatedToRole {
 			continue
 		}
-		out = append(out, *item)
+		if filter.EscalationStatus != "" && item.EscalationStatus != filter.EscalationStatus {
+			continue
+		}
+		out = append(out, item)
 	}
 	return out, nil
+}
+
+type mockPublisher struct{}
+
+func (p *mockPublisher) Publish(ctx context.Context, params events.PublishParams) error {
+	return nil
 }
 
 func setupTestRouter() (*chi.Mux, *mockStore) {
 	st := newMockStore()
+	pub := &mockPublisher{}
 	az := &mockAuthzClient{}
 	logger, _ := zap.NewDevelopment()
-	h := New(st, az, logger)
+	h := New(st, pub, az, logger)
 
 	r := chi.NewRouter()
 	RegisterRoutes(r, h)
 	return r, st
 }
 
-func TestCreateEscalateAndResolveException(t *testing.T) {
+func TestCreateAndGetExceptionCase(t *testing.T) {
 	r, _ := setupTestRouter()
 
-	createReqPayload := domain.CreateExceptionRequest{
-		LegalEntityID:    "entity-001",
-		JurisdictionID:   "GB-UK",
-		ExceptionType:    "OVERDUE_FILING",
-		SeverityLevel:    domain.SeverityHigh,
-		LinkedObjectType: "FILING",
-		LinkedObjectID:   "ftrk-2026-9901",
-		Description:      "VAT return not submitted before due date",
-		AssignedToRole:   "TAX_MANAGER",
-		CreatedBy:        "filing_tracker_svc",
+	reqPayload := map[string]interface{}{
+		"legal_entity_id":         "entity-001",
+		"exception_type":          "MISSED_DEADLINE",
+		"severity_level":          "HIGH",
+		"linked_object_type":      "FILING",
+		"linked_object_id":        "ftrk-2026-9901",
+		"created_by_principal_id": "filing_tracker_svc",
 	}
-	body, _ := json.Marshal(createReqPayload)
+	body, _ := json.Marshal(reqPayload)
 
-	req := httptest.NewRequest("POST", "/v1/exception-escalation/exceptions", bytes.NewBuffer(body))
+	req := httptest.NewRequest("POST", "/v1/exceptions/", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Principal-Id", "filing_tracker_svc")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
+	req.Header.Set("X-Tenant-Id", "tenant-001")
 	w := httptest.NewRecorder()
 
 	r.ServeHTTP(w, req)
@@ -184,103 +198,291 @@ func TestCreateEscalateAndResolveException(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&created); err != nil {
 		t.Fatalf("failed to decode response: %v", err)
 	}
-
-	// Escalate case
-	escReqPayload := domain.EscalateCaseRequest{
-		EscalatedToRole:  "COMPLIANCE_HEAD",
-		EscalationReason: "High severity overdue filing exceeding 7 days",
-		EscalatedBy:      "principal-test-01", // must be the calling principal
+	if created.ExceptionCaseID == "" {
+		t.Error("expected exception_case_id to be set")
 	}
-	escBody, _ := json.Marshal(escReqPayload)
-
-	escReq := httptest.NewRequest("POST", "/v1/exception-escalation/exceptions/"+created.ExceptionCaseID+"/escalate", bytes.NewBuffer(escBody))
-	escReq.Header.Set("Content-Type", "application/json")
-	escReq.Header.Set("X-Principal-Id", "principal-test-01")
-	escW := httptest.NewRecorder()
-
-	r.ServeHTTP(escW, escReq)
-
-	if escW.Code != http.StatusOK {
-		t.Fatalf("expected status 200 on escalate, got %d", escW.Code)
+	if created.LegalEntityID != "entity-001" {
+		t.Errorf("expected legal_entity_id entity-001, got %s", created.LegalEntityID)
 	}
-
-	// Resolve case
-	resReqPayload := domain.ResolveCaseRequest{
-		ClosedBy:      "principal-test-01", // must be the calling principal
-		ClosureReason: "Late filing approved and submitted with penalty waiver",
+	if created.ExceptionType != "MISSED_DEADLINE" {
+		t.Errorf("expected exception_type MISSED_DEADLINE, got %s", created.ExceptionType)
 	}
-	resBody, _ := json.Marshal(resReqPayload)
-
-	resReq := httptest.NewRequest("POST", "/v1/exception-escalation/exceptions/"+created.ExceptionCaseID+"/resolve", bytes.NewBuffer(resBody))
-	resReq.Header.Set("Content-Type", "application/json")
-	resReq.Header.Set("X-Principal-Id", "principal-test-01")
-	resW := httptest.NewRecorder()
-
-	r.ServeHTTP(resW, resReq)
-
-	if resW.Code != http.StatusOK {
-		t.Fatalf("expected status 200 on resolve, got %d", resW.Code)
+	if created.SeverityLevel != "HIGH" {
+		t.Errorf("expected severity_level HIGH, got %s", created.SeverityLevel)
+	}
+	if created.LinkedObjectType != "FILING" {
+		t.Errorf("expected linked_object_type FILING, got %s", created.LinkedObjectType)
+	}
+	if created.CaseStatus != "OPEN" {
+		t.Errorf("expected case_status OPEN, got %s", created.CaseStatus)
 	}
 
-	var resolved domain.ExceptionCase
-	if err := json.NewDecoder(resW.Body).Decode(&resolved); err != nil {
-		t.Fatalf("failed to decode resolved response: %v", err)
+	// Get by ID
+	getReq := httptest.NewRequest("GET", "/v1/exceptions/"+created.ExceptionCaseID, nil)
+	getReq.Header.Set("X-Principal-Id", "principal-test-01")
+	getReq.Header.Set("X-Tenant-Id", "tenant-001")
+	getW := httptest.NewRecorder()
+	r.ServeHTTP(getW, getReq)
+
+	if getW.Code != http.StatusOK {
+		t.Errorf("expected status 200 on GetByID, got %d", getW.Code)
 	}
-	if resolved.CaseStatus != domain.CaseClosed {
-		t.Errorf("expected status CLOSED, got %s", resolved.CaseStatus)
+
+	var getResult domain.ExceptionCase
+	_ = json.NewDecoder(getW.Body).Decode(&getResult)
+	if getResult.ExceptionCaseID != created.ExceptionCaseID {
+		t.Error("mismatch in GetByID result")
 	}
 }
 
-// TestResolveException_SelfApprovalForbidden enforces Segregation of Duties
-// (docs/original_doc/zoiko_suite_doc1.txt §12.3): the principal who created
-// an exception case may not be the same principal who resolves/closes it.
-func TestResolveException_SelfApprovalForbidden(t *testing.T) {
-	r, _ := setupTestRouter()
+func TestCreateEscalationRecord(t *testing.T) {
+	r, st := setupTestRouter()
 
-	const creator = "filing_tracker_svc"
-
-	createReqPayload := domain.CreateExceptionRequest{
-		LegalEntityID:    "entity-001",
-		JurisdictionID:   "GB-UK",
-		ExceptionType:    "OVERDUE_FILING",
-		SeverityLevel:    domain.SeverityHigh,
-		LinkedObjectType: "FILING",
-		LinkedObjectID:   "ftrk-2026-9902",
-		Description:      "VAT return not submitted before due date",
-		AssignedToRole:   "TAX_MANAGER",
-		CreatedBy:        creator,
+	// Create exception case first
+	now := time.Now().UTC()
+	ec := &domain.ExceptionCase{
+		ExceptionCaseID:        "excase-escalate-01",
+		TenantID:               "tenant-001",
+		LegalEntityID:          "entity-001",
+		ExceptionType:          "MISSED_DEADLINE",
+		SeverityLevel:          "HIGH",
+		LinkedObjectType:       "FILING",
+		LinkedObjectID:         "ftrk-2026-9901",
+		CaseStatus:             domain.CaseStatusOpen,
+		CreatedAt:              now,
+		CreatedByPrincipalID:   "filing_tracker_svc",
+		UpdatedAt:              now,
+		Version:                1,
 	}
-	body, _ := json.Marshal(createReqPayload)
+	st.cases[ec.ExceptionCaseID] = ec
 
-	req := httptest.NewRequest("POST", "/v1/exception-escalation/exceptions", bytes.NewBuffer(body))
+	reqPayload := map[string]interface{}{
+		"exception_case_id":        ec.ExceptionCaseID,
+		"escalated_to_role":        "COMPLIANCE_HEAD",
+		"escalation_reason":        "High severity overdue filing exceeding 7 days",
+		"created_by_principal_id":  "tax_manager",
+	}
+	body, _ := json.Marshal(reqPayload)
+
+	req := httptest.NewRequest("POST", "/v1/exceptions/"+ec.ExceptionCaseID+"/escalations", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Principal-Id", creator)
+	req.Header.Set("X-Principal-Id", "principal-test-01")
+	req.Header.Set("X-Tenant-Id", "tenant-001")
 	w := httptest.NewRecorder()
+
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusCreated {
 		t.Fatalf("expected status 201, got %d", w.Code)
 	}
 
-	var created domain.ExceptionCase
-	if err := json.NewDecoder(w.Body).Decode(&created); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
+	var created domain.EscalationRecord
+	_ = json.NewDecoder(w.Body).Decode(&created)
+	if created.EscalationRecordID == "" {
+		t.Error("expected escalation_record_id to be set")
+	}
+	if created.ExceptionCaseID != ec.ExceptionCaseID {
+		t.Errorf("expected exception_case_id %s, got %s", ec.ExceptionCaseID, created.ExceptionCaseID)
+	}
+	if created.EscalatedToRole != "COMPLIANCE_HEAD" {
+		t.Errorf("expected escalated_to_role COMPLIANCE_HEAD, got %s", created.EscalatedToRole)
+	}
+	if created.EscalationStatus != "PENDING" {
+		t.Errorf("expected escalation_status PENDING, got %s", created.EscalationStatus)
+	}
+}
+
+func TestUpdateExceptionCaseStatus(t *testing.T) {
+	r, st := setupTestRouter()
+
+	// Create exception case
+	now := time.Now().UTC()
+	ec := &domain.ExceptionCase{
+		ExceptionCaseID:        "excase-status-01",
+		TenantID:               "tenant-001",
+		LegalEntityID:          "entity-001",
+		ExceptionType:          "MISSED_DEADLINE",
+		SeverityLevel:          "HIGH",
+		LinkedObjectType:       "FILING",
+		LinkedObjectID:         "ftrk-2026-9901",
+		CaseStatus:             domain.CaseStatusOpen,
+		CreatedAt:              now,
+		CreatedByPrincipalID:   "filing_tracker_svc",
+		UpdatedAt:              now,
+		Version:                1,
+	}
+	st.cases[ec.ExceptionCaseID] = ec
+
+	// Update status to ESCALATED
+	updateReq := map[string]interface{}{
+		"case_status":       "ESCALATED",
+		"expected_version":  1,
+	}
+	body, _ := json.Marshal(updateReq)
+
+	req := httptest.NewRequest("POST", "/v1/exceptions/"+ec.ExceptionCaseID+"/status", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
+	req.Header.Set("X-Tenant-Id", "tenant-001")
+	w := httptest.NewRecorder()
+
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
 	}
 
-	// Attempt to resolve as the same principal that created the case.
-	resReqPayload := domain.ResolveCaseRequest{
-		ClosedBy:      creator,
-		ClosureReason: "Late filing approved and submitted with penalty waiver",
+	var result domain.ExceptionCase
+	_ = json.NewDecoder(w.Body).Decode(&result)
+	if result.CaseStatus != "ESCALATED" {
+		t.Errorf("expected case_status ESCALATED, got %s", result.CaseStatus)
 	}
-	resBody, _ := json.Marshal(resReqPayload)
+	if result.EscalatedAt == nil {
+		t.Error("expected escalated_at to be set when status is ESCALATED")
+	}
+	if result.Version != 2 {
+		t.Errorf("expected version 2, got %d", result.Version)
+	}
+}
 
-	resReq := httptest.NewRequest("POST", "/v1/exception-escalation/exceptions/"+created.ExceptionCaseID+"/resolve", bytes.NewBuffer(resBody))
-	resReq.Header.Set("Content-Type", "application/json")
-	resReq.Header.Set("X-Principal-Id", creator)
-	resW := httptest.NewRecorder()
-	r.ServeHTTP(resW, resReq)
+func TestListExceptionCases(t *testing.T) {
+	r, _ := setupTestRouter()
 
-	if resW.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 self-approval rejection, got %d — %s", resW.Code, resW.Body.String())
+	// Create two exception cases
+	cases := []map[string]interface{}{
+		{
+			"legal_entity_id":         "entity-101",
+			"exception_type":          "MISSED_DEADLINE",
+			"severity_level":          "HIGH",
+			"linked_object_type":      "FILING",
+			"linked_object_id":        "ftrk-2026-9901",
+			"created_by_principal_id": "filing_tracker_svc",
+		},
+		{
+			"legal_entity_id":         "entity-101",
+			"exception_type":          "INSUFFICIENT_EVIDENCE",
+			"severity_level":          "MEDIUM",
+			"linked_object_type":      "OBLIGATION",
+			"linked_object_id":        "obl-2026-001",
+			"created_by_principal_id": "compliance_officer",
+		},
+	}
+
+	for _, c := range cases {
+		body, _ := json.Marshal(c)
+		req := httptest.NewRequest("POST", "/v1/exceptions/", bytes.NewBuffer(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Principal-Id", "principal-test-01")
+		req.Header.Set("X-Tenant-Id", "tenant-001")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusCreated {
+			t.Errorf("failed to create exception case: %d", w.Code)
+		}
+	}
+
+	// List for entity-101
+	listReq := httptest.NewRequest("GET", "/v1/exceptions/?legal_entity_id=entity-101", nil)
+	listReq.Header.Set("X-Principal-Id", "principal-test-01")
+	listReq.Header.Set("X-Tenant-Id", "tenant-001")
+	listW := httptest.NewRecorder()
+	r.ServeHTTP(listW, listReq)
+
+	if listW.Code != http.StatusOK {
+		t.Errorf("expected status 200 on List, got %d", listW.Code)
+	}
+
+	var listResp map[string]interface{}
+	_ = json.NewDecoder(listW.Body).Decode(&listResp)
+	records := listResp["exception_cases"]
+	if records == nil {
+		t.Error("expected exception_cases in response")
+	}
+}
+
+func TestValidationErrors(t *testing.T) {
+	r, _ := setupTestRouter()
+
+	testCases := []struct {
+		name       string
+		payload    map[string]interface{}
+		wantStatus int
+	}{
+		{
+			name: "missing legal_entity_id",
+			payload: map[string]interface{}{
+				"exception_type":         "MISSED_DEADLINE",
+				"severity_level":         "HIGH",
+				"linked_object_type":     "FILING",
+				"linked_object_id":       "ftrk-2026-9901",
+				"created_by_principal_id": "test",
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "invalid exception_type",
+			payload: map[string]interface{}{
+				"legal_entity_id":         "entity-001",
+				"exception_type":          "INVALID",
+				"severity_level":          "HIGH",
+				"linked_object_type":      "FILING",
+				"linked_object_id":        "ftrk-2026-9901",
+				"created_by_principal_id": "test",
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "invalid severity_level",
+			payload: map[string]interface{}{
+				"legal_entity_id":         "entity-001",
+				"exception_type":          "MISSED_DEADLINE",
+				"severity_level":          "INVALID",
+				"linked_object_type":      "FILING",
+				"linked_object_id":        "ftrk-2026-9901",
+				"created_by_principal_id": "test",
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "invalid linked_object_type",
+			payload: map[string]interface{}{
+				"legal_entity_id":         "entity-001",
+				"exception_type":          "MISSED_DEADLINE",
+				"severity_level":          "HIGH",
+				"linked_object_type":      "INVALID",
+				"linked_object_id":        "ftrk-2026-9901",
+				"created_by_principal_id": "test",
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "invalid case_status",
+			payload: map[string]interface{}{
+				"case_status":        "INVALID",
+				"expected_version":   1,
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, _ := json.Marshal(tc.payload)
+			var req *http.Request
+			if tc.name == "invalid case_status" {
+				req = httptest.NewRequest("POST", "/v1/exceptions/excase-status-01/status", bytes.NewBuffer(body))
+			} else {
+				req = httptest.NewRequest("POST", "/v1/exceptions/", bytes.NewBuffer(body))
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Principal-Id", "principal-test-01")
+			req.Header.Set("X-Tenant-Id", "tenant-001")
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != tc.wantStatus {
+				t.Errorf("expected status %d, got %d", tc.wantStatus, w.Code)
+			}
+		})
 	}
 }

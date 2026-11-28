@@ -431,9 +431,23 @@ panes, verify, seal, package verify, both downloads, full record).
   identity-envelope, governance-decision-log-svc incl. DB, policy-svc,
   workflow-svc, access-control-svc).
 
+### 2026-11-18 — 000019: one lineage for the TRUNCATE guards
+
+`migrate.py status` reported 000007 and 000011 as edited after applying. Both were
+rewritten in place on 12 Oct. 000007's edit only made the backfill re-runnable (the
+dev DB holds the column and no unbackfilled row). 000011's edit renamed the guard:
+databases migrated before 12 Oct have `block_truncate()` on four tables (it also
+refused TRUNCATE on `idempotency_keys` and `outbox`), fresh ones `reject_truncate()`
+on two, and 000011's down could not remove the old triggers. 000019 converges an
+old-lineage database and is a no-op on a fresh one (both proven on scratch
+databases; 000011's down then removes everything). Applied live (19/19); the two
+checksums re-recorded with the reconciliation as their method. Suite 215 / 0 / 0
+(store on Postgres, `REQUIRE_DB_TESTS=1`).
+
 ## Next steps
 
-- [ ] Commit and open the PR (nothing committed yet).
+- [x] Commit: `c7d00cce` (11 Nov 2026). The PR to `main` is the estate's
+      closure step CL-7 (tracker Session 25). 18 Nov: dashboard row set to 🏁.
 - [x] GDL-2: workflow-svc's ledger relay live (e2e "workflow relay: *").
 - [x] contract-lifecycle-svc, decision-support-svc, evidence-manifest-svc on
       :8450 with their own certificates (D2-2.F07, 11 Nov evening).
@@ -444,3 +458,27 @@ panes, verify, seal, package verify, both downloads, full record).
       svc-decision-support READ (authorization-svc 000042); writers
       svc-policy / svc-workflow by 000043.
 - [x] Both event names registered in schema-registry-svc (R9).
+
+## Automatic decision capture (25 Nov 2026, tracker DL-0…DL-9)
+
+Every governance engine now writes its own verdicts here; people only read,
+verify and export (decision D-DL-2). Writers and their words: CONTEXT.md
+"Writers".
+
+- 000020: outcome categories for REQUIRE_APPROVAL, CERTIFIED, RELEASED,
+  PUBLISHED, ACTIVATED, UNBLOCKED, SUPERSEDED, WITHDRAWN, ROLLED_BACK, RAISED,
+  WAIVED, SATISFIED, MISSING, NO_REQUIREMENTS_DEFINED and workflow's APPROVE,
+  REJECT, CANCELLED, INVALIDATED, EXPIRED, REOPENED (seven quorum votes read
+  OTHER before); domain keywords for jurisdiction, obligation and access
+  actions. `TestSummary_WriterOutcomesAreCategorised`.
+- New peers on :8450 (`IDENTITY_PEERS`): authorization-svc,
+  jurisdiction-rules-svc, obligations-svc, evidence-requirements-svc, each with
+  its own bootstrap token; their principals hold RECORD by authorization-svc
+  000046. `deployments/scripts/probe-decision-log-writers.py` appends once per
+  certificate.
+- The human GOVERNANCE_FULL bundle no longer carries
+  GOVERNANCE_DECISION_RECORD (`seed-demo-rbac.ps1`); the console has no write
+  command left (frontend `app/admin/governance`).
+- End to end: `deployments/scripts/e2e-decision-capture.py`.
+
+Status: 🔵 built, not verified.

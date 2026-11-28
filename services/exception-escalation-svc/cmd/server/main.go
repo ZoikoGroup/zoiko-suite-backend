@@ -15,18 +15,14 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
-	"zoiko.io/eventing/kafkaout"
-	eventingoutbox "zoiko.io/eventing/outbox"
 	"zoiko.io/exception-escalation-svc/internal/authz"
 	"zoiko.io/exception-escalation-svc/internal/config"
 	svcenvelope "zoiko.io/exception-escalation-svc/internal/envelope"
 	"zoiko.io/exception-escalation-svc/internal/events"
 	"zoiko.io/exception-escalation-svc/internal/handler"
 	"zoiko.io/exception-escalation-svc/internal/health"
-	"zoiko.io/exception-escalation-svc/internal/idempotency"
 	"zoiko.io/exception-escalation-svc/internal/middleware"
 	"zoiko.io/exception-escalation-svc/internal/mtls"
-	"zoiko.io/exception-escalation-svc/internal/outbox"
 	"zoiko.io/exception-escalation-svc/internal/store"
 	"zoiko.io/exception-escalation-svc/internal/telemetry"
 )
@@ -64,43 +60,9 @@ func main() {
 		logger.Info("connected to postgres database")
 	}
 
-	// The shared eventing outbox table must exist before the first write tries to enqueue into it.
-	if pool != nil {
-		if err := eventingoutbox.VerifySchema(ctx, pool); err != nil {
-			logger.Fatal("eventing outbox schema missing", zap.Error(err))
-		}
-	}
-	pgStore := store.NewPgStore(pool, store.WithEventRegion(cfg.EventResidencyRegion))
+	pgStore := store.NewPgStore(pool)
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
-
-	// Relay for the BIZ-08 deadline events on the shared eventing outbox. The other events keep
-	// the direct publisher. With no brokers the relay is not started: events queue in eventing_outbox.
-	relayCtx, cancelRelay := context.WithCancel(context.Background())
-	defer cancelRelay()
-	eventingRelayDone := make(chan struct{}, 1)
-	if pool == nil || cfg.KafkaBrokers == "" {
-		logger.Warn("no database or KAFKA_BROKERS: the eventing outbox relay is not running; BIZ-08 deadline events will queue in eventing_outbox")
-		eventingRelayDone <- struct{}{}
-	} else {
-		eventingWriter, err := kafkaout.New(kafkaout.Config{
-			Brokers:                brokers,
-			Topic:                  cfg.KafkaEventsTopic,
-			AllowAutoTopicCreation: cfg.Env == "local",
-		})
-		if err != nil {
-			logger.Fatal("eventing outbox kafka writer", zap.Error(err))
-		}
-		defer func() { _ = eventingWriter.Close() }()
-		eventingRelay, err := eventingoutbox.NewRelay(pool, eventingWriter, eventingoutbox.DefaultConfig(), logger)
-		if err != nil {
-			logger.Fatal("eventing outbox relay", zap.Error(err))
-		}
-		go func() {
-			eventingRelay.Run(relayCtx)
-			eventingRelayDone <- struct{}{}
-		}()
-	}
 
 	const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 	var authzClient *authz.Client
@@ -115,15 +77,7 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
 
-	h := handler.New(pgStore, authzClient, logger)
-
-	// Transactional outbox relay: every write enqueues its event in the same
-	// transaction as the change; the relay delivers it with retry.
-	relayCtx, stopRelay := context.WithCancel(context.Background())
-	defer stopRelay()
-	if pool != nil {
-		go outbox.NewRelay(pool, publisher, 0, 0, logger).Start(relayCtx)
-	}
+	h := handler.New(pgStore, publisher, authzClient, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -138,18 +92,10 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	// Replay protection for material writes: a retried POST/PUT with the same
-	// Idempotency-Key gets the first answer instead of running twice. Placed after
-	// the envelope middleware, which guarantees the key and tenant are present.
-	r.Use(idempotency.Middleware(idempotency.NewPgStore(pool), logger))
-
 	r.Get("/healthz", health.HealthzHandler)
 	r.Get("/readyz", health.ReadyzHandler(pool))
 
 	handler.RegisterRoutes(r, h)
-	handler.RegisterFindingRoutes(r, h, pgStore)
-	handler.RegisterTaskRoutes(r, h, pgStore)
-	handler.RegisterDeadlineRoutes(r, h, pgStore)
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,
@@ -176,14 +122,6 @@ func main() {
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("server shutdown forced", zap.Error(err))
-	}
-	// Stop the relay after the server: requests finishing during Shutdown may still commit
-	// events. Anything not delivered stays in the outbox for the next process.
-	cancelRelay()
-	select {
-	case <-eventingRelayDone:
-	case <-shutdownCtx.Done():
-		logger.Warn("eventing outbox relay did not stop before the shutdown deadline")
 	}
 	if pool != nil {
 		pool.Close()

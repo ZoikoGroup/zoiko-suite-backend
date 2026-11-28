@@ -212,14 +212,37 @@ func NewApprovalPolicy(baseURL string, c *http.Client) *ApprovalPolicy {
 	return &ApprovalPolicy{baseURL: strings.TrimRight(baseURL, "/"), http: newHTTP(c)}
 }
 
+// PolicyRequest is one approval-threshold question to policy-svc.
+type PolicyRequest struct {
+	TenantID      string
+	PrincipalID   string
+	LegalEntityID string
+	// Amount is the exact decimal the instruction carries, never a float
+	// (V-001 PDC-I-11); Currency is its ISO 4217 code.
+	Amount   string
+	Currency string
+	// DecisionID is stable for one version of one instruction, so a retried
+	// validation records one decision in policy-svc's evidence, not two.
+	DecisionID string
+	// Authorization is the caller's signed identity envelope, forwarded so
+	// policy-svc authorizes the person, not a bare header.
+	Authorization string
+	CorrelationID string
+}
+
 // Evaluate asks policy-svc for the APPROVAL_THRESHOLD of an amount, as payment-authorization-svc does
-// for AP payments. "No applicable policy" (404) is WITHIN_THRESHOLD, policy-svc's own documented stance;
-// an unreachable policy service is an error (validation is blocked), never a pass.
-func (p *ApprovalPolicy) Evaluate(ctx context.Context, tenantID, principalID, legalEntityID string, amount float64) (result, versionID string, err error) {
-	actionContext, _ := json.Marshal(map[string]float64{"amount": amount})
+// for AP payments. It fails closed: no governing policy (404 POLICY_NOT_EFFECTIVE) is APPROVAL_REQUIRED,
+// because policy-svc leaves that choice to the caller and a payroll payment with no threshold on record
+// is not "within" one. An unreachable policy service blocks validation. A refused caller (401/403) and a
+// refused request (400) are reported as such, not as an outage.
+func (p *ApprovalPolicy) Evaluate(ctx context.Context, in PolicyRequest) (result, versionID string, err error) {
+	actionContext, err := json.Marshal(map[string]any{"amount": json.Number(in.Amount), "currency": in.Currency})
+	if err != nil {
+		return "", "", domain.ErrPolicyRefused
+	}
 	payload, err := json.Marshal(map[string]any{
-		"policy_type": "APPROVAL_THRESHOLD", "tenant_id": tenantID, "legal_entity_id": legalEntityID,
-		"action_context": json.RawMessage(actionContext), "evaluated_by_principal_id": principalID, "decision_id": uuid.NewString(),
+		"policy_type": "APPROVAL_THRESHOLD", "tenant_id": in.TenantID, "legal_entity_id": in.LegalEntityID,
+		"action_context": json.RawMessage(actionContext), "decision_id": in.DecisionID,
 	})
 	if err != nil {
 		return "", "", domain.ErrPolicyUnavailable
@@ -229,16 +252,33 @@ func (p *ApprovalPolicy) Evaluate(ctx context.Context, tenantID, principalID, le
 		return "", "", domain.ErrPolicyUnavailable
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Tenant-Id", in.TenantID)
+	req.Header.Set("X-Principal-Id", in.PrincipalID)
+	if in.LegalEntityID != "" {
+		req.Header.Set("X-Legal-Entity-Id", in.LegalEntityID)
+	}
+	if in.Authorization != "" {
+		req.Header.Set("Authorization", in.Authorization)
+	}
+	if in.CorrelationID != "" {
+		req.Header.Set("X-Correlation-ID", in.CorrelationID)
+	}
+	req.Header.Set("X-Request-Id", uuid.NewString())
+	req.Header.Set("X-Source-Channel", "service")
 	resp, err := p.http.Do(req)
 	if err != nil {
 		return "", "", domain.ErrPolicyUnavailable
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return "WITHIN_THRESHOLD", "", nil
-	}
-	if resp.StatusCode != http.StatusOK {
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotFound:
+		return domain.PolicyApproval, "", nil
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return "", "", domain.ErrPolicyAccessDenied
+	case http.StatusBadRequest, http.StatusConflict, http.StatusUnprocessableEntity:
+		return "", "", domain.ErrPolicyRefused
+	default:
 		return "", "", domain.ErrPolicyUnavailable
 	}
 	var out struct {

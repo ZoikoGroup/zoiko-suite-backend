@@ -27,6 +27,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
@@ -34,6 +35,8 @@ import (
 	idenv "zoiko.io/identity-envelope"
 	apicontract "zoiko.io/identity-envelope/apicontract"
 	"zoiko.io/identity-envelope/apicontract/asyncpgx"
+	"zoiko.io/identity-envelope/decisionledger"
+	"zoiko.io/identity-envelope/mtlsclient"
 
 	"zoiko.io/jurisdiction-rules-svc/internal/approval"
 	"zoiko.io/jurisdiction-rules-svc/internal/authz"
@@ -45,6 +48,7 @@ import (
 	"zoiko.io/jurisdiction-rules-svc/internal/events"
 	"zoiko.io/jurisdiction-rules-svc/internal/handler"
 	"zoiko.io/jurisdiction-rules-svc/internal/health"
+	"zoiko.io/jurisdiction-rules-svc/internal/ledgermetrics"
 	"zoiko.io/jurisdiction-rules-svc/internal/mtls"
 	"zoiko.io/jurisdiction-rules-svc/internal/resolver"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
@@ -203,6 +207,42 @@ func main() {
 		registryPub = rp
 	}
 	h.WithRegistry(pgStore, registryPub).WithCertificationPolicy(cfg.PackCertMinReviews)
+
+	// Decision capture (DL-4, 25 Nov 2026; Doc 01 s7): governed decisions are
+	// queued in decision_log_outbox (000038) in the request's unit of work and
+	// relayed to governance-decision-log-svc as LEDGER_PRINCIPAL_ID with this
+	// service's own workload certificate. A ledger outage leaves records
+	// waiting; it never fails a change.
+	ledgerQueue := decisionledger.NewPgQueue(pool)
+	ledgerGauges := ledgermetrics.New(prometheus.DefaultRegisterer)
+	ledgerCtx, stopLedger := context.WithCancel(context.Background())
+	defer stopLedger()
+	go decisionledger.RunSampler(ledgerCtx, ledgerQueue, ledgerGauges, 15*time.Second, cfg.LedgerRetention, log)
+	if cfg.LedgerPrincipalID != "" {
+		h.WithDecisionLedger(pgStore.DB)
+	} else {
+		log.Warn("LEDGER_PRINCIPAL_ID unset — governed decisions are not relayed to the governance decision log")
+	}
+	if cfg.DecisionLogMTLSURL != "" && cfg.LedgerPrincipalID != "" {
+		ledgerIdentity := mtlsclient.Start(ledgerCtx, mtlsclient.Options{
+			ServiceName:        "jurisdiction-rules-svc",
+			ManagementURL:      cfg.MTLSManagementServiceURL,
+			BootstrapTokenPath: cfg.MTLSBootstrapTokenPath,
+		}, log)
+		ledgerRelay := decisionledger.NewRelay(ledgerQueue, &decisionledger.HTTPSender{
+			BaseURL: cfg.DecisionLogMTLSURL, Principal: cfg.LedgerPrincipalID,
+			KeyPrefix: "jurisdiction-ledger", Purpose: "jurisdiction_decision_evidence",
+			Client: ledgerIdentity.HTTPClient(5 * time.Second),
+		}, cfg.LedgerRelayInterval, log)
+		ledgerRelay.Observe(ledgerGauges)
+		ledgerRelay.SetMaxPerSecond(cfg.LedgerRelayMaxPerSecond)
+		ledgerRelay.Start()
+		defer ledgerRelay.Stop()
+		log.Info("decision-log relay: governance ledger over mTLS", zap.String("url", cfg.DecisionLogMTLSURL),
+			zap.String("principal", cfg.LedgerPrincipalID))
+	} else if cfg.LedgerPrincipalID != "" {
+		log.Warn("GOVERNANCE_DECISION_LOG_MTLS_URL unset — governed decisions wait in decision_log_outbox until a relay runs")
+	}
 	h.WithOperations(handler.OpsPolicy{
 		HotfixRetroSLA:  time.Duration(cfg.HotfixRetroSLAHours) * time.Hour,
 		CertAgeWarnDays: cfg.PackCertAgeWarnDays,

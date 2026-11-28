@@ -230,7 +230,15 @@ type AccessDecisionClient struct {
 }
 
 func NewAccessDecisionClient(baseURL string, log *zap.Logger) *AccessDecisionClient {
-	return &AccessDecisionClient{baseURL: baseURL, log: log, http: &http.Client{Timeout: 5 * time.Second}}
+	return NewAccessDecisionClientWithHTTPClient(baseURL, withForwarding(&http.Client{Timeout: 5 * time.Second}), log)
+}
+
+// NewAccessDecisionClientWithHTTPClient uses the provided HTTP client (e.g., an
+// mTLS client for the relay/scheduled path where no person is behind the
+// request). When an mTLS client is provided, the service must be listed in
+// authorization-svc's AUTHZ_ADMIN_DELEGATES.
+func NewAccessDecisionClientWithHTTPClient(baseURL string, httpClient *http.Client, log *zap.Logger) *AccessDecisionClient {
+	return &AccessDecisionClient{baseURL: baseURL, log: log, http: withForwarding(httpClient)}
 }
 
 // GetByID is the ONLY discovery mechanism authorization-svc exposes — no

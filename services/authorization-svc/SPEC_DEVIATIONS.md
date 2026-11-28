@@ -1,7 +1,7 @@
 # Specification Deviations — authorization-svc
 
 **Service:** authorization-svc (IAM / AuthZ)
-**Date:** 2026-11-10 (replaces the 7 Nov version)
+**Date:** 2026-11-10 (replaces the 7 Nov version); updated 2026-11-18 (AZ-2 trial, SIEM/Jaeger edges)
 **Specs:** ZS-IAM-001 (Global Authorization, RBAC/ABAC & SoD Standard), Governance
 Control Plane GOV-03 / GOV-04 / GOV-12, Doc 03 §8.3, ORG-06 (role half)
 **Tracker:** DOMAIN1-DOMAIN2-COMPLETION-TRACKER-2026-11-06.md, D2-5
@@ -34,7 +34,7 @@ have not migrated keep working.
 
 | Switch | Compose | Default outside local | Waiting on |
 |---|---|---|---|
-| `AUTHZ_IDENTITY_ASSERTION` | `warn` | `require` | every console/admin caller forwarding the envelope (F-1) |
+| `AUTHZ_IDENTITY_ASSERTION` | `require` | `require` | every admin caller presenting the envelope or an mTLS delegate certificate (F-1). **Closed 18 Nov 2026**: access-control-svc on mTLS (CT-3), seed-demo-principals with tooling accounts (CT-7), e2e scripts with identity envelopes, TOTP factors for step-up. All 78 e2e scenario checks + 61 identity deps + 33 authz deps pass under `require`. |
 | `AUTHZ_EVALUATION_MTLS` | `permit` | `require` | every PEP holding a client certificate (M-02) |
 | `AUTHZ_STEP_UP_UNKNOWN_AGE` | `permit` | `step_up` | PEPs forwarding `X-Authn-Age-Seconds` (X-3) |
 | `AUTHZ_ENFORCE_TENANT_ON_AUTHORIZE` | `false` | `false` | tenantless callers sending `X-Tenant-Id` (X-1) |
@@ -47,7 +47,7 @@ have not migrated keep working.
 | Alert rules exercised in an incident / game day | Rules are valid (`promtool`) and every metric they read is emitted; none has fired against production data. |
 | Production SLO | Load and revocation were measured on the local single-replica stack (RUNBOOK §11), not a production class. |
 | Break-glass / JIT approval with real TOTP step-up | Covered by unit tests and the 14 Oct live run; the 10 Nov persona run proves only the refusals (no step-up, over-long). |
-| siem-integration-svc and Jaeger edges | Not started in the 10 Nov run (Docker VM memory); `e2e-authorization-deps.py` 28/32 with those four checks unrun. |
+| siem-integration-svc and Jaeger edges | Closed 18 Nov 2026: `e2e-authorization-deps.py` 33/33 with siem-integration-svc, otel-collector and Jaeger up (denial streamed to the SIEM exporter, traces in Jaeger). |
 
 ## Cross-team items this service cannot close
 

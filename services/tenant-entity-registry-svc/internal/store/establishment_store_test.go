@@ -312,7 +312,7 @@ func TestRegisteredOffice_ABecomesAnAddressAndTheChangeKeepsTheOldOne(t *testing
 	assert.Len(t, all, 2)
 
 	// The ORG-03 profile history is untouched: it still holds the office as given.
-	versions, err := f.s.ListEntityProfileVersions(f.ctx, f.entityID)
+	versions, _, err := f.s.ListEntityProfileVersions(f.ctx, f.entityID, 50, "")
 	require.NoError(t, err)
 	require.Len(t, versions, 3)
 	assert.Contains(t, *versions[0].RegisteredOffice, "2 Registry Way")

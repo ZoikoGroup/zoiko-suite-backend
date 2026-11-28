@@ -34,6 +34,7 @@ tags:
   - name: versions
   - name: resolution
   - name: evaluation
+  - name: decisions
   - name: controls
   - name: attestations
   - name: health
@@ -59,6 +60,7 @@ paths:
     post:
       tags: [policies]
       operationId: createPolicy
+      x-spec-operation: GOV-05 CreatePolicyDraft (policy family)
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/CorrelationID'
@@ -87,6 +89,7 @@ paths:
     get:
       tags: [resolution]
       operationId: listApplicablePolicyVersions
+      x-spec-operation: Doc 03 8.1 get applicable policy set
       description: The governing version of every applicable chain, most specific scope first.
       parameters:
         - $ref: '#/components/parameters/PolicyType'
@@ -111,6 +114,7 @@ paths:
     get:
       tags: [resolution]
       operationId: resolveEffectivePolicy
+      x-spec-operation: GOV-05 ResolveEffectivePolicy; Doc 03 8.1 validate threshold applicability
       parameters:
         - $ref: '#/components/parameters/PolicyType'
         - $ref: '#/components/parameters/TenantIDQuery'
@@ -132,6 +136,7 @@ paths:
     get:
       tags: [resolution]
       operationId: explainPolicyResolution
+      x-spec-operation: GOV-05 ExplainPolicyResolution
       parameters:
         - $ref: '#/components/parameters/PolicyType'
         - $ref: '#/components/parameters/TenantIDQuery'
@@ -149,10 +154,26 @@ paths:
         '403': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
 
+  /v1/policies/summary:
+    get:
+      tags: [policies]
+      operationId: getPolicySummary
+      description: The console KPI row for the caller's tenant (POLICY_READ). Counts of rows, never estimates.
+      responses:
+        '200':
+          description: The counts
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PolicySummary'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
   /v1/policies/evaluate:
     post:
       tags: [evaluation]
       operationId: evaluatePolicy
+      x-spec-operation: Doc 03 8.1 evaluate policy against action context
       parameters:
         - $ref: '#/components/parameters/CorrelationID'
       requestBody:
@@ -176,6 +197,82 @@ paths:
         '501': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
 
+  /internal/v1/policy/signatory-matrix/resolve:
+    post:
+      tags: [decisions]
+      operationId: resolveSignatoryMatrix
+      x-spec-operation: ZS-GOV-INT-002 §4 signatory-matrix resolution
+      description: "Resolves the signer requirement for one instrument. Answers 200 with a signed decision: SIGNATURE_REQUIRED, PERMIT (exemption) or NOT_CONFIGURED. POLICY_EVALUATE."
+      parameters:
+        - $ref: '#/components/parameters/CorrelationID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SignatoryResolveRequest'}
+      responses:
+        '200':
+          description: The signed decision, stored as evidence and relayed to the governance ledger
+          headers:
+            X-Decision-Replayed: {schema: {type: string}, description: 'true when this is the stored decision of an earlier request with the same request_id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Decision'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '413': {$ref: '#/components/responses/Problem'}
+        '500': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /internal/v1/policy/decisions/{decision_id}:
+    parameters:
+      - {name: decision_id, in: path, required: true, schema: {type: string, format: uuid}}
+    get:
+      tags: [decisions]
+      operationId: getDecision
+      description: "The signed decision as answered. POLICY_READ."
+      responses:
+        '200':
+          description: The signed decision
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Decision'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-decision-keys:
+    get:
+      tags: [decisions]
+      operationId: getDecisionKeys
+      description: The Ed25519 public keys (JWKS, RFC 8037) that verify this service's decisions.
+      responses:
+        '200':
+          description: The key set
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DecisionKeys'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-types:
+    get:
+      tags: [decisions]
+      operationId: listPolicyTypes
+      description: "One status card per policy family for the caller's tenant. POLICY_READ."
+      responses:
+        '200':
+          description: The family catalogue with status
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PolicyTypes'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
   /v1/policies/{policy_id}:
     parameters:
       - $ref: '#/components/parameters/PolicyID'
@@ -194,12 +291,50 @@ paths:
         '404': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
 
+  /v1/policies/{policy_id}/retire:
+    parameters:
+      - $ref: '#/components/parameters/PolicyID'
+    post:
+      tags: [policies]
+      operationId: retirePolicyFamily
+      x-spec-operation: GOV-05 RetirePolicy (family, D8)
+      description: >-
+        Retires a policy family: no new versions, history kept. Refused (409 POLICY_IN_USE) while
+        a version is ACTIVE or SCHEDULED. Needs the family's record_version and a reason_code;
+        authorized as POLICY_VERSION_RETIRE (POLICY_VERSION_RETIRE_GLOBAL for a platform family).
+        Retiring a retired family answers it unchanged.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ReasonRequest'}
+      responses:
+        '200':
+          description: The retired family; record_version is the ETag
+          headers:
+            ETag: {schema: {type: string}}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Policy'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/Problem'}
+        '428': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
   /v1/policies/{policy_id}/versions:
     parameters:
       - $ref: '#/components/parameters/PolicyID'
     post:
       tags: [versions]
       operationId: createPolicyVersion
+      x-spec-operation: GOV-05 CreatePolicyDraft (version)
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/CorrelationID'
@@ -221,14 +356,16 @@ paths:
     get:
       tags: [versions]
       operationId: listVersionHistory
+      x-spec-operation: Doc 03 8.1 retrieve policy version history
+      parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
       responses:
         '200':
-          description: Every version visible to the caller's tenant, newest first
+          description: Every version visible to the caller's tenant, newest first, one page (API-4)
           content:
             application/json:
-              schema:
-                type: array
-                items: {$ref: '#/components/schemas/PolicyVersion'}
+              schema: {$ref: '#/components/schemas/PolicyVersionPage'}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
@@ -242,6 +379,7 @@ paths:
     post:
       tags: [versions]
       operationId: submitPolicyVersionForReview
+      x-spec-operation: GOV-05 SubmitPolicyReview
       parameters:
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -262,6 +400,7 @@ paths:
     post:
       tags: [versions]
       operationId: approvePolicyVersion
+      x-spec-operation: GOV-05 ApprovePolicy
       parameters:
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -282,6 +421,7 @@ paths:
     post:
       tags: [versions]
       operationId: activatePolicyVersion
+      x-spec-operation: GOV-05 ActivatePolicy; SupersedePolicy when a successor activates
       parameters:
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -302,6 +442,7 @@ paths:
     post:
       tags: [versions]
       operationId: schedulePolicyVersion
+      x-spec-operation: GOV-05 ScheduleActivation
       parameters:
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -322,6 +463,7 @@ paths:
     post:
       tags: [versions]
       operationId: suspendPolicyVersion
+      x-spec-operation: GOV-05 EmergencySuspendPolicy
       parameters:
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -342,6 +484,7 @@ paths:
     post:
       tags: [versions]
       operationId: retirePolicyVersion
+      x-spec-operation: GOV-05 RetirePolicy (version)
       parameters:
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -362,6 +505,7 @@ paths:
     post:
       tags: [versions]
       operationId: reviewPolicyVersionSuspension
+      x-spec-operation: GOV-05 negative path 3 suspension evidenced and reviewed
       parameters:
         - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -380,6 +524,7 @@ paths:
     post:
       tags: [accounting-policy]
       operationId: draftAccountingPolicy
+      x-spec-operation: REF-07 DraftAccountingPolicy
       summary: DraftAccountingPolicy, draft a version of an accounting policy (REF-07)
       description: |
         Drafts a version of the accounting policy for `(policy_domain, book_id, jurisdiction_id)` in
@@ -428,6 +573,7 @@ paths:
     get:
       tags: [accounting-policy]
       operationId: listApplicableAccountingPolicies
+      x-spec-operation: REF-07 applicable accounting policy set
       summary: ListApplicablePolicies, the accounting policies that apply (REF-07)
       description: |
         For the entity, book, jurisdiction and date, the resolution of every policy domain that has
@@ -464,6 +610,7 @@ paths:
     get:
       tags: [accounting-policy]
       operationId: resolveAccountingPolicy
+      x-spec-operation: REF-07 ResolveAccountingPolicy
       summary: ResolveAccountingPolicy, the one policy that governs (REF-07)
       description: |
         Resolves by `policy_domain`, `book_id`, `jurisdiction_id`, `legal_entity_id` and the
@@ -501,6 +648,7 @@ paths:
     get:
       tags: [accounting-policy]
       operationId: explainAccountingResolution
+      x-spec-operation: REF-07 ExplainAccountingResolution
       summary: ExplainPolicyResolution for an accounting policy (REF-07)
       description: |
         The resolution for one domain and, for every candidate version, whether it governs and why
@@ -530,6 +678,7 @@ paths:
     get:
       tags: [accounting-policy]
       operationId: getAccountingPolicyVersion
+      x-spec-operation: REF-07 GetAccountingPolicyVersion
       summary: GetPolicyVersion for an accounting policy (REF-07)
       description: |
         The version with its applicability, what it rests on (framework source, approved policy
@@ -555,6 +704,7 @@ paths:
     post:
       tags: [accounting-policy]
       operationId: submitAccountingPolicy
+      x-spec-operation: REF-07 SubmitAccountingPolicy
       summary: Submit an accounting policy draft for review (REF-07)
       description: |
         Moves a DRAFT to REVIEW. Needs `ACCOUNTING_POLICY_DRAFT`. Every lifecycle command needs the version's
@@ -582,6 +732,7 @@ paths:
     post:
       tags: [accounting-policy]
       operationId: approveAccountingPolicyVersion
+      x-spec-operation: REF-07 ApproveAccountingPolicy
       summary: ApprovePolicyVersion (REF-07)
       description: |
         Approves a version in REVIEW. **The author cannot approve their own version** (`403 SOD_CONFLICT`, also
@@ -610,6 +761,7 @@ paths:
     post:
       tags: [accounting-policy]
       operationId: activateAccountingPolicyVersion
+      x-spec-operation: REF-07 ActivateAccountingPolicy
       summary: ActivatePolicyVersion (REF-07)
       description: |
         Activates an APPROVED version: ACTIVE now, or SCHEDULED when its `effective_from` is in the future. Needs
@@ -643,6 +795,7 @@ paths:
     post:
       tags: [accounting-policy]
       operationId: supersedeAccountingPolicyVersion
+      x-spec-operation: REF-07 SupersedeAccountingPolicy
       summary: SupersedePolicyVersion (REF-07)
       description: |
         Activates an APPROVED version over the active version it names in `supersedes_version_id`, which must be the
@@ -673,6 +826,7 @@ paths:
     post:
       tags: [accounting-policy]
       operationId: emergencySuspendAccountingPolicy
+      x-spec-operation: REF-07 EmergencySuspendAccountingPolicy (break-glass)
       summary: EmergencySuspendPolicy (REF-07)
       description: |
         Withdraws an ACTIVE or SCHEDULED version at once. **Needs a live break-glass session:** its id in
@@ -705,6 +859,7 @@ paths:
     post:
       tags: [accounting-policy]
       operationId: reviewAccountingPolicySuspension
+      x-spec-operation: REF-07 ReviewAccountingPolicySuspension
       summary: Review an emergency suspension (REF-07)
       description: |
         The independent review of an emergency suspension, with `reason_code` and an `outcome` of `UPHELD` or
@@ -733,6 +888,7 @@ paths:
     get:
       tags: [accounting-policy]
       operationId: getAccountingPolicyImpact
+      x-spec-operation: REF-07 AccountingPolicyImpactAnalysis
       summary: Impact of activating an accounting policy version (REF-07)
       description: |
         What activating the version would do, worked out from the policies that exist, so a reviewer need not take
@@ -754,10 +910,82 @@ paths:
         '404': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
 
+  /v1/policy-families:
+    get:
+      tags: [policies]
+      operationId: listPolicyFamilies
+      description: >-
+        The policy register: platform families and the caller tenant's own (POLICY_READ),
+        newest first. GET /v1/policies stays the applicability set for one policy_type.
+      parameters:
+        - {name: 'filter[policy_type]', in: query, required: false, schema: {type: string, maxLength: 64}}
+        - {name: 'filter[scope]', in: query, required: false, schema: {type: string, enum: [TENANT, GLOBAL]}}
+        - {name: 'filter[policy_status]', in: query, required: false, schema: {type: string}}
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page (API-4)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PolicyPage'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-versions:
+    get:
+      tags: [versions]
+      operationId: listPolicyVersions
+      description: The version register across every visible family (POLICY_READ), newest first.
+      parameters:
+        - {name: 'filter[policy_id]', in: query, required: false, schema: {type: string, format: uuid}}
+        - {name: 'filter[policy_type]', in: query, required: false, schema: {type: string, maxLength: 64}}
+        - {name: 'filter[version_status]', in: query, required: false, schema: {type: string, enum: [DRAFT, REVIEW, APPROVED, SCHEDULED, ACTIVE, SUPERSEDED, SUSPENDED, RETIRED]}}
+        - {name: 'filter[legal_entity_id]', in: query, required: false, schema: {type: string, format: uuid}}
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page (API-4)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PolicyVersionPage'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-evaluations:
+    get:
+      tags: [evaluation]
+      operationId: listPolicyEvaluations
+      description: The caller tenant's evaluation evidence (POLICY_READ), newest first.
+      parameters:
+        - {name: 'filter[policy_type]', in: query, required: false, schema: {type: string, maxLength: 64}}
+        - {name: 'filter[result]', in: query, required: false, schema: {type: string}}
+        - {name: 'filter[legal_entity_id]', in: query, required: false, schema: {type: string, format: uuid}}
+        - {name: 'filter[decision_id]', in: query, required: false, schema: {type: string, maxLength: 64}}
+        - {name: 'filter[policy_version_id]', in: query, required: false, schema: {type: string, format: uuid}}
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page (API-4)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/EvaluationPage'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
   /v1/policy-versions/compare:
     get:
       tags: [versions]
       operationId: comparePolicyVersions
+      x-spec-operation: GOV-05 ComparePolicyVersions
       parameters:
         - {name: base, in: query, required: true, schema: {type: string, format: uuid}}
         - {name: target, in: query, required: true, schema: {type: string, format: uuid}}
@@ -779,6 +1007,7 @@ paths:
     get:
       tags: [versions]
       operationId: getPolicyVersion
+      x-spec-operation: GOV-05 GetPolicyVersion
       responses:
         '200': {$ref: '#/components/responses/PolicyVersion'}
         '400': {$ref: '#/components/responses/Problem'}
@@ -793,18 +1022,50 @@ paths:
     get:
       tags: [versions]
       operationId: listPolicyVersionTransitions
+      x-spec-operation: GOV-05 lifecycle evidence (approval, activation, suspension)
+      parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
       responses:
         '200':
-          description: Lifecycle transitions, oldest first
+          description: Lifecycle transitions, oldest first, one page (API-4)
           content:
             application/json:
-              schema:
-                type: array
-                items: {$ref: '#/components/schemas/VersionTransition'}
+              schema: {$ref: '#/components/schemas/VersionTransitionPage'}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-evaluations/{evidence_id}/redeliver:
+    parameters:
+      - {name: evidence_id, in: path, required: true, schema: {type: string, format: uuid}}
+    post:
+      tags: [evaluation]
+      operationId: redeliverPolicyEvidence
+      description: >-
+        Puts evidence the governance ledger refused for good (ledger_status FAILED) back on the
+        relay's queue, after an operator fixed the cause (POLICY_EVIDENCE_REDELIVER). Pending
+        evidence is left alone. The request is recorded as policy.evidence.redelivery_requested.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ReasonRequest'}
+      responses:
+        '200':
+          description: The evaluation, ledger_status PENDING
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/EvaluateResponse'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
 
   /v1/policy-evaluations/{evidence_id}:
@@ -813,6 +1074,7 @@ paths:
     get:
       tags: [evaluation]
       operationId: getPolicyEvaluation
+      x-spec-operation: Doc 03 8.1 preserve evaluation basis for governed decisions
       responses:
         '200':
           description: The recorded evaluation evidence
@@ -829,6 +1091,7 @@ paths:
     post:
       tags: [controls]
       operationId: createControlTestDefinition
+      x-spec-operation: doc7 E3 define control test
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -853,6 +1116,25 @@ paths:
         '409': {$ref: '#/components/responses/Problem'}
         '413': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [controls]
+      operationId: listControlTestDefinitions
+      description: The caller tenant's control-test register (CONTROL_TEST_DEFINITION_READ), newest first.
+      parameters:
+        - {name: 'filter[control_ref]', in: query, required: false, schema: {type: string, maxLength: 128}}
+        - {name: 'filter[design_status]', in: query, required: false, schema: {type: string}}
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page (API-4)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ControlTestDefinitionPage'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
 
   /v1/control-test-definitions/{id}:
     parameters:
@@ -860,6 +1142,7 @@ paths:
     get:
       tags: [controls]
       operationId: getControlTestDefinition
+      x-spec-operation: doc7 E3 read control test
       responses:
         '200':
           description: The definition
@@ -878,6 +1161,7 @@ paths:
     post:
       tags: [controls]
       operationId: createControlTestExecution
+      x-spec-operation: doc7 E3 record control test execution
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -901,14 +1185,16 @@ paths:
     get:
       tags: [controls]
       operationId: listControlTestExecutions
+      x-spec-operation: doc7 E3 control test executions
+      parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
       responses:
         '200':
-          description: Executions of this definition
+          description: Executions of this definition, latest period first, one page (API-4)
           content:
             application/json:
-              schema:
-                type: array
-                items: {$ref: '#/components/schemas/ControlTestExecution'}
+              schema: {$ref: '#/components/schemas/ControlTestExecutionPage'}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
@@ -920,6 +1206,7 @@ paths:
     get:
       tags: [controls]
       operationId: getControlEffectiveness
+      x-spec-operation: doc7 E3 control effectiveness
       responses:
         '200':
           description: Design status and operating effectiveness from the latest reviewed execution
@@ -935,6 +1222,7 @@ paths:
     post:
       tags: [attestations]
       operationId: createAttestation
+      x-spec-operation: doc7 E6 sign attestation
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -954,6 +1242,26 @@ paths:
         '409': {$ref: '#/components/responses/Problem'}
         '413': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [attestations]
+      operationId: listAttestations
+      description: The caller tenant's attestation register (ATTESTATION_READ), newest first.
+      parameters:
+        - {name: 'filter[subject_ref]', in: query, required: false, schema: {type: string, maxLength: 255}}
+        - {name: 'filter[attestation_status]', in: query, required: false, schema: {type: string, enum: [ACTIVE, CHALLENGED, REVOKED]}}
+        - {name: 'filter[signer_principal_id]', in: query, required: false, schema: {type: string}}
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page (API-4)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AttestationPage'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
 
   /v1/attestations/{id}:
     parameters:
@@ -961,6 +1269,7 @@ paths:
     get:
       tags: [attestations]
       operationId: getAttestation
+      x-spec-operation: doc7 E6 read attestation
       responses:
         '200':
           description: The attestation
@@ -979,6 +1288,7 @@ paths:
     post:
       tags: [attestations]
       operationId: revokeAttestation
+      x-spec-operation: doc7 E6 revoke attestation
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -999,6 +1309,297 @@ paths:
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
         '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  # ── V-001 PDC-05: certification suites, waivers, simulation, rollback ─────
+  /v1/policies/{policy_id}/test-cases:
+    parameters:
+      - $ref: '#/components/parameters/PolicyID'
+    post:
+      tags: [certification]
+      operationId: createPolicyTestCase
+      x-spec-operation: V-001 PDC-05 §17.1 unit/boundary/regression examples
+      description: Adds a case to an evaluable family's suite (POLICY_TEST_MANAGE). Idempotent on test_code. A case's content never changes; retire it and add another. Changing the suite makes every earlier certification STALE.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateTestCaseRequest'}
+      responses:
+        '201': {description: Added, content: {application/json: {schema: {$ref: '#/components/schemas/TestCase'}}}}
+        '200': {description: Replay, content: {application/json: {schema: {$ref: '#/components/schemas/TestCase'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [certification]
+      operationId: listPolicyTestCases
+      parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200': {description: One page (API-4), content: {application/json: {schema: {$ref: '#/components/schemas/TestCasePage'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policies/{policy_id}/test-cases/{test_case_id}/retire:
+    parameters:
+      - $ref: '#/components/parameters/PolicyID'
+      - {name: test_case_id, in: path, required: true, schema: {type: string, format: uuid}}
+    post:
+      tags: [certification]
+      operationId: retirePolicyTestCase
+      x-spec-operation: V-001 PDC-05 test definitions versioned
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200': {description: Retired (or already retired), content: {application/json: {schema: {$ref: '#/components/schemas/TestCase'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-versions/{version_id}/test-runs:
+    parameters:
+      - $ref: '#/components/parameters/VersionID'
+    post:
+      tags: [certification]
+      operationId: runPolicyTestSuite
+      x-spec-operation: V-001 PDC-05 §18.1 step 2 run mandatory suites
+      description: Runs the family's suite (static validation first) against the version with the production evaluator, in memory, and stores the immutable run (POLICY_TEST_RUN). A PASS emits policy.version.certified.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '201': {description: The run, content: {application/json: {schema: {$ref: '#/components/schemas/TestRun'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [certification]
+      operationId: listPolicyTestRuns
+      parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200': {description: 'One page (API-4), newest first', content: {application/json: {schema: {$ref: '#/components/schemas/TestRunPage'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-test-runs/{test_run_id}:
+    parameters:
+      - {name: test_run_id, in: path, required: true, schema: {type: string, format: uuid}}
+    get:
+      tags: [certification]
+      operationId: getPolicyTestRun
+      responses:
+        '200': {description: The run, content: {application/json: {schema: {$ref: '#/components/schemas/TestRun'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-versions/{version_id}/certification:
+    parameters:
+      - $ref: '#/components/parameters/VersionID'
+    get:
+      tags: [certification]
+      operationId: getPolicyVersionCertification
+      x-spec-operation: V-001 PDC-05 certification state
+      description: The version's standing against its family's current suite (CERTIFIED, WAIVED, FAILED, NOT_RUN, STALE, EXEMPT_NO_EVALUATOR). Activation and scheduling need CERTIFIED, WAIVED or EXEMPT_NO_EVALUATOR while POLICY_CERTIFICATION_GATE=enforce (409 CERTIFICATION_REQUIRED otherwise).
+      responses:
+        '200': {description: The certification, content: {application/json: {schema: {$ref: '#/components/schemas/Certification'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-versions/{version_id}/waivers:
+    parameters:
+      - $ref: '#/components/parameters/VersionID'
+    post:
+      tags: [certification]
+      operationId: requestPolicyTestWaiver
+      x-spec-operation: V-001 PDC-I-25 typed, scoped, time-bounded waiver
+      description: Asks to waive one failed mandatory case of this version (POLICY_WAIVER_REQUEST). expires_at is required and at most 180 days away. A waiver never turns a run into a pass.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RequestWaiverRequest'}
+      responses:
+        '201': {description: Requested, content: {application/json: {schema: {$ref: '#/components/schemas/Waiver'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [certification]
+      operationId: listPolicyTestWaivers
+      parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200': {description: One page (API-4), content: {application/json: {schema: {$ref: '#/components/schemas/WaiverPage'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-waivers/{waiver_id}/approve:
+    parameters:
+      - {name: waiver_id, in: path, required: true, schema: {type: string, format: uuid}}
+    post:
+      tags: [certification]
+      operationId: approvePolicyTestWaiver
+      description: Approves a requested waiver (POLICY_WAIVER_APPROVE). The requester can never approve (403 SOD_CONFLICT); an expired waiver cannot be approved.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200': {description: Approved (or already approved), content: {application/json: {schema: {$ref: '#/components/schemas/Waiver'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-waivers/{waiver_id}/revoke:
+    parameters:
+      - {name: waiver_id, in: path, required: true, schema: {type: string, format: uuid}}
+    post:
+      tags: [certification]
+      operationId: revokePolicyTestWaiver
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ReasonRequest'}
+      responses:
+        '200': {description: Revoked (or already revoked), content: {application/json: {schema: {$ref: '#/components/schemas/Waiver'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/simulations:
+    post:
+      tags: [certification]
+      operationId: simulatePolicyVersion
+      x-spec-operation: V-001 PDC-05 POST /v1/simulations (differential simulation)
+      description: >-
+        Evaluates the candidate (and the baseline: the named version, or the one governing the
+        candidate's scope now; with none, the as-issued results) over the caller tenant's own
+        recorded evaluations of that policy type, at most 5000, synchronously. Writes only the
+        simulation and policy.simulation.completed (POLICY_SIMULATE). A truncated corpus or an
+        input the candidate cannot evaluate makes it PARTIAL.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SimulateRequest'}
+      responses:
+        '201': {description: The simulation, content: {application/json: {schema: {$ref: '#/components/schemas/SimulationRun'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/simulations/{simulation_id}:
+    parameters:
+      - {name: simulation_id, in: path, required: true, schema: {type: string, format: uuid}}
+    get:
+      tags: [certification]
+      operationId: getPolicySimulation
+      responses:
+        '200': {description: The simulation, content: {application/json: {schema: {$ref: '#/components/schemas/SimulationRun'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/simulations/{simulation_id}/differences:
+    parameters:
+      - {name: simulation_id, in: path, required: true, schema: {type: string, format: uuid}}
+    get:
+      tags: [certification]
+      operationId: listPolicySimulationDifferences
+      parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200': {description: 'The decisions whose result would change, one page (API-4)', content: {application/json: {schema: {$ref: '#/components/schemas/SimulationDiffPage'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+
+  /v1/policy-versions/{version_id}/rollback-draft:
+    parameters:
+      - $ref: '#/components/parameters/VersionID'
+    post:
+      tags: [certification]
+      operationId: draftPolicyRollback
+      x-spec-operation: V-001 PDC-05 §18.1 step 8 governed rollback (PDC-I-28)
+      description: >-
+        Creates a DRAFT in the target's family and scope carrying the target's payload, taking
+        effect now or later (never backdated: NP-48). The target must have governed once
+        (SUPERSEDED or RETIRED). The draft then goes through review, approval, certification
+        and activation. POLICY_VERSION_CREATE (_GLOBAL for a global target).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rationale]
+              properties:
+                rationale: {type: string}
+                effective_from: {type: string, format: date-time, description: 'Default now; never in the past.'}
+      responses:
+        '201': {$ref: '#/components/responses/PolicyVersion'}
+        '200': {$ref: '#/components/responses/PolicyVersion'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
 
 components:
@@ -1025,6 +1626,8 @@ components:
     AccountingDomainOptional: {name: policy_domain, in: query, required: false, schema: {type: string, maxLength: 64}}
     BookID: {name: book_id, in: query, required: false, schema: {type: string, format: uuid}, description: 'The accounting book. Omit for a request that names none: only policies for every book apply.'}
     JurisdictionID: {name: jurisdiction_id, in: query, required: false, schema: {type: string, format: uuid}, description: 'Omit for a request that names none: only policies for every jurisdiction apply.'}
+    PageSize: {name: page_size, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 200, default: 50}}
+    Cursor: {name: cursor, in: query, required: false, schema: {type: string}, description: 'The next_cursor of the previous page. Bound to the tenant, the route and the filters: anything else is 400 invalid_cursor.'}
 
   requestBodies:
     Lifecycle:
@@ -1055,6 +1658,222 @@ components:
           schema: {$ref: '#/components/schemas/PolicyVersion'}
 
   schemas:
+    PageFields:
+      type: object
+      required: [items, page_size]
+      properties:
+        next_cursor: {type: string, description: 'Absent on the last page.'}
+        page_size: {type: integer}
+    PolicyPage:
+      allOf:
+        - $ref: '#/components/schemas/PageFields'
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: '#/components/schemas/Policy'}}
+    PolicyVersionPage:
+      allOf:
+        - $ref: '#/components/schemas/PageFields'
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: '#/components/schemas/PolicyVersion'}}
+    VersionTransitionPage:
+      allOf:
+        - $ref: '#/components/schemas/PageFields'
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: '#/components/schemas/VersionTransition'}}
+    EvaluationPage:
+      allOf:
+        - $ref: '#/components/schemas/PageFields'
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: '#/components/schemas/Evaluation'}}
+    ControlTestDefinitionPage:
+      allOf:
+        - $ref: '#/components/schemas/PageFields'
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: '#/components/schemas/ControlTestDefinition'}}
+    ControlTestExecutionPage:
+      allOf:
+        - $ref: '#/components/schemas/PageFields'
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: '#/components/schemas/ControlTestExecution'}}
+    AttestationPage:
+      allOf:
+        - $ref: '#/components/schemas/PageFields'
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: '#/components/schemas/Attestation'}}
+    CreateTestCaseRequest:
+      type: object
+      required: [test_code, layer, description, action_context, expected_result]
+      properties:
+        test_case_id: {type: string, format: uuid}
+        test_code: {type: string, maxLength: 128}
+        layer: {type: string, enum: [UNIT, BOUNDARY, REGRESSION]}
+        mandatory: {type: boolean, default: true}
+        description: {type: string}
+        action_context: {type: object, additionalProperties: true}
+        expected_result: {type: string, description: 'The evaluator result expected, or INPUT_ERROR for a negative test.'}
+    TestCase:
+      allOf:
+        - $ref: '#/components/schemas/CreateTestCaseRequest'
+        - type: object
+          properties:
+            policy_id: {type: string, format: uuid}
+            tenant_id: {type: string, format: uuid}
+            test_status: {type: string, enum: [ACTIVE, RETIRED]}
+            created_at: {type: string, format: date-time}
+            created_by_principal_id: {type: string}
+            retired_at: {type: string, format: date-time}
+            retired_by_principal_id: {type: string}
+    CaseResult:
+      type: object
+      properties:
+        test_case_id: {type: string, format: uuid}
+        test_code: {type: string}
+        mandatory: {type: boolean}
+        expected: {type: string}
+        actual: {type: string}
+        error: {type: string}
+        passed: {type: boolean}
+    TestRun:
+      type: object
+      properties:
+        test_run_id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        policy_id: {type: string, format: uuid}
+        policy_version_id: {type: string, format: uuid}
+        artifact_digest: {type: string}
+        suite_hash: {type: string}
+        evaluator_version: {type: string}
+        run_status: {type: string, enum: [PASS, FAIL]}
+        case_count: {type: integer}
+        failed_count: {type: integer}
+        static_findings: {type: array, items: {type: string}}
+        results: {type: array, items: {$ref: '#/components/schemas/CaseResult'}}
+        run_by_principal_id: {type: string}
+        run_at: {type: string, format: date-time}
+    Certification:
+      type: object
+      properties:
+        policy_version_id: {type: string, format: uuid}
+        status: {type: string, enum: [CERTIFIED, WAIVED, FAILED, NOT_RUN, STALE, EXEMPT_NO_EVALUATOR]}
+        suite_hash: {type: string}
+        test_run_id: {type: string, format: uuid}
+        unwaived_failed_test_case_ids: {type: array, items: {type: string, format: uuid}}
+        reason: {type: string}
+    RequestWaiverRequest:
+      type: object
+      required: [test_case_id, reason_code, justification, expires_at]
+      properties:
+        waiver_id: {type: string, format: uuid}
+        test_case_id: {type: string, format: uuid}
+        reason_code: {type: string, maxLength: 64}
+        justification: {type: string}
+        expires_at: {type: string, format: date-time, description: 'In the future and at most 180 days away.'}
+    Waiver:
+      type: object
+      properties:
+        waiver_id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        policy_version_id: {type: string, format: uuid}
+        test_case_id: {type: string, format: uuid}
+        reason_code: {type: string}
+        justification: {type: string}
+        expires_at: {type: string, format: date-time}
+        waiver_status: {type: string, enum: [REQUESTED, APPROVED, REVOKED]}
+        requested_by_principal_id: {type: string}
+        requested_at: {type: string, format: date-time}
+        approved_by_principal_id: {type: string}
+        approved_at: {type: string, format: date-time}
+        revoked_by_principal_id: {type: string}
+        revoked_at: {type: string, format: date-time}
+        revocation_reason: {type: string}
+    SimulateRequest:
+      type: object
+      required: [candidate_version_id]
+      properties:
+        simulation_id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid, description: 'Must equal the verified tenant when sent.'}
+        candidate_version_id: {type: string, format: uuid}
+        baseline_version_id: {type: string, format: uuid}
+        corpus_from: {type: string, format: date-time, description: 'Default 90 days before corpus_to.'}
+        corpus_to: {type: string, format: date-time, description: 'Default now.'}
+        corpus_limit: {type: integer, minimum: 0, maximum: 5000}
+    SimulationRun:
+      type: object
+      properties:
+        simulation_id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        policy_type: {type: string}
+        candidate_version_id: {type: string, format: uuid}
+        baseline_version_id: {type: string, format: uuid}
+        sim_status: {type: string, enum: [COMPLETE, PARTIAL, FAILED]}
+        corpus_from: {type: string, format: date-time}
+        corpus_to: {type: string, format: date-time}
+        corpus_limit: {type: integer}
+        corpus_size: {type: integer}
+        changed_count: {type: integer}
+        error_count: {type: integer}
+        requested_by_principal_id: {type: string}
+        created_at: {type: string, format: date-time}
+        completed_at: {type: string, format: date-time}
+    SimulationDiff:
+      type: object
+      properties:
+        evaluation_id: {type: string, format: uuid}
+        decision_id: {type: string}
+        baseline_result: {type: string}
+        candidate_result: {type: string}
+        candidate_error: {type: string}
+    TestCasePage:
+      allOf:
+        - $ref: '#/components/schemas/PageFields'
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: '#/components/schemas/TestCase'}}
+    TestRunPage:
+      allOf:
+        - $ref: '#/components/schemas/PageFields'
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: '#/components/schemas/TestRun'}}
+    WaiverPage:
+      allOf:
+        - $ref: '#/components/schemas/PageFields'
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: '#/components/schemas/Waiver'}}
+    SimulationDiffPage:
+      allOf:
+        - $ref: '#/components/schemas/PageFields'
+        - type: object
+          properties:
+            items: {type: array, items: {$ref: '#/components/schemas/SimulationDiff'}}
+    PolicySummary:
+      type: object
+      properties:
+        tenant_id: {type: string, format: uuid}
+        as_of: {type: string, format: date-time}
+        policy_families: {type: integer}
+        versions_draft: {type: integer}
+        versions_in_review: {type: integer}
+        versions_approved: {type: integer}
+        versions_scheduled: {type: integer}
+        versions_active: {type: integer}
+        versions_suspended: {type: integer}
+        suspensions_awaiting_review: {type: integer}
+        evaluations_24h: {type: integer}
+        evaluations_approval_required_24h: {type: integer}
+        evidence_pending: {type: integer}
+        evidence_failed: {type: integer}
+        control_test_definitions: {type: integer}
+        control_tests_failing: {type: integer, description: 'Definitions whose latest execution was not EFFECTIVE.'}
+        attestations_active: {type: integer}
+        attestations_revoked: {type: integer}
     Problem:
       type: object
       required: [type, title, status, code]
@@ -1097,10 +1916,22 @@ components:
         policy_name: {type: string}
         policy_type: {type: string}
         tenant_id: {type: string, format: uuid, nullable: true}
-        policy_status: {type: string}
+        policy_status: {type: string, description: 'ACTIVE or RETIRED (final: a retired family takes no new versions).'}
         versioning_mode: {type: string}
         created_at: {type: string, format: date-time}
         created_by_principal_id: {type: string}
+        record_version: {type: integer, description: 'The ETag; send it as If-Match or expected_version to retire.'}
+        retired_by_principal_id: {type: string}
+        retired_at: {type: string, format: date-time}
+        retirement_reason: {type: string}
+
+    ReasonRequest:
+      type: object
+      required: [reason_code]
+      properties:
+        reason_code: {type: string}
+        reason: {type: string, description: 'Free text beside reason_code; together at most 2000 characters.'}
+        expected_version: {type: integer, description: 'The record_version, when If-Match is not sent.'}
 
     CreatePolicyVersionRequest:
       type: object
@@ -1109,7 +1940,7 @@ components:
         policy_version_id: {type: string, format: uuid}
         tenant_id: {type: string, format: uuid, nullable: true}
         legal_entity_id: {type: string, format: uuid, nullable: true}
-        rule_payload: {type: object, additionalProperties: true}
+        rule_payload: {type: object, additionalProperties: true, description: "APPROVAL_THRESHOLD: {threshold_amount (exact decimal, >= 0), currency (optional ISO 4217; when set, evaluation needs the same action_context.currency)}."}
         effective_from: {type: string, format: date-time}
         effective_to: {type: string, format: date-time, nullable: true}
         source: {type: string}
@@ -1235,7 +2066,7 @@ components:
         policy_type: {type: string}
         tenant_id: {type: string, format: uuid, nullable: true}
         legal_entity_id: {type: string, format: uuid, nullable: true}
-        action_context: {type: object, additionalProperties: true}
+        action_context: {type: object, additionalProperties: true, description: "APPROVAL_THRESHOLD: {amount (exact decimal, >= 0), currency (required when the governing version names one; must match)}."}
         decision_id: {type: string}
         as_of: {type: string, format: date-time}
         known_at: {type: string, format: date-time}
@@ -1258,6 +2089,175 @@ components:
         known_at: {type: string, format: date-time}
         ledger_status: {type: string}
         replayed: {type: boolean}
+        contract_version: {type: string, description: 'ZS-GOV-INT-002 contract version (1.0)'}
+        outcome: {type: string, enum: [PERMIT, APPROVAL_REQUIRED, ERROR], description: 'The shared outcome of result: WITHIN_THRESHOLD is PERMIT'}
+        owning_service: {type: string}
+        reason_codes: {type: array, items: {type: string}}
+
+    Money:
+      type: object
+      required: [amount, currency, basis]
+      properties:
+        amount: {type: string, pattern: '^[0-9]+(\.[0-9]+)?$', description: 'Exact decimal as a string; never a JSON number'}
+        currency: {type: string, pattern: '^[A-Z]{3}$'}
+        basis: {type: string, enum: [GROSS, NET]}
+
+    DecisionResource:
+      type: object
+      required: [type, id, version]
+      properties:
+        type: {type: string, maxLength: 64}
+        id: {type: string, maxLength: 128}
+        version: {type: string, maxLength: 64}
+
+    SignatoryResolveRequest:
+      type: object
+      additionalProperties: false
+      required: [contract_version, request_id, correlation_id, tenant_id, legal_entity_id, action, resource, money, instrument_type, jurisdiction, document_hash, evaluated_for_at]
+      properties:
+        contract_version: {type: string, example: '1.0'}
+        request_id: {type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$', description: 'Identifies this evaluation attempt; the replay key'}
+        correlation_id: {type: string, maxLength: 128}
+        tenant_id: {type: string, format: uuid, description: 'Must equal the verified tenant (403 otherwise)'}
+        legal_entity_id: {type: string, format: uuid, description: 'Must equal X-Legal-Entity-Id when sent (403 otherwise)'}
+        actor_principal_id: {type: string, description: 'Must equal the verified X-Principal-Id; defaults to it'}
+        action: {type: string, pattern: '^[A-Z][A-Z0-9_]{2,63}$', example: SIGN_CONTRACT}
+        resource: {$ref: '#/components/schemas/DecisionResource'}
+        money: {$ref: '#/components/schemas/Money'}
+        instrument_type: {type: string, pattern: '^[A-Z][A-Z0-9_]{1,63}$', example: SUPPLIER_CONTRACT}
+        jurisdiction: {type: string, example: GB}
+        document_hash: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+        evaluated_for_at: {type: string, format: date-time}
+        term_months: {type: integer, minimum: 0, maximum: 1200}
+        options_amount: {type: string, description: 'Option value counted toward the committed value (same currency as money)'}
+        converted:
+          type: object
+          description: The committed value in the matrix currency, valued by the FX owner (Spend Controls). Never defaulted.
+          required: [amount, currency, fx_snapshot_ref]
+          properties:
+            amount: {type: string}
+            currency: {type: string}
+            fx_snapshot_ref: {type: string}
+        related_commitments:
+          type: array
+          maxItems: 100
+          description: Agreements and amendments of the same series, aggregated so a commitment cannot be split under a band
+          items:
+            type: object
+            required: [resource_id, amount, currency]
+            properties:
+              resource_id: {type: string}
+              amount: {type: string}
+              currency: {type: string}
+        risk_flags: {type: array, items: {type: string, pattern: '^[A-Z][A-Z0-9_]{1,63}$'}, description: 'RELATED_PARTY or HIGH_RISK make any instrument high-risk'}
+        context: {type: object, additionalProperties: true}
+
+    RequiredAction:
+      type: object
+      required: [kind]
+      properties:
+        kind: {type: string, enum: [APPROVAL, SIGNATURE_QUORUM, SIGNER_ELIGIBILITY, LEGAL_REVIEW, RELEASE_AUTHORIZATION, REVIEW]}
+        owner: {type: string}
+        office: {type: string}
+        min_distinct_signers: {type: integer}
+        required_offices:
+          type: array
+          items:
+            type: object
+            properties:
+              office: {type: string}
+              min_count: {type: integer}
+        eligible_offices: {type: array, items: {type: string}}
+        sequencing: {type: string, enum: [PARALLEL, SEQUENTIAL]}
+        order: {type: array, items: {type: string}}
+        constraints: {type: array, items: {type: string}}
+        document_hash: {type: string}
+        detail: {type: string}
+
+    Decision:
+      type: object
+      description: ZS-GOV-INT-002 decision. integrity is an Ed25519 signature over the other members.
+      required: [contract_version, decision_id, outcome, owning_service, rule_id, tenant_id, legal_entity_id, action, resource, evaluated_at, valid_until, input_fingerprint, reason_codes, required_actions, evidence_ref, integrity]
+      properties:
+        contract_version: {type: string}
+        decision_id: {type: string, format: uuid}
+        request_id: {type: string}
+        correlation_id: {type: string}
+        outcome: {type: string, enum: [PERMIT, APPROVAL_REQUIRED, SIGNATURE_REQUIRED, REVIEW_REQUIRED, DENY, NOT_CONFIGURED, NOT_IMPLEMENTED, ERROR]}
+        owning_service: {type: string}
+        policy_family: {type: string}
+        rule_id: {type: string}
+        policy_version: {type: string, description: 'The version number; empty when no rule produced the decision'}
+        policy_id: {type: string}
+        policy_code: {type: string}
+        policy_version_id: {type: string}
+        tenant_id: {type: string}
+        legal_entity_id: {type: string}
+        actor_principal_id: {type: string}
+        action: {type: string}
+        resource: {$ref: '#/components/schemas/DecisionResource'}
+        evaluated_at: {type: string, format: date-time}
+        valid_until: {type: string, format: date-time}
+        input_fingerprint: {type: string}
+        reason_codes: {type: array, items: {type: string}}
+        required_actions: {type: array, items: {$ref: '#/components/schemas/RequiredAction'}}
+        evidence_ref: {type: string}
+        upstream_refs: {type: array, items: {type: string}}
+        detail: {type: object, additionalProperties: true}
+        integrity:
+          type: object
+          properties:
+            alg: {type: string, enum: [EdDSA]}
+            kid: {type: string}
+            value: {type: string, description: base64url signature}
+
+    DecisionKeys:
+      type: object
+      properties:
+        keys:
+          type: array
+          items:
+            type: object
+            properties:
+              kty: {type: string}
+              crv: {type: string}
+              x: {type: string}
+              kid: {type: string}
+              alg: {type: string}
+              use: {type: string}
+
+    PolicyTypes:
+      type: object
+      properties:
+        tenant_id: {type: string}
+        as_of: {type: string, format: date-time}
+        contract_version: {type: string}
+        reason_codes_version: {type: string}
+        outcomes: {type: array, items: {type: string}}
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              policy_type: {type: string}
+              owning_service: {type: string}
+              evaluation_mode: {type: string, enum: [EVALUATED_HERE, RESOLVED_HERE, REFERENCE_ONLY, UNSUPPORTED]}
+              decision_route: {type: string}
+              enforced_by: {type: array, items: {type: string}}
+              evaluable_here: {type: boolean}
+              description: {type: string}
+              spec: {type: string}
+              display_state: {type: string, enum: [EVALUABLE, CONFIGURATION_REQUIRED, DECIDED_BY_OWNING_SERVICE, NOT_IMPLEMENTED]}
+              blocking: {type: boolean}
+              message: {type: string}
+              status:
+                type: object
+                properties:
+                  policy_type: {type: string}
+                  families: {type: integer}
+                  versions_by_status: {type: object, additionalProperties: {type: integer}}
+                  governing_versions: {type: array, items: {type: object, additionalProperties: true}}
+                  decisions_24h: {type: object, additionalProperties: {type: integer}}
 
     Evaluation:
       type: object

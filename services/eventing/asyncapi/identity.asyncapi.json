@@ -114,6 +114,14 @@
         }
       }
     },
+    "session": {
+      "address": "zoikosuite.identity.session.v1",
+      "messages": {
+        "revoked": {
+          "$ref": "#/components/messages/session.revoked"
+        }
+      }
+    },
     "subject": {
       "address": "zoikosuite.identity.subject.v1",
       "messages": {
@@ -451,6 +459,18 @@
         "x-zoiko-event-type": "com.zoikosuite.identity.provisioning.rejected",
         "x-zoiko-origin": "extension"
       },
+      "session.revoked": {
+        "contentType": "application/json",
+        "description": "Producer: Identity Context Service. Primary consumers / intent: SIEM, audit, authorization-svc. Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
+        "name": "com.zoikosuite.identity.session.revoked",
+        "payload": {
+          "$ref": "#/components/schemas/CloudEventEnvelope"
+        },
+        "summary": "Session: revoked.",
+        "title": "session revoked",
+        "x-zoiko-event-type": "com.zoikosuite.identity.session.revoked",
+        "x-zoiko-origin": "extension"
+      },
       "subject.disabled": {
         "contentType": "application/json",
         "description": "Producer: Identity Context Service. Primary consumers / intent: Not yet declared (extension observed in the producer; register consumers per section 23). Family: Identity (extension). Origin: extension (emitted by a service, not listed in section 19).",
@@ -767,6 +787,19 @@
         }
       ],
       "summary": "Publish provisioning facts after the authoritative commit (transactional outbox)."
+    },
+    "publish.session": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/session"
+      },
+      "description": "Producer(s): Identity Context Service. Only the owning domain may publish (ZS-EVENT-001 E-02).",
+      "messages": [
+        {
+          "$ref": "#/channels/session/messages/revoked"
+        }
+      ],
+      "summary": "Publish session facts after the authoritative commit (transactional outbox)."
     },
     "publish.subject": {
       "action": "send",

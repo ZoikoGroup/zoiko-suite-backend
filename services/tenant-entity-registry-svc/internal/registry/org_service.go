@@ -229,11 +229,14 @@ func (s *Service) BindTenantHost(ctx context.Context, tenantID string, req domai
 }
 
 // ListTenantHostBindings returns a tenant's bound hostnames.
-func (s *Service) ListTenantHostBindings(ctx context.Context, tenantID string) ([]*domain.TenantHostBinding, error) {
+func (s *Service) ListTenantHostBindings(ctx context.Context, tenantID string, limit int, cursor string) ([]*domain.TenantHostBinding, string, error) {
 	if err := s.assertTenantScope(ctx, tenantID); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return s.store.ListTenantHostBindings(ctx, tenantID)
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+	return s.store.ListTenantHostBindings(ctx, tenantID, limit, cursor)
 }
 
 // ---------------------------------------------------------------------------
@@ -515,11 +518,14 @@ func (s *Service) ChangeDefaultLocale(
 }
 
 // ListTenantLifecycleHistory is the ORG-02 read surface of the same name.
-func (s *Service) ListTenantLifecycleHistory(ctx context.Context, tenantID string) ([]*domain.TenantLifecycleEvent, error) {
+func (s *Service) ListTenantLifecycleHistory(ctx context.Context, tenantID string, limit int, cursor string) ([]*domain.TenantLifecycleEvent, string, error) {
 	if err := s.assertTenantScope(ctx, tenantID); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return s.store.ListTenantLifecycleHistory(ctx, tenantID)
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+	return s.store.ListTenantLifecycleHistory(ctx, tenantID, limit, cursor)
 }
 
 // GetTenantDefaults is the ORG-02 read surface of the same name.
@@ -910,11 +916,14 @@ func (s *Service) ChangeRegisteredOffice(ctx context.Context, legalEntityID stri
 // ---------------------------------------------------------------------------
 
 // ListEntityVersions is the ORG-03 read surface of the same name.
-func (s *Service) ListEntityVersions(ctx context.Context, legalEntityID string) ([]*domain.LegalEntityProfileVersion, error) {
+func (s *Service) ListEntityVersions(ctx context.Context, legalEntityID string, limit int, cursor string) ([]*domain.LegalEntityProfileVersion, string, error) {
 	if _, err := s.GetEntity(ctx, legalEntityID); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return s.store.ListEntityProfileVersions(ctx, legalEntityID)
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+	return s.store.ListEntityProfileVersions(ctx, legalEntityID, limit, cursor)
 }
 
 // GetLegalEntityAsOf is the ORG-03 read surface of the same name — §4.3's
@@ -1037,17 +1046,20 @@ func (s *Service) quarantineRegistryConflict(
 }
 
 // ListRegistryConflicts returns quarantined conflicts for the caller's tenant.
-func (s *Service) ListRegistryConflicts(ctx context.Context, openOnly bool) ([]*domain.EntityRegistryConflict, error) {
+func (s *Service) ListRegistryConflicts(ctx context.Context, openOnly bool, limit int, cursor string) ([]*domain.EntityRegistryConflict, string, error) {
 	if domain.TenantFromContext(ctx) == "" {
-		return nil, ErrNotFound
+		return nil, "", ErrNotFound
 	}
 	// Purpose limitation (ORG §3, ZS-SEC-001): a quarantine row carries the
 	// REJECTED claimant's submitted payload. Tenant membership alone used to
 	// be enough to read it; now it takes the resolver's read permission.
 	if err := s.authorize(ctx, "entity.registry-conflict", "read"); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return s.store.ListRegistryConflicts(ctx, openOnly)
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+	return s.store.ListRegistryConflicts(ctx, openOnly, limit, cursor)
 }
 
 // ResolveRegistryConflict records a human's conclusion about a quarantined

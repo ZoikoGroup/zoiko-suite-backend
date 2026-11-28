@@ -149,7 +149,7 @@ func principalSessionEnder(st *store.PgStore, provider *oidc.Provider, sessions 
 			ended += n
 		}
 		// Evict session contexts and emit per-session revoked events
-		scIDs, err := sessions.EvictAllForPrincipalWithIDs(ctx, principalID, tenantID, domain.InvalidationReasonAdminRevoke)
+		scIDs, err := sessions.EvictAllForPrincipalWithIDs(ctx, principalID, tenantID, domain.InvalidationReasonAdminRevoke, actor, correlationID)
 		if err != nil {
 			return ended, err
 		}
@@ -213,9 +213,8 @@ var _ identityctx.StatusChanger = statusChanger{}
 // identityMerger adapts lifecycle.Service to the handler's IdentityMerger.
 type identityMerger struct{ svc *lifecycle.Service }
 
-func (m identityMerger) MergeDuplicate(ctx context.Context, tenantID, actorID, survivorID, duplicateID, reason, correlationID string) (*store.IdentityMerge, bool, error) {
-	return m.svc.MergeDuplicate(ctx, lifecycle.Actor{PrincipalID: actorID, TenantID: tenantID, CorrelationID: correlationID},
-		survivorID, duplicateID, reason)
+func (m identityMerger) MergeDuplicate(ctx context.Context, tenantID string, actor lifecycle.Actor, survivorID, duplicateID, reason string, duplicateVersion int64, correlationID string) (*store.IdentityMerge, bool, error) {
+	return m.svc.MergeDuplicate(ctx, actor, survivorID, duplicateID, reason, duplicateVersion)
 }
 
 var _ identityctx.IdentityMerger = identityMerger{}

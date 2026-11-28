@@ -22,9 +22,6 @@ var (
 	ErrMergeNotFound = errors.New("survivor or duplicate subject not found")
 	// ErrMergeConflict (pg_merge.go) is shared: the duplicate was already
 	// merged, or the survivor is disabled or is itself a retired id.
-	//
-	// ErrMergeStale: the duplicate's record_version is not the If-Match value.
-	ErrMergeStale = errors.New("duplicate subject changed since it was read")
 )
 
 // maxAliasHops bounds the survivor chain walk. A merge refuses a survivor

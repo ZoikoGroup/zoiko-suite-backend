@@ -202,7 +202,7 @@ func TestOwnershipReads_RebuildThePastFromStoredRows(t *testing.T) {
 	proposed(t, f, parent, other, 10, 0)
 
 	read := func(day int) map[string]float64 {
-		rels, err := f.s.ListOwnershipInForceAt(f.ctx, at(day))
+		rels, _, err := f.s.ListOwnershipInForceAt(f.ctx, at(day), 50, "")
 		require.NoError(t, err)
 		got := map[string]float64{}
 		for _, r := range domain.GraphAsOf(rels, at(day), "").Relationships {
@@ -219,11 +219,11 @@ func TestOwnershipReads_RebuildThePastFromStoredRows(t *testing.T) {
 	assert.Empty(t, mapToList(read(10), other), "the pending proposal never counted")
 
 	// Control chain at two dates, from the same rows.
-	rels, _ := f.s.ListOwnershipInForceAt(f.ctx, at(10))
+	rels, _, _ := f.s.ListOwnershipInForceAt(f.ctx, at(10), 50, "")
 	chain := domain.ExplainControlChain(rels, at(10), child)
 	require.Len(t, chain.Chains, 1)
 	assert.InDelta(t, 60, chain.Chains[0].EffectiveOwnershipPct, 0.0001)
-	rels, _ = f.s.ListOwnershipInForceAt(f.ctx, at(200))
+	rels, _, _ = f.s.ListOwnershipInForceAt(f.ctx, at(200), 50, "")
 	chain = domain.ExplainControlChain(rels, at(200), child)
 	assert.InDelta(t, 80, chain.Chains[0].EffectiveOwnershipPct, 0.0001)
 
@@ -247,10 +247,10 @@ func TestOwnershipReads_AreTenantScoped(t *testing.T) {
 	activated(t, a, a.entityID, e[0], 60, 0)
 	b := secondTenant(t, a)
 
-	rels, err := b.s.ListOwnershipInForceAt(b.ctx, at(10))
+	rels, _, err := b.s.ListOwnershipInForceAt(b.ctx, at(10), 50, "")
 	require.NoError(t, err)
 	assert.Empty(t, rels, "tenant B sees nothing of tenant A's structure")
-	rels, err = a.s.ListOwnershipInForceAt(a.ctx, at(10))
+	rels, _, err = a.s.ListOwnershipInForceAt(a.ctx, at(10), 50, "")
 	require.NoError(t, err)
 	assert.Len(t, rels, 1)
 }

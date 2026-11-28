@@ -24,25 +24,32 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 	idenv "zoiko.io/identity-envelope"
 	apicontract "zoiko.io/identity-envelope/apicontract"
+	"zoiko.io/identity-envelope/decisionledger"
+	"zoiko.io/identity-envelope/mtlsclient"
 
 	"zoiko.io/obligations-svc/internal/authz"
+	"zoiko.io/obligations-svc/internal/clock"
 	"zoiko.io/obligations-svc/internal/config"
 	svcenvelope "zoiko.io/obligations-svc/internal/envelope"
 	"zoiko.io/obligations-svc/internal/events"
+	"zoiko.io/obligations-svc/internal/evidencereq"
 	"zoiko.io/obligations-svc/internal/handler"
 	"zoiko.io/obligations-svc/internal/health"
 	"zoiko.io/obligations-svc/internal/jurisdiction"
+	"zoiko.io/obligations-svc/internal/ledgermetrics"
 	svcmiddleware "zoiko.io/obligations-svc/internal/middleware"
 	"zoiko.io/obligations-svc/internal/outbox"
 	"zoiko.io/obligations-svc/internal/registry"
 	"zoiko.io/obligations-svc/internal/store"
 	"zoiko.io/obligations-svc/internal/telemetry"
+	"zoiko.io/obligations-svc/internal/workflowclient"
 )
 
 func main() {
@@ -139,6 +146,16 @@ func main() {
 	jurisdictionValidator := jurisdiction.NewHTTPValidator(cfg.JurisdictionRulesURL, log)
 	authzClient := authz.NewHTTPClient(cfg.AuthZServiceURL, log)
 
+	// Evidence requirements client for pre-closure evidence validation
+	var evidenceReqClient evidencereq.Client = evidencereq.Unconfigured{}
+	if cfg.EvidenceRequirementsURL != "" {
+		evidenceReqClient = evidencereq.NewHTTPClient(cfg.EvidenceRequirementsURL, log)
+	} else if !cfg.LocalEnv() {
+		log.Fatal("EVIDENCE_REQUIREMENTS_URL is required outside local/dev: closing an obligation and fulfilling a clock need an evidence evaluation")
+	} else {
+		log.Warn("EVIDENCE_REQUIREMENTS_URL unset: every evidence check fails closed (503) until it is set")
+	}
+
 	// ── 4a. Outbox relay ──────────────────────────────────────────────────────
 	// Every obligation event is written to event_outbox in the same
 	// transaction as the mutation; the relay delivers it to Kafka and retries
@@ -156,6 +173,67 @@ func main() {
 	overdueCtx, overdueCancel := context.WithCancel(context.Background())
 	defer overdueCancel()
 	go runOverdueScheduler(overdueCtx, pgStore, log)
+
+	// ── 4d. WFC-05 deadline clocks (R-001 s7) ────────────────────────────────
+	// Due dates come from jurisdiction-rules-svc's calculation API; waivers
+	// and escalation cases go to workflow-svc. The worker persists computed
+	// moves and fires milestones; reads never wait for it (R-INV-26).
+	calculator := jurisdiction.NewHTTPCalculator(cfg.JurisdictionRulesURL, log)
+	var workflow workflowclient.Client
+	switch {
+	case cfg.WorkflowURL != "":
+		workflow = workflowclient.New(cfg.WorkflowURL, log)
+	case !cfg.LocalEnv():
+		log.Fatal("WORKFLOW_SERVICE_URL is required outside local/dev: waivers are verified there and escalation cases are opened there")
+	default:
+		log.Warn("WORKFLOW_SERVICE_URL unset: waivers answer 503 and escalation case requests stay queued (local/dev only)")
+	}
+	clockCtx, clockCancel := context.WithCancel(context.Background())
+	defer clockCancel()
+
+	// Decision capture (DL-5, 25 Nov 2026; Doc 01 s7): an obligation raised by
+	// evaluate and a clock waiver are queued in decision_log_outbox (000017)
+	// in their own transaction and relayed to governance-decision-log-svc as
+	// LEDGER_PRINCIPAL_ID with this service's workload certificate.
+	ledgerQueue := decisionledger.NewPgQueue(pool)
+	ledgerGauges := ledgermetrics.New(prometheus.DefaultRegisterer)
+	go decisionledger.RunSampler(clockCtx, ledgerQueue, ledgerGauges, 15*time.Second,
+		time.Duration(cfg.LedgerRetentionHours)*time.Hour, log)
+	pgStore.SetDecisionLedger(cfg.LedgerPrincipalID != "")
+	if cfg.DecisionLogMTLSURL != "" && cfg.LedgerPrincipalID != "" {
+		ledgerIdentity := mtlsclient.Start(clockCtx, mtlsclient.Options{
+			ServiceName:        "obligations-svc",
+			ManagementURL:      cfg.MTLSManagementServiceURL,
+			BootstrapTokenPath: cfg.MTLSBootstrapTokenPath,
+		}, log)
+		ledgerRelay := decisionledger.NewRelay(ledgerQueue, &decisionledger.HTTPSender{
+			BaseURL: cfg.DecisionLogMTLSURL, Principal: cfg.LedgerPrincipalID,
+			KeyPrefix: "obligations-ledger", Purpose: "obligation_decision_evidence",
+			Client: ledgerIdentity.HTTPClient(5 * time.Second),
+		}, time.Duration(cfg.LedgerRelayIntervalMS)*time.Millisecond, log)
+		ledgerRelay.Observe(ledgerGauges)
+		ledgerRelay.SetMaxPerSecond(cfg.LedgerRelayMaxPerSecond)
+		ledgerRelay.Start()
+		defer ledgerRelay.Stop()
+		log.Info("decision-log relay: governance ledger over mTLS", zap.String("url", cfg.DecisionLogMTLSURL),
+			zap.String("principal", cfg.LedgerPrincipalID))
+	} else if cfg.LedgerPrincipalID != "" {
+		log.Warn("GOVERNANCE_DECISION_LOG_MTLS_URL unset — obligation decisions wait in decision_log_outbox until a relay runs")
+	}
+	clockWorker := clock.NewWorker(pgStore, workflow, metrics, log, time.Duration(cfg.ClockSweepIntervalSeconds)*time.Second)
+	clockWorker.Start(clockCtx)
+	defer clockWorker.Stop()
+
+	if cfg.CalendarTopic != "" {
+		calendarReader := kafka.NewReader(kafka.ReaderConfig{
+			Brokers: cfg.Kafka.Brokers, GroupID: cfg.Kafka.GroupID + "-calendar", Topic: cfg.CalendarTopic,
+			MinBytes: 1, MaxBytes: 10e6, MaxWait: time.Second,
+		})
+		go clock.NewCalendarConsumer(pgStore, calculator, cfg.ServicePrincipal, metrics, log).Run(clockCtx, calendarReader)
+		log.Info("calendar consumer started", zap.String("topic", cfg.CalendarTopic))
+	} else {
+		log.Warn("KAFKA_CALENDAR_TOPIC unset: calendar corrections do not recalculate clocks (OB-S8)")
+	}
 
 	// ── 4c. Identity gate and legal-entity registry ──────────────────────────
 	// X-Principal-Id / X-Tenant-Id were read exactly as sent, and host port
@@ -203,7 +281,10 @@ func main() {
 	r.Use(apicontract.EnvelopeRefusals)
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, jurisdictionValidator, authzClient, log).WithRegistry(entityChecker)
+	h := handler.New(pgStore, jurisdictionValidator, authzClient, log).
+		WithRegistry(entityChecker).
+		WithEvidenceRequirementsClient(evidenceReqClient).
+		WithClocks(pgStore, calculator, workflow)
 	handler.RegisterRoutes(r, h)
 	handler.RegisterApplicabilityRoutes(r, h)
 

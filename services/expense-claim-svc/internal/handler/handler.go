@@ -21,6 +21,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -671,7 +672,13 @@ func (h *Handler) SubmitExpenseClaim(w http.ResponseWriter, r *http.Request) {
 		Authorization: r.Header.Get("Authorization"),
 		RequestID:     r.Header.Get("X-Request-Id"),
 		CorrelationID: corr,
+		DecisionID:    fmt.Sprintf("expense-claim-%s-%.4f", claimID, total),
 	}, verifiedTenant, claim.LegalEntityID, total)
+	if errors.Is(perr, domain.ErrPolicyAccessDenied) {
+		// Not an outage, and not "unassessed": the submitter may not ask.
+		writeErr(w, http.StatusForbidden, CodePolicyUnavailable, "policy-svc refused the caller (POLICY_EVALUATE); the claim stays SUBMITTED")
+		return
+	}
 	if perr != nil {
 		controlled := h.anyControlled(lines)
 		switch {

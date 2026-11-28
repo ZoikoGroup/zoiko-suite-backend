@@ -69,6 +69,19 @@ type Metrics struct {
 	EvidenceFailed      prometheus.Gauge
 	OutboxPending       prometheus.Gauge
 	OutboxOldestSeconds prometheus.Gauge
+
+	// Decisions by family and outcome (ZS-GOV-INT-002 §10.4: NOT_IMPLEMENTED
+	// hits, NOT_CONFIGURED, holds). Labels never carry tenant or personal
+	// data; the per-tenant view is the policy-types status card.
+	Decisions *prometheus.CounterVec
+}
+
+// ObserveDecision counts one decision of a family.
+func (m *Metrics) ObserveDecision(policyType, outcome string) {
+	if m == nil || m.Decisions == nil {
+		return
+	}
+	m.Decisions.WithLabelValues(policyType, outcome).Inc()
 }
 
 func NewMetrics(serviceName string) *Metrics {
@@ -109,9 +122,14 @@ func NewMetrics(serviceName string) *Metrics {
 			Help:        "Age of the oldest unpublished event, 0 when none.",
 			ConstLabels: prometheus.Labels{"service": serviceName},
 		}),
+		Decisions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name:        "policy_decisions_total",
+			Help:        "Policy decisions by family and outcome (PERMIT, APPROVAL_REQUIRED, SIGNATURE_REQUIRED, NOT_CONFIGURED, NOT_IMPLEMENTED, ...).",
+			ConstLabels: prometheus.Labels{"service": serviceName},
+		}, []string{"policy_type", "outcome"}),
 	}
 	prometheus.MustRegister(m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp,
-		m.EvidencePending, m.EvidenceFailed, m.OutboxPending, m.OutboxOldestSeconds)
+		m.EvidencePending, m.EvidenceFailed, m.OutboxPending, m.OutboxOldestSeconds, m.Decisions)
 	return m
 }
 

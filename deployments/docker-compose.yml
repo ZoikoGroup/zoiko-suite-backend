@@ -206,25 +206,28 @@ services:
   # ── S3-Class Object Storage (MinIO — §10.3 Document & Evidence Store) ────────
   # Port 9000: S3 API consumed by services. Port 9001: MinIO Console UI.
   # http://localhost:9001 (minioadmin / miniosecret) — dev only.
-  # Bucket naming follows data-classification tiers defined in §10.3:
-  #   zoiko-restricted | zoiko-confidential | zoiko-internal | zoiko-public
+# Bucket naming follows data-classification tiers defined in §10.3:
+#   zoiko-restricted | zoiko-confidential | zoiko-internal | zoiko-public
   minio:
-    image: minio/minio:RELEASE.2024-11-07T00-52-20Z
+    image: localstack/localstack:3.0
     container_name: zoiko-minio
     mem_limit: 512m
     cpus: "0.5"
-    command: server /data --console-address ":9001"
+    command: ["localstack", "start", "--host"]
     ports:
       - "9000:9000"
       - "9001:9001"
+      - "4566:4566"
+      - "4510-4559:4510-4559"
     environment:
+      SERVICES: s3
+      DEBUG: 1
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: miniosecret
     volumes:
-      - minio_data:/data
+      - minio_data:/var/lib/localstack
     healthcheck:
-      # mc ready polls the S3 health endpoint — guaranteed by the image.
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -364,7 +367,7 @@ services:
     command:
       - |
         set -e
-        for svc in identity-context-svc gateway-auth-svc tenant-entity-registry-svc authorization-svc ai-governance-svc governance-decision-log-svc policy-svc workflow-svc contract-lifecycle-svc decision-support-svc evidence-manifest-svc; do
+        for svc in identity-context-svc gateway-auth-svc tenant-entity-registry-svc authorization-svc ai-governance-svc governance-decision-log-svc policy-svc workflow-svc contract-lifecycle-svc decision-support-svc evidence-manifest-svc access-control-svc jurisdiction-rules-svc obligations-svc evidence-requirements-svc; do
           mkdir -p "/bootstrap/$$svc"
           if [ ! -f "/bootstrap/$$svc/token" ]; then
             head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "/bootstrap/$$svc/token"
@@ -422,7 +425,7 @@ services:
       - "--entrypoints.websecure.address=:443"
       - "--entrypoints.websecure.http.tls=true"
       # Global rate limit: 1000 req/s burst 2000 (adjust for production)
-      - "--entrypoints.websecure.http.middlewares=ratelimit@file,buffering@file,security-headers@file,compress@file"
+      - "--entrypoints.websecure.http.middlewares=ratelimit@file,buffering@file,security-headers@file,compress@file,preserve-host@file"
       # TLS: self-signed cert for local dev (generated on first run, persisted in volume)
       - "--certificatesresolvers.local.acme.tlschallenge=true"
       - "--certificatesresolvers.local.acme.email=dev@zoiko.local"
@@ -624,6 +627,14 @@ services:
       AUTH_MAX_FAILED_ATTEMPTS: "5"
       AUTH_LOCK_DURATION_SECONDS: "900"
       TENANT_REGISTRY_URL: "http://tenant-svc:8081"
+      # tenant-svc's identity gate is strict (require): a caller with no
+      # envelope is admitted only as a registered mTLS peer. A context resolve
+      # has no envelope yet (it mints one), so on the plain URL every sign-in
+      # failed with 401 from the registry. This sends every registry call to
+      # its mTLS listener with this service's own certificate (same bootstrap
+      # token as the listener below); tenant-svc lists identity-context-svc in
+      # MTLS_ALLOWED_CLIENTS. Empty = plain HTTP to TENANT_REGISTRY_URL.
+      TENANT_REGISTRY_MTLS_URL: "${IDENTITY_TENANT_REGISTRY_MTLS_URL:-https://tenant-entity-registry-svc:8449}"
       DELEGATED_AUTHORITY_URL: "http://identity-svc:8080"
       # access-control-svc, NOT this service. internal/upstream calls
       # GET {ACCESS_CONTROL_URL}/v1/role-definitions/{id}/permission-bundles,
@@ -763,7 +774,7 @@ services:
       # SCIM provisioning, role requests to access-control-svc, and the deprovisioning worker. Requires
       # FEDERATION_ENABLED. IDENTITY_SERVICE_PRINCIPAL_ID needs ROLE_MANAGE on the entities its mappings name:
       # an operator grant, never something federation gives itself.
-      FEDERATION_PROVISIONING_ENABLED: "${FEDERATION_PROVISIONING_ENABLED:-false}"
+      FEDERATION_PROVISIONING_ENABLED: "${FEDERATION_PROVISIONING_ENABLED:-true}"
       FEDERATION_WORKER_INTERVAL_SECONDS: "15"
       FEDERATION_RETRY_BASE_SECONDS: "10"
       FEDERATION_REVOKE_RETRY_MAX_SECONDS: "60"
@@ -936,10 +947,8 @@ services:
     environment:
       # Identity gate (X-R3): a presented signed envelope is verified and its
       # session checked; its claims replace X-Principal-Id / X-Tenant-Id.
-      # warn here: the services outside Groups 1-2 that read entities forward
-      # the principal but not the envelope. The gateway's tenant-context calls
-      # come over mTLS as a peer. The code default outside local is require.
-      IDENTITY_VERIFY: "${TENANT_REGISTRY_IDENTITY_VERIFY:-warn}"
+      # strict: enforce envelope verification; reject requests without valid envelope
+      IDENTITY_VERIFY: "${TENANT_REGISTRY_IDENTITY_VERIFY:-strict}"
       IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
       IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
       IDENTITY_ISSUER: "identity-context-svc"
@@ -974,11 +983,15 @@ services:
       # Provisioning retries in the background: mtls-management-svc being down
       # never stops the plaintext listener. Only the listed client CNs are
       # admitted, and X-Workload-Id is set to the verified one.
+      # identity-context-svc reads tenants and entities here while it resolves
+      # a sign-in, before any envelope exists, so it must be a peer.
+      # workflow-svc checks the legal entity of a case opened by a service
+      # relay (obligations-svc's escalations), which carries no envelope.
       MTLS_ENABLED: "true"
       MTLS_PORT: "8449"
       MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
       MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
-      MTLS_ALLOWED_CLIENTS: "gateway-auth-svc,authorization-svc"
+      MTLS_ALLOWED_CLIENTS: "gateway-auth-svc,authorization-svc,identity-context-svc,workflow-svc"
     volumes:
       # Only this service's own bootstrap token (register M-01): the
       # sub-directory tenant-entity-registry-svc/ of the keygen volume, so /bootstrap/token
@@ -1079,9 +1092,28 @@ services:
       KAFKA_GROUP_ID: "jurisdiction-rules-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.jurisdiction.events"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+      # Decision capture (DL-1, 25 Nov 2026): this engine relays its verdicts to
+      # governance-decision-log-svc from its outbox over the :8450 mTLS listener,
+      # with its own workload certificate, as svc-jurisdiction-rules (authorization 000046).
+      # Unset URL: records wait in the outbox (evidence fails safe).
+      GOVERNANCE_DECISION_LOG_MTLS_URL: "${JURISDICTION_DECISION_LOG_MTLS_URL:-https://governance-decision-log-svc:8450}"
+      LEDGER_PRINCIPAL_ID: "${JURISDICTION_LEDGER_PRINCIPAL_ID:-svc-jurisdiction-rules}"
+      # Deliveries per second; a burst waits in the outbox instead of competing with decisions.
+      LEDGER_RELAY_MAX_PER_SECOND: "${JURISDICTION_LEDGER_RELAY_MAX_PER_SECOND:-20}"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
     volumes:
       - ./jurisdiction/dev-keys:/keys:ro
+      # Only this service's own bootstrap token (register M-01).
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: jurisdiction-rules-svc
     depends_on:
+      mtls-bootstrap-keygen:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       kafka:
@@ -1196,7 +1228,7 @@ services:
       MTLS_PORT: "8450"
       MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
       MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
-      IDENTITY_PEERS: "${DECISION_LOG_IDENTITY_PEERS:-policy-svc,workflow-svc,contract-lifecycle-svc,decision-support-svc,evidence-manifest-svc}"
+      IDENTITY_PEERS: "${DECISION_LOG_IDENTITY_PEERS:-policy-svc,workflow-svc,contract-lifecycle-svc,decision-support-svc,evidence-manifest-svc,authorization-svc,jurisdiction-rules-svc,obligations-svc,evidence-requirements-svc}"
       # Production hardening (11 Nov): the workload certificate is renewed at
       # two thirds of its lifetime, and :8450 refuses a client certificate on
       # mtls-management-svc's CRL (and every one while no current CRL is
@@ -1331,11 +1363,13 @@ services:
       # identity-context-svc's signed envelope (verified against its JWKS, its
       # session checked at introspection, AU-01) replaces X-Tenant-Id /
       # X-Principal-Id, or a peer certificate on the :8449 mTLS listener vouches
-      # for them. governance-decision-log-svc's replay forwards the envelope
-      # since 21 Oct; warn remains for the out-of-domain evaluate callers
-      # (expense-claim-svc, payment-authorization-svc), which forward the
-      # principal but not the envelope. The code default is enforce.
-      POLICY_IDENTITY_VERIFY: "${POLICY_IDENTITY_VERIFY:-warn}"
+      # for them. Enforced since 18 Nov 2026 (POL-3): e2e-policy-deps.py passes
+      # 112/112 under enforce (console envelope; governance-decision-log-svc
+      # replay and workflow-svc over :8449), and expense-claim-svc,
+      # payment-authorization-svc and payroll-run-svc forward the caller's
+      # envelope, so a forwarded request is accepted and an envelope-less one
+      # is refused 401, which each caller turns into a fail-closed 403.
+      POLICY_IDENTITY_VERIFY: "${POLICY_IDENTITY_VERIFY:-enforce}"
       IDENTITY_JWKS_URL: "http://identity-svc:8080/.well-known/jwks.json"
       IDENTITY_INTROSPECT_URL: "http://identity-svc:8080/v1/context/session/introspect"
       EXPECTED_ISSUER: "identity-context-svc"
@@ -1345,6 +1379,24 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "policy-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.policy.events"
+      # Peer listener (:8449): system callers with no person's envelope
+      # present their workload certificate instead of bare headers
+      # (governance-decision-log-svc's replay, notification-svc's legal-basis
+      # reads, workflow-svc's signatory-decision reads). Only these CNs are
+      # admitted.
+      MTLS_ENABLED: "true"
+      MTLS_PORT: "8449"
+      MTLS_ALLOWED_CLIENTS: "governance-decision-log-svc,notification-svc,workflow-svc"
+      # PDC-05 activation gate: an evaluable version goes live only when
+      # certified against its family's test suite (or waived).
+      POLICY_CERTIFICATION_GATE: "${POLICY_CERTIFICATION_GATE:-enforce}"
+      # ZS-GOV-INT-002 decision signing key (Ed25519 seed, 64 hex). Empty is
+      # accepted only with ENV=local: a per-process key, published at
+      # /v1/policy-decision-keys. Every other tier must set it.
+      POLICY_DECISION_SIGNING_KEY_HEX: "${POLICY_DECISION_SIGNING_KEY_HEX:-}"
+      POLICY_DECISION_SIGNING_KEY_ID: "${POLICY_DECISION_SIGNING_KEY_ID:-}"
+      # API-4 cursors; local only, any 32+ byte hex key in other tiers.
+      CURSOR_SIGNING_KEY_HEX: "${POLICY_CURSOR_SIGNING_KEY_HEX:-}"
     volumes:
       # Only this service's own bootstrap token (register M-01).
       - type: volume
@@ -1525,6 +1577,16 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.obligations.events"
       # Every legal entity a write names must exist in the caller's tenant.
       TENANT_REGISTRY_URL: "http://tenant-entity-registry-svc:8081"
+      # WFC-05 deadline clocks (R-001 s7): closing an obligation and fulfilling
+      # a clock need an evidence evaluation (fail closed without it); waivers
+      # are verified and escalation cases opened in workflow-svc; a published
+      # calendar correction recalculates live clocks (OB-S8). The clock worker
+      # and the calendar consumer act as svc-obligations (authorization 000044).
+      EVIDENCE_REQUIREMENTS_URL: "http://evidence-requirements-svc:8130"
+      WORKFLOW_SERVICE_URL: "http://workflow-svc:8090"
+      KAFKA_CALENDAR_TOPIC: "zoiko.jurisdiction.events"
+      CLOCK_SWEEP_INTERVAL_SECONDS: "${OBLIGATIONS_CLOCK_SWEEP_INTERVAL_SECONDS:-60}"
+      SERVICE_PRINCIPAL_ID: "svc-obligations"
       # Identity gate (X5 / X-R3): the signed envelope is verified when sent
       # and a refused envelope is 401 in every mode; warn admits a request
       # that carries none until every caller forwards it. Code default
@@ -1533,7 +1595,27 @@ services:
       IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
       IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
       IDENTITY_ISSUER: "identity-context-svc"
+      # Decision capture (DL-1, 25 Nov 2026): this engine relays its verdicts to
+      # governance-decision-log-svc from its outbox over the :8450 mTLS listener,
+      # with its own workload certificate, as svc-obligations (authorization 000046).
+      # Unset URL: records wait in the outbox (evidence fails safe).
+      GOVERNANCE_DECISION_LOG_MTLS_URL: "${OBLIGATIONS_DECISION_LOG_MTLS_URL:-https://governance-decision-log-svc:8450}"
+      LEDGER_PRINCIPAL_ID: "${OBLIGATIONS_LEDGER_PRINCIPAL_ID:-svc-obligations}"
+      # Deliveries per second; a burst waits in the outbox instead of competing with decisions.
+      LEDGER_RELAY_MAX_PER_SECOND: "${OBLIGATIONS_LEDGER_RELAY_MAX_PER_SECOND:-20}"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
+    volumes:
+      # Only this service's own bootstrap token (register M-01).
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: obligations-svc
     depends_on:
+      mtls-bootstrap-keygen:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       kafka:
@@ -1710,7 +1792,7 @@ services:
       # service's mTLS off; production points at
       # https://identity-context-svc:8449/.well-known/jwks.json, which
       # allow-lists authorization-svc and is fetched with its own certificate.
-      AUTHZ_IDENTITY_ASSERTION: "warn"
+      AUTHZ_IDENTITY_ASSERTION: "${AUTHZ_IDENTITY_ASSERTION:-require}"
       AUTHZ_IDENTITY_JWKS_URL: "http://identity-svc:8080/.well-known/jwks.json"
       # AU-01: every verified envelope's session is checked here (live answers
       # reused for 5 s), so a logout stops the admin routes at once instead of
@@ -1727,6 +1809,14 @@ services:
       AUTHZ_MAX_JIT_SECONDS: "28800"
       AUTHZ_MAX_BREAK_GLASS_SECONDS: "7200"
       AUTHZ_MAX_SUPPORT_SECONDS: "14400"
+      # Decision capture (DL-1, 25 Nov 2026): this engine relays its verdicts to
+      # governance-decision-log-svc from its outbox over the :8450 mTLS listener,
+      # with its own workload certificate, as svc-authorization (authorization 000046).
+      # Unset URL: records wait in the outbox (evidence fails safe).
+      GOVERNANCE_DECISION_LOG_MTLS_URL: "${AUTHZ_DECISION_LOG_MTLS_URL:-https://governance-decision-log-svc:8450}"
+      LEDGER_PRINCIPAL_ID: "${AUTHZ_LEDGER_PRINCIPAL_ID:-svc-authorization}"
+      # Deliveries per second; a burst waits in the outbox instead of competing with decisions.
+      LEDGER_RELAY_MAX_PER_SECOND: "${AUTHZ_LEDGER_RELAY_MAX_PER_SECOND:-20}"
     volumes:
       # Only this service's own bootstrap token (register M-01): the
       # sub-directory authorization-svc/ of the keygen volume, so /bootstrap/token
@@ -1794,6 +1884,21 @@ services:
       # Without the grant every decision still commits, and its ledger record
       # waits durably in the outbox.
       WORKFLOW_LEDGER_PRINCIPAL_ID: "${WORKFLOW_LEDGER_PRINCIPAL_ID:-svc-workflow}"
+      # Approver and requester notices (26 Nov 2026): every transition writes
+      # them to the outbox in its own transaction, and a relay sends them to
+      # notification-svc's POST /v1/notifications (bell + email) as
+      # svc-workflow, which holds NOTIFICATION_SEND (WORKFLOW_NOTIFIER in
+      # deployments/supabase/seed-rbac.sql). Unset NOTIFICATION_SERVICE_URL
+      # turns notices off. CONSOLE_BASE_URL prefixes the link in each notice.
+      NOTIFICATION_SERVICE_URL: "${WORKFLOW_NOTIFICATION_SERVICE_URL:-http://notification-svc:8133}"
+      WORKFLOW_NOTIFY_PRINCIPAL_ID: "${WORKFLOW_NOTIFY_PRINCIPAL_ID:-svc-workflow}"
+      CONSOLE_BASE_URL: "${CONSOLE_BASE_URL:-http://localhost:3000}"
+      # Signature workflows (ZS-GOV-INT-002 §4.2) are created only from a
+      # policy-svc SIGNATORY_MATRIX decision, read from policy-svc's :8449 peer
+      # listener with this service's certificate and verified against
+      # policy-svc's published decision keys.
+      POLICY_SERVICE_URL: "http://policy-svc:8085"
+      POLICY_SERVICE_MTLS_URL: "${WORKFLOW_POLICY_MTLS_URL:-https://policy-svc:8449}"
       # Reads need WORKFLOW_READ unless the caller is a participant (the
       # WORKFLOW_APPROVER / WORKFLOW_ADMINISTRATOR templates, access-control 000021).
       WORKFLOW_READ_AUTHZ: "${WORKFLOW_READ_AUTHZ:-enforce}"
@@ -1802,6 +1907,10 @@ services:
       # CreateWorkflow validates the legal entity against the registry
       # (cross-domain fact) rather than trusting a caller-supplied UUID.
       TENANT_ENTITY_REGISTRY_SERVICE_URL: "http://tenant-entity-registry-svc:8081"
+      # A check with no caller envelope to forward (a case opened by
+      # obligations-svc's escalation relay) goes to the registry's mTLS peer
+      # listener with this service's certificate.
+      TENANT_REGISTRY_MTLS_URL: "${WORKFLOW_TENANT_REGISTRY_MTLS_URL:-https://tenant-entity-registry-svc:8449}"
       # Identity gate (X5 / X-R3): verify a presented signed envelope against
       # identity-context-svc and derive the trusted principal/tenant from it.
       # Warn locally while the console does not forward the envelope on every
@@ -1830,6 +1939,12 @@ services:
         condition: service_healthy
       document-vault-svc:
         condition: service_healthy
+      clamav:
+        condition: service_healthy
+        # clamav runs only under the "scan" profile; without it the
+        # dependant starts and refuses uploads (fail closed), and
+        # `docker compose config` stays valid.
+        required: false
       tenant-svc:
         condition: service_healthy
       # The compose service key is governance-svc (container
@@ -1902,6 +2017,27 @@ services:
     entrypoint: ["/bin/sh", "-c", "chown -R 65532:65532 /data/documents"]
     restart: "no"
 
+  # ── ClamAV for document-vault-svc virus scanning ──────────────────────────────
+  # Runs under "scan" profile; document-vault-svc refuses uploads without it.
+  clamav:
+    # Pinned (ER-S2): a floating tag changed the scanner under every rebuild
+    # (1.4.1, named in the plan, is not a published tag; 1.5.4 is).
+    image: clamav/clamav:1.5.4
+    container_name: zoiko-clamav
+    mem_limit: 1g
+    cpus: "1.0"
+    command: ["sh", "-c", "freshclam -d --checks=1 & clamd --foreground=true"]
+    profiles: ["scan"]
+    volumes:
+      - clamav_db:/var/lib/clamav
+    healthcheck:
+      test: ["CMD-SHELL", "clamdscan --ping=3 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    restart: on-failure
+
   # ── Phase 2: Document Vault Service (Port: 8094) ─────────────────────────────
   # Stores critical documents with version lineage, access lineage, integrity
   # controls (SHA-256, verified on every read), retention, and jurisdiction-
@@ -1944,6 +2080,8 @@ services:
       # Message both carrying a Topic), the transactional outbox had never
       # actually delivered a single event to Kafka.
       KAFKA_BROKERS: "kafka:9094"
+      # ClamAV for virus scanning — required for uploads (fails closed if unavailable)
+      CLAMAV_URL: "clamav:3310"
       EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
     volumes:
       - document_vault_storage:/data/documents
@@ -1954,6 +2092,12 @@ services:
         condition: service_healthy
       document-vault-storage-init:
         condition: service_completed_successfully
+      clamav:
+        condition: service_healthy
+        # clamav runs only under the "scan" profile; without it the
+        # dependant starts and refuses uploads (fail closed), and
+        # `docker compose config` stays valid.
+        required: false
     healthcheck:
       # readyz, not healthz: liveness answers 200 whenever the process is up, so a
       # dead database pool reads as healthy while every read returns 500.
@@ -3019,12 +3163,33 @@ services:
       # EVENT_TRIGGERED review of the linked subject, reviewed by their manager
       # when linked, else by this principal. Unset turns the consumer off.
       ACS_EVENT_REVIEW_DEFAULT_REVIEWER: "5eed0000-0000-4000-8000-00000000a001"
+      # mTLS for authorization-svc calls (CT-3): present this service's
+      # certificate as a registered delegate (AUTHZ_ADMIN_DELEGATES in
+      # authorization-svc already includes access-control-svc).
+      AUTHZ_MTLS_ENABLED: "true"
+      AUTHZ_MTLS_URL: "https://authorization-svc:8449"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
+    volumes:
+      # Only this service's own bootstrap token (register M-01): the
+      # sub-directory access-control-svc/ of the keygen volume, so /bootstrap/token
+      # here is a token mtls-management-svc binds to access-control-svc alone.
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: access-control-svc
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      mtls-bootstrap-keygen:
+        condition: service_completed_successfully
+      mtls-management-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8137/healthz"]
@@ -3226,7 +3391,27 @@ services:
       IDENTITY_JWKS_URL: "http://identity-context-svc:8080/.well-known/jwks.json"
       IDENTITY_INTROSPECT_URL: "http://identity-context-svc:8080/v1/context/session/introspect"
       IDENTITY_ISSUER: "identity-context-svc"
+      # Decision capture (DL-1, 25 Nov 2026): this engine relays its verdicts to
+      # governance-decision-log-svc from its outbox over the :8450 mTLS listener,
+      # with its own workload certificate, as svc-evidence-requirements (authorization 000046).
+      # Unset URL: records wait in the outbox (evidence fails safe).
+      GOVERNANCE_DECISION_LOG_MTLS_URL: "${EVIDENCE_DECISION_LOG_MTLS_URL:-https://governance-decision-log-svc:8450}"
+      LEDGER_PRINCIPAL_ID: "${EVIDENCE_LEDGER_PRINCIPAL_ID:-svc-evidence-requirements}"
+      # Deliveries per second; a burst waits in the outbox instead of competing with decisions.
+      LEDGER_RELAY_MAX_PER_SECOND: "${EVIDENCE_LEDGER_RELAY_MAX_PER_SECOND:-20}"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
+    volumes:
+      # Only this service's own bootstrap token (register M-01).
+      - type: volume
+        source: mtls_bootstrap_token
+        target: /bootstrap
+        read_only: true
+        volume:
+          subpath: evidence-requirements-svc
     depends_on:
+      mtls-bootstrap-keygen:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       kafka:
@@ -3235,6 +3420,12 @@ services:
         condition: service_healthy
       document-vault-svc:
         condition: service_healthy
+      clamav:
+        condition: service_healthy
+        # clamav runs only under the "scan" profile; without it the
+        # dependant starts and refuses uploads (fail closed), and
+        # `docker compose config` stays valid.
+        required: false
       tenant-svc:
         condition: service_healthy
     healthcheck:
@@ -3458,6 +3649,12 @@ services:
         condition: service_healthy
       document-vault-svc:
         condition: service_healthy
+      clamav:
+        condition: service_healthy
+        # clamav runs only under the "scan" profile; without it the
+        # dependant starts and refuses uploads (fail closed), and
+        # `docker compose config` stays valid.
+        required: false
       asset-management-svc:
         condition: service_healthy
       inventory-management-svc:
@@ -5549,6 +5746,12 @@ services:
         condition: service_healthy
       document-vault-svc:
         condition: service_healthy
+      clamav:
+        condition: service_healthy
+        # clamav runs only under the "scan" profile; without it the
+        # dependant starts and refuses uploads (fail closed), and
+        # `docker compose config` stays valid.
+        required: false
       tax-determination-svc:
         condition: service_healthy
       policy-svc:
@@ -6619,3 +6822,4 @@ volumes:
   mtls_bootstrap_token:
   gateway_admin_token:
   traefik-certs:
+  clamav_db:

@@ -549,7 +549,7 @@ func (h *Handler) writeSupportError(w http.ResponseWriter, r *http.Request, err 
 			Code:   domain.ErrCodeBreakGlassRequired,
 			Detail: err.Error(),
 		})
-	default:
+default:
 		h.log.Error("attach support context failed", zap.Error(err))
 		apicontract.WriteProblem(w, r, apicontract.Problem{
 			Status: http.StatusInternalServerError,
@@ -557,4 +557,34 @@ func (h *Handler) writeSupportError(w http.ResponseWriter, r *http.Request, err 
 			Detail: "could not attach the support context",
 		})
 	}
+}
+
+// VerifyRevocation is POST /v1/internal/revocation/verify.
+// Called by gateway-auth-svc /verify when it confirms a session is revoked.
+// Body: { "session_context_id": "...", "tenant_id": "...", "revoked_at": "RFC3339", "reason": "..." }
+// This records the revocation lag for IAM-8 SLO measurement.
+func (h *Handler) VerifyRevocation(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionContextID string                     `json:"session_context_id"`
+		TenantID         string                     `json:"tenant_id"`
+		RevokedAt        string                     `json:"revoked_at"`
+		Reason           domain.InvalidationReason `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeCoded(w, r, http.StatusBadRequest, "invalid_request", "invalid request body")
+		return
+	}
+	if req.SessionContextID == "" || req.TenantID == "" || req.RevokedAt == "" {
+		writeCoded(w, r, http.StatusBadRequest, "invalid_request", "session_context_id, tenant_id, revoked_at are required")
+		return
+	}
+	revokedAt, err := time.Parse(time.RFC3339, req.RevokedAt)
+	if err != nil {
+		writeCoded(w, r, http.StatusBadRequest, "invalid_request", "revoked_at must be RFC3339")
+		return
+}
+	if h.metrics != nil {
+		h.metrics.ObserveRevocationLag(revokedAt, req.Reason)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "recorded"})
 }

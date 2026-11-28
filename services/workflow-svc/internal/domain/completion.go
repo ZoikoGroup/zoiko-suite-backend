@@ -26,6 +26,14 @@ type ActionAuthority struct {
 // request hash (a retried command with the same key replays; a different
 // body is ErrIdempotencyMismatch), and the governance-ledger decision id the
 // transition is recorded under.
+// CommandReplay is the decision an Idempotency-Key already committed on an
+// instance: who acted, on which stage, and the ledger decision id.
+type CommandReplay struct {
+	ActedBy    string
+	StageOrder *int
+	DecisionID *string
+}
+
 type CommandMeta struct {
 	IdempotencyKey string
 	RequestHash    string

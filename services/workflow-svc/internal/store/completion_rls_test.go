@@ -317,3 +317,72 @@ func TestPgStore_RLS_ListTenantsWithPendingCrossesTenants(t *testing.T) {
 		t.Fatalf("tenants = %v, %v", tenants, err)
 	}
 }
+
+// DL-2 (25 Nov 2026): a workflow started for an escalated governance decision
+// stores it, and every ledger record the workflow writes names it as
+// causation_id, unless the action supplies its own. Runs as the runtime role.
+func TestPgStore_DL2_LedgerRecordsCarryTheResolvedDecision(t *testing.T) {
+	admin := getTestPool(t)
+	defer admin.Close()
+	setupTestDB(t, admin)
+	s := store.New(appRolePool(t, admin), zap.NewNop())
+	ctx := tenantCtx(testTenantID)
+
+	params := twoStageParams()
+	params.CausationDecisionID = "policy-decision-escalated-1"
+	inst, _, created, err := s.CreateWorkflow(ctx, params)
+	if err != nil || !created {
+		t.Fatalf("create: created=%v err=%v", created, err)
+	}
+	if inst.CausationDecisionID == nil || *inst.CausationDecisionID != "policy-decision-escalated-1" {
+		t.Fatalf("instance causation = %v", inst.CausationDecisionID)
+	}
+	read, err := s.FindWorkflowByID(ctx, inst.WorkflowInstanceID)
+	if err != nil || read.CausationDecisionID == nil || *read.CausationDecisionID != "policy-decision-escalated-1" {
+		t.Fatalf("read back: %+v, %v", read, err)
+	}
+
+	m1 := meta("idem-dl2-1", "h1")
+	if _, _, moved, err := s.SubmitAction(ctx, domain.SubmitActionParams{WorkflowInstanceID: inst.WorkflowInstanceID,
+		ActorPrincipalID: "approver-1", Action: "APPROVE", Meta: m1}); err != nil || !moved {
+		t.Fatalf("approve stage 1: moved=%v err=%v", moved, err)
+	}
+	own := "explicit-cause-2"
+	m2 := meta("idem-dl2-2", "h2")
+	if _, _, moved, err := s.SubmitAction(ctx, domain.SubmitActionParams{WorkflowInstanceID: inst.WorkflowInstanceID,
+		ActorPrincipalID: "approver-2", Action: "APPROVE", CausationID: &own, Meta: m2}); err != nil || !moved {
+		t.Fatalf("approve stage 2: moved=%v err=%v", moved, err)
+	}
+
+	causation := func(decisionID string) string {
+		var c *string
+		if err := admin.QueryRow(context.Background(), `SELECT payload->>'causation_id' FROM outbox_events
+			WHERE destination = 'decision_log' AND outbox_event_id::text = $1`, decisionID).Scan(&c); err != nil {
+			t.Fatalf("ledger record %s: %v", decisionID, err)
+		}
+		if c == nil {
+			return ""
+		}
+		return *c
+	}
+	if got := causation(m1.DecisionID); got != "policy-decision-escalated-1" {
+		t.Fatalf("stage 1 ledger causation_id = %q, want the escalated decision", got)
+	}
+	if got := causation(m2.DecisionID); got != own {
+		t.Fatalf("stage 2 ledger causation_id = %q, want the action's own %q", got, own)
+	}
+
+	// A workflow started for no decision writes no causation.
+	plain, _, _, err := s.CreateWorkflow(ctx, twoStageParams())
+	if err != nil || plain.CausationDecisionID != nil {
+		t.Fatalf("plain workflow: %+v, %v", plain, err)
+	}
+	m3 := meta("idem-dl2-3", "h3")
+	if _, _, _, err := s.SubmitAction(ctx, domain.SubmitActionParams{WorkflowInstanceID: plain.WorkflowInstanceID,
+		ActorPrincipalID: "approver-1", Action: "APPROVE", Meta: m3}); err != nil {
+		t.Fatal(err)
+	}
+	if got := causation(m3.DecisionID); got != "" {
+		t.Fatalf("plain workflow ledger causation_id = %q, want none", got)
+	}
+}

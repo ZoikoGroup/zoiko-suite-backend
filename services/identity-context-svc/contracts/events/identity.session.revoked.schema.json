@@ -1,0 +1,25 @@
+{
+  "description": "ZS-EVENT-001 payload of com.zoikosuite.identity.session.revoked (identity-context-svc, schema 1.0.0): one session ended by a named actor, written in the invalidation's own transaction (IC-16, D1-1.F21). Written by hand from internal/session/durable.go, 24 Nov 2026.",
+  "properties": {
+    "session_context_id": {
+      "type": "string"
+    },
+    "principal_id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "invalidation_reason": {
+      "type": "string"
+    },
+    "actor": {
+      "type": "string"
+    },
+    "correlation_id": {
+      "type": "string"
+    }
+  },
+  "required": ["session_context_id", "tenant_id", "actor"],
+  "type": "object"
+}

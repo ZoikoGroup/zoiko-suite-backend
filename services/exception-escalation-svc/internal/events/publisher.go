@@ -68,7 +68,6 @@ func NewKafkaPublisher(brokers []string, topic string, logger *zap.Logger) *Kafk
 		Addr:                   kafka.TCP(brokers...),
 		Topic:                  topic,
 		Balancer:               &kafka.LeastBytes{},
-		BatchTimeout:           20 * time.Millisecond,
 		AllowAutoTopicCreation: true,
 	}
 	return &KafkaPublisher{writer: w, logger: logger}
@@ -80,12 +79,11 @@ func NewKafkaPublisherWithWriter(writer MessageWriter, logger *zap.Logger) *Kafk
 	return &KafkaPublisher{writer: writer, logger: logger}
 }
 
-// BuildEvent assembles the envelope for params with the given identity. The
-// store writes it to the transactional outbox at transaction time, so it
-// carries the actor and correlation of the request that caused the change.
-func BuildEvent(params PublishParams, eventID string, occurredAt time.Time) Event {
-	return Event{
-		EventID:         eventID,
+func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) error {
+	evt := Event{
+		// A fresh UUID per publish, not a deterministic string — see
+		// docs/architecture/known-gaps.md's event_id collision writeup.
+		EventID:         "evt-" + uuid.New().String(),
 		EventType:       params.EventType,
 		EventVersion:    "1.0",
 		SchemaVersion:   "1.0",
@@ -96,18 +94,10 @@ func BuildEvent(params PublishParams, eventID string, occurredAt time.Time) Even
 		Jurisdiction:    params.Jurisdiction,
 		ActorID:         params.ActorID,
 		CorrelationID:   params.CorrelationID,
-		OccurredAt:      occurredAt.UTC(),
+		OccurredAt:      time.Now().UTC(),
 		Payload:         params.Payload,
 	}
-}
-
-// Publish sends one event immediately. Request handlers no longer call it
-// (writes go through the transactional outbox, delivered by PublishOutbox);
-// it is kept for tools and tests, and returns the delivery error.
-func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) error {
-	// A fresh UUID per publish, not a deterministic string — see
-	// docs/architecture/known-gaps.md's event_id collision writeup.
-	data, err := json.Marshal(BuildEvent(params, "evt-"+uuid.New().String(), time.Now()))
+	data, err := json.Marshal(evt)
 	if err != nil {
 		return err
 	}
@@ -115,18 +105,10 @@ func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) erro
 		Key:   []byte(params.CaseID),
 		Value: data,
 	}); err != nil {
-		p.logger.Warn("kafka publish failed",
+		p.logger.Warn("kafka publish failed — event dropped",
 			zap.String("event_type", params.EventType),
 			zap.Error(err),
 		)
-		return err
 	}
 	return nil
-}
-
-// PublishOutbox writes one already-serialised envelope from the outbox,
-// keyed by subject ID as before, and returns the real delivery error so the
-// relay retries instead of marking the row published.
-func (p *KafkaPublisher) PublishOutbox(ctx context.Context, _ string, aggregateID string, payload []byte) error {
-	return p.writer.WriteMessages(ctx, kafka.Message{Key: []byte(aggregateID), Value: payload})
 }

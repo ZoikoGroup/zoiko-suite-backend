@@ -189,13 +189,13 @@ func TestPgStore_Migration000016DownIsRefusedWhileAnAssignmentIsSuspended(t *tes
 
 	now := time.Now().UTC()
 	require.NoError(t, s.SuspendRoleAssignment(ctx, "t-1", "a-1", now))
-	_, err := pool.Exec(ctx, read("000016_role_assignment_suspension.down.sql"))
+	_, err := pool.Exec(ctx, read("000023_role_assignment_suspension.down.sql"))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "000016 down refused")
 
 	require.NoError(t, s.ResumeRoleAssignment(ctx, "t-1", "a-1", now.Add(time.Minute)))
-	_, err = pool.Exec(ctx, read("000016_role_assignment_suspension.down.sql"))
+	_, err = pool.Exec(ctx, read("000023_role_assignment_suspension.down.sql"))
 	require.NoError(t, err, "with nothing suspended the down migration applies")
-	_, err = pool.Exec(ctx, read("000016_role_assignment_suspension.up.sql"))
+	_, err = pool.Exec(ctx, read("000023_role_assignment_suspension.up.sql"))
 	require.NoError(t, err, "and the up migration applies again")
 }

@@ -1,0 +1,189 @@
+asyncapi: '3.0.0'
+info:
+  title: obligations-svc events
+  version: '1.0.0'
+  description: |
+    Events of obligations-svc (Doc 03 §8.5; R-001 WFC-05 §7, §10.2, §10.3).
+
+    Delivery: every event is written to the transactional outbox (`event_outbox`, destination
+    KAFKA) in the same transaction as the change it reports, and relayed by `internal/outbox`
+    (claimed FOR UPDATE SKIP LOCKED, exponential backoff, parked after 200 failures).
+    At-least-once: consumers de-duplicate on event_id. Kafka key `<tenant_id>/<aggregate_id>`.
+
+    Clock events carry the R-001 §10.3 envelope minimum (event_name, payload_schema_version,
+    event_time, emitted_at, emitting_service, tenant_id, plane, actor, subject type/id/version,
+    correlation_id, causation_id, rule/calendar/pack version refs, data_class, residency_region,
+    evidence_refs, idempotency_key, payload_hash).
+
+    Not an event: an escalation that opens a workflow case writes an outbox row with destination
+    WORKFLOW_CASE (`workflow.case.open_requested`), which the clock worker delivers to
+    workflow-svc `POST /v1/cases` and never to Kafka.
+
+    Consumed: jurisdiction-rules-svc's calendar publications (business-calendar.updated,
+    jurisdiction.calendar.changed) on zoiko.jurisdiction.events, when KAFKA_CALENDAR_TOPIC is set.
+servers:
+  local:
+    host: kafka:9094
+    protocol: kafka
+channels:
+  obligationsEvents:
+    address: zoiko.obligations.events
+    messages:
+      created: {$ref: '#/components/messages/ObligationCreated'}
+      updated: {$ref: '#/components/messages/ObligationUpdated'}
+      overdue: {$ref: '#/components/messages/ObligationOverdue'}
+      closed: {$ref: '#/components/messages/ObligationClosed'}
+      validated: {$ref: '#/components/messages/ObligationValidated'}
+      dueSoon: {$ref: '#/components/messages/ObligationDueSoon'}
+      fulfilled: {$ref: '#/components/messages/ObligationFulfilled'}
+      waived: {$ref: '#/components/messages/ObligationWaived'}
+      notApplicable: {$ref: '#/components/messages/ObligationNotApplicable'}
+      superseded: {$ref: '#/components/messages/ObligationSuperseded'}
+      breached: {$ref: '#/components/messages/ObligationBreached'}
+      disputed: {$ref: '#/components/messages/ObligationDisputed'}
+      migrated: {$ref: '#/components/messages/ObligationMigrated'}
+      definitionChanged: {$ref: '#/components/messages/ObligationDefinitionChanged'}
+      mappingChanged: {$ref: '#/components/messages/ObligationEntityMappingChanged'}
+      clockStarted: {$ref: '#/components/messages/ClockStarted'}
+      clockActivated: {$ref: '#/components/messages/ClockActivated'}
+      clockDueSoon: {$ref: '#/components/messages/ClockDueSoon'}
+      clockDue: {$ref: '#/components/messages/ClockDue'}
+      clockOverdue: {$ref: '#/components/messages/ClockOverdue'}
+      clockFulfilled: {$ref: '#/components/messages/ClockFulfilled'}
+      clockWaived: {$ref: '#/components/messages/ClockWaived'}
+      clockNotApplicable: {$ref: '#/components/messages/ClockNotApplicable'}
+      clockSuperseded: {$ref: '#/components/messages/ClockSuperseded'}
+      escalated: {$ref: '#/components/messages/ObligationEscalated'}
+  jurisdictionEvents:
+    address: zoiko.jurisdiction.events
+    messages:
+      businessCalendarUpdated: {$ref: '#/components/messages/BusinessCalendarUpdated'}
+      calendarChanged: {$ref: '#/components/messages/CalendarChanged'}
+operations:
+  publishObligationEvents:
+    action: send
+    channel: {$ref: '#/channels/obligationsEvents'}
+  consumeCalendarCorrections:
+    action: receive
+    channel: {$ref: '#/channels/jurisdictionEvents'}
+components:
+  messages:
+    ObligationCreated: {name: obligation.created, title: An obligation was raised, payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ObligationUpdated: {name: obligation.updated, title: 'Status, attributes, workflow link or filing changed (changed_fields)', payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ObligationOverdue: {name: obligation.overdue, title: The obligation's due_date passed while OPEN or IN_PROGRESS, payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ObligationClosed: {name: obligation.closed, title: The obligation was closed, payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ObligationValidated: {name: obligation.validated, title: 'An AI-extracted obligation was validated into PLANNED (WFC-05)', payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ObligationDueSoon: {name: obligation.due_soon, title: 'An EXTENDED obligation entered DUE_SOON (WFC-05)', payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ObligationFulfilled: {name: obligation.fulfilled, title: 'An EXTENDED obligation was fulfilled (WFC-05)', payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ObligationWaived: {name: obligation.waived, title: 'An EXTENDED obligation was waived (WFC-05)', payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ObligationNotApplicable: {name: obligation.not_applicable, title: 'An EXTENDED obligation was marked not applicable (WFC-05)', payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ObligationSuperseded: {name: obligation.superseded, title: 'An EXTENDED obligation was superseded by another (WFC-05)', payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ObligationBreached: {name: obligation.breached, title: 'An EXTENDED obligation was breached (WFC-05)', payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ObligationDisputed: {name: obligation.disputed, title: 'An EXTENDED obligation was disputed (WFC-05)', payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ObligationMigrated: {name: obligation.migrated, title: 'A legacy obligation was backfilled into the EXTENDED lifecycle', payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ObligationDefinitionChanged: {name: obligation.definition.changed, title: A definition was created, versioned or retired, payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ObligationEntityMappingChanged: {name: obligation.entity_mapping.changed, title: A definition was mapped to an entity or the mapping ended, payload: {$ref: '#/components/schemas/ObligationEnvelope'}}
+    ClockStarted: {name: obligation.clock.started, title: 'A deadline clock started (R-001 deadline_clock_started); a successor carries supersedes_clock_id', payload: {$ref: '#/components/schemas/ClockEnvelope'}}
+    ClockActivated: {name: obligation.clock.activated, title: A PLANNED clock became ACTIVE, payload: {$ref: '#/components/schemas/ClockEnvelope'}}
+    ClockDueSoon: {name: obligation.clock.due_soon, title: The warning instant passed (obligation_due_soon), payload: {$ref: '#/components/schemas/ClockEnvelope'}}
+    ClockDue: {name: obligation.clock.due, title: The local due date began (obligation_due), payload: {$ref: '#/components/schemas/ClockEnvelope'}}
+    ClockOverdue: {name: obligation.clock.overdue, title: 'now > due_at and not satisfied; effective_at is due_at (obligation_overdue)', payload: {$ref: '#/components/schemas/ClockEnvelope'}}
+    ClockFulfilled: {name: obligation.clock.fulfilled, title: Satisfaction evidence accepted (obligation_fulfilled); overdue_since kept, payload: {$ref: '#/components/schemas/ClockEnvelope'}}
+    ClockWaived: {name: obligation.clock.waived, title: Waived under an approved waiver (obligation_waived), payload: {$ref: '#/components/schemas/ClockEnvelope'}}
+    ClockNotApplicable: {name: obligation.clock.not_applicable, title: Not applicable under an approved decision, payload: {$ref: '#/components/schemas/ClockEnvelope'}}
+    ClockSuperseded: {name: obligation.clock.superseded, title: 'A recalculation replaced the clock; previous_due_at and new_due_at in the payload', payload: {$ref: '#/components/schemas/ClockEnvelope'}}
+    ObligationEscalated: {name: obligation.escalated, title: 'An escalation milestone fired: RAISE_PRIORITY, ADD_OWNER, OPEN_CASE, NOTIFY or REQUIRE_APPROVAL; never fulfilment', payload: {$ref: '#/components/schemas/ClockEnvelope'}}
+    BusinessCalendarUpdated: {name: business-calendar.updated, title: jurisdiction-rules-svc published a calendar version (consumed), payload: {$ref: '#/components/schemas/CalendarEvent'}}
+    CalendarChanged: {name: jurisdiction.calendar.changed, title: jurisdiction-rules-svc published a calendar version (consumed), payload: {$ref: '#/components/schemas/CalendarEvent'}}
+  schemas:
+    ObligationEnvelope:
+      type: object
+      required: [event_id, event_type, event_version, emitted_at, source_service, tenant_id, correlation_id, payload]
+      properties:
+        event_id: {type: string}
+        event_type: {type: string}
+        event_version: {type: string}
+        emitted_at: {type: string, format: date-time}
+        schema_version: {type: string}
+        source_service: {type: string, const: obligations-svc}
+        tenant_id: {type: string, format: uuid}
+        legal_entity_id: {type: string}
+        jurisdiction: {type: string}
+        actor_id: {type: string}
+        correlation_id: {type: string}
+        payload: {type: object}
+    ClockEnvelope:
+      type: object
+      required: [event_id, event_name, payload_schema_version, event_time, emitted_at, emitting_service, tenant_id, plane, actor_id, subject, correlation_id, rule_refs, data_class, payload_hash, payload]
+      properties:
+        event_id: {type: string}
+        event_type: {type: string}
+        event_name: {type: string}
+        event_version: {type: string}
+        payload_schema_version: {type: string}
+        event_time: {type: string, format: date-time}
+        emitted_at: {type: string, format: date-time}
+        source_service: {type: string}
+        emitting_service: {type: string, const: obligations-svc}
+        tenant_id: {type: string, format: uuid}
+        plane: {type: string, enum: [TENANT_BUSINESS, PLATFORM_COMMERCIAL, PLATFORM_CONTROL]}
+        legal_entity_id: {type: string}
+        jurisdiction: {type: string}
+        actor_id: {type: string}
+        subject:
+          type: object
+          properties:
+            type: {type: string, const: OBLIGATION_CLOCK}
+            id: {type: string, format: uuid}
+            version: {type: integer}
+        correlation_id: {type: string}
+        causation_id: {type: string}
+        rule_refs:
+          type: object
+          properties:
+            obligation_rule_id: {type: string}
+            rule_version: {type: integer}
+            rule_content_digest: {type: string}
+            calculation_ref: {type: string}
+            calendar_version_id: {type: string}
+            pack_version_id: {type: string}
+        data_class: {type: string}
+        residency_region: {type: [string, 'null']}
+        evidence_refs: {type: array, items: {type: string}}
+        idempotency_key: {type: string}
+        payload_hash: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+        payload:
+          type: object
+          required: [clock_id, obligation_id, clock_class, due_at, local_due_date, timezone]
+          properties:
+            clock_id: {type: string, format: uuid}
+            obligation_id: {type: string, format: uuid}
+            clock_class: {type: string}
+            due_at: {type: string, format: date-time}
+            local_due_date: {type: string, format: date}
+            timezone: {type: string}
+            from_state: {type: string}
+            to_state: {type: string}
+            effective_at: {type: string, format: date-time}
+            overdue_since: {type: string, format: date-time}
+            approval_reference: {type: string}
+            reason_code: {type: string}
+            supersedes_clock_id: {type: string}
+            superseded_by_clock_id: {type: string}
+            previous_due_at: {type: string, format: date-time}
+            new_due_at: {type: string, format: date-time}
+            action: {type: string}
+            milestone_id: {type: string}
+    CalendarEvent:
+      type: object
+      required: [event_id, event_type, payload]
+      properties:
+        event_id: {type: string}
+        event_type: {type: string}
+        payload:
+          type: object
+          properties:
+            calendar_code: {type: string}
+            calendar_version: {type: integer}
+            version: {type: integer}
+            calendar_version_id: {type: string}

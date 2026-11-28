@@ -503,3 +503,12 @@ var ErrNotApplicableEvidenceRequired = errorString("not_applicable_reason is req
 type errorString string
 
 func (e errorString) Error() string { return string(e) }
+
+// ListFilingRequirementsFilter holds optional filters for querying filing requirements.
+type ListFilingRequirementsFilter struct {
+	ObligationID   string
+	Limit          int
+	Offset         int
+	AfterCreatedAt *time.Time
+	AfterID        string
+}

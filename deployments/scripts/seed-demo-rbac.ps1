@@ -116,12 +116,28 @@ $WORKFLOW_SERVICE_ID      = "svc-workflow"
 $CONTRACT_LIFECYCLE_SERVICE_ID = "svc-contract-lifecycle"
 $DECISION_SUPPORT_SERVICE_ID   = "svc-decision-support"
 
+# identity-context-svc's own identity (IDENTITY_SERVICE_PRINCIPAL_ID).
+# Its federation provisioning pipeline (IC-15 / S1-B5) calls access-control-svc
+# to create assignments for mapped roles. It acts as svc-identity-context and
+# must hold ROLE_MANAGE on the legal entities its mappings name: an operator
+# grant, never something federation gives itself. The production grant is
+# provisioned by access-control-svc migration 000061 in every tenant; this script
+# only verifies it in the demo tenant.
+$IDENTITY_SERVICE_ID = "svc-identity-context"
+
 $ROLE_CODE = "CONSOLE_DEMO_OPERATOR"
 
 # Platform-scope records (decisions, config, flags, secret policies, policy
 # definitions) authorize against this id -- see the platform-scope assignment
 # below and the verification loop at the bottom.
 $PLATFORM_SCOPE = "00000000-0000-0000-0000-00000000f001"
+
+# Identity context service URL for getting envelopes.
+$IDENTITY_URL = "http://127.0.0.1:8080"
+
+# Cache for identity envelopes (actor -> @{ token; expires }). TTL ≤ 4 min.
+$EnvelopeCache = @{}
+$EnvelopeCacheTTL = 240  # seconds
 
 # One bundle per service, so a service's grants can be read off in one place and
 # a newly wired service is one entry rather than an edit in four places.
@@ -168,7 +184,8 @@ $BUNDLES = @(
         Actions = @("EVIDENCE_EVALUATE", "EVIDENCE_REQUIREMENT_READ", "EVIDENCE_EVALUATION_READ",
                     "EVIDENCE_REQUIREMENT_CREATE", "EVIDENCE_REQUIREMENT_RETIRE",
                     "EVIDENCE_REQUEST_CREATE", "EVIDENCE_REQUEST_MANAGE",
-                    "EVIDENCE_REQUEST_SUBMIT_RESPONSE", "EVIDENCE_REQUEST_EVALUATE")
+                    "EVIDENCE_REQUEST_SUBMIT_RESPONSE", "EVIDENCE_REQUEST_EVALUATE",
+                    "EVIDENCE_MANIFEST_READ")
     },
     @{
         # accounts-payable-svc gates each lifecycle hop on its own action, so
@@ -445,16 +462,21 @@ $BUNDLES = @(
         Actions = @("VENDOR_DD_INITIATE", "VENDOR_DD_VIEW")
     },
     @{
-        # governance-decision-log-svc authorizes a write on the decision's legal
-        # entity, and a tenant-wide read (an unfiltered register, the summary,
-        # the evidence chain) and a seal on authzPlatformScopeID, so this grant
-        # is checked on the platform scope below. READ is the Governance Log
-        # console's register; REPLAY its replay command; GOVERNANCE_EVIDENCE_SEAL
-        # its "Seal package" (G-07).
+        # governance-decision-log-svc authorizes a tenant-wide read (an
+        # unfiltered register, the summary, the evidence chain) and a seal on
+        # authzPlatformScopeID, so this grant is checked on the platform scope
+        # below. READ is the Governance Log console's register; REPLAY is the
+        # auditors' API replay; GOVERNANCE_EVIDENCE_SEAL the API seal (the
+        # ledger also seals itself hourly).
+        #
+        # No GOVERNANCE_DECISION_RECORD (decision D-DL-2, 25 Nov 2026): people
+        # never write the ledger. Every governance engine records its own
+        # decisions as its service principal (authorization-svc 000043,
+        # 000046); this run REPLACES the bundle's actions, so it also takes
+        # RECORD back from every person who held it through this bundle.
         Code    = "GOVERNANCE_FULL"
         Service = "governance-decision-log-svc"
-        Actions = @("GOVERNANCE_DECISION_RECORD", "GOVERNANCE_DECISION_READ", "GOVERNANCE_DECISION_REPLAY",
-                    "GOVERNANCE_EVIDENCE_SEAL")
+        Actions = @("GOVERNANCE_DECISION_READ", "GOVERNANCE_DECISION_REPLAY", "GOVERNANCE_EVIDENCE_SEAL")
     },
     @{
         # policy-svc checks its actions against the legal entity when the
@@ -485,7 +507,18 @@ $BUNDLES = @(
                     "POLICY_VERSION_APPROVE", "POLICY_VERSION_APPROVE_GLOBAL",
                     "POLICY_VERSION_ACTIVATE", "POLICY_VERSION_ACTIVATE_GLOBAL",
                     "POLICY_VERSION_SUSPEND", "POLICY_VERSION_SUSPEND_GLOBAL",
-                    "POLICY_VERSION_RETIRE", "POLICY_VERSION_RETIRE_GLOBAL")
+                    "POLICY_VERSION_RETIRE", "POLICY_VERSION_RETIRE_GLOBAL",
+                    # V-001 PDC-05 certification (access-control 000058). This
+                    # script REPLACES a bundle's actions, so they belong here:
+                    # until 18 Nov only e2e-policy-deps.py added them, by psql,
+                    # and every seed run took them away again.
+                    "POLICY_TEST_MANAGE", "POLICY_TEST_RUN", "POLICY_WAIVER_REQUEST", "POLICY_WAIVER_APPROVE",
+                    "POLICY_SIMULATE", "POLICY_EVIDENCE_REDELIVER",
+                    # REF-07 accounting policies (access-control 000039/000040).
+                    # The emergency suspension is still honoured only under a live
+                    # break-glass session; holding the action alone suspends nothing.
+                    "ACCOUNTING_POLICY_DRAFT", "ACCOUNTING_POLICY_APPROVE", "ACCOUNTING_POLICY_ACTIVATE",
+                    "ACCOUNTING_POLICY_EMERGENCY_SUSPEND")
     },
     @{
         # policy-svc's control tests and attestations (doc7 E3/E6) authorize
@@ -850,7 +883,14 @@ $BUNDLES = @(
             "iam.authority_limit.approve",
             # Workload bindings (§16): the register read and its writes share
             # one action.
-            "iam.workload.manage"
+            "iam.workload.manage",
+            # ORG-06 SuspendAssignment (authorization-svc 000037, access-control
+            # 000036): the console's Role grants drawer suspends and resumes a
+            # grant. access-control creates no production template for these
+            # (a Security role-design decision), so only the demo operators
+            # hold them; the service still refuses a holder resuming their own.
+            "iam.assignment.suspend",
+            "iam.assignment.resume"
         )
     },
     @{
@@ -884,6 +924,18 @@ $BUNDLES = @(
                     # proposed the version.
                     "FEDERATION_READ", "FEDERATION_CONFIGURE", "FEDERATION_APPROVE",
                     "FEDERATION_SUSPEND", "FEDERATION_LINK", "FEDERATION_PROVISIONING_MANAGE")
+    },
+    @{
+        # identity-context-svc's federation provisioning operator (IC-15 / S1-B5).
+        # The provisioning pipeline (internal/federation/provision.go) calls
+        # access-control-svc to create assignments for mapped roles. It acts as
+        # svc-identity-context and must hold ROLE_MANAGE on the legal entities its
+        # mappings name: an operator grant, never something federation gives itself.
+        # The production grant is provisioned by access-control-svc migration 000061
+        # in every tenant; this bundle is the demo tenant verification.
+        Code    = "IDENTITY_PROVISIONING_OPERATOR"
+        Service = "identity-context-svc"
+        Actions = @("ROLE_MANAGE")
     },
     @{
         # siem-integration-svc (access-control 000024): configuring where the
@@ -1057,11 +1109,101 @@ if ($PSCmdlet.ParameterSetName -eq "Gateway") {
 # Non-writes (/v1/authorize probes) omit Idempotency-Key: the service classifies
 # that path as non-material, so it requires no idempotency key and the probe stays
 # representative of a real read-path call.
+function Get-Envelope {
+    param(
+        [Parameter(Mandatory)] [string] $Actor,
+        [Parameter(Mandatory)] [string] $Email,
+        [Parameter(Mandatory)] [string] $Password
+    )
+    # Check cache first.
+    if ($EnvelopeCache.ContainsKey($Actor)) {
+        $cached = $EnvelopeCache[$Actor]
+        if ((Get-Date) -lt $cached.expires) {
+            return $cached.token
+        }
+    }
+
+    # Authenticate with identity-context-svc.
+    # The console's confidential client (IDP_CLIENT_AUTH=required since 3 Nov
+    # 2026); without it every sign-in was refused and the run fell back to bare
+    # headers, which authorization-svc's identity gate now answers 401.
+    $authBody = @{
+        tenant_id     = "11111111-1111-1111-1111-111111111111"
+        email         = $Email
+        password      = $Password
+        client_id     = "zoiko-console"
+        client_secret = "local-dev-console-client-secret"
+    } | ConvertTo-Json -Compress
+
+    try {
+        $authResp = Invoke-WebRequest -Uri "$IDENTITY_URL/v1/authenticate" -Method POST `
+            -ContentType "application/json" -Body $authBody -UseBasicParsing -TimeoutSec 10
+        $authResult = $authResp.Content | ConvertFrom-Json
+        $accessToken = $authResult.access_token
+    } catch {
+        Write-Warning "Failed to authenticate $Email with identity-context-svc: $_"
+        Write-Warning "Falling back to headers-only mode (works under warn)"
+        # Remember the failure for the cache's lifetime: retrying on every call
+        # made ~600 sign-ins a run and tripped identity-context-svc's per-IP
+        # limit (AUTH_RATE_IP_PER_MINUTE, 429) for every later caller.
+        $EnvelopeCache[$Actor] = @{ token = $null; expires = (Get-Date).AddSeconds($EnvelopeCacheTTL) }
+        return $null
+    }
+
+    # Resolve context for the demo legal entity.
+    # /v1/context/resolve takes the bearer token in the body and answers the
+    # signed envelope as envelope_jwt (25 Nov 2026: this sent entity_id and read
+    # identity_token, which the service never answered).
+    $resolveBody = @{
+        bearer_token    = $accessToken
+        legal_entity_id = "22222222-2222-2222-2222-222222222222"
+    } | ConvertTo-Json -Compress
+
+    try {
+        $resolveResp = Invoke-WebRequest -Uri "$IDENTITY_URL/v1/context/resolve" -Method POST `
+            -ContentType "application/json" -Body $resolveBody `
+            -Headers @{
+                "X-Tenant-Id"       = "11111111-1111-1111-1111-111111111111"
+                "X-Legal-Entity-Id" = "22222222-2222-2222-2222-222222222222"
+                "X-Request-Id"      = [guid]::NewGuid().ToString()
+                "X-Correlation-ID"  = [guid]::NewGuid().ToString()
+                "Idempotency-Key"   = [guid]::NewGuid().ToString()
+                "X-Source-Channel"  = "api"
+            } `
+            -UseBasicParsing -TimeoutSec 10
+        $resolveResult = $resolveResp.Content | ConvertFrom-Json
+        $identityToken = $resolveResult.envelope_jwt
+    } catch {
+        Write-Warning "Failed to resolve context for ${Email}: $_"
+        Write-Warning "Falling back to headers-only mode (works under warn)"
+        $EnvelopeCache[$Actor] = @{ token = $null; expires = (Get-Date).AddSeconds($EnvelopeCacheTTL) }
+        return $null
+    }
+
+    # Cache the envelope.
+    $EnvelopeCache[$Actor] = @{
+        token   = $identityToken
+        expires = (Get-Date).AddSeconds($EnvelopeCacheTTL)
+    }
+
+    return $identityToken
+}
+
 function New-AuthzEnvelope {
     param(
         [Parameter(Mandatory)] [string] $Path,
         [string] $Actor = $PRINCIPAL_ID
     )
+
+    # Map actor to their credentials for envelope retrieval.
+    $envelope = $null
+    switch ($Actor) {
+        $PRINCIPAL_ID    { $envelope = Get-Envelope -Actor $Actor -Email "admin@zoikosuite.com"    -Password "Zoiko@Governance1" }
+        $APPROVER_ID     { $envelope = Get-Envelope -Actor $Actor -Email "legal.counsel@zoikosuite.com" -Password "Zoiko@Legal2026!" }
+        $SEED_ADMIN_ID   { $envelope = Get-Envelope -Actor $Actor -Email "seed.admin@zoiko.local"   -Password "Seed@Admin2026!" }
+        default          { $envelope = $null }
+    }
+
     $headers = @{
         "X-Tenant-Id"       = $TENANT_ID
         "X-Principal-Id"    = $Actor
@@ -1071,12 +1213,54 @@ function New-AuthzEnvelope {
         "X-Source-System"   = "console-seed"
         "X-Source-Channel"  = "api"
     }
+
+    if ($envelope) {
+        $headers["Authorization"] = "Bearer $envelope"
+    }
+
     if ($Path -ne "/v1/authorize") {
         $headers["Idempotency-Key"] = [guid]::NewGuid().ToString()
         $headers["X-Occurred-At"]   = [DateTime]::UtcNow.ToString("o")
         $headers["X-Operation"]     = "admin_seed"
     }
     return $headers
+}
+
+# authorization-svc stores the same grant twice when asked twice: nothing makes a
+# role assignment unique, and the "409|23505|duplicate" catches below never fire.
+# Every re-run of this script used to add another copy of each demo grant. On
+# 18 Nov 2026 the demo admin held CONSOLE_DEMO_OPERATOR 34 times, and the
+# identity envelope listing them all pushed the console's session cookie past
+# the browser's 4096-byte limit, so the admin could no longer sign in. So a
+# grant is made only when the principal does not already hold the role, live
+# and approved, on that scope.
+function Test-Assigned {
+    param(
+        [Parameter(Mandatory)] [string] $PrincipalId,
+        [Parameter(Mandatory)] [string] $RoleId,
+        [Parameter(Mandatory)] [string] $Scope
+    )
+    $path = "/v1/admin/role-assignments"
+    $headers = New-AuthzEnvelope -Path $path -Actor $SEED_ADMIN_ID
+    $headers.Remove("Idempotency-Key")
+    try {
+        $response = Invoke-WebRequest -Uri "$AUTHZ$path`?principal_id=$PrincipalId&role_id=$RoleId" -Method GET `
+            -Headers $headers -UseBasicParsing -TimeoutSec 10
+    } catch {
+        # Unreadable (the IAM bootstrap has not run yet): make the grant, as before.
+        return $false
+    }
+    # Windows PowerShell 5.1 emits a JSON array as ONE object down the pipeline,
+    # so assign it first; foreach then walks the elements.
+    $rows = ConvertFrom-Json $response.Content
+    foreach ($a in $rows) {
+        $approved = (-not $a.approval_status) -or ($a.approval_status -eq "APPROVED")
+        $live = (-not $a.effective_to) -or ([datetime] $a.effective_to -gt (Get-Date))
+        if ($a.role_id -eq $RoleId -and $a.legal_entity_id -eq $Scope -and $approved -and $live -and -not $a.suspended_at) {
+            return $true
+        }
+    }
+    return $false
 }
 
 function Invoke-Authz {
@@ -1089,6 +1273,10 @@ function Invoke-Authz {
         # privilege").
         [string] $Actor = $PRINCIPAL_ID
     )
+    if ($Path -eq "/v1/admin/role-assignments" -and
+        (Test-Assigned -PrincipalId $Body.principal_id -RoleId $Body.role_id -Scope $Body.legal_entity_id)) {
+        return @{ status = 200; body = @{ principal_role_assignment_id = "(already held, not granted again)" } }
+    }
     $json = $Body | ConvertTo-Json -Compress -Depth 5
     $headers = New-AuthzEnvelope -Path $Path -Actor $Actor
     # The legal entity mirrors the body's own scope when the call carries one
@@ -1159,6 +1347,31 @@ try {
 # database, so a legal-entity-only probe found nothing missing, skipped the
 # bundles, and never granted the platform scope that schema-registry-svc
 # actually authorizes against for an entity-less registration.
+# -- D-DL-2 (25 Nov 2026): people never record governance decisions --------
+#
+# GOVERNANCE_FULL no longer carries GOVERNANCE_DECISION_RECORD. The probe below
+# only looks for MISSING actions, so on a volume seeded before 25 Nov it finds
+# nothing to do and the bundle would keep RECORD. When the demo principal still
+# holds it, the bundle is posted again here: a bundle post replaces the
+# bundle's actions, which takes RECORD back from every person holding the role.
+# Service identities keep it through their own roles (authorization-svc
+# 000043, 000046).
+$recordProbe = Get-Decision -Action "GOVERNANCE_DECISION_RECORD" -Scope $PLATFORM_SCOPE
+if ($recordProbe.decision_outcome -eq "GRANTED") {
+    $governanceFull = $BUNDLES | Where-Object { $_.Code -eq "GOVERNANCE_FULL" }
+    Write-Host "D-DL-2  bundle GOVERNANCE_FULL without GOVERNANCE_DECISION_RECORD" -NoNewline
+    $result = Invoke-Authz -Actor $SEED_ADMIN_ID -Path "/v1/admin/roles/$ROLE_ID/permission-bundles" -Body @{
+        bundle_code       = $governanceFull.Code
+        permitted_actions = $governanceFull.Actions
+    }
+    Write-Host "  -> $($result.status) [$($result.body.permitted_actions -join ', ')]"
+    # The grant cache holds the old answer until AUTHZ_CACHE_TTL_SECONDS (5).
+    Start-Sleep -Seconds 6
+    if ((Get-Decision -Action "GOVERNANCE_DECISION_RECORD" -Scope $PLATFORM_SCOPE).decision_outcome -eq "GRANTED") {
+        throw "D-DL-2: $PRINCIPAL_ID still holds GOVERNANCE_DECISION_RECORD after GOVERNANCE_FULL was replaced (another role grants it?)"
+    }
+}
+
 $missing = @()
 foreach ($action in $ALL_ACTIONS) {
     if ((Get-Decision -Action $action -Scope $LEGAL_ENTITY).decision_outcome -ne "GRANTED") {
@@ -1871,6 +2084,19 @@ foreach ($p in @($PRINCIPAL_ID, $APPROVER_ID)) {
             Write-Host "     $p does not hold TOKEN_DETOKENIZE on $scope ($outcome)" -ForegroundColor Green
         }
     }
+}
+
+# IC-15: identity-context-svc provisioning operator must hold ROLE_MANAGE on the
+# demo legal entity (migration 000061 provisions it in every tenant).
+Write-Host "Verifying identity-context-svc provisioning operator (IC-15):" -ForegroundColor Cyan
+$probe = Invoke-Authz -Path "/v1/authorize" -Body @{
+    principal_id = $IDENTITY_SERVICE_ID; legal_entity_id = $LEGAL_ENTITY; action_type = "ROLE_MANAGE"
+}
+if ($probe.body.decision_outcome -ne "GRANTED") {
+    $failed += "ROLE_MANAGE ($IDENTITY_SERVICE_ID on $LEGAL_ENTITY)"
+    Write-Host ("     {0,-28} {1,-28} -> {2}" -f $IDENTITY_SERVICE_ID, "ROLE_MANAGE", $probe.body.decision_outcome) -ForegroundColor Red
+} else {
+    Write-Host ("     {0,-28} {1,-28} -> GRANTED" -f $IDENTITY_SERVICE_ID, "ROLE_MANAGE") -ForegroundColor Green
 }
 
 if ($failed.Count -gt 0) {

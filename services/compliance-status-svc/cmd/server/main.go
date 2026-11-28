@@ -76,7 +76,7 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
 
-	h := handler.New(pgStore, authzClient, logger)
+	h := handler.New(pgStore, publisher, authzClient, logger)
 
 	// Transactional outbox relay: every write enqueues its event in the same
 	// transaction as the change; the relay delivers it with retry.

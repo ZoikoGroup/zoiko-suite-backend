@@ -16,8 +16,9 @@ func mfaBaseEnv(t *testing.T) {
 	t.Setenv("MFA_SECRET_KEY", "")
 	t.Setenv("MFA_SECRET_KEY_ID", "")
 	t.Setenv("MFA_SECRET_PREVIOUS_KEYS", "")
-	t.Setenv("IDP_CLIENT_AUTH", "")
-	t.Setenv("IDP_CLIENT_SECRETS_FILE", "")
+	t.Setenv("IDP_CLIENT_AUTH", "required")
+	t.Setenv("IDP_CLIENT_SECRETS_FILE", "/fake/secrets.json")
+	t.Setenv("IDP_CLIENT_CHANNELS", "zoiko-console=web")
 	t.Setenv("MFA_TOTP_SKEW_STEPS", "")
 	t.Setenv("OIDC_ISSUER", "https://auth.example.com")
 	t.Setenv("CURSOR_SIGNING_KEY_HEX", "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
@@ -100,7 +101,8 @@ func TestIDPClientAuth_Validated(t *testing.T) {
 		t.Fatal("invalid IDP_CLIENT_AUTH accepted")
 	}
 	t.Setenv("IDP_CLIENT_AUTH", "required")
-	if _, err := Load(); err == nil {
-		t.Fatal("required client auth with no registry accepted")
+	t.Setenv("IDP_CLIENT_SECRETS_FILE", "")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "IDP_CLIENT_SECRETS_FILE") {
+		t.Fatalf("required client auth with no registry should fail with secrets file error, got %v", err)
 	}
 }

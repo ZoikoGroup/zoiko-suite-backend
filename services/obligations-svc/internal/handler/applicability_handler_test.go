@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -271,6 +272,60 @@ func TestCreateApplicabilityDecision_SelfAttributedDecisionAllowed(t *testing.T)
 	}
 }
 
+// TestCreateApplicabilityDecision_IdempotentReplay proves the Idempotency-Key
+// replay contract: same key + same body → 200 with the original decision.
+func TestCreateApplicabilityDecision_IdempotentReplay(t *testing.T) {
+	store := &stubStore{
+		applicabilityDecision: &domain.ApplicabilityDecision{ApplicabilityDecisionID: "ad-1"},
+		idempotencyReplay:     true, // stub signals this is a replay
+	}
+	r := newApplicabilityTestRouter(store)
+
+	body := applicabilityBody(testPrincipal, testPrincipal, "")
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/obligations/o-1/applicability-decisions", bytes.NewBufferString(body)))
+	req.Header.Set("Idempotency-Key", "idem-key-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 on idempotent replay, got %d: %s", w.Code, w.Body.String())
+	}
+	var got domain.ApplicabilityDecision
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.ApplicabilityDecisionID != "ad-1" {
+		t.Fatalf("expected original decision id ad-1, got %q", got.ApplicabilityDecisionID)
+	}
+}
+
+// TestCreateApplicabilityDecision_IdempotencyMismatch proves that reusing
+// an Idempotency-Key with a different body is refused (409).
+func TestCreateApplicabilityDecision_IdempotencyMismatch(t *testing.T) {
+	store := &stubStore{
+		idempotencyMismatch: true, // stub signals mismatch
+	}
+	r := newApplicabilityTestRouter(store)
+
+	body := applicabilityBody(testPrincipal, testPrincipal, "")
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/obligations/o-1/applicability-decisions", bytes.NewBufferString(body)))
+	req.Header.Set("Idempotency-Key", "idem-key-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 on idempotency mismatch, got %d: %s", w.Code, w.Body.String())
+	}
+	var bodyMap map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &bodyMap); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// RFC 9457: the stable code is the problem's "code" member.
+	if bodyMap["code"] != "IDEMPOTENCY_KEY_CONFLICT" {
+		t.Fatalf("expected code IDEMPOTENCY_KEY_CONFLICT, got %v (%v)", bodyMap["code"], bodyMap)
+	}
+}
+
 // Both reads used to answer 503 store_unavailable when no tenant header was
 // present: the store returned ErrTenantMissing and the handler's switch folded
 // it into the default branch, blaming the database for an unscoped request.
@@ -299,5 +354,28 @@ func TestApplicabilityReads_MissingTenantIsUnauthorizedNotUnavailable(t *testing
 				t.Fatalf("expected 401 for an unscoped read, got %d: %s", w.Code, w.Body.String())
 			}
 		})
+	}
+}
+
+// OB-S3 (doc7 §E2): exactly one decider, and UNASSESSED is never stored.
+func TestOB2_BothDecidersAreRefused(t *testing.T) {
+	store := &stubStore{findObligation: &domain.Obligation{ObligationID: "o-1", LegalEntityID: "le-1"}}
+	w := postApplicability(t, newApplicabilityTestRouter(store), applicabilityBody(testPrincipal, testPrincipal, "rule-engine"), true)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("both deciders: %d %s", w.Code, w.Body.String())
+	}
+	if store.applicabilityParams.ObligationID != "" {
+		t.Fatal("a decision with two deciders reached the store")
+	}
+}
+
+func TestOB2_UnassessedIsNeverStored(t *testing.T) {
+	store := &stubStore{findObligation: &domain.Obligation{ObligationID: "o-1", LegalEntityID: "le-1"}}
+	body := strings.Replace(applicabilityBody(testPrincipal, testPrincipal, ""), `"APPLICABLE"`, `"UNASSESSED"`, 1)
+	if w := postApplicability(t, newApplicabilityTestRouter(store), body, true); w.Code != http.StatusBadRequest {
+		t.Fatalf("UNASSESSED: %d %s", w.Code, w.Body.String())
+	}
+	if store.applicabilityParams.ObligationID != "" {
+		t.Fatal("UNASSESSED reached the store")
 	}
 }

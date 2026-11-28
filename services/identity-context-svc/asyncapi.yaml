@@ -87,6 +87,7 @@ channels:
           - $ref: "#/components/messages/MFAFactorReset"
           - $ref: "#/components/messages/PasswordResetRequested"
           - $ref: "#/components/messages/PasswordResetDecided"
+          - $ref: "#/components/messages/PasswordResetExpired"
           - $ref: "#/components/messages/StepUpSucceeded"
           - $ref: "#/components/messages/StepUpFailed"
           - $ref: "#/components/messages/TenantContextCacheInvalidated"
@@ -563,6 +564,17 @@ components:
         holds a recent step-up. Payload: request_id, principal_id (the
         subject), decided_by, decision (APPROVE or REJECT), reason. Never the
         reset link or its token.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    PasswordResetExpired:
+      name: identity.password_reset.expired
+      title: A password reset request expired without a decision
+      summary: |
+        IC-13. Written when a reset request's ExpiresAt is reached while still
+        PENDING_APPROVAL. Payload: request_id, principal_id (the subject), reason.
       payload:
         allOf:
           - $ref: "#/components/schemas/Envelope"

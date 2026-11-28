@@ -23,7 +23,7 @@ import (
 // no tenant cannot be acted on — see requireTenant below.
 type SessionRevoker interface {
 	EvictAllForPrincipal(ctx context.Context, principalID, tenantID string, reason domain.InvalidationReason) (int, error)
-	EvictAllForEntity(ctx context.Context, legalEntityID, tenantID string, reason domain.InvalidationReason) (int, error)
+	EvictAllForEntity(ctx context.Context, legalEntityID, tenantID string, reason domain.InvalidationReason, actorID, correlationID string) (int, error)
 }
 
 // RoleDirectory answers "who holds this role", so a role change can be turned
@@ -40,6 +40,8 @@ type RoleDirectory interface {
 type RoleAssignmentProjector interface {
 	UpsertRoleAssignment(ctx context.Context, tenantID string, a domain.PrincipalRoleAssignment) error
 	EndRoleAssignment(ctx context.Context, tenantID, assignmentID string, at time.Time) error
+	SuspendRoleAssignment(ctx context.Context, tenantID, assignmentID string, at time.Time) error
+	ResumeRoleAssignment(ctx context.Context, tenantID, assignmentID string, at time.Time) error
 }
 
 // RiskSignalWriter is the write half of the risk cache. Kept separate from the
@@ -675,7 +677,7 @@ func (c *Consumer) handleEntityUpdated(ctx context.Context, ev inbound) error {
 		return nil
 	}
 
-	n, err := c.sessions.EvictAllForEntity(ctx, legalEntityID, ev.TenantID, domain.InvalidationReasonAdminRevoke)
+	n, err := c.sessions.EvictAllForEntity(ctx, legalEntityID, ev.TenantID, domain.InvalidationReasonAdminRevoke, ev.ActorID, ev.CorrelationID)
 	if err != nil {
 		c.log.Error("failed to revoke sessions for entity — will retry",
 			zap.String("legal_entity_id", legalEntityID), zap.Error(err))

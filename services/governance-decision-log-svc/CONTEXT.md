@@ -126,6 +126,31 @@ retention class below requires.
 | `X-Purpose-Context` on reads or appends (D-06) | **Reads**, not appends | `internal/envelope/contract.go` (`PurposeContext: RequiredOnRead`) |
 | Event naming (D-07, group decision C3) | **Keep the Doc 03 wire names and publish the Event Catalogue canonical names alongside** (rule R9, deprecation window): `com.zoikosuite.governance.decision.recorded` / `.replayed` | `events.WithCanonicalAlias`; two outbox rows per event, same `payload_hash`, the alias carries `alias_of_event_id` |
 
+## Writers — automatic decision capture (25 Nov 2026, DL-0)
+
+Every governance engine of Doc 01 §7 relays its own verdicts here; no person
+records a decision (decision D-DL-2: only service identities hold
+`GOVERNANCE_DECISION_RECORD`). Each writer puts the ledger record in its own
+outbox in the transaction of the decision it records, and a relay delivers it
+to the :8450 mTLS listener with the writer's workload certificate. The actor is
+the writer's service principal; the person who caused the decision is in
+`evaluation_context.on_behalf_of` (workflow-svc: `actor_principal_id`).
+`decision_id` is derived from the source record, so a redelivery is a replay.
+
+| Writer (principal, grant) | `action_type` | `outcome` → category | `rule_basis` |
+|---|---|---|---|
+| policy-svc (`svc-policy`, authorization 000043) | the policy type: `APPROVAL_THRESHOLD`, `SIGNATORY_MATRIX`, … | `GRANTED`/`APPROVED` → APPROVED, `APPROVAL_REQUIRED`/`SIGNATURE_REQUIRED` → ESCALATED, `DENIED`/`NOT_CONFIGURED`/`ERROR` → DENIED | `code:<policy_version_id>` |
+| workflow-svc (`svc-workflow`, 000043) | `WORKFLOW_STAGE_APPROVE`/`_REJECT`, `WORKFLOW_QUORUM_VOTE_APPROVE`/`_REJECT`, `WORKFLOW_ESCALATE`, `WORKFLOW_REQUEST_CHANGES`, cancel / invalidate / expire | `APPROVED`/`APPROVE` → APPROVED, `REJECTED`/`REJECT`/`CANCELLED`/`INVALIDATED`/`EXPIRED` → DENIED, `ESCALATED`, `REOPENED` → PENDING | `workflow:<type> definition:<id>@v<n> access_decision:<id> basis:<basis>`; `causation_id` = the governance decision the workflow resolves (DL-2) |
+| authorization-svc (`svc-authorization`, 000046) | `ACCESS_<evaluated action>`; domain sent as `ORGANIZATION_ACCESS` | `DENY` → DENIED, `REQUIRE_APPROVAL` → ESCALATED. Only these two (D-DL-1); every `PERMIT` and `STEP_UP` stays in its access-decision log | `<policy_set_version> reasons:<codes> basis:<basis>`; the attributes digest only, never attribute values |
+| jurisdiction-rules-svc (`svc-jurisdiction-rules`, 000046) | `JURISDICTION_PACK_CERTIFY`, `_RELEASE`, `_BLOCK`, `_UNBLOCK`, `_WITHDRAW`, `_ROLLBACK`, `_SUPERSEDE`; `JURISDICTION_INTERPRETATION_APPROVE`; `JURISDICTION_IMPORT_APPROVE`; `JURISDICTION_CALENDAR_PUBLISH`; `JURISDICTION_PAYMENT_TERM_APPROVE` | `CERTIFIED`, `RELEASED`, `UNBLOCKED`, `SUPERSEDED`, `APPROVED`, `PUBLISHED`, `ACTIVATED` → APPROVED; `BLOCKED`, `WITHDRAWN`, `ROLLED_BACK` → DENIED | `<pack_ref>@<version>` (calendar `calendar:<code>@<version>`, term `payment_term:<code>@<version>`, …); `causation_id` = the workflow decision when the approval came through workflow-svc |
+| obligations-svc (`svc-obligations`, 000044 + 000046) | `OBLIGATION_EVALUATE`, `OBLIGATION_CLOCK_WAIVE` | `RAISED` → PENDING, `WAIVED` → APPROVED | `definition:<id>@v<n> calendar:<version>` |
+| evidence-requirements-svc (`svc-evidence-requirements`, 000046) | `EVIDENCE_<evaluated action>`; domain sent as `GOVERNANCE_COMPLIANCE` | `SATISFIED`, `NO_REQUIREMENTS_DEFINED` → APPROVED, `MISSING` → DENIED | `requirements:<domain>/<action>@<version>` |
+
+Outcome words and action keywords: migrations 000016, 000018 and 000020
+(`decision_outcome_categories`, `decision_domain_rules`).
+`TestSummary_WriterOutcomesAreCategorised` keeps every word above out of
+OTHER. Each writer's own `progress.md` names its relay and outbox metrics.
+
 ## Idempotency
 
 Two keys, both truthful (12 Oct 2026):

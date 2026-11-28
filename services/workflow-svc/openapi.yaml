@@ -1,54 +1,47 @@
-openapi: 3.1.0
+openapi: 3.0.3
 info:
-  title: workflow-svc
-  version: 2.0.0
+  title: Workflow Service API
+  version: v1
   description: |
-    Workflow & Approval Service (Doc 03 §8.4, ZS-SVC-R-001): approval workflows that extend
-    authorization, never replace it. This document covers the governed approval surface
-    (workflow instances and versioned definitions). The audit-engagement, planning, workpaper,
-    review and form modules served by the same process are separate products with their own
-    contracts and are not described here.
-
-    Identity: identity-context-svc's signed envelope (Authorization: Bearer), verified against
-    its JWKS and session status; a service may instead call over verified mTLS as a registered
-    peer workload. X-Tenant-Id must be a UUID. Every route needs a principal and a tenant.
-
-    Authorization (authorization-svc, fail closed): WORKFLOW_APPROVE for every decision, with
-    `workflow_type`, `approver_role` and `stage_order` passed as attributes; a delegate must hold
-    WORKFLOW_APPROVE by a live delegation FROM the stage's named approver. WORKFLOW_CANCEL /
-    WORKFLOW_ESCALATE for participants, WORKFLOW_ADMINISTER otherwise, WORKFLOW_INVALIDATE,
-    WORKFLOW_ESCALATE_TO, WORKFLOW_DEFINE (PLATFORM scope). Reads need WORKFLOW_READ on the
-    instance's legal entity (PLATFORM for lists and definitions) unless the caller is the
-    initiator or an approver of the current stage. A service account or system principal cannot
-    decide an approval (403 approver_not_human); the initiator never can (403
-    self_approval_not_allowed); nobody decides two stages of one instance.
-
-    Commands: Idempotency-Key with a request hash (same key and body replays with 200; a
-    different body is 409 idempotency_mismatch). Each decision returns the governance-ledger
-    `decision_id` it is recorded under; the record reaches governance-decision-log-svc through
-    the transactional outbox.
-
-    Timers: an instance past `due_at` expires (workflow.expired); a PENDING stage past its deadline
-    escalates to the definition's escalation target, or to ESCALATED. policy.updated,
-    policy.version.activated, authority.* and authorization.denied flag pending approvals for an
-    approver re-check; an approver who may no longer approve escalates the instance.
-
-    Errors: RFC 9457 problem+json with the §16 error_class; the legacy `error` member is kept.
-
-    Events (topic zoiko.workflow.events, key `<tenant>/<workflow_instance_id>`): workflow.started,
-    approval.granted, approval.rejected, workflow.escalated, workflow.completed (also for
-    CANCELLED), workflow.expired, workflow.reopened, workflow.approval.invalidated.
+    Approval workflow engine with quorum voting, case management, work items,
+    audit engagements, and form submissions.
 servers:
-  - url: http://localhost:8090
-security:
-  - identityEnvelope: []
-tags:
-  - name: instances
-  - name: decisions
-  - name: lifecycle
-  - name: definitions
+  - url: /api/v1
 paths:
   /v1/workflows:
+    get:
+      tags: [instances]
+      operationId: listWorkflows
+      description: List all workflow instances with optional filters. Supports cursor paging (API-4).
+      parameters:
+        - {name: legal_entity_id, in: query, schema: {type: string}}
+        - {name: workflow_type, in: query, schema: {type: string}}
+        - {name: workflow_status, in: query, schema: {type: string}}
+        - {name: subject_type, in: query, schema: {type: string}}
+        - {name: subject_id, in: query, schema: {type: string}}
+        - {name: workflow_definition_id, in: query, schema: {type: string}}
+        - {name: limit, in: query, schema: {type: integer, default: 50}}
+        - {name: cursor, in: query, schema: {type: string}}
+        - {$ref: '#/components/parameters/CorrelationID'}
+      responses:
+        '200':
+          description: Workflow instances
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  records:
+                    type: array
+                    items: {$ref: '#/components/schemas/WorkflowInstance'}
+                  next_cursor:
+                    type: string
+                  watermark:
+                    type: string
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
     post:
       tags: [instances]
       operationId: createWorkflow
@@ -79,16 +72,27 @@ paths:
     get:
       tags: [instances]
       operationId: listPendingApprovals
-      description: PENDING and ESCALATED instances of the tenant. WORKFLOW_READ at PLATFORM scope.
+      description: Lists workflow instances pending the caller's approval. Supports cursor paging (API-4).
       parameters:
         - {name: limit, in: query, schema: {type: integer, default: 50}}
-        - {name: offset, in: query, schema: {type: integer, default: 0}}
+        - {name: cursor, in: query, schema: {type: string}}
+        - {$ref: '#/components/parameters/CorrelationID'}
       responses:
         '200':
-          description: Pending instances
+          description: Pending approvals
           content:
             application/json:
-              schema: {type: array, items: {$ref: '#/components/schemas/WorkflowInstance'}}
+              schema:
+                type: object
+                properties:
+                  records:
+                    type: array
+                    items: {$ref: '#/components/schemas/WorkflowInstance'}
+                  next_cursor:
+                    type: string
+                  watermark:
+                    type: string
+        '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
@@ -104,112 +108,30 @@ paths:
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
-  /v1/workflows/{workflow_instance_id}/next-approver:
-    get:
-      tags: [instances]
-      operationId: getNextApprover
-      description: The current stage. 404 `no_current_stage` when the workflow is terminal.
-      parameters: [{$ref: '#/components/parameters/WorkflowInstanceID'}]
-      responses:
-        '200':
-          description: The current stage
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/WorkflowStage'}
-        '400': {$ref: '#/components/responses/Problem'}
-        '401': {$ref: '#/components/responses/Problem'}
-        '403': {$ref: '#/components/responses/Problem'}
-        '404': {$ref: '#/components/responses/Problem'}
-        '503': {$ref: '#/components/responses/Problem'}
-  /v1/workflows/{workflow_instance_id}/evidence:
-    get:
-      tags: [instances]
-      operationId: getApprovalEvidence
-      description: The append-only transition log with its lineage (access decision, authority basis, delegation, decision id, review cycle).
-      parameters: [{$ref: '#/components/parameters/WorkflowInstanceID'}]
-      responses:
-        '200':
-          description: Transitions, oldest first
-          content:
-            application/json:
-              schema: {type: array, items: {$ref: '#/components/schemas/WorkflowTransition'}}
-        '400': {$ref: '#/components/responses/Problem'}
-        '401': {$ref: '#/components/responses/Problem'}
-        '403': {$ref: '#/components/responses/Problem'}
-        '404': {$ref: '#/components/responses/Problem'}
-        '503': {$ref: '#/components/responses/Problem'}
   /v1/workflows/{workflow_instance_id}/actions:
     post:
-      tags: [decisions]
+      tags: [lifecycle]
       operationId: submitAction
       description: |
-        APPROVE or REJECT the current stage, as its named approver, a delegate of that approver,
-        a holder of a ROLE stage's role, or the escalation target of an ESCALATED instance.
-        REJECT requires a rationale.
+        Approve or reject the current stage. Reject must include rationale.
+        Approve may include rationale. WORKFLOW_APPROVE on the specific approver.
       parameters:
         - {$ref: '#/components/parameters/WorkflowInstanceID'}
         - {$ref: '#/components/parameters/IdempotencyKey'}
-      requestBody: {$ref: '#/components/requestBodies/Decision'}
-      responses:
-        '200': {$ref: '#/components/responses/Decision'}
-        '400': {$ref: '#/components/responses/Problem'}
-        '401': {$ref: '#/components/responses/Problem'}
-        '403': {$ref: '#/components/responses/Problem'}
-        '404': {$ref: '#/components/responses/Problem'}
-        '409': {$ref: '#/components/responses/Problem'}
-        '503': {$ref: '#/components/responses/Problem'}
-  /v1/workflows/{workflow_instance_id}/quorum-votes:
-    post:
-      tags: [decisions]
-      operationId: submitQuorumVote
-      description: One eligible approver's vote on the current QUORUM stage. Votes on one stage are serialised; every vote is recorded. REJECT requires a rationale.
-      parameters:
-        - {$ref: '#/components/parameters/WorkflowInstanceID'}
-        - {$ref: '#/components/parameters/IdempotencyKey'}
-      requestBody: {$ref: '#/components/requestBodies/Decision'}
-      responses:
-        '200': {$ref: '#/components/responses/Decision'}
-        '400': {$ref: '#/components/responses/Problem'}
-        '401': {$ref: '#/components/responses/Problem'}
-        '403': {$ref: '#/components/responses/Problem'}
-        '404': {$ref: '#/components/responses/Problem'}
-        '409': {$ref: '#/components/responses/Problem'}
-        '503': {$ref: '#/components/responses/Problem'}
-  /v1/workflows/{workflow_instance_id}/escalate:
-    post:
-      tags: [lifecycle]
-      operationId: escalateWorkflow
-      description: PENDING → ESCALATED; the current stage stays actionable.
-      parameters:
-        - {$ref: '#/components/parameters/WorkflowInstanceID'}
-        - {$ref: '#/components/parameters/IdempotencyKey'}
-      responses:
-        '200': {$ref: '#/components/responses/Workflow'}
-        '400': {$ref: '#/components/responses/Problem'}
-        '401': {$ref: '#/components/responses/Problem'}
-        '403': {$ref: '#/components/responses/Problem'}
-        '404': {$ref: '#/components/responses/Problem'}
-        '409': {$ref: '#/components/responses/Problem'}
-        '503': {$ref: '#/components/responses/Problem'}
-  /v1/workflows/{workflow_instance_id}/escalate-to:
-    post:
-      tags: [lifecycle]
-      operationId: escalateToWorkflow
-      description: Escalates to a named owner, who may then decide the current stage. The target may not be the initiator.
-      parameters:
-        - {$ref: '#/components/parameters/WorkflowInstanceID'}
-        - {$ref: '#/components/parameters/IdempotencyKey'}
+        - {$ref: '#/components/parameters/CorrelationID'}
+        - {name: X-Expected-Version, in: header, required: true, schema: {type: string}}
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [escalation_target, reason_code]
+              required: [action]
               properties:
-                escalation_target: {type: string}
-                reason_code: {type: string}
-                narrative: {type: string}
+                action: {type: string, enum: [APPROVE, REJECT]}
+                rationale: {type: string, description: Required for REJECT}
+                causation_id: {type: string}
+                document_hash: {type: string, pattern: '^sha256:[0-9a-f]{64}$', description: Signature workflows only. Must equal the bound document hash}
       responses:
         '200': {$ref: '#/components/responses/Workflow'}
         '400': {$ref: '#/components/responses/Problem'}
@@ -217,14 +139,67 @@ paths:
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
         '409': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/workflows/{workflow_instance_id}/quorum-votes:
+    post:
+      tags: [lifecycle]
+      operationId: submitQuorumVote
+      description: Submit a vote on a QUORUM stage. WORKFLOW_APPROVE on the specific approver.
+      parameters:
+        - {$ref: '#/components/parameters/WorkflowInstanceID'}
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+        - {$ref: '#/components/parameters/CorrelationID'}
+        - {name: X-Expected-Version, in: header, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action: {type: string, enum: [APPROVE, REJECT]}
+                rationale: {type: string}
+                causation_id: {type: string}
+      responses:
+        '200': {$ref: '#/components/responses/Workflow'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/workflows/{workflow_instance_id}/escalate:
+    post:
+      tags: [lifecycle]
+      operationId: escalateWorkflow
+      description: Escalates the current stage to its configured escalation target. WORKFLOW_ADMINISTER.
+      parameters:
+        - {$ref: '#/components/parameters/WorkflowInstanceID'}
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+        - {$ref: '#/components/parameters/CorrelationID'}
+        - {name: X-Expected-Version, in: header, required: true, schema: {type: string}}
+      responses:
+        '200': {$ref: '#/components/responses/Workflow'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
   /v1/workflows/{workflow_instance_id}/cancel:
     post:
       tags: [lifecycle]
       operationId: cancelWorkflow
+      description: Cancels a PENDING or ESCALATED instance. WORKFLOW_ADMINISTER.
       parameters:
         - {$ref: '#/components/parameters/WorkflowInstanceID'}
         - {$ref: '#/components/parameters/IdempotencyKey'}
+        - {$ref: '#/components/parameters/CorrelationID'}
+        - {name: X-Expected-Version, in: header, required: true, schema: {type: string}}
       responses:
         '200': {$ref: '#/components/responses/Workflow'}
         '400': {$ref: '#/components/responses/Problem'}
@@ -232,6 +207,7 @@ paths:
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
         '409': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
   /v1/workflows/{workflow_instance_id}/request-changes:
     post:
@@ -241,12 +217,15 @@ paths:
       parameters:
         - {$ref: '#/components/parameters/WorkflowInstanceID'}
         - {$ref: '#/components/parameters/IdempotencyKey'}
+        - {$ref: '#/components/parameters/CorrelationID'}
+        - {name: X-Expected-Version, in: header, required: true, schema: {type: string}}
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
+              required: [rationale]
               properties:
                 rationale: {type: string}
                 causation_id: {type: string}
@@ -255,12 +234,13 @@ paths:
           description: Changes requested
           content:
             application/json:
-              schema: {type: object, properties: {status: {type: string, const: changes_requested}}}
+              schema: {type: object, properties: {status: {type: string, enum: [changes_requested]}}}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
         '409': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
   /v1/workflows/{workflow_instance_id}/invalidate:
     post:
@@ -292,12 +272,47 @@ paths:
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
         '409': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/workflows/{workflow_instance_id}/available-actions:
+    get:
+      tags: [instances]
+      operationId: getAvailableActions
+      description: Returns the actions available for the current principal on this workflow (ST-2).
+      parameters: [{$ref: '#/components/parameters/WorkflowInstanceID'}]
+      responses:
+        '200':
+          description: Available actions
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AvailableActions'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/workflows/{workflow_instance_id}/transition-history:
+    get:
+      tags: [instances]
+      operationId: getTransitionHistory
+      description: Returns the complete transition history for a workflow (ST-3).
+      parameters: [{$ref: '#/components/parameters/WorkflowInstanceID'}]
+      responses:
+        '200':
+          description: Transition history
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/TransitionHistoryEntry'}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
   /v1/workflows/{workflow_instance_id}/verify-release:
     post:
       tags: [lifecycle]
       operationId: verifyRelease
-      description: Critical Release Rule (ZS-STATE-001 §6.1). 409 with can_release=false when the approval does not cover the current subject.
+      description: Critical Release Rule (ZS-STATE-001 §6.1). 409 with can_release=false when the approval does not cover the current subject. It changes nothing, so If-Match is optional; when sent, a stale version is 412.
       parameters: [{$ref: '#/components/parameters/WorkflowInstanceID'}]
       requestBody:
         required: true
@@ -309,6 +324,7 @@ paths:
               properties:
                 expected_subject_version: {type: integer, minimum: 0}
                 current_subject_fingerprint: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+                current_signatory_decision_id: {type: string, format: uuid, description: Signature workflows only. A fresh policy-svc decision}
       responses:
         '200': {$ref: '#/components/responses/ReleaseVerification'}
         '409': {$ref: '#/components/responses/ReleaseVerification'}
@@ -316,51 +332,149 @@ paths:
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
-  /v1/workflow-definitions:
+  /v1/workflows/{workflow_instance_id}/summary:
     get:
-      tags: [definitions]
-      operationId: listWorkflowDefinitions
-      parameters:
-        - {name: workflow_type, in: query, schema: {type: string}}
-        - {name: is_active, in: query, schema: {type: boolean}}
-        - {name: limit, in: query, schema: {type: integer, default: 50}}
-        - {name: offset, in: query, schema: {type: integer, default: 0}}
+      tags: [instances]
+      operationId: getInstanceSummary
+      description: Returns a summary view of a workflow instance including its stages.
+      parameters: [{$ref: '#/components/parameters/WorkflowInstanceID'}]
       responses:
         '200':
-          description: Definitions
+          description: Instance summary
           content:
             application/json:
-              schema: {type: array, items: {$ref: '#/components/schemas/WorkflowDefinition'}}
+              schema: {$ref: '#/components/schemas/InstanceSummary'}
+        '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
+  /v1/workflows/{workflow_instance_id}/next-approver:
+    get:
+      tags: [instances]
+      operationId: getNextApprover
+      description: Returns the next approver for the current stage of a workflow instance.
+      parameters: [{$ref: '#/components/parameters/WorkflowInstanceID'}]
+      responses:
+        '200':
+          description: Next approver
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  workflow_instance_id: {type: string}
+                  current_stage: {type: integer}
+                  stage_type: {type: string}
+                  approver_principal_id: {type: string, nullable: true}
+                  approver_role: {type: string, nullable: true}
+                  required_approvals: {type: integer, nullable: true}
+                  quorum_approvers:
+                    type: array
+                    items: {type: string}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/workflows/{workflow_instance_id}/evidence:
+    get:
+      tags: [instances]
+      operationId: getApprovalEvidence
+      description: Returns the approval evidence (transition log) for a workflow instance.
+      parameters: [{$ref: '#/components/parameters/WorkflowInstanceID'}]
+      responses:
+        '200':
+          description: Approval evidence
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/WorkflowTransition'}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/workflows/{workflow_instance_id}/escalate-to:
     post:
-      tags: [definitions]
-      operationId: createWorkflowDefinition
+      tags: [lifecycle]
+      operationId: escalateToWorkflow
+      description: |
+        Escalates the current stage to a named target with custom narrative. WORKFLOW_ADMINISTER.
+        Per ZS-STATE-001 §4.2; the new target must hold the relevant approval authority.
+      parameters:
+        - {$ref: '#/components/parameters/WorkflowInstanceID'}
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+        - {$ref: '#/components/parameters/CorrelationID'}
+        - {name: X-Expected-Version, in: header, required: true, schema: {type: string}}
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [tenant_id, workflow_type, version, stages_json]
+              required: [escalation_target]
               properties:
-                tenant_id: {type: string, format: uuid}
-                workflow_type: {type: string}
-                version: {type: integer, minimum: 1}
-                stages_json: {type: string, contentEncoding: base64, description: JSON array of DefinitionStage}
-                name: {type: string}
-                description: {type: string}
+                escalation_target: {type: string}
+                narrative: {type: string}
       responses:
-        '201':
-          description: Created
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/WorkflowDefinition'}
+        '200': {$ref: '#/components/responses/Workflow'}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '412': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/workflow-definitions:
+    get:
+      tags: [definitions]
+      operationId: listWorkflowDefinitions
+      description: Lists workflow definitions with cursor paging (API-4).
+      parameters:
+        - {name: workflow_type, in: query, schema: {type: string}}
+        - {name: is_active, in: query, schema: {type: boolean}}
+        - {name: limit, in: query, schema: {type: integer, default: 50}}
+        - {name: cursor, in: query, schema: {type: string}}
+        - {$ref: '#/components/parameters/CorrelationID'}
+      responses:
+        '200':
+          description: Workflow definitions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  records:
+                    type: array
+                    items: {$ref: '#/components/schemas/WorkflowDefinition'}
+                  next_cursor:
+                    type: string
+                  watermark:
+                    type: string
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+    post:
+      tags: [definitions]
+      operationId: createWorkflowDefinition
+      description: Creates a new versioned workflow definition.
+      parameters:
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+        - {$ref: '#/components/parameters/CorrelationID'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateWorkflowDefinition'}
+      responses:
+        '201': {$ref: '#/components/responses/WorkflowDefinition'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
   /v1/workflow-definitions/{workflow_definition_id}:
     get:
@@ -368,11 +482,7 @@ paths:
       operationId: getWorkflowDefinition
       parameters: [{$ref: '#/components/parameters/WorkflowDefinitionID'}]
       responses:
-        '200':
-          description: The definition
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/WorkflowDefinition'}
+        '200': {$ref: '#/components/responses/WorkflowDefinition'}
         '400': {$ref: '#/components/responses/Problem'}
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
@@ -382,7 +492,10 @@ paths:
     post:
       tags: [definitions]
       operationId: supersedeWorkflowDefinition
-      parameters: [{$ref: '#/components/parameters/WorkflowDefinitionID'}]
+      parameters:
+        - {$ref: '#/components/parameters/WorkflowDefinitionID'}
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+        - {$ref: '#/components/parameters/CorrelationID'}
       requestBody:
         required: true
         content:
@@ -398,6 +511,7 @@ paths:
         '401': {$ref: '#/components/responses/Problem'}
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
   /v1/workflow-definitions/{workflow_definition_id}/activate:
     post:
@@ -435,6 +549,311 @@ paths:
         '403': {$ref: '#/components/responses/Problem'}
         '404': {$ref: '#/components/responses/Problem'}
         '503': {$ref: '#/components/responses/Problem'}
+  /v1/workflow-definitions/{workflow_definition_id}/validate:
+    post:
+      tags: [definitions]
+      operationId: validateDefinition
+      description: Transitions DRAFT → VALIDATION_PENDING. Validates stage shapes, quorum pool, due hours, escalation target.
+      parameters: [{$ref: '#/components/parameters/WorkflowDefinitionID'}]
+      responses:
+        '200': {$ref: '#/components/responses/DefinitionStatus'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/workflow-definitions/{workflow_definition_id}/submit-approval:
+    post:
+      tags: [definitions]
+      operationId: submitDefinitionApproval
+      description: Transitions VALIDATION_PENDING → APPROVAL_PENDING. Submits the definition for approval.
+      parameters: [{$ref: '#/components/parameters/WorkflowDefinitionID'}]
+      responses:
+        '200': {$ref: '#/components/responses/DefinitionStatus'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/workflow-definitions/{workflow_definition_id}/approve:
+    post:
+      tags: [definitions]
+      operationId: approveDefinition
+      description: Transitions VALIDATED → APPROVAL_PENDING (or APPROVAL_PENDING → PUBLISHED). Maker ≠ checker enforced.
+      parameters: [{$ref: '#/components/parameters/WorkflowDefinitionID'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason_code]
+              properties:
+                reason_code: {type: string}
+                narrative: {type: string}
+      responses:
+        '200': {$ref: '#/components/responses/DefinitionStatus'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/workflow-definitions/{workflow_definition_id}/reject:
+    post:
+      tags: [definitions]
+      operationId: rejectDefinition
+      description: Transitions VALIDATION_PENDING/APPROVAL_PENDING → REJECTED.
+      parameters: [{$ref: '#/components/parameters/WorkflowDefinitionID'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason_code]
+              properties:
+                reason_code: {type: string}
+                narrative: {type: string}
+      responses:
+        '200': {$ref: '#/components/responses/DefinitionStatus'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/workflow-definitions/{workflow_definition_id}/publish:
+    post:
+      tags: [definitions]
+      operationId: publishDefinition
+      description: Transitions APPROVAL_PENDING → PUBLISHED. Computes checksum, sets effective window.
+      parameters: [{$ref: '#/components/parameters/WorkflowDefinitionID'}]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                effective_from: {type: string, format: date-time}
+                effective_to: {type: string, format: date-time}
+      responses:
+        '200': {$ref: '#/components/responses/DefinitionStatus'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/work-items:
+    post:
+      tags: [work-items]
+      operationId: createWorkItem
+      description: Creates a new work item.
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CorrelationID'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateWorkItem'}
+      responses:
+        '201': {$ref: '#/components/responses/WorkItem'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+    get:
+      tags: [work-items]
+      operationId: listWorkItems
+      description: Lists work items with filters and cursor paging (API-4).
+      parameters:
+        - {name: legal_entity_id, in: query, schema: {type: string}}
+        - {name: case_id, in: query, schema: {type: string}}
+        - {name: workflow_instance_id, in: query, schema: {type: string}}
+        - {name: item_type, in: query, schema: {type: string}}
+        - {name: queue, in: query, schema: {type: string}}
+        - {name: assignee_principal_id, in: query, schema: {type: string}}
+        - {name: state, in: query, schema: {type: string}}
+        - {name: mandatory, in: query, schema: {type: boolean}}
+        - {name: limit, in: query, schema: {type: integer, default: 50}}
+        - {name: cursor, in: query, schema: {type: string}}
+        - {$ref: '#/components/parameters/CorrelationID'}
+      responses:
+        '200':
+          description: Work items
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  records:
+                    type: array
+                    items: {$ref: '#/components/schemas/WorkItem'}
+                  next_cursor:
+                    type: string
+                  watermark:
+                    type: string
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/work-items/bulk-complete:
+    post:
+      tags: [work-items]
+      operationId: bulkCompleteWorkItems
+      description: Bulk completes work items. Per-item authorization and per-item results.
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CorrelationID'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [work_item_ids]
+              properties:
+                work_item_ids:
+                  type: array
+                  items: {type: string}
+      responses:
+        '200':
+          description: Bulk completion results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/WorkItem'}
+                  results:
+                    type: array
+                    items: {$ref: '#/components/schemas/WorkItemResult'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/work-items/{work_item_id}:
+    get:
+      tags: [work-items]
+      operationId: getWorkItem
+      parameters: [{$ref: '#/components/parameters/WorkItemID'}]
+      responses:
+        '200': {$ref: '#/components/responses/WorkItem'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/work-items/{work_item_id}/claim:
+    post:
+      tags: [work-items]
+      operationId: claimWorkItem
+      parameters: [{$ref: '#/components/parameters/WorkItemID'}, {$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CorrelationID'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [assignee_principal_id]
+              properties:
+                assignee_principal_id: {type: string}
+      responses:
+        '200': {$ref: '#/components/responses/WorkItem'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/work-items/{work_item_id}/release:
+    post:
+      tags: [work-items]
+      operationId: releaseWorkItem
+      parameters: [{$ref: '#/components/parameters/WorkItemID'}, {$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CorrelationID'}]
+      responses:
+        '200': {$ref: '#/components/responses/WorkItem'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/work-items/{work_item_id}/complete:
+    post:
+      tags: [work-items]
+      operationId: completeWorkItem
+      parameters: [{$ref: '#/components/parameters/WorkItemID'}, {$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CorrelationID'}]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                completion_data:
+                  type: object
+      responses:
+        '200': {$ref: '#/components/responses/WorkItem'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/work-items/{work_item_id}/reassign:
+    post:
+      tags: [work-items]
+      operationId: reassignWorkItem
+      parameters: [{$ref: '#/components/parameters/WorkItemID'}, {$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CorrelationID'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [new_assignee_principal_id, reason]
+              properties:
+                new_assignee_principal_id: {type: string}
+                reason: {type: string}
+      responses:
+        '200': {$ref: '#/components/responses/WorkItem'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/work-items/{work_item_id}/cancel:
+    post:
+      tags: [work-items]
+      operationId: cancelWorkItem
+      parameters: [{$ref: '#/components/parameters/WorkItemID'}, {$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CorrelationID'}]
+      responses:
+        '200': {$ref: '#/components/responses/WorkItem'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/work-items/{work_item_id}/escalate:
+    post:
+      tags: [work-items]
+      operationId: escalateWorkItem
+      parameters: [{$ref: '#/components/parameters/WorkItemID'}, {$ref: '#/components/parameters/IdempotencyKey'}, {$ref: '#/components/parameters/CorrelationID'}]
+      responses:
+        '200': {$ref: '#/components/responses/WorkItem'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
 components:
   securitySchemes:
     identityEnvelope: {type: http, scheme: bearer, bearerFormat: JWT}
@@ -443,6 +862,7 @@ components:
     CorrelationID: {name: X-Correlation-ID, in: header, required: true, schema: {type: string}}
     WorkflowInstanceID: {name: workflow_instance_id, in: path, required: true, schema: {type: string, format: uuid}}
     WorkflowDefinitionID: {name: workflow_definition_id, in: path, required: true, schema: {type: string, format: uuid}}
+    WorkItemID: {name: work_item_id, in: path, required: true, schema: {type: string, format: uuid}}
   requestBodies:
     Decision:
       required: true
@@ -455,6 +875,7 @@ components:
               action: {type: string, enum: [APPROVE, REJECT]}
               rationale: {type: string, description: Required for REJECT}
               causation_id: {type: string}
+              document_hash: {type: string, pattern: '^sha256:[0-9a-f]{64}$', description: Signature workflows only. Must equal the bound document hash}
   responses:
     Problem:
       description: RFC 9457 problem document
@@ -476,6 +897,16 @@ components:
       content:
         application/json:
           schema: {$ref: '#/components/schemas/WorkflowWithStages'}
+    WorkItem:
+      description: The work item
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/WorkItem'}
+    WorkflowDefinition:
+      description: The workflow definition
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/WorkflowDefinition'}
     ReleaseVerification:
       description: Release verification result
       content:
@@ -542,6 +973,18 @@ components:
         workflow_definition_id: {type: string, format: uuid}
         workflow_definition_version: {type: integer}
         stages: {type: array, items: {$ref: '#/components/schemas/StageInput'}, description: Required unless workflow_definition_id supplies the route}
+        signatory_decision_id: {type: string, format: uuid, description: A policy-svc SIGNATURE_REQUIRED decision; makes this a signature workflow}
+    SignatoryBinding:
+      type: object
+      properties:
+        workflow_instance_id: {type: string}
+        tenant_id: {type: string}
+        signatory_decision_id: {type: string}
+        signatory_policy_version_id: {type: string}
+        signatory_rule_id: {type: string}
+        document_hash: {type: string}
+        requirement: {type: object, additionalProperties: true, description: The SIGNATURE_QUORUM required action as verified}
+        bound_at: {type: string, format: date-time}
     WorkflowInstance:
       type: object
       properties:
@@ -555,12 +998,12 @@ components:
         initiated_by: {type: string}
         created_by: {type: string}
         correlation_id: {type: string}
-        due_at: {type: [string, 'null'], format: date-time}
-        next_action_at: {type: [string, 'null'], format: date-time}
-        escalation_target: {type: [string, 'null']}
-        escalated_at: {type: [string, 'null'], format: date-time}
-        workflow_definition_id: {type: [string, 'null']}
-        workflow_definition_version: {type: [integer, 'null']}
+        due_at: {type: string, nullable: true, format: date-time}
+        next_action_at: {type: string, nullable: true, format: date-time}
+        escalation_target: {type: string, nullable: true}
+        escalated_at: {type: string, nullable: true, format: date-time}
+        workflow_definition_id: {type: string, nullable: true}
+        workflow_definition_version: {type: integer, nullable: true}
         row_version: {type: integer}
       additionalProperties: true
     WorkflowStage:
@@ -571,36 +1014,20 @@ components:
         stage_order: {type: integer}
         stage_type: {type: string}
         approver_principal_id: {type: string}
-        approver_role: {type: [string, 'null']}
-        required_approvals: {type: [integer, 'null']}
+        approver_role: {type: string, nullable: true}
+        required_approvals: {type: integer, nullable: true}
         stage_status: {type: string}
-        due_at: {type: [string, 'null'], format: date-time}
-        acted_at: {type: [string, 'null'], format: date-time}
-        acted_by: {type: [string, 'null']}
-        rationale: {type: [string, 'null']}
+        due_at: {type: string, nullable: true, format: date-time}
+        acted_at: {type: string, nullable: true, format: date-time}
+        acted_by: {type: string, nullable: true}
+        rationale: {type: string, nullable: true}
       additionalProperties: true
     WorkflowWithStages:
-      allOf:
-        - {$ref: '#/components/schemas/WorkflowInstance'}
-        - type: object
-          properties:
-            stages: {type: array, items: {$ref: '#/components/schemas/WorkflowStage'}}
-            decision_id: {type: string, description: The governance-ledger record of this decision}
-    WorkflowTransition:
       type: object
       properties:
-        from_state: {type: string}
-        to_state: {type: string}
-        acted_by: {type: string}
-        rationale: {type: string}
-        stage_order: {type: [integer, 'null']}
-        review_cycle: {type: [integer, 'null']}
-        access_decision_id: {type: [string, 'null']}
-        authority_basis: {type: [string, 'null']}
-        delegation_id: {type: [string, 'null']}
-        decision_id: {type: [string, 'null']}
-        workflow_definition_version: {type: [integer, 'null']}
-      additionalProperties: true
+        instance: {$ref: '#/components/schemas/WorkflowInstance'}
+        stages: {type: array, items: {$ref: '#/components/schemas/WorkflowStage'}}
+        ledger_decision_id: {type: string, nullable: true}
     WorkflowDefinition:
       type: object
       properties:
@@ -608,8 +1035,155 @@ components:
         tenant_id: {type: string}
         workflow_type: {type: string}
         version: {type: integer}
+        stages_json: {type: string}
+        name: {type: string, nullable: true}
+        description: {type: string, nullable: true}
+        created_by: {type: string}
+        created_at: {type: string, format: date-time}
+        superseded_by: {type: string, nullable: true}
         is_active: {type: boolean}
-        superseded_by: {type: [string, 'null']}
-        expiry_hours: {type: [integer, 'null']}
-        escalation_target: {type: [string, 'null']}
+        row_version: {type: integer}
+        updated_at: {type: string, format: date-time}
+        plane: {type: string}
+        data_class: {type: string}
+        residency_region: {type: string}
+        expiry_hours: {type: integer, nullable: true}
+        escalation_target: {type: string, nullable: true}
       additionalProperties: true
+    WorkflowTransition:
+      type: object
+      properties:
+        workflow_transition_id: {type: string}
+        workflow_instance_id: {type: string}
+        from_state: {type: string}
+        to_state: {type: string}
+        acted_by: {type: string}
+        rationale: {type: string, nullable: true}
+        correlation_id: {type: string, nullable: true}
+        causation_id: {type: string, nullable: true}
+        stage_order: {type: integer, nullable: true}
+        review_cycle: {type: integer, nullable: true}
+        workflow_definition_version: {type: integer, nullable: true}
+        idempotency_key: {type: string, nullable: true}
+        request_hash: {type: string, nullable: true}
+        access_decision_id: {type: string, nullable: true}
+        authority_basis: {type: string, nullable: true}
+        delegation_id: {type: string, nullable: true}
+        decision_id: {type: string, nullable: true}
+        occurred_at: {type: string, format: date-time}
+    AvailableActions:
+      type: object
+      properties:
+        workflow_instance_id: {type: string}
+        current_stage: {type: integer}
+        current_status: {type: string}
+        actions: {type: array, items: {type: string}}
+        principal_id: {type: string}
+        can_act: {type: boolean}
+        reason: {type: string}
+    TransitionHistoryEntry:
+      type: object
+      properties:
+        transition_id: {type: string}
+        workflow_instance_id: {type: string}
+        from_stage: {type: integer}
+        to_stage: {type: integer}
+        from_status: {type: string}
+        to_status: {type: string}
+        actor_principal_id: {type: string}
+        action_type: {type: string}
+        rationale: {type: string}
+        decision_id: {type: string, nullable: true}
+        quorum: {type: 'object'}
+        occurred_at: {type: string, format: date-time}
+    InstanceSummary:
+      type: object
+      properties:
+        workflow_instance_id: {type: string}
+        workflow_type: {type: string}
+        workflow_status: {type: string}
+        current_stage: {type: integer}
+        initiated_by: {type: string}
+        subject_type: {type: string, nullable: true}
+        subject_id: {type: string, nullable: true}
+        subject_version: {type: integer, nullable: true}
+        started_at: {type: string, format: date-time}
+        completed_at: {type: string, nullable: true, format: date-time}
+        due_at: {type: string, nullable: true, format: date-time}
+        next_action_at: {type: string, nullable: true, format: date-time}
+        escalation_target: {type: string, nullable: true}
+        review_cycle: {type: integer}
+        stages_summary:
+          type: array
+          items: {$ref: '#/components/schemas/StageSummary'}
+    StageSummary:
+      type: object
+      properties:
+        stage_order: {type: integer}
+        stage_type: {type: string}
+        stage_status: {type: string}
+        approver_principal_id: {type: string, nullable: true}
+        required_approvals: {type: integer, nullable: true}
+        quorum_approvers:
+          type: array
+          items: {type: string}
+        acted_at: {type: string, nullable: true, format: date-time}
+        acted_by: {type: string, nullable: true}
+        rationale: {type: string, nullable: true}
+    WorkItem:
+      type: object
+      properties:
+        work_item_id: {type: string}
+        tenant_id: {type: string}
+        legal_entity_id: {type: string}
+        case_id: {type: string, nullable: true}
+        workflow_instance_id: {type: string, nullable: true}
+        item_type: {type: string}
+        queue: {type: string, nullable: true}
+        role: {type: string, nullable: true}
+        assignee_principal_id: {type: string, nullable: true}
+        state: {type: string, enum: [UNASSIGNED, CLAIMED, COMPLETED, CANCELLED]}
+        mandatory: {type: boolean}
+        completion_schema: {type: object}
+        due_at: {type: string, nullable: true, format: date-time}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        row_version: {type: integer}
+    CreateWorkflowDefinition:
+      type: object
+      required: [tenant_id, legal_entity_id, workflow_type]
+      properties:
+        tenant_id: {type: string, format: uuid}
+        legal_entity_id: {type: string, format: uuid}
+        workflow_type: {type: string}
+        subject_type: {type: string}
+        subject_id: {type: string}
+        subject_version: {type: integer, minimum: 0}
+        subject_fingerprint: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+        escalation_target: {type: string}
+        workflow_definition_id: {type: string, format: uuid}
+        workflow_definition_version: {type: integer}
+        stages: {type: array, items: {$ref: '#/components/schemas/StageInput'}, description: Required unless workflow_definition_id supplies the route}
+        signatory_decision_id: {type: string, format: uuid, description: A policy-svc SIGNATURE_REQUIRED decision; makes this a signature workflow}
+    WorkItemResult:
+      type: object
+      properties:
+        work_item_id: {type: string}
+        success: {type: boolean}
+        error: {type: string, nullable: true}
+    CreateWorkItem:
+      type: object
+      required: [tenant_id, legal_entity_id, item_type]
+      properties:
+        tenant_id: {type: string, format: uuid}
+        legal_entity_id: {type: string, format: uuid}
+        case_id: {type: string, nullable: true, format: uuid}
+        workflow_instance_id: {type: string, nullable: true, format: uuid}
+        item_type: {type: string}
+        queue: {type: string, nullable: true}
+        role: {type: string, nullable: true}
+        assignee_principal_id: {type: string, nullable: true}
+        mandatory: {type: boolean, nullable: true}
+        completion_schema: {type: object, nullable: true}
+        due_at: {type: string, nullable: true, format: date-time}
+        bulk_safe: {type: boolean, nullable: true}

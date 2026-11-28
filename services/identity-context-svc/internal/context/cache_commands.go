@@ -20,7 +20,7 @@ type IngressBindingWriter interface {
 
 // TenantSessionRevoker revokes every live session in a tenant.
 type TenantSessionRevoker interface {
-	EvictAllForTenant(ctx context.Context, tenantID string, reason domain.InvalidationReason) (int, error)
+	EvictAllForTenant(ctx context.Context, tenantID string, reason domain.InvalidationReason, actorID, correlationID string) (int, error)
 }
 
 // ContextCacheService implements GOV-01's two cache commands:
@@ -129,7 +129,7 @@ func (s *ContextCacheService) InvalidateTenant(
 		reason = domain.InvalidationReasonAdminRevoke
 	}
 
-	revoked, err := s.sessions.EvictAllForTenant(ctx, tenantID, reason)
+	revoked, err := s.sessions.EvictAllForTenant(ctx, tenantID, reason, actorPrincipalID, req.CorrelationID)
 	if err != nil {
 		// A PARTIAL revocation is still reported, because the sessions that
 		// were revoked stay revoked and a caller told only "error" would

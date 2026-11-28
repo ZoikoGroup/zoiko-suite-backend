@@ -47,9 +47,14 @@ type BNK0304Handler struct {
 }
 
 // RegisterBNK0304Routes mounts BNK-03/04's routes on r. Called separately
-// from RegisterRoutes in cmd/server/main.go.
-func RegisterBNK0304Routes(r chi.Router, h *Handler, bnk0304Store store.BNK0304Store) {
-	bh := &BNK0304Handler{Handler: h, bnk0304Store: bnk0304Store}
+// from RegisterRoutes in cmd/server/main.go. The document-vault client is
+// optional: callers that do not store raw files pass none.
+func RegisterBNK0304Routes(r chi.Router, h *Handler, bnk0304Store store.BNK0304Store, vaults ...documentvault.Client) {
+	var documentVault documentvault.Client
+	if len(vaults) > 0 {
+		documentVault = vaults[0]
+	}
+	bh := &BNK0304Handler{Handler: h, bnk0304Store: bnk0304Store, documentVault: documentVault}
 	// Full paths, not r.Route(...): a Route on /v1/banking/statements shadowed
 	// the legacy POST /v1/banking/statements registered by RegisterRoutes.
 	r.Post("/v1/banking/statements/ingest", bh.IngestStatement)
@@ -60,20 +65,6 @@ func RegisterBNK0304Routes(r chi.Router, h *Handler, bnk0304Store store.BNK0304S
 	r.Post("/v1/banking/transactions/normalize", bh.NormalizeTransaction)
 	r.Post("/v1/banking/transactions/{id}/re-normalize", bh.ReNormalizeTransaction)
 	r.Post("/v1/banking/transactions/quarantine", bh.QuarantineTransaction)
-func RegisterBNK0304Routes(r chi.Router, h *Handler, bnk0304Store store.BNK0304Store, documentVault documentvault.Client) {
-	bh := &BNK0304Handler{Handler: h, bnk0304Store: bnk0304Store, documentVault: documentVault}
-	r.Route("/v1/banking/statements", func(r chi.Router) {
-		r.Post("/ingest", bh.IngestStatement)
-		r.Post("/{id}/validate", bh.ValidateStatement)
-		r.Post("/{id}/accept", bh.AcceptStatement)
-		r.Post("/{id}/quarantine", bh.QuarantineStatement)
-		r.Post("/{id}/reprocess", bh.ReprocessQuarantinedStatement)
-	})
-	r.Route("/v1/banking/transactions", func(r chi.Router) {
-		r.Post("/normalize", bh.NormalizeTransaction)
-		r.Post("/{id}/re-normalize", bh.ReNormalizeTransaction)
-		r.Post("/quarantine", bh.QuarantineTransaction)
-	})
 	r.Post("/v1/banking/transaction-mappings", bh.CreateTransactionMapping)
 	// Full paths, not r.Route("/v1/banking/canonical-transactions", ...), for
 	// the same route-shadowing reason as RegisterRoutes.

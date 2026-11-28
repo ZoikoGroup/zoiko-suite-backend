@@ -1,0 +1,11 @@
+-- Migration 000061 (no-op since 23 Nov 2026).
+--
+-- First written on 19 Nov 2026 to grant identity-context-svc ROLE_MANAGE for
+-- SCIM provisioning (IC-15). It wrote roles / permission_bundles /
+-- principal_role_assignments, tables that exist only in authorization-svc, so
+-- it failed on every access_control database ("relation \"roles\" does not
+-- exist") and no database ever recorded it. The grant now lives where the
+-- assignments are evaluated: authorization-svc migration 000045
+-- (IDENTITY_PROVISIONING_OPERATOR for svc-identity-context in every tenant).
+-- The file stays so the numbering of later migrations does not move.
+SELECT 1;

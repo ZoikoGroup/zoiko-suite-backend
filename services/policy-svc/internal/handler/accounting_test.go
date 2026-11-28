@@ -186,7 +186,7 @@ func TestDraftAccounting_IsInTheVerifiedTenantAsTheVerifiedCaller(t *testing.T) 
 	g := newAcctRig(st, nil)
 	w := g.do(http.MethodPost, "/v1/accounting-policies", strings.Replace(draftBody, `"policy_domain"`, `"tenant_id": "`+otherTenant+`", "policy_domain"`, 1), header("Idempotency-Key", "key-1"))
 	expect(t, w, http.StatusCreated, "")
-	if w.Header().Get("ETag") != `"1"` {
+	if w.Header().Get("ETag") != `"v1"` {
 		t.Errorf("ETag = %q, want the row_version", w.Header().Get("ETag"))
 	}
 	p := st.gotDraft
@@ -572,7 +572,7 @@ func TestGetAccountingVersion(t *testing.T) {
 	g := newAcctRig(&acctStub{version: v}, nil)
 	w := g.do(http.MethodGet, "/v1/accounting-policies/versions/"+versionID)
 	body := expect(t, w, http.StatusOK, "")
-	if body["policy_code"] != "ACCT:X:1" || w.Header().Get("ETag") != `"1"` {
+	if body["policy_code"] != "ACCT:X:1" || w.Header().Get("ETag") != `"v1"` {
 		t.Errorf("body = %v etag %q", body, w.Header().Get("ETag"))
 	}
 	expect(t, g.do(http.MethodGet, "/v1/accounting-policies/versions/not-a-uuid"), http.StatusBadRequest, "INVALID_REQUEST")

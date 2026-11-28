@@ -591,3 +591,29 @@ func TestPgStore_ListObligationsCursorPages(t *testing.T) {
 		t.Fatalf("cursor pages returned %d of 5 obligations", len(seen))
 	}
 }
+
+// OB-S3 in the database: both deciders, no decider and UNASSESSED are refused
+// by CHECK constraints even if a caller skips the handler.
+func TestOB2_DatabaseRefusesBadDecidersAndUnassessed(t *testing.T) {
+	admin := getTestPool(t)
+	defer admin.Close()
+	setupTestDB(t, admin)
+	s := store.New(rlsPool(t, admin), zap.NewNop())
+	ctx := tenantCtx(testTenantID)
+	o, _, err := s.CreateObligation(ctx, validParams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := domain.CreateApplicabilityDecisionParams{ObligationID: o.ObligationID, JurisdictionCode: "IN-KA", EntityRef: "le-1",
+		Decision: "APPLICABLE", SourceRuleRef: "R-7", SourceRuleVersion: "v3", EffectiveFrom: time.Now().UTC(), CreatedByPrincipalID: "admin-1"}
+	both := base
+	both.DecidedByPrincipalID, both.DecidedBySystem = "admin-1", "rule-engine"
+	none := base
+	unassessed := base
+	unassessed.DecidedBySystem, unassessed.Decision = "rule-engine", "UNASSESSED"
+	for name, p := range map[string]domain.CreateApplicabilityDecisionParams{"both deciders": both, "no decider": none, "UNASSESSED": unassessed} {
+		if _, _, err := s.CreateApplicabilityDecision(ctx, p); err == nil {
+			t.Errorf("%s was stored", name)
+		}
+	}
+}

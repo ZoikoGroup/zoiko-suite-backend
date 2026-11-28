@@ -1,6 +1,6 @@
 # workflow-svc — Progress
 
-## Status (21 Oct 2026): Doc 03 §8.4 complete; governed under the runtime role
+**Status (19 Nov 2026):** Doc 03 §8.4 complete + WFC-01..03 + WFC-04 + ST-1/2/3 complete; governed under the runtime role.
 
 The Governance Platform audit (14 Oct: 26 ✅ / 23 ⚠️ / 12 ❌) was re-run on
 21 Oct and every local gap closed. The first finding was a defect the earlier
@@ -16,12 +16,23 @@ chain, escalation, timers, re-check and append-only log as a NOBYPASSRLS role
 
 | Stage | Description | Status | Evidence |
 |-------|-------------|--------|----------|
-| S0 | Baseline | ✅ Done | No untracked files; progress.md matrix added |
-| S1 | Backend unit tests | ✅ Done | 14 packages, all pass |
-| S2 | Store integration tests | ✅ Done | Runs on scratch Postgres (requires TEST_DATABASE_URL) |
-| S3 | Contract parity | ✅ Done | OpenAPI parity test + kin-openapi validation |
-| S4 | Frontend | ⏳ Pending | Console v2.0 rebuild |
-| S5 | Live verification | ⏳ Pending | scripts/audit.sh, e2e-workflow-deps.py |
+| S0a | Fix handler test compilation, store suite reset | 🔵 Done | d198c47c · go test -count=1 ./... 18/18 pass · go vet clean · gofmt clean |
+| S0 | Baseline matrix with real test counts, migrations up/down/up on scratch DB | 🔵 Done | This commit · go test -count=1 ./... 18/18 pass (unit) · go test -count=1 -tags=integration ./internal/store/... 131s · migrations 000001-000024 up/down/up on scratch postgres:16 clean |
+| S1 | Cases schema, commands | ⏳ Pending | |
+| S2 | Cases closure gate | ⏳ Pending | |
+| S3 | Cases merge/split | ⏳ Pending | |
+| S4 | Cases confidentiality | ⏳ Pending | |
+| S5 | Cases events, idempotent open | ⏳ Pending | |
+| S6 | WFC-01 definition lifecycle | ⏳ Pending | |
+| S7 | WFC-02 work items | ⏳ Pending | |
+| S8 | State machine registry | ⏳ Pending | |
+| S9 | Available-actions | ⏳ Pending | |
+| S10 | Transition-history | ⏳ Pending | |
+| S11 | WF-1 open rows | ⏳ Pending | |
+| S11a | Approval integrity | ⏳ Pending | |
+| S11b | Instance list/summary routes | ⏳ Pending | |
+| S12-20 | Handler tests, policy events, audit/forms, R-001 mapping, identity, contracts, live, e2e, mutants | ⏳ Pending | |
+| S21 | Hand-back | ⏳ Pending | |
 
 What changed (migration 000020):
 
@@ -85,6 +96,38 @@ Still open, outside this service: relationship independence (R-INV-09) needs
 an org-structure source (H-6); automatic invalidation needs the subject owners
 to call `/invalidate` (H-5); invoice-approval-svc does not start workflows
 correctly (N-3); the gateway route and published port (H-4).
+
+## WFC-01..03 Implementation Status (WF-1)
+
+| Item | Description | Status | Evidence |
+|------|-------------|--------|----------|
+| L-2 | Quorum races: serialize votes on one stage with `FOR UPDATE` on stage row; tallies per review cycle; ESCALATED stages votable | ✅ Done | TestWF1_QuorumNoRace |
+| L-8 | RLS on six tables: stages, transitions, quorum_votes, quorum_tallies, outbox, workflow_definitions; runtime role NOBYPASSRLS | ✅ Done | Migration 000017 (5 tables) + 000022 (outbox); Store integration tests as NOBYPASSRLS |
+| Q-3 | State model, common columns, event naming | ✅ Done | TestWF1_StateModelConsistency |
+| Q-6 | Per-type approve authority: approve authority resolved per workflow type; authorization attributes workflow_type, approver_role, stage_order | ✅ Done | TestWF1_ApproveAuthorityPerType |
+
+## Feature Matrix (WF-0 Baseline)
+
+| ID | Requirement | Route / consumer | Test | Status |
+|---|---|---|---|---|
+| D2-6.F01 | Create workflow instance | `POST /v1/workflows`, `GET /v1/workflows`, `GET …/{id}` | TestWF1_Create, TestWF1_Get, TestWF1_List | DONE |
+| D2-6.F02 | Submit action (approve/reject/request-changes) | `POST …/{id}/actions` | TestWF1_Actions | DONE |
+| D2-6.F03 | Quorum voting | `POST …/{id}/vote` | TestWF1_QuorumNoRace | DONE |
+| D2-6.F04 | Escalation / escalate-to | `POST …/{id}/escalate`, `POST …/{id}/escalate-to` | TestWF1_Escalation | DONE |
+| D2-6.F05 | Cancel / invalidate / next-approver | `POST …/{id}/cancel`, `POST …/{id}/invalidate`, `GET …/{id}/next-approver` | TestWF1_Lifecycle | DONE |
+| D2-6.F06 | Workflow definitions | `GET/POST /v1/workflow-definitions`, `GET …/{id}`, `GET/POST …/{id}/versions`, `POST …/{id}/retire` | TestWF1_Definitions | DONE |
+| D2-6.F07 | Transactional outbox | `event_outbox`, relay, Kafka | TestWF1_Outbox | DONE |
+| D2-6.F08 | Idempotency-Key, If-Match, RLS | All mutations | TestWF1_Idempotency, TestAPI3_* | DONE |
+| D2-6.F09 | Registry check of legal entity | `GET /v1/entities/{id}/status` | TestWF1_RegistryCheck | DONE |
+| D2-6.F10 | Timer sweep | `internal/timers` | TestWF1_Timers | DONE |
+| D2-6.F11 | Consumed events (policy.updated, etc.) | `internal/consumer` | TestWF1_ConsumedEvents | DONE |
+| D2-6.F12 | **WFC-01..03: Quorum, RLS, State Model, Authority** | | TestWF1_* | DONE |
+| D2-6.F13 | Audit Engagement module | `GET/POST /v1/audit-engagements`, transitions, workpapers | TestAUD_* | DONE |
+| D2-6.F14 | Forms module | `GET/POST /v1/forms`, submissions, routing | TestFORM_* | DONE |
+| D2-6.F15 | **WFC-04: Cases** | Case lifecycle, linking | TestWF2_* | 🔵 WF-S0a, S0 done |
+| D2-6.F16 | **ST-1/2/3: State Machine Registry** | Registry, available-actions, transition-history, no generic status writes | TestST_* | ⏳ WF-S8-S10 pending |
+| D2-6.F17 | API-4 cursor paging | All list endpoints | TestWF1_API4Paging | DONE |
+| D2-6.F18 | Dependency E2E + console v2.0 | `e2e-workflow-deps.py`, console | WF-8, WF-FE | ⏳ WF-FE-1..3 pending |
 
 ## History: v1 built and verified end-to-end (2026-07-09)
 
@@ -170,3 +213,58 @@ plain assignment and inside a `CASE`/`IN` comparison in the same query
 confuses Postgres's type inference (`inconsistent types deduced for
 parameter $1`, SQLSTATE 42P08). Fixed with an explicit `::VARCHAR` cast in
 both occurrences.
+
+## Decision capture (DL-2, 25 Nov 2026)
+
+A workflow started for an escalated governance decision stores it (`causation_id` in the body or
+`X-Causation-Id`, which must agree; default the bound signatory decision) in `workflow_instances.causation_decision_id`
+(migration 000027). Every ledger record the workflow writes carries it as `causation_id` unless the action names
+its own, so the decision log links the escalation to the approval that resolved it. Tests:
+`TestCreateWorkflow_DL2_CausationDecision`, `TestSignatureWorkflow_CreatedFromVerifiedDecision` (handler);
+`TestPgStore_DL2_LedgerRecordsCarryTheResolvedDecision` (store).
+
+**Blocked (25 Nov 2026):** the store suite fails on this HEAD: `CreateWorkflow` as rewritten by 7a59de35
+(WF-S1..S7) inserts `workflow_stages.quorum_approvers`, a column no migration creates, and other WF-S SQL names
+tables that do not exist (`authorization_svc_role_holders`, `workflow_stages.tenant_id`). DL-2 fixed what it
+touched (scanInstance read 33 targets for 32 columns; the instance INSERT passed 19 arguments for 18 placeholders;
+migration 000025 did not parse). Store suite on a scratch DB: 33 pass / 35 fail, every failure in `CreateWorkflow`.
+The user chose (25 Nov) to repair WF-S separately. The running image (18 Nov) predates WF-S and DL-2.
+
+## Approver and requester notices (26 Nov 2026)
+
+The person who must decide is now told a request waits on them, and the requester is told how it was decided,
+with the reason (Doc 03 §9.7). No frontend change: the approver still decides on Workflows & Approvals → "My
+Approvals"; the notice reaches the topbar bell and the mailbox.
+
+- **Where.** Every transition writes its notices to `outbox_events` (destination `notification`) in its own
+  transaction (`internal/store/notices.go`, called from `CreateWorkflow`, `advanceTx`, `transitionInstanceStatus`,
+  `EscalateToWorkflow`, `RequestChanges`, `InvalidateWorkflow`, so the timers are covered too). A rolled-back or
+  replayed command writes none. A third relay (`internal/notifyclient`) sends each to notification-svc
+  `POST /v1/notifications` as `svc-workflow` with `Idempotency-Key: workflow-notice:<outbox id>` (a redelivery is a
+  replay). Only 409 parks a notice; anything else retries with the outbox backoff. A notice never touches the
+  decision.
+- **Who hears what** (`internal/notify`, table-tested): started → stage-1 approvers; stage approved → the next
+  stage's approvers and the requester (with the comment); approved / rejected → the requester (with the reason);
+  reopened → stage-1 approvers and the requester; escalated → the target and the requester; expired → the requester;
+  cancelled / invalidated → whoever was due to decide and the requester. Never the actor, never a `svc-*` or
+  `system:` principal. SINGLE stage: its approver; QUORUM: the pool; ROLE: nobody (no named holder here; logged).
+- **Channels.** Each recipient gets IN_APP (the bell, plain text) and EMAIL. notification-svc sends a free-text body
+  as `text/html` as given, so the EMAIL copy is escaped HTML with the request linked (`notify.HTMLBody`): an
+  approver's reason can never become markup in the requester's mailbox.
+- **Config.** `NOTIFICATION_SERVICE_URL` (empty = off, no rows written), `WORKFLOW_NOTIFY_PRINCIPAL_ID` (default
+  `svc-workflow`), `CONSOLE_BASE_URL` (link prefix). Compose sets all three.
+- **Grant.** authorization-svc `000048_workflow_notifier`: role `SVC_WORKFLOW_NOTIFIER` for `svc-workflow` with
+  `NOTIFICATION_SEND` and `IDENTITY_PRINCIPAL_READ` in every tenant (notification-svc resolves an email recipient
+  from identity-context-svc as the sender; without the read every email waited RECIPIENT_UNRESOLVED, seen live).
+  Same in `deployments/supabase/seed-rbac.sql` section 5.
+- **Evidence.** `go test ./...` with the store suite on a scratch DB: 362 pass / 0 fail, including
+  `TestPgStore_Notices_*` (10) and `TestPgStore_RLS_NoticesAsTheRuntimeRole` (NOBYPASSRLS); a mutant dropping the
+  approver lookup failed 3 of them. authorization `TestWN_WorkflowNotifierProvisionedWithATenantsFirstRole` and the
+  four grant tests beside it pass; 000048 up/down/up clean. Live (image from host binaries, old kept as
+  `deployments-workflow-svc:pre-26nov`; notification-svc at HEAD on a scratch DB): a scratchpad e2e signed in as
+  cfo@ (requester), legal.counsel@ and admin@ (approvers): 20/20, covering each bell, the reason, IN_APP+EMAIL
+  delivered, the escaped email in Mailpit, a redelivered row answered as a replay, and notification-svc down → the
+  workflow still starts and the notice arrives once it is back. The bell showed the items with no frontend change.
+- **Open** (tracker D1-7.F25 / F26 / F27, NT-9 / NT-10): ROLE-stage holders; a link on the bell item; notification-svc's
+  retry worker resolves recipients without the legal entity, so an email whose first attempt failed never succeeds;
+  under `IDENTITY_VERIFY=require` notification-svc needs an mTLS peer path for `svc-workflow`.

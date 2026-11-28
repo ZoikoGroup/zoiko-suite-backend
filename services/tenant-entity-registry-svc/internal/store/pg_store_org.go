@@ -24,9 +24,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"go.uber.org/zap"
 
@@ -259,10 +261,25 @@ func (s *PgStore) ChangeDefaultLocale(ctx context.Context, tenantID, locale, tim
 }
 
 // ListTenantLifecycleHistory is the ORG-02 read surface of the same name.
-func (s *PgStore) ListTenantLifecycleHistory(ctx context.Context, tenantID string) ([]*domain.TenantLifecycleEvent, error) {
+func (s *PgStore) ListTenantLifecycleHistory(ctx context.Context, tenantID string, limit int, cursor string) ([]*domain.TenantLifecycleEvent, string, error) {
 	tid := tenantFromCtxOrFallback(ctx, tenantID)
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+
+	var afterOccurred *time.Time
+	afterID := ""
+	if cursor != "" {
+		ds, id, ok := strings.Cut(cursor, "|")
+		d, err := time.Parse(time.RFC3339, ds)
+		if _, perr := uuid.Parse(id); !ok || err != nil || perr != nil {
+			return nil, "", fmt.Errorf("%w: cursor is not one this service issued", registry.ErrInvalidInput)
+		}
+		afterOccurred, afterID = &d, id
+	}
 
 	var out []*domain.TenantLifecycleEvent
+	var next string
 	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			SELECT lifecycle_event_id, tenant_id, from_state, to_state,
@@ -272,7 +289,8 @@ func (s *PgStore) ListTenantLifecycleHistory(ctx context.Context, tenantID strin
 			       home_region_decision_ref, from_region_id::text, to_region_id::text
 			  FROM tenant_lifecycle_history
 			 WHERE tenant_id = $1
-			 ORDER BY occurred_at DESC, lifecycle_event_id DESC`, tid)
+			 AND ($2::timestamptz IS NULL OR (occurred_at, lifecycle_event_id) < ($2::timestamptz, $3::uuid))
+			 ORDER BY occurred_at DESC, lifecycle_event_id DESC LIMIT $4`, tid, afterOccurred, nullUUID(afterID), limit+1)
 		if err != nil {
 			return err
 		}
@@ -294,17 +312,22 @@ func (s *PgStore) ListTenantLifecycleHistory(ctx context.Context, tenantID strin
 				st := domain.TenantLifecycleState(*from)
 				e.FromState = &st
 			}
+			if len(out) == limit {
+				last := out[len(out)-1]
+				next = last.OccurredAt.UTC().Format(time.RFC3339) + "|" + last.LifecycleEventID
+				break
+			}
 			out = append(out, &e)
 		}
 		return rows.Err()
 	})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if out == nil {
 		out = []*domain.TenantLifecycleEvent{}
 	}
-	return out, nil
+	return out, next, nil
 }
 
 // GetTenantDefaults is the ORG-02 GetTenantDefaults read surface.
@@ -416,17 +439,33 @@ func (s *PgStore) ResolveTenantByHost(ctx context.Context, hostname string) (*do
 }
 
 // ListTenantHostBindings returns a tenant's hostnames.
-func (s *PgStore) ListTenantHostBindings(ctx context.Context, tenantID string) ([]*domain.TenantHostBinding, error) {
+func (s *PgStore) ListTenantHostBindings(ctx context.Context, tenantID string, limit int, cursor string) ([]*domain.TenantHostBinding, string, error) {
 	tid := tenantFromCtxOrFallback(ctx, tenantID)
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+
+	var afterCreated *time.Time
+	afterID := ""
+	if cursor != "" {
+		ds, id, ok := strings.Cut(cursor, "|")
+		d, err := time.Parse(time.RFC3339, ds)
+		if _, perr := uuid.Parse(id); !ok || err != nil || perr != nil {
+			return nil, "", fmt.Errorf("%w: cursor is not one this service issued", registry.ErrInvalidInput)
+		}
+		afterCreated, afterID = &d, id
+	}
 
 	var out []*domain.TenantHostBinding
+	var next string
 	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			SELECT host_binding_id, hostname, tenant_id, is_primary, active_flag,
 			       created_at, created_by_principal_id
 			  FROM tenant_host_bindings
 			 WHERE tenant_id = $1
-			 ORDER BY is_primary DESC, hostname`, tid)
+			 AND ($2::timestamptz IS NULL OR (created_at, host_binding_id) < ($2::timestamptz, $3::uuid))
+			 ORDER BY is_primary DESC, created_at ASC, host_binding_id ASC LIMIT $4`, tid, afterCreated, nullUUID(afterID), limit+1)
 		if err != nil {
 			return err
 		}
@@ -437,17 +476,22 @@ func (s *PgStore) ListTenantHostBindings(ctx context.Context, tenantID string) (
 				&b.IsPrimary, &b.ActiveFlag, &b.CreatedAt, &b.CreatedByPrincipalID); err != nil {
 				return err
 			}
+			if len(out) == limit {
+				last := out[len(out)-1]
+				next = last.CreatedAt.UTC().Format(time.RFC3339) + "|" + last.HostBindingID
+				break
+			}
 			out = append(out, &b)
 		}
 		return rows.Err()
 	})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if out == nil {
 		out = []*domain.TenantHostBinding{}
 	}
-	return out, nil
+	return out, next, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -731,16 +775,31 @@ func (s *PgStore) AmendLegalProfile(
 
 // ListEntityProfileVersions is the ORG-03 ListEntityVersions read surface.
 // Newest first, which is the order a reader auditing a change wants.
-func (s *PgStore) ListEntityProfileVersions(ctx context.Context, legalEntityID string) ([]*domain.LegalEntityProfileVersion, error) {
+func (s *PgStore) ListEntityProfileVersions(ctx context.Context, legalEntityID string, limit int, cursor string) ([]*domain.LegalEntityProfileVersion, string, error) {
 	tid := domain.TenantFromContext(ctx)
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+
+	var afterVersion *int
+	if cursor != "" {
+		ds, id, ok := strings.Cut(cursor, "|")
+		v, err := strconv.Atoi(ds)
+		if _, perr := uuid.Parse(id); !ok || err != nil || perr != nil {
+			return nil, "", fmt.Errorf("%w: cursor is not one this service issued", registry.ErrInvalidInput)
+		}
+		afterVersion = &v
+	}
 
 	var out []*domain.LegalEntityProfileVersion
+	var next string
 	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			SELECT `+profileVersionColumns+`
 			  FROM legal_entity_profile_versions
 			 WHERE legal_entity_id = $1 AND tenant_id = $2
-			 ORDER BY version_number DESC`, legalEntityID, tid)
+			 AND ($3::int IS NULL OR version_number < $3)
+			 ORDER BY version_number DESC LIMIT $4`, legalEntityID, tid, afterVersion, limit+1)
 		if err != nil {
 			return err
 		}
@@ -750,17 +809,22 @@ func (s *PgStore) ListEntityProfileVersions(ctx context.Context, legalEntityID s
 			if err != nil {
 				return err
 			}
+			if len(out) == limit {
+				last := out[len(out)-1]
+				next = strconv.Itoa(last.VersionNumber) + "|" + last.ProfileVersionID
+				break
+			}
 			out = append(out, v)
 		}
 		return rows.Err()
 	})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if out == nil {
 		out = []*domain.LegalEntityProfileVersion{}
 	}
-	return out, nil
+	return out, next, nil
 }
 
 // GetEntityProfileAsOf is the ORG-03 GetLegalEntityAsOf read surface —
@@ -957,10 +1021,25 @@ func (s *PgStore) RecordRegistryConflict(ctx context.Context, c *domain.EntityRe
 }
 
 // ListRegistryConflicts returns quarantined conflicts for the caller's tenant.
-func (s *PgStore) ListRegistryConflicts(ctx context.Context, openOnly bool) ([]*domain.EntityRegistryConflict, error) {
+func (s *PgStore) ListRegistryConflicts(ctx context.Context, openOnly bool, limit int, cursor string) ([]*domain.EntityRegistryConflict, string, error) {
 	tid := domain.TenantFromContext(ctx)
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+
+	var afterDetected *time.Time
+	afterID := ""
+	if cursor != "" {
+		ds, id, ok := strings.Cut(cursor, "|")
+		d, err := time.Parse(time.RFC3339, ds)
+		if _, perr := uuid.Parse(id); !ok || err != nil || perr != nil {
+			return nil, "", fmt.Errorf("%w: cursor is not one this service issued", registry.ErrInvalidInput)
+		}
+		afterDetected, afterID = &d, id
+	}
 
 	var out []*domain.EntityRegistryConflict
+	var next string
 	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
 		q := `
 			SELECT conflict_id, tenant_id, registration_number, jurisdiction_id,
@@ -973,9 +1052,11 @@ func (s *PgStore) ListRegistryConflicts(ctx context.Context, openOnly bool) ([]*
 		if openOnly {
 			q += ` AND status = 'OPEN'`
 		}
-		q += ` ORDER BY detected_at DESC`
+		q += `
+			 AND ($2::timestamptz IS NULL OR (detected_at, conflict_id) < ($2::timestamptz, $3::uuid))
+			 ORDER BY detected_at DESC, conflict_id DESC LIMIT $4`
 
-		rows, err := tx.Query(ctx, q, tid)
+		rows, err := tx.Query(ctx, q, tid, afterDetected, nullUUID(afterID), limit+1)
 		if err != nil {
 			return err
 		}
@@ -995,17 +1076,22 @@ func (s *PgStore) ListRegistryConflicts(ctx context.Context, openOnly bool) ([]*
 			if len(payload) > 0 {
 				_ = json.Unmarshal(payload, &c.AttemptedPayload)
 			}
+			if len(out) == limit {
+				last := out[len(out)-1]
+				next = last.DetectedAt.UTC().Format(time.RFC3339) + "|" + last.ConflictID
+				break
+			}
 			out = append(out, &c)
 		}
 		return rows.Err()
 	})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if out == nil {
 		out = []*domain.EntityRegistryConflict{}
 	}
-	return out, nil
+	return out, next, nil
 }
 
 // ResolveRegistryConflict records a human's conclusion about a conflict.
@@ -1035,6 +1121,50 @@ func (s *PgStore) ResolveRegistryConflict(ctx context.Context, conflictID string
 			Note: note, ResolvedBy: actorID, At: time.Now().UTC(),
 		})
 	})
+}
+
+// GetRegistrySummary returns KPIs for the console header.
+func (s *PgStore) GetRegistrySummary(ctx context.Context, tenantID string) (*domain.RegistrySummary, error) {
+	tid := tenantFromCtxOrFallback(ctx, tenantID)
+
+	var summary domain.RegistrySummary
+	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
+		// Active tenants (lifecycle_state = 'ACTIVE')
+		// Note: RLS means this query only sees the caller's tenant, so count is 0 or 1
+		err := tx.QueryRow(ctx, `
+			SELECT count(*) FROM tenants WHERE tenant_id = $1 AND lifecycle_state = 'ACTIVE'`, tid).Scan(&summary.ActiveTenants)
+		if err != nil {
+			return err
+		}
+
+		// Active legal entities
+		err = tx.QueryRow(ctx, `
+			SELECT count(*) FROM legal_entities WHERE tenant_id = $1 AND entity_status = 'ACTIVE'`, tid).Scan(&summary.ActiveLegalEntities)
+		if err != nil {
+			return err
+		}
+
+		// Approvals awaiting decision (PENDING and not expired)
+		err = tx.QueryRow(ctx, `
+			SELECT count(*) FROM approval_requests
+			 WHERE tenant_id = $1 AND status = 'PENDING' AND expires_at > NOW()`, tid).Scan(&summary.ApprovalsAwaitingDecision)
+		if err != nil {
+			return err
+		}
+
+		// Open registry conflicts
+		err = tx.QueryRow(ctx, `
+			SELECT count(*) FROM entity_registry_conflicts WHERE tenant_id = $1 AND status = 'OPEN'`, tid).Scan(&summary.OpenRegistryConflicts)
+		if err != nil {
+			return err
+		}
+
+		// Open party resolution cases
+		err = tx.QueryRow(ctx, `
+			SELECT count(*) FROM resolution_cases WHERE tenant_id = $1 AND status = 'OPEN'`, tid).Scan(&summary.OpenPartyResolutionCases)
+		return err
+	})
+	return &summary, err
 }
 
 // ---------------------------------------------------------------------------

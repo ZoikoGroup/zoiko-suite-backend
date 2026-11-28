@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -14,20 +15,23 @@ import (
 const evaluationColumns = `
 	e.evaluation_id, e.tenant_id, e.decision_id, e.legal_entity_id, e.policy_type,
 	COALESCE(e.requested_by_principal_id, ''), e.input_fingerprint, e.action_context,
-	e.as_of, e.known_at, e.result, e.outcome, e.policy_id, e.policy_version_id,
-	e.policy_code, e.artifact_digest, e.rule_basis, e.selected_rule_ids,
+	e.as_of, e.known_at, e.result, e.outcome, COALESCE(e.policy_id::text, ''), COALESCE(e.policy_version_id::text, ''),
+	COALESCE(e.policy_code, ''), COALESCE(e.artifact_digest, ''), e.rule_basis, e.selected_rule_ids,
 	e.evaluator_version, e.correlation_id, COALESCE(e.causation_id, ''),
 	COALESCE(e.request_id, ''), e.evaluated_at,
 	CASE
 		WHEN o.delivered_at IS NOT NULL THEN 'RECORDED'
 		WHEN o.failed_at IS NOT NULL THEN 'FAILED'
 		ELSE 'PENDING'
-	END
+	END,
+	COALESCE(e.contract_version, ''), COALESCE(e.decision_outcome, ''), e.reason_codes, e.valid_until,
+	e.decision_envelope
 	FROM policy_evaluations e
 	LEFT JOIN policy_evidence_outbox o ON o.evaluation_id = e.evaluation_id`
 
 func scanEvaluation(row pgx.Row) (*domain.Evaluation, error) {
 	e := &domain.Evaluation{}
+	var envelope *string
 	err := row.Scan(
 		&e.EvaluationID, &e.TenantID, &e.DecisionID, &e.LegalEntityID, &e.PolicyType,
 		&e.RequestedByPrincipalID, &e.InputFingerprint, &e.ActionContext,
@@ -35,7 +39,12 @@ func scanEvaluation(row pgx.Row) (*domain.Evaluation, error) {
 		&e.PolicyCode, &e.ArtifactDigest, &e.RuleBasis, &e.SelectedRuleIDs,
 		&e.EvaluatorVersion, &e.CorrelationID, &e.CausationID,
 		&e.RequestID, &e.EvaluatedAt, &e.LedgerStatus,
+		&e.ContractVersion, &e.DecisionOutcome, &e.ReasonCodes, &e.ValidUntil,
+		&envelope,
 	)
+	if envelope != nil && *envelope != "" {
+		e.DecisionEnvelope = json.RawMessage(*envelope)
+	}
 	return e, err
 }
 
@@ -54,22 +63,40 @@ func (s *PgStore) SaveEvaluation(ctx context.Context, ev *domain.Evaluation) (*d
 		if len(action) == 0 {
 			action = []byte(`{}`)
 		}
+		evaluatedAt := ev.EvaluatedAt
+		if evaluatedAt.IsZero() {
+			evaluatedAt = s.now()
+		}
+		reasons := ev.ReasonCodes
+		if reasons == nil {
+			reasons = []string{}
+		}
+		// Stored as text, byte for byte: the signed envelope a replay serves
+		// must be the one first answered.
+		var envelope *string
+		if len(ev.DecisionEnvelope) > 0 {
+			text := string(ev.DecisionEnvelope)
+			envelope = &text
+		}
 		var id string
 		err := tx.QueryRow(ctx, `
 			INSERT INTO policy_evaluations (
+				evaluation_id,
 				tenant_id, decision_id, legal_entity_id, policy_type, requested_by_principal_id,
 				input_fingerprint, action_context, as_of, known_at, result, outcome,
 				policy_id, policy_version_id, policy_code, artifact_digest, rule_basis,
 				selected_rule_ids, evaluator_version, correlation_id, causation_id, request_id,
-				evaluated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+				evaluated_at, contract_version, decision_outcome, reason_codes, valid_until, decision_envelope
+			) VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+				$13::uuid, $14::uuid, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
 			ON CONFLICT (tenant_id, decision_id) DO NOTHING
 			RETURNING evaluation_id;`,
+			nullableString(ev.EvaluationID),
 			ev.TenantID, ev.DecisionID, ev.LegalEntityID, ev.PolicyType, nullableString(ev.RequestedByPrincipalID),
 			ev.InputFingerprint, action, ev.AsOf, ev.KnownAt, ev.Result, ev.Outcome,
-			ev.PolicyID, ev.PolicyVersionID, ev.PolicyCode, ev.ArtifactDigest, ev.RuleBasis,
+			nullableString(ev.PolicyID), nullableString(ev.PolicyVersionID), nullableString(ev.PolicyCode), nullableString(ev.ArtifactDigest), ev.RuleBasis,
 			ev.SelectedRuleIDs, ev.EvaluatorVersion, ev.CorrelationID, nullableString(ev.CausationID), nullableString(ev.RequestID),
-			s.now(),
+			evaluatedAt, nullableString(ev.ContractVersion), nullableString(ev.DecisionOutcome), reasons, ev.ValidUntil, envelope,
 		).Scan(&id)
 		switch {
 		case errors.Is(err, pgx.ErrNoRows):
@@ -138,73 +165,132 @@ type PendingEvidence struct {
 // not pick the same rows while this one is delivering them.
 func (s *PgStore) ClaimEvidence(ctx context.Context, limit int, lease time.Duration) ([]PendingEvidence, error) {
 	now := s.now()
-	rows, err := s.pool.Query(ctx, `
-		UPDATE policy_evidence_outbox
-		SET next_attempt_at = $3, attempts = attempts + 1
-		WHERE evaluation_id IN (
-			SELECT evaluation_id FROM policy_evidence_outbox
-			WHERE delivered_at IS NULL AND failed_at IS NULL AND next_attempt_at <= $1
-			ORDER BY next_attempt_at
-			LIMIT $2
-			FOR UPDATE SKIP LOCKED
-		)
-		RETURNING evaluation_id, tenant_id, attempts;`, now, limit, now.Add(lease))
+	var out []PendingEvidence
+	err := s.withRelay(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			UPDATE policy_evidence_outbox
+			SET next_attempt_at = $3, attempts = attempts + 1
+			WHERE evaluation_id IN (
+				SELECT evaluation_id FROM policy_evidence_outbox
+				WHERE delivered_at IS NULL AND failed_at IS NULL AND next_attempt_at <= $1
+				ORDER BY next_attempt_at
+				LIMIT $2
+				FOR UPDATE SKIP LOCKED
+			)
+			RETURNING evaluation_id, tenant_id, attempts;`, now, limit, now.Add(lease))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var p PendingEvidence
+			if err := rows.Scan(&p.EvaluationID, &p.TenantID, &p.Attempts); err != nil {
+				return err
+			}
+			out = append(out, p)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		return nil, s.domainError("ClaimEvidence", err)
 	}
-	defer rows.Close()
-	var out []PendingEvidence
-	for rows.Next() {
-		var p PendingEvidence
-		if err := rows.Scan(&p.EvaluationID, &p.TenantID, &p.Attempts); err != nil {
-			return nil, s.domainError("ClaimEvidence", err)
+	return out, nil
+}
+
+// RedeliverEvidence puts evidence the ledger refused (FAILED) back on the
+// relay's queue, in the caller's tenant scope, and records who asked and why
+// as policy.evidence.redelivery_requested in the same transaction. Evidence
+// still pending is left alone (changed=false); evidence already recorded is
+// ErrEvidenceAlreadyRecorded.
+func (s *PgStore) RedeliverEvidence(ctx context.Context, p domain.EvidenceRedeliveryParams) (bool, error) {
+	var changed bool
+	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
+		var delivered, failed *time.Time
+		err := tx.QueryRow(ctx, `
+			SELECT delivered_at, failed_at FROM policy_evidence_outbox
+			WHERE evaluation_id = $1 FOR UPDATE;`, p.EvaluationID).Scan(&delivered, &failed)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrEvaluationNotFound
 		}
-		out = append(out, p)
+		if err != nil {
+			return err
+		}
+		switch {
+		case delivered != nil:
+			return domain.ErrEvidenceAlreadyRecorded
+		case failed == nil:
+			return nil // still pending: the relay already has it
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE policy_evidence_outbox
+			SET failed_at = NULL, attempts = 0, next_attempt_at = $2,
+			    last_error = 'redelivery requested: ' || COALESCE(last_error, '')
+			WHERE evaluation_id = $1;`, p.EvaluationID, s.now()); err != nil {
+			return err
+		}
+		changed = true
+		key := p.Meta.IdempotencyKey
+		if key == "" {
+			key = "policy.evidence.redelivery_requested:" + p.EvaluationID + ":" + s.now().Format(time.RFC3339Nano)
+		}
+		tenant := p.TenantID
+		return s.enqueue(ctx, tx, OutboxEvent{
+			EventType: "policy.evidence.redelivery_requested", TenantID: &tenant, ActorID: p.ActorID,
+			CorrelationID: p.Meta.CorrelationID, CausationID: p.Meta.CausationID, IdempotencyKey: key,
+			JurisdictionContext: p.Meta.JurisdictionContext, AggregateID: p.EvaluationID, AggregateVersion: 1,
+			Payload: mustJSON(map[string]any{
+				"evidence_id": p.EvaluationID, "requested_by_principal_id": p.ActorID, "reason": p.Reason,
+			}),
+		})
+	})
+	if err != nil {
+		return false, s.domainError("RedeliverEvidence", err)
 	}
-	return out, rows.Err()
+	return changed, nil
+}
+
+// relayExec runs one statement against the evidence outbox as the relay.
+func (s *PgStore) relayExec(ctx context.Context, op, sql string, args ...any) error {
+	if err := s.withRelay(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, sql, args...)
+		return err
+	}); err != nil {
+		return s.domainError(op, err)
+	}
+	return nil
 }
 
 // MarkEvidenceDelivered records that the ledger holds the evaluation.
 func (s *PgStore) MarkEvidenceDelivered(ctx context.Context, evaluationID string) error {
-	_, err := s.pool.Exec(ctx, `
+	return s.relayExec(ctx, "MarkEvidenceDelivered", `
 		UPDATE policy_evidence_outbox SET delivered_at = $2, last_error = NULL
 		WHERE evaluation_id = $1;`, evaluationID, s.now())
-	if err != nil {
-		return s.domainError("MarkEvidenceDelivered", err)
-	}
-	return nil
 }
 
 // MarkEvidenceRetry records a failed attempt and when to try again.
 func (s *PgStore) MarkEvidenceRetry(ctx context.Context, evaluationID, lastError string, next time.Time) error {
-	_, err := s.pool.Exec(ctx, `
+	return s.relayExec(ctx, "MarkEvidenceRetry", `
 		UPDATE policy_evidence_outbox SET last_error = $2, next_attempt_at = $3
 		WHERE evaluation_id = $1;`, evaluationID, lastError, next)
-	if err != nil {
-		return s.domainError("MarkEvidenceRetry", err)
-	}
-	return nil
 }
 
 // MarkEvidenceFailed parks an evaluation the ledger refused for good. It is
 // kept (and counted in EvidenceBacklog) for an operator, never retried.
 func (s *PgStore) MarkEvidenceFailed(ctx context.Context, evaluationID, lastError string) error {
-	_, err := s.pool.Exec(ctx, `
+	return s.relayExec(ctx, "MarkEvidenceFailed", `
 		UPDATE policy_evidence_outbox SET last_error = $2, failed_at = $3
 		WHERE evaluation_id = $1;`, evaluationID, lastError, s.now())
-	if err != nil {
-		return s.domainError("MarkEvidenceFailed", err)
-	}
-	return nil
 }
 
 // EvidenceBacklog counts evaluations not yet in the ledger, and those parked.
 func (s *PgStore) EvidenceBacklog(ctx context.Context) (pending, failed int64, err error) {
-	err = s.pool.QueryRow(ctx, `
-		SELECT
-			COUNT(*) FILTER (WHERE delivered_at IS NULL AND failed_at IS NULL),
-			COUNT(*) FILTER (WHERE failed_at IS NOT NULL)
-		FROM policy_evidence_outbox;`).Scan(&pending, &failed)
+	err = s.withRelay(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT
+				COUNT(*) FILTER (WHERE delivered_at IS NULL AND failed_at IS NULL),
+				COUNT(*) FILTER (WHERE failed_at IS NOT NULL)
+			FROM policy_evidence_outbox;`).Scan(&pending, &failed)
+	})
 	if err != nil {
 		return 0, 0, s.domainError("EvidenceBacklog", err)
 	}

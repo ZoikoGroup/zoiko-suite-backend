@@ -150,9 +150,19 @@ var registeredActionMigrations = []struct {
 		"PARTY_CONTACT_RETIRE": "STANDARD",
 		"PARTY_CONTACT_READ":   "STANDARD",
 	}},
+	{"000057_register_policy_evidence_redeliver", "policy-svc", map[string]string{
+		"POLICY_EVIDENCE_REDELIVER": "HIGH",
+	}},
 	{"000057_register_crm_read_actions", "counterparty-management-svc", map[string]string{
 		"CRM_READ":         "STANDARD",
 		"CRM_CONSENT_READ": "STANDARD",
+	}},
+	{"000058_register_policy_certification_actions", "policy-svc", map[string]string{
+		"POLICY_TEST_MANAGE":    "HIGH",
+		"POLICY_TEST_RUN":       "HIGH",
+		"POLICY_WAIVER_REQUEST": "STANDARD",
+		"POLICY_WAIVER_APPROVE": "HIGH",
+		"POLICY_SIMULATE":       "STANDARD",
 	}},
 	{"000058_register_restricted_classification_action", "document-vault-svc", map[string]string{
 		"CONFIRM_RESTRICTED_CLASSIFICATION": "HIGH",
@@ -160,11 +170,30 @@ var registeredActionMigrations = []struct {
 	{"000059_register_comment_moderate_action", "comments-collaboration-svc", map[string]string{
 		"COMMENT_MODERATE": "STANDARD",
 	}},
+	{"000060_register_signatory_office_actions", "workflow-svc", map[string]string{
+		"SIGNATORY_SIGN_AS_DIRECTOR":          "HIGH",
+		"SIGNATORY_SIGN_AS_CFO":               "HIGH",
+		"SIGNATORY_SIGN_AS_CEO":               "HIGH",
+		"SIGNATORY_SIGN_AS_FINANCE_SIGNER":    "HIGH",
+		"SIGNATORY_SIGN_AS_COMPANY_SECRETARY": "HIGH",
+		"SIGNATORY_SIGN_AS_GENERAL_COUNSEL":   "HIGH",
+		"SIGNATORY_SIGN_AS_TREASURER":         "HIGH",
+	}},
+	{"000062_register_obligation_clock_actions", "obligations-svc", map[string]string{
+		"OBLIGATION_CLOCK_CREATE":             "STANDARD",
+		"OBLIGATION_CLOCK_SATISFY":            "STANDARD",
+		"OBLIGATION_CLOCK_RECALCULATE":        "STANDARD",
+		"OBLIGATION_CLOCK_WAIVE":              "HIGH",
+		"OBLIGATION_CLOCK_NOT_APPLICABLE":     "HIGH",
+		"OBLIGATION_ESCALATION_POLICY_MANAGE": "STANDARD",
+	}},
 }
 
 // templatePublishers are the migrations, in this list, that publish role
 // templates carrying actions earlier migrations registered (rule R5).
-var templatePublishers = []string{"000052_jurisdiction_rules_templates"}
+// 000062 publishes OBLIGATION_MANAGER v4, which inherits v3's actions
+// (000047's EVIDENCE_MANIFEST_READ among them).
+var templatePublishers = []string{"000052_jurisdiction_rules_templates", "000062_register_obligation_clock_actions"}
 
 // newPermCatalog is the permission catalogue used by alias tests. It is a
 // function, not a package-level var: a var would be initialised before

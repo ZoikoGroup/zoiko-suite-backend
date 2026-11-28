@@ -374,6 +374,67 @@ func TestSummary_CountsWindowsAndFacets(t *testing.T) {
 	}
 }
 
+// DL-0 (25 Nov 2026): every outcome word and action type the automatic writers
+// relay (authorization, jurisdiction-rules, obligations, evidence-requirements,
+// and workflow's quorum and lifecycle words) lands in a status category and a
+// domain, never in OTHER.
+func TestSummary_WriterOutcomesAreCategorised(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+	now := time.Now().UTC()
+
+	writers := []struct{ action, outcome, category, domain string }{
+		{"ACCESS_PAYMENT_RELEASE", "REQUIRE_APPROVAL", domain.CategoryEscalated, ""},
+		{"ACCESS_iam.assignment.read", "DENY", domain.CategoryDenied, "ORGANIZATION_ACCESS"},
+		{"JURISDICTION_PACK_CERTIFY", "CERTIFIED", domain.CategoryApproved, "GOVERNANCE_COMPLIANCE"},
+		{"JURISDICTION_PACK_RELEASE", "RELEASED", domain.CategoryApproved, "GOVERNANCE_COMPLIANCE"},
+		{"JURISDICTION_PACK_BLOCK", "BLOCKED", domain.CategoryDenied, "GOVERNANCE_COMPLIANCE"},
+		{"JURISDICTION_PACK_UNBLOCK", "UNBLOCKED", domain.CategoryApproved, "GOVERNANCE_COMPLIANCE"},
+		{"JURISDICTION_PACK_WITHDRAW", "WITHDRAWN", domain.CategoryDenied, "GOVERNANCE_COMPLIANCE"},
+		{"JURISDICTION_PACK_ROLLBACK", "ROLLED_BACK", domain.CategoryDenied, "GOVERNANCE_COMPLIANCE"},
+		{"JURISDICTION_PACK_SUPERSEDE", "SUPERSEDED", domain.CategoryApproved, "GOVERNANCE_COMPLIANCE"},
+		{"JURISDICTION_INTERPRETATION_APPROVE", "APPROVED", domain.CategoryApproved, "GOVERNANCE_COMPLIANCE"},
+		{"JURISDICTION_CALENDAR_PUBLISH", "PUBLISHED", domain.CategoryApproved, "GOVERNANCE_COMPLIANCE"},
+		{"JURISDICTION_PAYMENT_TERM_APPROVE", "ACTIVATED", domain.CategoryApproved, "FINANCE_TAX"},
+		{"OBLIGATION_EVALUATE", "RAISED", domain.CategoryPending, "GOVERNANCE_COMPLIANCE"},
+		{"OBLIGATION_CLOCK_WAIVE", "WAIVED", domain.CategoryApproved, "GOVERNANCE_COMPLIANCE"},
+		{"EVIDENCE_EVALUATE", "SATISFIED", domain.CategoryApproved, "GOVERNANCE_COMPLIANCE"},
+		{"EVIDENCE_EVALUATE", "MISSING", domain.CategoryDenied, "GOVERNANCE_COMPLIANCE"},
+		{"EVIDENCE_EVALUATE", "NO_REQUIREMENTS_DEFINED", domain.CategoryApproved, "GOVERNANCE_COMPLIANCE"},
+		{"WORKFLOW_QUORUM_VOTE_APPROVE", "APPROVE", domain.CategoryApproved, "GOVERNANCE_COMPLIANCE"},
+		{"WORKFLOW_QUORUM_VOTE_REJECT", "REJECT", domain.CategoryDenied, "GOVERNANCE_COMPLIANCE"},
+		{"WORKFLOW_CANCEL", "CANCELLED", domain.CategoryDenied, "GOVERNANCE_COMPLIANCE"},
+		{"WORKFLOW_INVALIDATE", "INVALIDATED", domain.CategoryDenied, "GOVERNANCE_COMPLIANCE"},
+		{"WORKFLOW_EXPIRE", "EXPIRED", domain.CategoryDenied, "GOVERNANCE_COMPLIANCE"},
+		{"WORKFLOW_REQUEST_CHANGES", "REOPENED", domain.CategoryPending, "GOVERNANCE_COMPLIANCE"},
+	}
+	want := domain.CategoryCounts{}
+	for i, w := range writers {
+		d := sampleDecision(fmt.Sprintf("writer-%02d", i))
+		d.ActionType, d.Outcome = w.action, w.outcome
+		d.DecidedAt = now.Add(-time.Duration(i+1) * time.Minute).Truncate(time.Microsecond)
+		stored, _, err := s.RecordDecision(ctx, store.DecisionRecord{Decision: d})
+		if err != nil {
+			t.Fatalf("%s %s: %v", w.action, w.outcome, err)
+		}
+		if w.domain != "" && stored.Domain != w.domain {
+			t.Errorf("%s classified as %s, want %s", w.action, stored.Domain, w.domain)
+		}
+		want.Add(w.category, 1)
+	}
+	sum, err := s.Summary(ctx, store.SummaryParams{TenantID: "tenant-1", From: now.Add(-24 * time.Hour), To: now.Add(time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Totals.Other != 0 {
+		t.Fatalf("a writer outcome reads as OTHER: %+v", sum.Totals)
+	}
+	if sum.Totals != want {
+		t.Fatalf("categories: got %+v want %+v", sum.Totals, want)
+	}
+}
+
 // The tenant-wide replay history joins each manifest to its decision. Its
 // column list once split COALESCE(idempotency_key, ”) on the comma and every
 // call answered 503 (found by the dependency e2e, 11 Nov).

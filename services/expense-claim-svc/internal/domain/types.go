@@ -430,6 +430,7 @@ const (
 	ErrDocumentServiceUnavailable = sentinel("document-vault-svc unavailable")
 	ErrMissingRequiredReceipt     = sentinel("one or more expense lines exceed the receipt-required threshold without an attached, verified receipt")
 	ErrTaxDeterminationFailed     = sentinel("tax-determination-svc call failed for a line claiming tax recovery")
+	ErrPolicyAccessDenied         = sentinel("policy-svc refused the caller: no POLICY_EVALUATE grant, or the identity was refused")
 	ErrPolicyServiceUnavailable   = sentinel("policy-svc unavailable")
 	ErrNoApplicablePolicy         = sentinel("policy-svc has no applicable approval-threshold policy")
 	ErrPayableServiceUnavailable  = sentinel("payable-open-item-svc unavailable")

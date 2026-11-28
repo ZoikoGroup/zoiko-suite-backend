@@ -82,3 +82,21 @@ tenant-entity-registry-svc events (`establishment.*`, `registration.*`, `address
   unverified id would look like evidence.
 - **Registrations held by a party** (not a legal entity) are not projected.
 - **The ledger holds digests.** The recorded request and the evidence chain carry a digest of each establishment or registration id, never the id.
+
+## R4: two migrations numbered 000032
+
+`000032_registry_facts` (main's JUR-1 work) and `000032_tenant_row_security` (this branch) were
+written in parallel and met in the 16 Nov merge. `deployments/migrate.py` orders and tracks migrations
+by file name, so both apply deterministically (`registry_facts` first), and renaming either would
+orphan the applied-migration record of every database that has it. Up / down / up of 000032–000037
+on a scratch database passes (18 Nov 2026). A new migration takes 000038.
+
+## R-001 §7.3 / R-INV-18: due instants across daylight-saving changes
+
+Go's `time.Date` does not say which offset it uses for an ambiguous local time, and it moves a
+nonexistent one without saying so. The due instant is therefore resolved by a named rule in
+`domain.ResolveLocalInstant` (23 Nov 2026, JR-DST-1): a local cutoff or end of day inside a forward
+gap resolves to the first instant after the gap (the transition itself); one inside a backward fold
+resolves to the earlier occurrence. The explanation of the calculation records which rule applied.
+Tests: `TestResolveLocalInstant_Rules` and `TestDueDate_CutoffInDSTGapAndFold_UsesTheDocumentedRule`
+(Europe/London 2026-03-29 and 2026-10-25, America/New_York 2026-03-08 and 2026-11-01).

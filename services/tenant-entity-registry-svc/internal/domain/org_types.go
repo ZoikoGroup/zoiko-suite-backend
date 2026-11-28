@@ -507,3 +507,30 @@ type ResolveRegistryConflictRequest struct {
 	ResolutionNote string                 `json:"resolution_note"`
 	CorrelationID  string                 `json:"correlation_id"`
 }
+
+// ---------------------------------------------------------------------------
+// Console summary — TER-FE-1
+// ---------------------------------------------------------------------------
+
+// RegistrySummary is the GET /v1/registry/summary response: KPIs for the
+// console header.
+type RegistrySummary struct {
+	// ActiveTenants is the count of tenants in lifecycle_state = 'ACTIVE'
+	// within the caller's tenant (always 1 for a tenant-scoped call, but
+	// returned for consistency with the platform-wide scope).
+	ActiveTenants int `json:"active_tenants"`
+
+	// ActiveLegalEntities is the count of legal entities in entity_status = 'ACTIVE'
+	// within the caller's tenant.
+	ActiveLegalEntities int `json:"active_legal_entities"`
+
+	// ApprovalsAwaitingDecision is the count of approval requests in status = 'PENDING'
+	// whose expires_at is in the future.
+	ApprovalsAwaitingDecision int `json:"approvals_awaiting_decision"`
+
+	// OpenRegistryConflicts is the count of registry conflicts in status = 'OPEN'.
+	OpenRegistryConflicts int `json:"open_registry_conflicts"`
+
+	// OpenPartyResolutionCases is the count of resolution cases in status = 'OPEN'.
+	OpenPartyResolutionCases int `json:"open_party_resolution_cases"`
+}

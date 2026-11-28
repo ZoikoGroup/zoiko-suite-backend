@@ -51,7 +51,7 @@ func TestChangeHomeRegion_ApprovalAppliesItWithEvidence(t *testing.T) {
 	approveByID(t, svc, orgTenant, a.ApprovalRequestID)
 
 	assert.Equal(t, before+1, ms.tenants[orgTenant].RecordVersion)
-	history, err := svc.ListTenantLifecycleHistory(tenantCtx(orgTenant), orgTenant)
+	history, _, err := svc.ListTenantLifecycleHistory(tenantCtx(orgTenant), orgTenant, 50, "")
 	require.NoError(t, err)
 	require.NotEmpty(t, history)
 	last := history[len(history)-1]

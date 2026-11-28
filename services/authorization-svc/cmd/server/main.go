@@ -34,7 +34,10 @@ import (
 	"go.uber.org/zap"
 	idenv "zoiko.io/identity-envelope"
 	apicontract "zoiko.io/identity-envelope/apicontract"
+	"zoiko.io/identity-envelope/decisionledger"
+	"zoiko.io/identity-envelope/mtlsclient"
 
+	"zoiko.io/authorization-svc/internal/assignmentexpiry"
 	"zoiko.io/authorization-svc/internal/cache"
 	"zoiko.io/authorization-svc/internal/config"
 	svcenvelope "zoiko.io/authorization-svc/internal/envelope"
@@ -44,10 +47,10 @@ import (
 	"zoiko.io/authorization-svc/internal/idempotency"
 	idgate "zoiko.io/authorization-svc/internal/identity"
 	"zoiko.io/authorization-svc/internal/jurisdiction"
+	"zoiko.io/authorization-svc/internal/ledger"
 	"zoiko.io/authorization-svc/internal/mtls"
 	"zoiko.io/authorization-svc/internal/outbox"
 	"zoiko.io/authorization-svc/internal/registry"
-	"zoiko.io/authorization-svc/internal/assignmentexpiry"
 	"zoiko.io/authorization-svc/internal/retention"
 	"zoiko.io/authorization-svc/internal/siem"
 	"zoiko.io/authorization-svc/internal/store"
@@ -332,6 +335,40 @@ func main() {
 	defer stopRelay()
 	go authzMetrics.RunSampler(relayCtx, pgStore.OperationalSnapshot, authzStore.Telemetry, cfg.OpsSampleInterval, log)
 	go outbox.NewRelay(pool, kafkaWriter, time.Second, 100, log).Run(relayCtx)
+
+	// Decision capture (DL-3, 25 Nov 2026; Doc 01 s7, D-DL-1): every DENY and
+	// REQUIRE_APPROVAL is queued in decision_log_outbox (000047) in its
+	// decision's transaction, and relayed to governance-decision-log-svc as
+	// LEDGER_PRINCIPAL_ID with this service's own workload certificate. A
+	// ledger outage leaves records waiting; it never fails a decision.
+	ledgerQueue := decisionledger.NewPgQueue(pool)
+	ledgerMetrics := ledger.NewMetrics(prometheus.DefaultRegisterer)
+	go decisionledger.RunSampler(relayCtx, ledgerQueue, ledgerMetrics, 15*time.Second, cfg.LedgerRetention, log)
+	if cfg.LedgerPrincipalID != "" {
+		pgStore.SetDecisionLedger(ledger.Builder(cfg.LedgerPrincipalID, cfg.PlatformScopeEntityID))
+	} else {
+		log.Warn("LEDGER_PRINCIPAL_ID unset — denials are not relayed to the governance decision log")
+	}
+	if cfg.DecisionLogMTLSURL != "" && cfg.LedgerPrincipalID != "" {
+		ledgerIdentity := mtlsclient.Start(relayCtx, mtlsclient.Options{
+			ServiceName:        "authorization-svc",
+			ManagementURL:      cfg.MTLSManagementServiceURL,
+			BootstrapTokenPath: cfg.MTLSBootstrapTokenPath,
+		}, log)
+		ledgerRelay := decisionledger.NewRelay(ledgerQueue, &decisionledger.HTTPSender{
+			BaseURL: cfg.DecisionLogMTLSURL, Principal: cfg.LedgerPrincipalID,
+			KeyPrefix: "authorization-ledger", Purpose: "access_decision_evidence",
+			Client: ledgerIdentity.HTTPClient(5 * time.Second),
+		}, cfg.LedgerRelayInterval, log)
+		ledgerRelay.Observe(ledgerMetrics)
+		ledgerRelay.SetMaxPerSecond(cfg.LedgerRelayMaxPerSecond)
+		ledgerRelay.Start()
+		defer ledgerRelay.Stop()
+		log.Info("decision-log relay: governance ledger over mTLS", zap.String("url", cfg.DecisionLogMTLSURL),
+			zap.String("principal", cfg.LedgerPrincipalID))
+	} else if cfg.LedgerPrincipalID != "" {
+		log.Warn("GOVERNANCE_DECISION_LOG_MTLS_URL unset — denials wait in decision_log_outbox until a relay runs")
+	}
 	// Records what has run out: GOV-04 exceptions past expiry
 	// (sod.exception.expired) and privileged assignments whose approval
 	// window passed. Decisions already ignore both from the instant they

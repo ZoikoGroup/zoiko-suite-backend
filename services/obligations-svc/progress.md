@@ -1,84 +1,95 @@
 # obligations-svc — Progress
 
-**Status (21 Oct 2026):** Doc 03 §8.5 scope complete. Group 2 completion pass;
-the contract is `openapi.yaml` (validated with kin-openapi, route parity tested),
-the collection is `postman/postman/ZoikoSuite_Obligations.postman_collection.json`.
+**Status (23 Nov 2026):** Doc 03 §8.5 surface plus R-001 WFC-05 deadline clocks, rebuilt and tested
+at unit and store level. Not yet run live (image, dev DB migration, dependency E2E, console): see
+"Open" below. Plan and step table: `docs/audit_files/DOMAIN1-DOMAIN2-COMPLETION-TRACKER-2026-11-06.md`
+§D2-4. Contracts: `openapi.yaml` (kin-openapi valid, router parity tested) and `asyncapi.yaml`
+(two-way contract test).
 
-## Owns (Doc 03 §8.5)
+This file replaces the 18–19 Nov version, which cited tests that never existed (`TestOB1_*`,
+`TestWF3_*` before 23 Nov) and claimed S0–S6.
 
-| Concern | Where |
-|---|---|
-| Obligation definitions | `obligation_definitions` + immutable `obligation_definition_versions` (000012); `/v1/obligation-definitions` |
-| Obligation state and due dates | `obligations` (OPEN → IN_PROGRESS / OVERDUE / CLOSED; CLOSED terminal); `PATCH /v1/obligations/{id}` for due date, severity, responsible function |
-| Obligation-to-entity mappings | `obligation_entity_mappings` (interval, one open mapping per definition and entity); an obligation raised from a definition must name a mapped entity and is pinned to the definition version |
-| Obligation-to-workflow mappings | `workflow_id` (000007); `POST/DELETE /v1/obligations/{id}/workflow` |
-| Source-origin references | `obligation_source_type/id`, `source_reference` (required, Atomic Linking) |
-| Filing requirements | create, list, get; lifecycle PENDING → IN_PREPARATION → SUBMITTED → ACCEPTED / REJECTED, WITHDRAWN exit, append-only history |
-| Applicability decisions | versioned, append-only (doc7 §E2); UNASSESSED is never stored |
+## Suite (23 Nov 2026, commit after `3b3de75d`)
 
-## Controls
+`go build ./...` and `go vet ./...` clean. `go test -count=1 -p 1 ./...` with
+`TEST_DATABASE_URL` on a scratch database (`obligations_test_ob`): **129 pass, 0 fail, 0 skip**.
+The store suite resets the whole `public` schema before each test and runs the store as a
+NOSUPERUSER, NOBYPASSRLS role that does not own the tables (`rlsPool`).
 
-- **Entity- and jurisdiction-bound, fail-closed.** The legal entity is confirmed
-  against tenant-entity-registry-svc (`GET /v1/entities/{id}/status`, in the
-  caller's tenant; 422 otherwise, 503 if unreachable). The jurisdiction is
-  confirmed against jurisdiction-rules-svc.
-- **Identity.** `zoiko.io/identity-envelope` gate: the signed envelope is verified
-  (JWKS) and its session must be live (introspection, AU-01); X-Principal-Id /
-  X-Tenant-Id are then set from the verified claims. `IDENTITY_VERIFY` defaults
-  to `require` outside local/dev; compose runs `warn` until every caller forwards
-  the envelope. Outbound calls (authorization, jurisdiction, registry) forward it.
-- **Authorization** per action, at the entity acted on, fail-closed:
-  OBLIGATION_CREATE / _READ / _UPDATE / _STATUS_UPDATE, FILING_REQUIREMENT_CREATE /
-  _READ / _STATUS_UPDATE, APPLICABILITY_DECISION_RECORD / _READ,
-  OBLIGATION_ENTITY_MAPPING_MANAGE; the tenant-wide catalogue at PLATFORM scope
-  (OBLIGATION_DEFINITION_MANAGE / _READ).
-- **Tenant isolation.** FORCE RLS with NULLIF on every table; the runtime role
-  is NOBYPASSRLS and not the owner. The store suite runs as such a role.
-- **Idempotency.** Obligation create on `(tenant, obligation_code)` and on
-  `Idempotency-Key` + body hash; applicability decisions on `Idempotency-Key`
-  (same body replays 200, a changed body 409 IDEMPOTENCY_MISMATCH); filing
-  requirements on their natural key; status and filing moves are no-ops when
-  repeated.
-- **Concurrency.** Row locks on every transition; If-Match / ETag on status,
-  attributes (mandatory, 428 without), filing status and definition versions.
-- **Errors.** RFC 9457 problem+json, legacy `error` kept, §16 `error_class`.
-- **Pagination.** Default 50, max 200; keyset cursor (`X-Next-Cursor`, `Link`).
+## Owns (Doc 03 §8.5) and where
 
-## Events
+| Concern | Where | Tests |
+|---|---|---|
+| Obligations (entity- and jurisdiction-bound, fail closed) | `POST/GET /v1/obligations`, `GET/PATCH …/{id}` | `TestCreateObligation_*`, `TestPgStore_CreateObligation_IdempotencyAnd409`, `TestPatchObligation_NeedsIfMatchAndAuthorizesAtTheEntity` |
+| Status OPEN → IN_PROGRESS / OVERDUE / CLOSED | `POST …/{id}/status`; overdue sweep | `TestUpdateObligationStatus_*`, `TestPgStore_UpdateObligationStatus_*`, `TestPgStore_OverdueSweepFindsTenantsUnderRLS` |
+| Workflow link | `POST/DELETE …/{id}/workflow` | handler suite |
+| Filing requirements and their lifecycle | `…/filing-requirements[/{fr}[/status|/transitions]]` | `TestPgStore_FilingLifecycleAndHistory`, `TestPgStore_FilingRequirement_CreateAndList`, `TestFilingStatus_ValidationAndRoute` |
+| Definitions, versions, entity mappings | `/v1/obligation-definitions…` | `TestPgStore_DefinitionsMappingsAndPinnedObligations`, `TestDefinitions_CreateAndRaiseFromDefinition` |
+| Applicability decisions (append-only, UNASSESSED never stored, exactly one decider) | `…/applicability-decisions`, `…/applicability` | `TestCreateApplicabilityDecision_*`, `TestPgStore_ApplicabilityIdempotencyKey`, `TestOB2_*` |
+| **WFC-05 deadline clocks** | see below | `TestWFC05_*`, `TestWF3_*` |
 
-Transactional outbox (`event_outbox`), relayed by `internal/outbox`:
-claimed `FOR UPDATE SKIP LOCKED`, exponential backoff (2^n s, cap 300 s),
-parked only after 200 consecutive failures (~16 h); gauges
-`outbox_pending_events`, `outbox_failed_events` (alert on > 0),
-`outbox_oldest_pending_seconds`. Kafka key `<tenant>/<aggregate>`.
-Topic `zoiko.obligations.events`: `obligation.created`, `obligation.updated`
-(status, attribute, workflow link and filing changes, with `changed_fields`),
-`obligation.overdue`, `obligation.closed`, `obligation.definition.changed`,
-`obligation.entity_mapping.changed`. Parked events are requeued with
-`PgStore.RequeueFailedOutbox` (or `UPDATE event_outbox SET status='PENDING',
-attempts=0, failed_at=NULL, next_attempt_at=NOW() WHERE status='FAILED'`).
+## WFC-05 deadline clocks (R-001 §7, §9, §10)
 
-## Overdue
+| Rule | How | Tests |
+|---|---|---|
+| Classes HARD_LEGAL / REGULATORY / CONTRACTUAL / INTERNAL_SLA / ADVISORY | 000016 CHECK; SOFT_INTERNAL → INTERNAL_SLA, EXTENSION → HARD_LEGAL (old value kept for the down) | `TestMigration000016_UpDownUp_KeepsOld000014Rows` |
+| Due date only from jurisdiction-rules (R-INV-15/16) | `POST …/clocks` calls `POST /v1/obligation-calculations:calculate`; any outcome but DUE_DATE_CALCULATED is 422 naming it; outage 503; no due-date field exists | `TestWF3_StartClock_OnlyACalculatedAnswerMakesAClock`, `TestWF3_StartClock_ACallerDueDateIsRefused` |
+| Provenance and trigger evidence stored verbatim (NP-12) | rule, version, digest, calendar code/version/id, time zone, convention, anchor/unadjusted/local due date, extension, pack, decision id; trigger event id/type/time, business time, source object, ingestion latency | `TestWFC05_StartClock_ProvenanceRoundTripsAndKeyIsIdempotent` |
+| due_at immutable; history never deleted (R-INV-17) | trigger `obligation_clocks_immutable_provenance`; delete and update refused on clocks, transitions, milestones, escalation events | `TestWFC05_DueAtAndProvenanceAreImmutable_AndNothingIsDeleted` |
+| Computed state (R-INV-26, NP-16) | `domain.EffectiveState`; every read resolves at now | `TestWFC05_EffectiveState_FrozenClockReadsOverdueWithoutSweep`, `TestWF3_GetClock_ReadsOverdueWithoutASweep`, `TestWFC05_FrozenClockOverdueOnRead_SweepPersistsOnce` |
+| Sweep persists once (NP-37) | row lock + state/version predicate + unique (clock_id, row_version) transitions | `TestWFC05_ConcurrentSweepsPersistOneMove` |
+| Fulfilled after overdue keeps the overdue period (NP-38) | `overdue_since` set once, never cleared (trigger) | `TestWFC05_SatisfyAfterOverdue_KeepsTheOverduePeriod` |
+| Fulfilment needs evidence (R-INV-14, NP-17) | evidence-requirements `POST /v1/evidence/evaluate` (MISSING 409, outage 503, NO_REQUIREMENTS_DEFINED accepted with refs and logged); DB CHECK | `TestWF3_SatisfyClock_NeedsAcceptedEvidence`, `TestWFC05_FulfilledWithoutEvidenceIsRefusedByTheDatabase` |
+| Waiver / N-A with authority (NP-18) | `OBLIGATION_CLOCK_WAIVE` / `_NOT_APPLICABLE` grant; APPROVED `OBLIGATION_WAIVER` / `OBLIGATION_NOT_APPLICABLE` workflow about this clock, released for the subject fingerprint (verify-release), decided by another principal; N/A links a NOT_APPLICABLE decision; DB CHECK approver ≠ requester | `TestWF3_WaiveClock_AuthorityAndASecondPerson`, `TestWF3_NotApplicable_NeedsANotApplicableDecisionOfThisObligation`, `TestWFC05_WaiverNeedsADistinctApprover_AndNALinksADecision` |
+| Supersession (R-INV-17, NP-14, NP-32) | `POST …/recalculate`; calendar consumer on `business-calendar.updated` / `jurisdiction.calendar.changed` (replay-safe) | `TestWFC05_Supersede_KeepsTheOldClockAndLinksBothWays`, `TestWF3_Recalculate_SupersedesOnlyWhenTheAnswerChanges`, `TestWFC05_CalendarCorrection_*` |
+| Escalation never changes the clock (R-INV-19) | milestones fire once; RAISE_PRIORITY, ADD_OWNER, OPEN_CASE (outbox WORKFLOW_CASE → workflow-svc `POST /v1/cases`), NOTIFY, REQUIRE_APPROVAL; versioned escalation policies | `TestWFC05_MilestoneFiresOnce_EscalationNeverChangesTheClock`, `TestWFC05_EscalationPolicyVersionsAreImmutable`, `TestWFC05_WorkerTick_*` |
+| DST (R-INV-18) | the instant is jurisdiction-rules' answer (`ResolveLocalInstant`, JR-DST-1), stored with its time zone | jurisdiction `TestResolveLocalInstant_Rules`; `TestWFC05_DueDayStart_UsesTheClockZone` |
+| ST-2 / ST-3 | `…/available-actions`, `…/transitions`; `…/status` is a deprecated alias (`Deprecation: true`) that only activates | `TestWF3_AvailableActions_FollowStateAndGrants`, `TestWF3_ClockStatusRoute_IsADeprecatedAlias` |
+| Tenant isolation | FORCE RLS with WITH CHECK on every clock table; system workers read across tenants only under `app.clock_sweep` | `TestWFC05_RLS_AnotherTenantCannotSeeTheClock` |
+| Events (R-001 §10.3 envelope) | `asyncapi.yaml` | `TestAsyncAPI_MatchesTheCode` |
+| Metrics and alerts | `obligation_clocks_overdue`, `obligation_clock_sweep_lag_seconds`, `obligation_escalation_failures_total`, …; `deployments/prometheus-rules.yml` group `obligations` (promtool SUCCESS) | — |
 
-An in-process sweep (every minute) lists tenants with due OPEN / IN_PROGRESS
-obligations under the SELECT-only `overdue_sweep_select` policy and transitions
-each per tenant (events through the outbox). Before 000012 it found no tenants
-under the runtime role and never ran.
+Grants: access-control 000062 registers the six clock actions (OBLIGATION_MANAGER v2,
+OBLIGATION_AUTHORITY v1, COMPLIANCE_CATALOGUE_ADMINISTRATOR v2); authorization 000044 provisions
+`svc-obligations` (OBLIGATION_CALCULATION_CALCULATE, CASE_OPEN) in every tenant
+(`TestOBS8_ObligationsServiceIdentityProvisionedWithATenantsFirstRole`).
 
-## Not in scope here
+## Mutation check (23 Nov 2026)
 
-- R-001 WFC-05 (clock classes, computed deadlines, DUE_SOON / FULFILLED /
-  WAIVED): roadmap by decision of 21 Oct 2026; the 16 rows stay unscored.
-- ComplianceStatus / ExceptionCase / EscalationRecord (Doc 04 §13.1): no spec
-  section assigns them to this service.
-- Single owner of "obligations" (C8): obligation-tracking-svc and
-  filing-tracker-svc, outside this domain, still keep their own tables and
-  obligation-tracking-svc emits the same event names.
+17 mutants, all killed: computed OVERDUE ×2, provenance required ×2, waiver authority ×3,
+supersession keeps the old clock ×2, satisfy needs evidence ×2, applicability deciders ×2,
+sweep once (all three guard layers removed; a single layer removed survives because the other two
+still hold), milestone fires once (app guards removed; the DB trigger holds). Runner:
+`D:\zoikocomp\.cache\tools\mutate.py` with the specs `ob_mutants*.json` there.
 
-## Deploy
+## Decision D-OB-1 (user, 23 Nov 2026)
 
-1. Apply migration **000012** before the new binary (`deployments/migrate.py up`).
-2. Set `TENANT_REGISTRY_URL` (required outside local/dev) and the `IDENTITY_*`
-   variables (see `idenv.NewGateFromEnv`).
-3. Register the new actions in access-control-svc (000021) and grant them.
-4. Build from the repository root: `docker build -f services/obligations-svc/Dockerfile .`
+ComplianceStatus, ExceptionCase and EscalationRecord are not owned here (Doc 03 §13.7, §13.9,
+§18). 000015 drops their tables; the 11 routes are gone (404). An overdue clock opens a workflow
+case and emits `obligation.*` events their owners can consume.
+
+## Open
+
+- OB-S16 identity `require`: callers still send headers in compose (`warn`).
+- OB-S18/S19 live: image rebuild, `migrate.py up --db obligations` (000015, 000016), rewritten
+  `e2e-obligations-deps.py`, `scripts/audit.sh`.
+- The escalation case relay needs workflow-svc's `POST /v1/cases` with `source_type` /
+  `source_id` / `milestone` idempotency (WF-S2, WF-S7) and its mTLS peer listener (WF-S16).
+- NOTIFY needs a notification-svc template and trigger for `obligation.escalated` (D1-7).
+- OB-FE-1…3 console; C8 single owner (cross-team); R-OD-05 (clock pauses: none built),
+  R-OD-06 (evidence classes per domain) on the decision sheet.
+
+## Decision capture (DL-5, 25 Nov 2026)
+
+Doc 01 §7: an obligation raised by `POST /v1/obligations/evaluate` (`OBLIGATION_EVALUATE` → `RAISED`, basis the
+jurisdiction, obligation rule version, pack and calendar version of its due date) and a clock waiver
+(`OBLIGATION_CLOCK_WAIVE` → `WAIVED`, basis the reason code and the approval reference, which also goes in
+`workflow_instance_id`) reach governance-decision-log-svc as `svc-obligations` (authorization-svc 000046, beside
+the 000044 clock-worker role). Queued in the clock's own transaction (`internal/store/decision_ledger.go`,
+`PgStore.SetDecisionLedger`), migration 000017 `decision_log_outbox`; metrics `obligations_decision_log_*`.
+Tests: `TestEvaluateRecord_RaisedWithItsBasis`, `TestWaiveRecord_WaivedWithReasonAndApproval`.
+
+Built before the 23 Nov D2-4 step table is ✅ (the assignment's order asked for after); the user asked on
+25 Nov 2026 for the whole assignment.
+
+The record is written to `decision_log_outbox` in the transaction of the decision it records and delivered by `identity-envelope/decisionledger`'s relay (lease-based claim, backoff to 10 minutes, a 409 parks the row for an operator, delivered rows purged after `LEDGER_RETENTION_HOURS`, default 168) to `GOVERNANCE_DECISION_LOG_MTLS_URL` with this service's own workload certificate (`mtlsclient`, bootstrap token `MTLS_BOOTSTRAP_TOKEN_PATH`). Deliveries are capped at `LEDGER_RELAY_MAX_PER_SECOND` (default 20): a ledger outage or a burst delays the evidence, it never fails or slows the decision. Status: 🔵 built, not verified (tracker "Assignment 25 Nov 2026").

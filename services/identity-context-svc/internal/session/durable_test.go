@@ -2,6 +2,7 @@ package session_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sort"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/identity-context-svc/internal/domain"
+	"zoiko.io/identity-context-svc/internal/events"
 	"zoiko.io/identity-context-svc/internal/outbox"
 	"zoiko.io/identity-context-svc/internal/session"
 )
@@ -160,6 +162,7 @@ type fakeStore struct {
 	livePrincErr  error
 	liveTenantErr error
 	invalidated   []string
+	marked        map[string]bool
 }
 
 func newFakeStore() *fakeStore {
@@ -193,13 +196,24 @@ func (f *fakeStore) InsertSessionContextWithEvent(_ context.Context, sc domain.S
 	return nil
 }
 
-func (f *fakeStore) MarkSessionInvalidated(_ context.Context, id, tenantID string, reason domain.InvalidationReason, at time.Time) error {
+func (f *fakeStore) MarkSessionInvalidated(_ context.Context, id, tenantID string, reason domain.InvalidationReason, at time.Time, recs ...outbox.Record) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.invalidated = append(f.invalidated, id)
+	// Like the store: the records commit with the invalidation, and only when
+	// this call ended the session.
+	// (The hot fake shares the seeded struct, so "already invalidated" is
+	// tracked here, as the store's own row would be.)
 	if sc, ok := f.contexts[id]; ok && sc.TenantID == tenantID {
 		sc.InvalidatedAt = &at
 		sc.InvalidationReason = &reason
+		if f.marked == nil {
+			f.marked = map[string]bool{}
+		}
+		if !f.marked[id] {
+			f.marked[id] = true
+			f.events = append(f.events, recs...)
+		}
 	}
 	return nil
 }
@@ -308,7 +322,7 @@ func TestSessionCap_EvictedEnvelopeRefusedByIntrospection(t *testing.T) {
 	f.seed("sc-1", "tenant-a", "p-1")
 
 	require.NoError(t, f.dc.Invalidate(context.Background(), "sc-1", "tenant-a",
-		domain.InvalidationReasonSessionConcurrencyCap, time.Now().UTC()))
+		domain.InvalidationReasonSessionConcurrencyCap, time.Now().UTC(), "actor-1", "corr-1"))
 	require.NoError(t, f.dc.Evict(context.Background(), "sc-1"))
 
 	_, err := f.dc.Get(context.Background(), "sc-1", "tenant-a")
@@ -428,7 +442,7 @@ func TestInvalidate_ForeignTenantIsANoOp(t *testing.T) {
 	f.seed("sc-1", "tenant-a", "p-1")
 
 	require.NoError(t, f.dc.Invalidate(context.Background(), "sc-1", "tenant-b",
-		domain.InvalidationReasonAdminRevoke, time.Now().UTC()))
+		domain.InvalidationReasonAdminRevoke, time.Now().UTC(), "actor-1", "corr-1"))
 
 	assert.Empty(t, f.store.invalidated,
 		"a session in another tenant must not be revocable by id alone")
@@ -440,7 +454,7 @@ func TestInvalidate_OwnTenantMarksBothStores(t *testing.T) {
 	f.seed("sc-1", "tenant-a", "p-1")
 
 	require.NoError(t, f.dc.Invalidate(context.Background(), "sc-1", "tenant-a",
-		domain.InvalidationReasonLogout, time.Now().UTC()))
+		domain.InvalidationReasonLogout, time.Now().UTC(), "actor-1", "corr-1"))
 
 	assert.Equal(t, []string{"sc-1"}, f.store.invalidated)
 	require.NotNil(t, f.store.contexts["sc-1"].InvalidatedAt)
@@ -449,7 +463,7 @@ func TestInvalidate_OwnTenantMarksBothStores(t *testing.T) {
 func TestInvalidate_AbsentSessionIsANoOpNotAnError(t *testing.T) {
 	f := newFixture()
 	require.NoError(t, f.dc.Invalidate(context.Background(), "sc-nope", "tenant-a",
-		domain.InvalidationReasonLogout, time.Now().UTC()))
+		domain.InvalidationReasonLogout, time.Now().UTC(), "actor-1", "corr-1"))
 }
 
 // ── Principal-wide revocation ───────────────────────────────────────────────
@@ -547,7 +561,7 @@ func TestEvictAllForEntity_RevokesEntityScopedSessions(t *testing.T) {
 	f.hot.byEntity["entity-1"] = []string{"sc-1"}
 
 	n, err := f.dc.EvictAllForEntity(context.Background(), "entity-1", "tenant-a",
-		domain.InvalidationReasonAdminRevoke)
+		domain.InvalidationReasonAdminRevoke, "actor-1", "corr-1")
 
 	require.NoError(t, err)
 	assert.Equal(t, 1, n)
@@ -557,7 +571,7 @@ func TestEvictAllForEntity_RevokesEntityScopedSessions(t *testing.T) {
 func TestEvictAllForEntity_NoSessionsIsNotAnError(t *testing.T) {
 	f := newFixture()
 	n, err := f.dc.EvictAllForEntity(context.Background(), "entity-nobody", "tenant-a",
-		domain.InvalidationReasonAdminRevoke)
+		domain.InvalidationReasonAdminRevoke, "actor-1", "corr-1")
 	require.NoError(t, err)
 	assert.Zero(t, n)
 }
@@ -577,7 +591,7 @@ func TestEvictAllForTenant_RevokesEveryLiveSession(t *testing.T) {
 	f.store.liveTenant["tenant-a"] = []string{"sc-1", "sc-2"}
 
 	n, err := f.dc.EvictAllForTenant(context.Background(), "tenant-a",
-		domain.InvalidationReasonAdminRevoke)
+		domain.InvalidationReasonAdminRevoke, "admin-1", "corr-t")
 
 	require.NoError(t, err)
 	assert.Equal(t, 2, n)
@@ -590,14 +604,14 @@ func TestEvictAllForTenant_StoreFailureIsReported(t *testing.T) {
 	f.store.liveTenantErr = errors.New("postgres down")
 
 	_, err := f.dc.EvictAllForTenant(context.Background(), "tenant-a",
-		domain.InvalidationReasonAdminRevoke)
+		domain.InvalidationReasonAdminRevoke, "admin-1", "corr-t")
 	require.Error(t, err)
 }
 
 func TestEvictAllForTenant_NothingLiveIsZeroNotAnError(t *testing.T) {
 	f := newFixture()
 	n, err := f.dc.EvictAllForTenant(context.Background(), "tenant-quiet",
-		domain.InvalidationReasonAdminRevoke)
+		domain.InvalidationReasonAdminRevoke, "admin-1", "corr-t")
 	require.NoError(t, err)
 	assert.Zero(t, n)
 }
@@ -617,3 +631,71 @@ func TestPut_StoresWithoutATenantArgument(t *testing.T) {
 
 var _ session.HotCache = (*fakeHot)(nil)
 var _ session.ContextStore = (*fakeStore)(nil)
+
+// ── IC-16 / D1-1.F21: identity.session.revoked per session ──────────────────
+
+func revokedEvents(f *fixture) []map[string]any {
+	var out []map[string]any
+	for _, rec := range f.store.events {
+		if rec.EventType != events.EventSessionRevoked {
+			continue
+		}
+		var env struct {
+			TenantID string         `json:"tenant_id"`
+			ActorID  string         `json:"actor_id"`
+			Payload  map[string]any `json:"payload"`
+		}
+		_ = json.Unmarshal(rec.Payload, &env)
+		env.Payload["envelope_tenant_id"], env.Payload["envelope_actor_id"] = env.TenantID, env.ActorID
+		out = append(out, env.Payload)
+	}
+	return out
+}
+
+func TestIC16_StatusChangeEndingTwoSessionsEmitsTwoEvents(t *testing.T) {
+	f := newFixture()
+	f.seed("sc-1", "tenant-a", "p-1")
+	f.seed("sc-2", "tenant-a", "p-1")
+	f.store.livePrincipal["p-1"] = []string{"sc-1", "sc-2"}
+	ids, err := f.dc.EvictAllForPrincipalWithIDs(context.Background(), "p-1", "tenant-a", domain.InvalidationReasonAdminRevoke, "admin-1", "corr-1")
+	require.NoError(t, err)
+	require.Len(t, ids, 2)
+	evs := revokedEvents(f)
+	require.Len(t, evs, 2, "one identity.session.revoked per session ended")
+	got := map[any]bool{evs[0]["session_context_id"]: true, evs[1]["session_context_id"]: true}
+	assert.True(t, got["sc-1"] && got["sc-2"])
+	// Ending them again changes nothing and emits nothing.
+	_, err = f.dc.EvictAllForPrincipalWithIDs(context.Background(), "p-1", "tenant-a", domain.InvalidationReasonAdminRevoke, "admin-1", "corr-2")
+	require.NoError(t, err)
+	assert.Len(t, revokedEvents(f), 2)
+}
+
+func TestIC16_EventCarriesTenantAndActor(t *testing.T) {
+	f := newFixture()
+	f.seed("sc-1", "tenant-a", "p-1")
+	require.NoError(t, f.dc.Invalidate(context.Background(), "sc-1", "tenant-a", domain.InvalidationReasonAdminRevoke, time.Now().UTC(), "admin-1", "corr-1"))
+	evs := revokedEvents(f)
+	require.Len(t, evs, 1)
+	assert.Equal(t, "tenant-a", evs[0]["tenant_id"])
+	assert.Equal(t, "tenant-a", evs[0]["envelope_tenant_id"], "the envelope's tenant is the session's tenant, not its id")
+	assert.Equal(t, "admin-1", evs[0]["actor"])
+	assert.Equal(t, "admin-1", evs[0]["envelope_actor_id"])
+	assert.Equal(t, "p-1", evs[0]["principal_id"])
+	assert.Equal(t, "sc-1", evs[0]["session_context_id"])
+}
+
+func TestIC16_TenantEvictionEmitsOneEventPerSession(t *testing.T) {
+	f := newFixture()
+	f.seed("sc-1", "tenant-a", "p-1")
+	f.seed("sc-2", "tenant-a", "p-2")
+	f.store.liveTenant["tenant-a"] = []string{"sc-1", "sc-2"}
+	n, err := f.dc.EvictAllForTenant(context.Background(), "tenant-a", domain.InvalidationReasonAdminRevoke, "admin-1", "corr-t")
+	require.NoError(t, err)
+	assert.Equal(t, 2, n)
+	evs := revokedEvents(f)
+	require.Len(t, evs, 2)
+	for _, e := range evs {
+		assert.Equal(t, "admin-1", e["actor"])
+		assert.Equal(t, "tenant-a", e["tenant_id"])
+	}
+}

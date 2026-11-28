@@ -176,6 +176,11 @@ func (h *Handler) RollbackChange(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// If-Match (API-3) names the version of the change being rolled back.
+	r, ok = requirePrecondition(w, r, false)
+	if !ok {
+		return
+	}
 
 	proposed, err := h.store.RollbackChange(r.Context(), changeID, tenantScope, principalID, correlationID)
 	if err != nil {

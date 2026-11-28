@@ -277,6 +277,7 @@ const (
 	ErrPayeeDestinationChanged            = sentinel("a payee's active banking destination has changed since this authorization was requested")
 	ErrPayeeDestinationServiceUnavailable = sentinel("payee-banking-identity-svc unavailable")
 	ErrNoActiveDestination                = sentinel("payee-banking-identity-svc has no active destination on file for this payee")
+	ErrPolicyAccessDenied                 = sentinel("policy-svc refused the caller: no POLICY_EVALUATE grant, or the identity was refused")
 	ErrPolicyServiceUnavailable           = sentinel("policy-svc unavailable")
 	ErrStoreUnavailable                   = sentinel("store unavailable")
 	ErrAlreadySigned                      = sentinel("this principal has already signed this authorization")

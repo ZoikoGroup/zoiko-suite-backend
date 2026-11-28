@@ -96,7 +96,7 @@ func (s *PgStore) CreateControlTestDefinition(ctx context.Context, params domain
 		))
 		if err == nil {
 			out, created = d, true
-			return nil
+			return s.enqueue(ctx, tx, controlEvent("policy.control_test.defined", params.TenantID, d.ControlTestDefinitionID, params.Meta, d))
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
@@ -244,7 +244,10 @@ func (s *PgStore) CreateControlTestExecution(ctx context.Context, params domain.
 		if isUniqueViolation(scanErr) {
 			return domain.ErrConflict
 		}
-		return scanErr
+		if scanErr != nil {
+			return scanErr
+		}
+		return s.enqueue(ctx, tx, controlEvent("policy.control_test.executed", params.TenantID, out.ControlTestDefinitionID, params.Meta, out))
 	})
 	if err != nil {
 		return nil, s.domainError("CreateControlTestExecution", err)
@@ -409,7 +412,10 @@ func (s *PgStore) CreateAttestation(ctx context.Context, params domain.CreateAtt
 		if isUniqueViolation(scanErr) {
 			return domain.ErrConflict
 		}
-		return scanErr
+		if scanErr != nil {
+			return scanErr
+		}
+		return s.enqueue(ctx, tx, controlEvent("policy.attestation.signed", params.TenantID, out.AttestationID, params.Meta, out))
 	})
 	if err != nil {
 		return nil, s.domainError("CreateAttestation", err)
@@ -437,9 +443,10 @@ func (s *PgStore) FindAttestationByID(ctx context.Context, id string) (*domain.A
 
 // RevokeAttestation transitions one of the caller's attestations to REVOKED
 // — legal only from ACTIVE or CHALLENGED.
-func (s *PgStore) RevokeAttestation(ctx context.Context, attestationID, reason string) (*domain.Attestation, error) {
+func (s *PgStore) RevokeAttestation(ctx context.Context, attestationID, reason string, meta domain.EventMeta) (*domain.Attestation, error) {
 	var a *domain.Attestation
-	err := s.withRLS(ctx, contextTenantID(ctx), func(tx pgx.Tx) error {
+	tenantID := contextTenantID(ctx)
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		var scanErr error
 		a, scanErr = scanAttestation(tx.QueryRow(ctx, `
 			UPDATE attestations
@@ -447,6 +454,9 @@ func (s *PgStore) RevokeAttestation(ctx context.Context, attestationID, reason s
 			WHERE attestation_id = $2 AND attestation_status = ANY($3::text[])
 			RETURNING `+attestationColumns+`;`,
 			nullableString(reason), attestationID, []string{"ACTIVE", "CHALLENGED"}))
+		if scanErr == nil {
+			return s.enqueue(ctx, tx, controlEvent("policy.attestation.revoked", tenantID, a.AttestationID, meta, a))
+		}
 		if !errors.Is(scanErr, pgx.ErrNoRows) {
 			return scanErr
 		}
@@ -463,6 +473,28 @@ func (s *PgStore) RevokeAttestation(ctx context.Context, attestationID, reason s
 		return nil, s.domainError("RevokeAttestation", err)
 	}
 	return a, nil
+}
+
+// controlEvent is the event written in the same transaction as a control-test
+// or attestation record (doc7 §E3/§E6: a test result and a signed or revoked
+// attestation are facts other services act on). The payload is the record.
+func controlEvent(eventType, tenantID, aggregateID string, meta domain.EventMeta, record any) OutboxEvent {
+	key := meta.IdempotencyKey
+	if key == "" {
+		key = eventType + ":" + aggregateID
+	}
+	return OutboxEvent{
+		EventType:           eventType,
+		TenantID:            &tenantID,
+		ActorID:             meta.ActorID,
+		CorrelationID:       meta.CorrelationID,
+		CausationID:         meta.CausationID,
+		IdempotencyKey:      key,
+		JurisdictionContext: meta.JurisdictionContext,
+		AggregateID:         aggregateID,
+		AggregateVersion:    1,
+		Payload:             mustJSON(record),
+	}
 }
 
 func nullableString(s string) *string {

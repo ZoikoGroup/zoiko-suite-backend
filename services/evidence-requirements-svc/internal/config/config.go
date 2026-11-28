@@ -33,6 +33,19 @@ type Config struct {
 
 	MTLSManagementServiceURL string
 
+	// Decision capture (DL-6, 25 Nov 2026): every evaluation is queued in
+	// decision_log_outbox (000013) and relayed to governance-decision-log-svc
+	// (GOVERNANCE_DECISION_LOG_MTLS_URL) as LedgerPrincipalID with this
+	// service's own workload certificate. An empty URL leaves records waiting;
+	// an empty principal queues nothing.
+	DecisionLogMTLSURL     string
+	LedgerPrincipalID      string
+	MTLSBootstrapTokenPath string
+	LedgerRelayIntervalMS  int
+	// LedgerRelayMaxPerSecond caps deliveries (decisionledger.SetMaxPerSecond).
+	LedgerRelayMaxPerSecond int
+	LedgerRetentionHours    int
+
 	// DocumentVaultServiceURL is document-vault-svc's base URL. Artifacts
 	// asserted with evidence_type SUPPORTING_DOCUMENT are verified against
 	// the real Document record before they count as evidence, rather than
@@ -131,6 +144,12 @@ func Load() (*Config, error) {
 		AuthzMTLSEnabled:           env("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:               env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
 		MTLSManagementServiceURL:   env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+		DecisionLogMTLSURL:         env("GOVERNANCE_DECISION_LOG_MTLS_URL", ""),
+		LedgerPrincipalID:          env("LEDGER_PRINCIPAL_ID", "svc-evidence-requirements"),
+		MTLSBootstrapTokenPath:     env("MTLS_BOOTSTRAP_TOKEN_PATH", ""),
+		LedgerRelayIntervalMS:      envInt("LEDGER_RELAY_INTERVAL_MS", 2000),
+		LedgerRelayMaxPerSecond:    envInt("LEDGER_RELAY_MAX_PER_SECOND", 20),
+		LedgerRetentionHours:       envInt("LEDGER_RETENTION_HOURS", 168),
 		DocumentVaultServiceURL:    env("DOCUMENT_VAULT_SERVICE_URL", "http://document-vault-svc:8094"),
 		EvidenceManifestServiceURL: env("EVIDENCE_MANIFEST_SERVICE_URL", ""),
 		EsignatureServiceURL:       env("ESIGNATURE_SERVICE_URL", ""),

@@ -107,3 +107,19 @@ func TestVerify_AnOutageOrALackOfGrantIsNeverAcceptance(t *testing.T) {
 		t.Fatalf("unreachable: %v", err)
 	}
 }
+
+// X2: the mTLS variant reads through the HTTP client it is given (the one
+// presenting this service's certificate), not a plain one.
+func TestVerify_OverTheGivenClient(t *testing.T) {
+	f := okPolicy()
+	srv := httptest.NewTLSServer(http.HandlerFunc(f.handler))
+	t.Cleanup(srv.Close)
+	b, err := NewClientWithHTTPClient(srv.URL, "notification-svc", srv.Client(), nil).
+		Verify(context.Background(), "t1", "corr", "v-1", time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil || b.PolicyVersionID != "v-1" {
+		t.Fatalf("over TLS with the given client: %+v %v", b, err)
+	}
+	if _, err := NewClient(srv.URL, "notification-svc", 0, nil).Verify(context.Background(), "t1", "", "v-1", time.Now()); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("a client without the server's trust must not get through, got %v", err)
+	}
+}

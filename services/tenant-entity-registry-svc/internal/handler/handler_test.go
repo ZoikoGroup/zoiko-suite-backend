@@ -104,9 +104,9 @@ func (s *stubSvc) GetEntity(_ context.Context, id string) (*domain.LegalEntity, 
 	return &domain.LegalEntity{LegalEntityID: id, RecordVersion: 1}, s.err
 }
 
-func (s *stubSvc) ListEntities(_ context.Context, id string) ([]*domain.LegalEntity, error) {
+func (s *stubSvc) ListEntities(_ context.Context, id string, limit int, cursor string) ([]*domain.LegalEntity, string, error) {
 	s.gotID = id
-	return []*domain.LegalEntity{{LegalEntityID: entityID}}, s.err
+	return []*domain.LegalEntity{{LegalEntityID: entityID}}, "", s.err
 }
 
 func (s *stubSvc) CreateWorkspace(_ context.Context, req domain.CreateWorkspaceRequest) (*domain.Workspace, error) {
@@ -119,9 +119,9 @@ func (s *stubSvc) GetWorkspace(_ context.Context, id string) (*domain.Workspace,
 	return &domain.Workspace{WorkspaceID: id, RecordVersion: 1}, s.err
 }
 
-func (s *stubSvc) ListWorkspaces(_ context.Context, id string) ([]*domain.Workspace, error) {
+func (s *stubSvc) ListWorkspaces(_ context.Context, id string, limit int, cursor string) ([]*domain.Workspace, string, error) {
 	s.gotID = id
-	return []*domain.Workspace{{WorkspaceID: wsID}}, s.err
+	return []*domain.Workspace{{WorkspaceID: wsID}}, "", s.err
 }
 
 func (s *stubSvc) UpdateWorkspace(_ context.Context, id string, req domain.UpdateWorkspaceRequest) (*domain.Workspace, error) {
@@ -163,9 +163,9 @@ func (s *stubSvc) EndDateHierarchy(_ context.Context, id string, endDate time.Ti
 	return s.err
 }
 
-func (s *stubSvc) ListHierarchies(_ context.Context, id string) ([]*domain.EntityHierarchy, error) {
+func (s *stubSvc) ListHierarchies(_ context.Context, id string, limit int, cursor string) ([]*domain.EntityHierarchy, string, error) {
 	s.gotID = id
-	return []*domain.EntityHierarchy{{HierarchyID: hierID}}, s.err
+	return []*domain.EntityHierarchy{{HierarchyID: hierID}}, "", s.err
 }
 
 func (s *stubSvc) AssignJurisdiction(_ context.Context, id string, req domain.AssignJurisdictionRequest) (*domain.EntityJurisdictionAssignment, error) {
@@ -174,9 +174,9 @@ func (s *stubSvc) AssignJurisdiction(_ context.Context, id string, req domain.As
 	return &domain.EntityJurisdictionAssignment{AssignmentID: assignID}, s.err
 }
 
-func (s *stubSvc) ListJurisdictions(_ context.Context, id string) ([]*domain.EntityJurisdictionAssignment, error) {
+func (s *stubSvc) ListJurisdictions(_ context.Context, id string, limit int, cursor string) ([]*domain.EntityJurisdictionAssignment, string, error) {
 	s.gotID = id
-	return []*domain.EntityJurisdictionAssignment{{AssignmentID: assignID}}, s.err
+	return []*domain.EntityJurisdictionAssignment{{AssignmentID: assignID}}, "", s.err
 }
 
 func (s *stubSvc) EndDateJurisdictionAssignment(_ context.Context, id string, endDate time.Time, correlationID string) error {
@@ -198,8 +198,8 @@ func (s *stubSvc) GetResidencyRegion(_ context.Context, id string) (*domain.Resi
 	return &domain.ResidencyRegion{ResidencyRegionID: id}, s.err
 }
 
-func (s *stubSvc) ListResidencyRegions(_ context.Context) ([]*domain.ResidencyRegion, error) {
-	return []*domain.ResidencyRegion{{ResidencyRegionID: regionID}}, s.err
+func (s *stubSvc) ListResidencyRegions(_ context.Context, limit int, cursor string) ([]*domain.ResidencyRegion, string, error) {
+	return []*domain.ResidencyRegion{{ResidencyRegionID: regionID}}, "", s.err
 }
 
 func (s *stubSvc) ResolveTenantRegion(_ context.Context, id string) (*domain.ResolvedTenantRegion, error) {
@@ -227,14 +227,25 @@ func (s *stubSvc) GetJurisdictionAssignmentByID(_ context.Context, id string) (*
 	return &domain.EntityJurisdictionAssignment{AssignmentID: id, RecordVersion: 1}, s.err
 }
 
-func (s *stubSvc) ListTaxIdentityBundles(_ context.Context, id string) ([]*domain.TaxIdentityBundle, error) {
+func (s *stubSvc) ListTaxIdentityBundles(_ context.Context, id string, limit int, cursor string) ([]*domain.TaxIdentityBundle, string, error) {
 	s.gotID = id
-	return []*domain.TaxIdentityBundle{{TaxIdentityBundleID: bundleID}}, s.err
+	return []*domain.TaxIdentityBundle{{TaxIdentityBundleID: bundleID}}, "", s.err
 }
 
 func (s *stubSvc) TransitionTaxIdentityBundleStatus(_ context.Context, id string, _ domain.TransitionTaxIdentityBundleStatusRequest) error {
 	s.gotID = id
 	return s.err
+}
+
+func (s *stubSvc) GetRegistrySummary(_ context.Context, id string) (*domain.RegistrySummary, error) {
+	s.gotID = id
+	return &domain.RegistrySummary{
+		ActiveTenants:             1,
+		ActiveLegalEntities:       5,
+		ApprovalsAwaitingDecision: 2,
+		OpenRegistryConflicts:     1,
+		OpenPartyResolutionCases:  3,
+	}, s.err
 }
 
 // Compile-time proof the stub still satisfies the interface the handler takes.
@@ -296,6 +307,8 @@ func allRoutes() []route {
 		{"get tenant", http.MethodGet, "/v1/tenants/" + tenantID, "", http.StatusOK, tenantID},
 		{"tenant lifecycle", http.MethodPost, "/v1/tenants/" + tenantID + "/lifecycle", `{"new_lifecycle_state":"ACTIVE"}`, http.StatusNoContent, tenantID},
 		{"resolve tenant region", http.MethodGet, "/v1/tenants/" + tenantID + "/residency-region", "", http.StatusOK, tenantID},
+		// TER-FE-1: registry summary for console KPIs
+		{"registry summary", http.MethodGet, "/v1/registry/summary", "", http.StatusOK, ""},
 		{"list entities", http.MethodGet, "/v1/tenants/" + tenantID + "/entities", "", http.StatusOK, tenantID},
 		{"list workspaces", http.MethodGet, "/v1/tenants/" + tenantID + "/workspaces", "", http.StatusOK, tenantID},
 		{"create workspace", http.MethodPost, "/v1/workspaces", `{"name":"W1"}`, http.StatusCreated, ""},

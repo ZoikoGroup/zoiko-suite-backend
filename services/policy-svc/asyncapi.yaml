@@ -1,0 +1,174 @@
+asyncapi: "2.6.0"
+
+info:
+  title: Policy Service — Event Contract
+  version: "2.0.0"
+  description: |
+    The published and consumed event surface of policy-svc (D2-3): Doc 03 §8.1,
+    GOV-05, REF-07, V-001 PDC-05 and doc7 §E3/§E6.
+
+    ## Delivery semantics
+
+    Every published event is written to the `outbox` table in the same database
+    transaction as the change it announces; the API answers only after that commit.
+    The outbox relay (internal/outbox) claims rows with FOR UPDATE SKIP LOCKED under
+    the relay context (`app.outbox_relay`, migration 000010), publishes them in
+    outbox order with one WriteMessages call per batch, and retries with backoff.
+    Delivery is at-least-once: `event_id` is stable per outbox row, so consumers
+    deduplicate on it. The Kafka key is the aggregate id, so the events of one
+    policy family (or one waiver, run, simulation) stay in order on one partition.
+
+    ## Envelope
+
+    Every message is the envelope below. `payload_hash` is the sha256 of `payload`.
+    `tenant_id` is absent for a platform (GLOBAL) policy family or version.
+    `residency_region` is EVENT_RESIDENCY_REGION. `aggregate_version` is the
+    aggregate's version after the change when it has one.
+
+    ## Naming
+
+    Dotted Doc 03 names (pending group decision C3). `policy.rule.retired` covers both
+    supersession and retirement; its payload says which (`previous_status`).
+
+    ## Contract test
+
+    internal/events/asyncapi_test.go fails when an event type the code can publish is
+    missing here, or when this document names one the code does not publish.
+
+defaultContentType: application/json
+
+servers:
+  local:
+    url: kafka:9094
+    protocol: kafka
+
+channels:
+  zoiko.policy.events:
+    description: Everything policy-svc publishes (KAFKA_EVENTS_TOPIC).
+    subscribe:
+      operationId: policyEvents
+      message:
+        oneOf:
+          # ── policy families and versions (Doc 03 §8.1, GOV-05) ─────────────
+          - $ref: '#/components/messages/policy.created'
+          - $ref: '#/components/messages/policy.updated'
+          - $ref: '#/components/messages/policy.retired'
+          - $ref: '#/components/messages/policy.version.submitted'
+          - $ref: '#/components/messages/policy.version.approved'
+          - $ref: '#/components/messages/policy.version.scheduled'
+          - $ref: '#/components/messages/policy.version.activated'
+          - $ref: '#/components/messages/policy.version.suspended'
+          - $ref: '#/components/messages/policy.version.suspension_reviewed'
+          - $ref: '#/components/messages/policy.rule.retired'
+          - $ref: '#/components/messages/policy.applicability.conflicted'
+          - $ref: '#/components/messages/policy.evidence.redelivery_requested'
+          # ── ZS-GOV-INT-002 §10.2 signatory matrix ──────────────────────────
+          - $ref: '#/components/messages/policy.signatory_matrix.published'
+          # ── REF-07 accounting policy ───────────────────────────────────────
+          - $ref: '#/components/messages/accounting.policy.approved'
+          - $ref: '#/components/messages/accounting.policy.activated'
+          - $ref: '#/components/messages/accounting.policy.superseded'
+          - $ref: '#/components/messages/accounting.policy.suspended'
+          # ── doc7 §E3/§E6 control tests and attestations ────────────────────
+          - $ref: '#/components/messages/policy.control_test.defined'
+          - $ref: '#/components/messages/policy.control_test.executed'
+          - $ref: '#/components/messages/policy.attestation.signed'
+          - $ref: '#/components/messages/policy.attestation.revoked'
+          # ── V-001 PDC-05 certification ─────────────────────────────────────
+          - $ref: '#/components/messages/policy.test_case.added'
+          - $ref: '#/components/messages/policy.test_case.retired'
+          - $ref: '#/components/messages/policy.test_run.completed'
+          - $ref: '#/components/messages/policy.version.certified'
+          - $ref: '#/components/messages/policy.waiver.requested'
+          - $ref: '#/components/messages/policy.waiver.approved'
+          - $ref: '#/components/messages/policy.waiver.revoked'
+          - $ref: '#/components/messages/policy.simulation.completed'
+
+  zoiko.entity.events:
+    description: Consumed (Doc 03 §8.1). entity.created drops the tenant's cached resolution candidates.
+    publish:
+      operationId: entityCreated
+      message: {$ref: '#/components/messages/entity.created'}
+  zoiko.access-control.events:
+    description: Consumed. role.updated drops the tenant's cached resolution candidates.
+    publish:
+      operationId: roleUpdated
+      message: {$ref: '#/components/messages/role.updated'}
+  zoiko.delegated-authority.events:
+    description: Consumed. authority.delegated drops the tenant's cached resolution candidates.
+    publish:
+      operationId: authorityDelegated
+      message: {$ref: '#/components/messages/authority.delegated'}
+
+components:
+  schemas:
+    Envelope:
+      type: object
+      required: [event_id, event_type, event_version, schema_version, source_service, correlation_id, emitted_at, published_at, payload]
+      properties:
+        event_id: {type: string, format: uuid, description: 'Stable per outbox row: the deduplication key.'}
+        event_type: {type: string}
+        event_version: {type: string}
+        schema_version: {type: string}
+        source_service: {type: string, const: policy-svc}
+        tenant_id: {type: string, format: uuid}
+        legal_entity_id: {type: string, format: uuid}
+        actor_id: {type: string}
+        correlation_id: {type: string}
+        causation_id: {type: string}
+        jurisdiction_context: {type: string}
+        classification: {type: string}
+        payload_hash: {type: string}
+        aggregate_version: {type: string}
+        residency_region: {type: string}
+        emitted_at: {type: string, format: date-time}
+        published_at: {type: string, format: date-time}
+        payload: {type: object}
+    VersionPayload:
+      type: object
+      description: The version's identity, scope, window, status and digest, so a consumer refreshes by exact version and hash (V-001 §20.2).
+      properties:
+        policy_version_id: {type: string, format: uuid}
+        policy_id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        legal_entity_id: {type: string, format: uuid}
+        version_status: {type: string}
+        version_number: {type: integer}
+        effective_from: {type: string, format: date-time}
+        effective_to: {type: string, format: date-time}
+        artifact_digest: {type: string}
+        actor_id: {type: string}
+
+  messages:
+    policy.created: {name: policy.created, summary: A policy family was created (also for an accounting policy's family), payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.updated: {name: policy.updated, summary: A version was drafted, payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.retired: {name: policy.retired, summary: A policy family was retired (no new versions), payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.version.submitted: {name: policy.version.submitted, summary: DRAFT to REVIEW, payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.version.approved: {name: policy.version.approved, summary: REVIEW to APPROVED by an independent approver, payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.version.scheduled: {name: policy.version.scheduled, summary: APPROVED to SCHEDULED (effective_from in the future), payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.version.activated: {name: policy.version.activated, summary: The version governs its scope, payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.version.suspended: {name: policy.version.suspended, summary: Emergency suspension, with its reason, payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.version.suspension_reviewed: {name: policy.version.suspension_reviewed, summary: An independent review of a suspension (UPHELD or OVERTURNED), payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.rule.retired: {name: policy.rule.retired, summary: A version stopped governing (superseded or retired; previous_status says which), payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.applicability.conflicted: {name: policy.applicability.conflicted, summary: An evaluation found equally specific policies; none was applied (V-001 §20.1), payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.evidence.redelivery_requested: {name: policy.evidence.redelivery_requested, summary: An operator re-queued evidence the governance ledger refused, payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.signatory_matrix.published: {name: policy.signatory_matrix.published, summary: A SIGNATORY_MATRIX version now governs, payload: {$ref: '#/components/schemas/Envelope'}}
+    accounting.policy.approved: {name: accounting.policy.approved, summary: REF-07 accounting policy version approved, payload: {$ref: '#/components/schemas/Envelope'}}
+    accounting.policy.activated: {name: accounting.policy.activated, summary: REF-07 accounting policy version activated, payload: {$ref: '#/components/schemas/Envelope'}}
+    accounting.policy.superseded: {name: accounting.policy.superseded, summary: REF-07 accounting policy version superseded by a named successor, payload: {$ref: '#/components/schemas/Envelope'}}
+    accounting.policy.suspended: {name: accounting.policy.suspended, summary: REF-07 emergency suspension under a break-glass session, payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.control_test.defined: {name: policy.control_test.defined, summary: A control test definition was created (payload is the definition), payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.control_test.executed: {name: policy.control_test.executed, summary: A control test execution was recorded (payload is the execution), payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.attestation.signed: {name: policy.attestation.signed, summary: An attestation was signed, payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.attestation.revoked: {name: policy.attestation.revoked, summary: An attestation was revoked, payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.test_case.added: {name: policy.test_case.added, summary: A case joined a family's certification suite (every earlier certification is now STALE), payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.test_case.retired: {name: policy.test_case.retired, summary: A case left a family's suite, payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.test_run.completed: {name: policy.test_run.completed, summary: 'A suite run finished: run status, case and failure counts, suite hash', payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.version.certified: {name: policy.version.certified, summary: A run passed; the version is certified against the current suite (V-001 pdc.package.certified), payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.waiver.requested: {name: policy.waiver.requested, summary: A waiver of a failed mandatory case was requested, payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.waiver.approved: {name: policy.waiver.approved, summary: A waiver was approved by someone other than its requester, payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.waiver.revoked: {name: policy.waiver.revoked, summary: A waiver was revoked, payload: {$ref: '#/components/schemas/Envelope'}}
+    policy.simulation.completed: {name: policy.simulation.completed, summary: 'A differential simulation finished: corpus size, changes, errors', payload: {$ref: '#/components/schemas/Envelope'}}
+    entity.created: {name: entity.created, summary: Consumed from tenant-entity-registry-svc}
+    role.updated: {name: role.updated, summary: Consumed from access-control-svc}
+    authority.delegated: {name: authority.delegated, summary: Consumed from delegated-authority-svc}

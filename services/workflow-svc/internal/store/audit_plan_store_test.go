@@ -183,11 +183,30 @@ func TestPgStore_RecordMateriality_ApprovedPlanDemotesAndReassessesCoverage(t *t
 	if err != nil {
 		t.Fatalf("identify risk: %v", err)
 	}
-	// Simulate the risk having already reached COVERED (no dedicated
-	// "MarkCovered" command exists in v1 — set directly for this test's
-	// own purpose of proving the reassessment flip).
-	if _, err := pool.Exec(ctx, `UPDATE risk_assessments SET coverage_status='COVERED' WHERE risk_id=$1`, risk.RiskID); err != nil {
-		t.Fatalf("seed covered risk: %v", err)
+	// Reach COVERED through the real command, so the seed satisfies
+	// risk_covered_has_evidence (000031): assess the risk, then name the
+	// prepared workpaper whose procedures executed the response.
+	if err := s.LinkAssertion(ctx, domain.LinkAssertionParams{RiskID: risk.RiskID, TenantID: testTenantID, AssertionCode: "EXISTENCE"}); err != nil {
+		t.Fatalf("link assertion: %v", err)
+	}
+	if err := s.DesignAuditResponse(ctx, domain.DesignAuditResponseParams{RiskID: risk.RiskID, TenantID: testTenantID, Description: "Observe the inventory count", DesignedByPrincipalID: "preparer-1"}); err != nil {
+		t.Fatalf("design response: %v", err)
+	}
+	if _, _, err := s.AssessRisk(ctx, domain.AssessRiskParams{RiskID: risk.RiskID, TenantID: testTenantID, ActorPrincipalID: "reviewer-1", CorrelationID: "risk-assess-mat-1"}); err != nil {
+		t.Fatalf("assess risk: %v", err)
+	}
+	wp, _, err := s.CreateWorkpaper(ctx, domain.CreateWorkpaperParams{
+		EngagementID: eng.EngagementID, TenantID: testTenantID, Reference: "WP-MAT-1", Purpose: "Inventory existence procedures",
+		Required: true, CreatedByPrincipalID: "preparer-1", CorrelationID: "wp-mat-create-1",
+	})
+	if err != nil {
+		t.Fatalf("create workpaper: %v", err)
+	}
+	if _, _, err := s.MarkWorkpaperPrepared(ctx, domain.MarkWorkpaperPreparedParams{WorkpaperID: wp.WorkpaperID, TenantID: testTenantID, ActorPrincipalID: "preparer-1", CorrelationID: "wp-mat-prep-1"}); err != nil {
+		t.Fatalf("mark workpaper prepared: %v", err)
+	}
+	if _, _, err := s.RecordRiskCoverage(ctx, domain.RecordRiskCoverageParams{RiskID: risk.RiskID, TenantID: testTenantID, WorkpaperID: wp.WorkpaperID, ActorPrincipalID: "preparer-1"}); err != nil {
+		t.Fatalf("record risk coverage: %v", err)
 	}
 
 	if _, err := s.RecordMateriality(ctx, domain.RecordMaterialityParams{

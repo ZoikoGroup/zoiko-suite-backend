@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
@@ -727,6 +728,208 @@ func headerValue(m kafka.Message, key string) string {
 // ── control tests and attestations ───────────────────────────────────────────
 
 // Audit row "Control-test / attestation reads are scoped".
+// Migration 000010: the outbox, the evidence outbox and the activation
+// schedule are under FORCE RLS. A request transaction sees its own tenant's
+// rows and platform rows; only the relay context sees every tenant's.
+func TestRelayTables_RLS(t *testing.T) {
+	e := newEnv(t)
+	pA := e.family(t, tenantA, sp(tenantA), "RLS-A")
+	e.family(t, tenantB, sp(tenantB), "RLS-B")
+	vA := e.draft(t, tenantA, pA, sp(tenantA), nil, e.clock.Add(48*time.Hour), `{"threshold_amount": 1}`)
+	e.release(t, tenantA, vA) // future effective_from: SCHEDULED, one schedule row for tenant A
+
+	if n := e.count(t, `SELECT COUNT(*) FROM policy_activation_schedule WHERE tenant_id = $1`, tenantA); n != 1 {
+		t.Fatalf("setup: want 1 schedule row for tenant A, got %d", n)
+	}
+
+	read := func(tenant string, relay bool, table string) int {
+		t.Helper()
+		var n int
+		err := pgx.BeginFunc(context.Background(), e.app, func(tx pgx.Tx) error {
+			if _, err := tx.Exec(context.Background(), `SELECT set_config('app.tenant_id', $1, true)`, tenant); err != nil {
+				return err
+			}
+			if relay {
+				if _, err := tx.Exec(context.Background(), `SELECT set_config('app.outbox_relay', 'true', true)`); err != nil {
+					return err
+				}
+			}
+			return tx.QueryRow(context.Background(), `SELECT COUNT(*) FROM `+table+` WHERE tenant_id IS NOT NULL`).Scan(&n)
+		})
+		if err != nil {
+			t.Fatalf("read %s: %v", table, err)
+		}
+		return n
+	}
+	for _, table := range []string{"outbox", "policy_activation_schedule"} {
+		all := e.count(t, `SELECT COUNT(*) FROM `+table+` WHERE tenant_id IS NOT NULL`)
+		own := e.count(t, `SELECT COUNT(*) FROM `+table+` WHERE tenant_id = $1`, tenantB)
+		if got := read(tenantB, false, table); got != own {
+			t.Errorf("%s: tenant B sees %d tenant rows, want only its own %d", table, got, own)
+		}
+		if got := read("", false, table); got != 0 {
+			t.Errorf("%s: a connection with no tenant and no relay flag sees %d tenant rows", table, got)
+		}
+		if got := read("", true, table); got != all {
+			t.Errorf("%s: the relay sees %d rows, want all %d", table, got, all)
+		}
+	}
+	if got := read(tenantB, false, "policy_activation_schedule"); got != 0 {
+		t.Errorf("tenant B sees tenant A's schedule row")
+	}
+
+	// A request transaction cannot write a row for another tenant.
+	err := pgx.BeginFunc(context.Background(), e.app, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(context.Background(), `SELECT set_config('app.tenant_id', $1, true)`, tenantB); err != nil {
+			return err
+		}
+		_, err := tx.Exec(context.Background(), `INSERT INTO outbox (event_type, tenant_id, idempotency_key, payload) VALUES ('x', $1, 'k', '{}')`, tenantA)
+		return err
+	})
+	if err == nil {
+		t.Fatal("tenant B wrote an outbox row for tenant A")
+	}
+}
+
+// A family is retired only when no version of it governs; retirement is
+// evidenced, final, compare-and-set, and stops new versions (D8).
+func TestRetirePolicy_GuardedEvidencedAndFinal(t *testing.T) {
+	e := newEnv(t)
+	p := e.family(t, tenantA, sp(tenantA), "RET-1")
+	v := e.draft(t, tenantA, p, sp(tenantA), nil, e.clock.Add(-time.Hour), `{"threshold_amount": 1}`)
+	v = e.release(t, tenantA, v)
+
+	retire := func(expected int64) (*domain.Policy, bool, error) {
+		return e.s.RetirePolicy(as(tenantA), domain.RetirePolicyParams{
+			PolicyID: p.PolicyID, ExpectedVersion: expected, ActorID: "retirer", Reason: "OBSOLETE",
+			Meta: domain.EventMeta{CorrelationID: "corr"},
+		})
+	}
+	if _, _, err := retire(p.RecordVersion); !errors.Is(err, domain.ErrPolicyInUse) {
+		t.Fatalf("a family with an ACTIVE version must not retire, got %v", err)
+	}
+	if _, err := e.cmd(t, tenantA, v, domain.CommandRetire, "retirer"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := retire(p.RecordVersion + 5); !errors.Is(err, domain.ErrConcurrencyConflict) {
+		t.Fatalf("a stale record_version must be refused, got %v", err)
+	}
+	if _, _, err := e.s.RetirePolicy(as(tenantB), domain.RetirePolicyParams{PolicyID: p.PolicyID, ExpectedVersion: p.RecordVersion, ActorID: "x", Reason: "x"}); !errors.Is(err, domain.ErrPolicyNotFound) {
+		t.Fatalf("tenant B must not see tenant A's family, got %v", err)
+	}
+	out, changed, err := retire(p.RecordVersion)
+	if err != nil || !changed || out.PolicyStatus != domain.PolicyStatusRetired || out.RetiredByPrincipalID == nil ||
+		*out.RetiredByPrincipalID != "retirer" || out.RecordVersion != p.RecordVersion+1 {
+		t.Fatalf("retire: %+v changed=%v err=%v", out, changed, err)
+	}
+	if again, changed, err := retire(out.RecordVersion); err != nil || changed || again.PolicyStatus != domain.PolicyStatusRetired {
+		t.Fatalf("retiring a retired family is a no-op: changed=%v err=%v", changed, err)
+	}
+	if n := e.count(t, `SELECT COUNT(*) FROM outbox WHERE event_type = 'policy.retired' AND aggregate_id = $1`, p.PolicyID); n != 1 {
+		t.Fatalf("want one policy.retired event, got %d", n)
+	}
+	_, _, err = e.s.CreatePolicyVersion(as(tenantA), domain.CreatePolicyVersionParams{
+		PolicyID: p.PolicyID, TenantID: sp(tenantA), RulePayload: []byte(`{"threshold_amount": 2}`),
+		EffectiveFrom: e.clock, CreatedByPrincipalID: "author", RequestKey: uuid.NewString(),
+	})
+	if !errors.Is(err, domain.ErrPolicyRetired) {
+		t.Fatalf("a retired family must take no new version, got %v", err)
+	}
+	// Even the superuser cannot bring a retired family back.
+	if _, err := e.admin.Exec(context.Background(), `UPDATE policies SET policy_status = 'ACTIVE' WHERE policy_id = $1`, p.PolicyID); err == nil {
+		t.Fatal("a retired family must stay retired")
+	}
+}
+
+// Only FAILED evidence is re-queued; recorded evidence is refused; another
+// tenant's evidence is not found; the request is evidenced as an event.
+func TestRedeliverEvidence_RequeuesOnlyFailed(t *testing.T) {
+	e := newEnv(t)
+	saved, _, err := e.s.SaveEvaluation(context.Background(), evaluation(tenantA, "dec-r"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := domain.EvidenceRedeliveryParams{TenantID: tenantA, EvaluationID: saved.EvaluationID, ActorID: "operator", Reason: "LEDGER_FIXED"}
+	if changed, err := e.s.RedeliverEvidence(context.Background(), req); err != nil || changed {
+		t.Fatalf("pending evidence is left alone: changed=%v err=%v", changed, err)
+	}
+	if err := e.s.MarkEvidenceFailed(context.Background(), saved.EvaluationID, "409"); err != nil {
+		t.Fatal(err)
+	}
+	other := req
+	other.TenantID = tenantB
+	if _, err := e.s.RedeliverEvidence(context.Background(), other); !errors.Is(err, domain.ErrEvaluationNotFound) {
+		t.Fatalf("tenant B must not redeliver tenant A's evidence, got %v", err)
+	}
+	if changed, err := e.s.RedeliverEvidence(context.Background(), req); err != nil || !changed {
+		t.Fatalf("failed evidence must be re-queued: changed=%v err=%v", changed, err)
+	}
+	if claimed, _ := e.s.ClaimEvidence(context.Background(), 10, time.Minute); len(claimed) != 1 || claimed[0].EvaluationID != saved.EvaluationID {
+		t.Fatalf("the relay must pick the re-queued evidence up again, got %v", claimed)
+	}
+	if n := e.count(t, `SELECT COUNT(*) FROM outbox WHERE event_type = 'policy.evidence.redelivery_requested' AND actor_id = 'operator'`); n != 1 {
+		t.Fatalf("want one redelivery_requested event, got %d", n)
+	}
+	if err := e.s.MarkEvidenceDelivered(context.Background(), saved.EvaluationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.s.RedeliverEvidence(context.Background(), req); !errors.Is(err, domain.ErrEvidenceAlreadyRecorded) {
+		t.Fatalf("recorded evidence must not be redelivered, got %v", err)
+	}
+}
+
+// The registers and the summary read through the caller's tenant scope:
+// platform families and the tenant's own, never another tenant's.
+func TestRegisters_ScopedFilteredPagedAndCounted(t *testing.T) {
+	e := newEnv(t)
+	global := e.family(t, tenantA, nil, "REG-GLOBAL")
+	ownA := e.family(t, tenantA, sp(tenantA), "REG-A")
+	e.family(t, tenantB, sp(tenantB), "REG-B")
+	v := e.draft(t, tenantA, ownA, sp(tenantA), nil, e.clock.Add(-time.Hour), `{"threshold_amount": 10}`)
+	e.release(t, tenantA, v)
+	e.draft(t, tenantA, ownA, sp(tenantA), nil, e.clock.Add(time.Hour), `{"threshold_amount": 20}`)
+
+	all, err := e.s.ListPolicyFamilies(as(tenantA), domain.ListQuery{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	codes := map[string]bool{}
+	for _, p := range all {
+		codes[p.PolicyCode] = true
+	}
+	if len(all) != 2 || !codes["REG-GLOBAL"] || !codes["REG-A"] || codes["REG-B"] {
+		t.Fatalf("tenant A must see the platform family and its own only, got %v", codes)
+	}
+	globals, _ := e.s.ListPolicyFamilies(as(tenantA), domain.ListQuery{Limit: 10, Filters: map[string]string{"scope": domain.ScopeTypeGlobal}})
+	if len(globals) != 1 || globals[0].PolicyID != global.PolicyID {
+		t.Fatalf("scope=GLOBAL: %v", globals)
+	}
+	first, _ := e.s.ListPolicyFamilies(as(tenantA), domain.ListQuery{Limit: 1})
+	second, _ := e.s.ListPolicyFamilies(as(tenantA), domain.ListQuery{Limit: 1, Offset: 1})
+	if len(first) != 1 || len(second) != 1 || first[0].PolicyID == second[0].PolicyID {
+		t.Fatalf("offset paging must move through the register: %v / %v", first, second)
+	}
+
+	active, _ := e.s.ListPolicyVersions(as(tenantA), domain.ListQuery{Limit: 10, Filters: map[string]string{"version_status": domain.StatusActive}})
+	if len(active) != 1 || active[0].PolicyVersionID != v.PolicyVersionID {
+		t.Fatalf("version register filtered ACTIVE: %v", active)
+	}
+	if none, _ := e.s.ListPolicyVersions(as(tenantB), domain.ListQuery{Limit: 10}); len(none) != 0 {
+		t.Fatalf("tenant B must not see tenant A's versions: %v", none)
+	}
+
+	sum, err := e.s.PolicySummary(as(tenantA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.PolicyFamilies != 2 || sum.VersionsActive != 1 || sum.VersionsDraft != 1 || sum.Evaluations24h != 0 {
+		t.Fatalf("summary for tenant A: %+v", sum)
+	}
+	if sumB, _ := e.s.PolicySummary(as(tenantB)); sumB.VersionsActive != 0 || sumB.PolicyFamilies != 2 {
+		t.Fatalf("summary for tenant B counts only what B can see: %+v", sumB)
+	}
+}
+
 func TestControlTests_TenantIsolation(t *testing.T) {
 	e := newEnv(t)
 	def, created, err := e.s.CreateControlTestDefinition(as(tenantA), domain.CreateControlTestDefinitionParams{
@@ -767,14 +970,30 @@ func TestControlTests_TenantIsolation(t *testing.T) {
 	if _, err := e.s.FindAttestationByID(as(tenantB), att.AttestationID); !errors.Is(err, domain.ErrAttestationNotFound) {
 		t.Fatalf("tenant B must not read tenant A's attestation, got %v", err)
 	}
-	if _, err := e.s.RevokeAttestation(as(tenantB), att.AttestationID, "x"); !errors.Is(err, domain.ErrAttestationNotFound) {
+	if _, err := e.s.RevokeAttestation(as(tenantB), att.AttestationID, "x", domain.EventMeta{ActorID: "revoker"}); !errors.Is(err, domain.ErrAttestationNotFound) {
 		t.Fatalf("tenant B must not revoke tenant A's attestation, got %v", err)
 	}
-	if _, err := e.s.RevokeAttestation(as(tenantA), att.AttestationID, ""); err != nil {
+	if _, err := e.s.RevokeAttestation(as(tenantA), att.AttestationID, "", domain.EventMeta{ActorID: "revoker"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.s.RevokeAttestation(as(tenantA), att.AttestationID, ""); !errors.Is(err, domain.ErrInvalidAttestationTransition) {
+	if _, err := e.s.RevokeAttestation(as(tenantA), att.AttestationID, "", domain.EventMeta{ActorID: "revoker"}); !errors.Is(err, domain.ErrInvalidAttestationTransition) {
 		t.Fatalf("a second revocation is an invalid transition, got %v", err)
+	}
+
+	// Every record above wrote exactly one event in its own transaction; the
+	// refused writes (tenant B's, the second revocation) wrote none.
+	for eventType, want := range map[string]int{
+		"policy.control_test.defined":  1,
+		"policy.control_test.executed": 1,
+		"policy.attestation.signed":    1,
+		"policy.attestation.revoked":   1,
+	} {
+		if n := e.count(t, `SELECT COUNT(*) FROM outbox WHERE event_type = $1 AND tenant_id = $2`, eventType, tenantA); n != want {
+			t.Errorf("%s: want %d events for tenant A, got %d", eventType, want, n)
+		}
+	}
+	if n := e.count(t, `SELECT COUNT(*) FROM outbox WHERE event_type = 'policy.attestation.revoked' AND actor_id = 'revoker'`); n != 1 {
+		t.Errorf("the revocation event must carry its actor, got %d", n)
 	}
 }
 

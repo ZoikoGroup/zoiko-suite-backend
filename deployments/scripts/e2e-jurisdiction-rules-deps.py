@@ -64,12 +64,16 @@ OTHER_TENANT = "99999999-8888-4777-8666-555555555555"
 ENTITY = "22222222-2222-2222-2222-222222222222"
 ADMIN = "33333333-3333-3333-3333-333333333333"
 APPROVER = "66666666-6666-6666-6666-666666666666"
+# The certifier must be independent of the author, compiler, test author and reviewers (s24):
+# tax.officer@ holds the JURISDICTION grants on the platform scope (granted 16 Nov 2026).
+CERTIFIER = "44444444-4444-4444-4444-444444444444"
 STRANGER = "e2e00000-0000-4000-8000-0000000000bb"
 RESIDENCY_POLICY = "77777777-7777-7777-7777-777777777777"
 FISCAL_CALENDAR = "99999999-9999-9999-9999-999999999999"
 
 H = "http://127.0.0.1"
 JR, IDENTITY, TER, WF = f"{H}:8082", f"{H}:8080", f"{H}:8081", f"{H}:8090"
+GDL = f"{H}:8083"
 PG, KAFKA, CONTAINER = "zoiko-postgres", "zoiko-kafka", "jurisdiction-rules-svc"
 TOPIC = "zoiko.jurisdiction.events"
 RUN = uuid.uuid4().hex[:8]
@@ -143,7 +147,10 @@ def base_headers(principal, tenant=TENANT, write=False):
     return h
 
 
-ACCOUNTS = {ADMIN: ("admin@zoikosuite.com", "Zoiko@Governance1"), APPROVER: ("legal.counsel@zoikosuite.com", "Zoiko@Legal2026!")}
+ACCOUNTS = {ADMIN: ("admin@zoikosuite.com", "Zoiko@Governance1"), APPROVER: ("legal.counsel@zoikosuite.com", "Zoiko@Legal2026!"),
+            CERTIFIER: ("tax.officer@zoikosuite.com", "Zoiko@Tax2026!")}
+# Decisions the run made that must reach the governance ledger (DL-4): (action_type, rule_basis, on_behalf_of).
+LEDGER_EXPECT = []
 _ENVELOPES = {}
 
 
@@ -378,6 +385,8 @@ def pack_lifecycle(jid, jcode, signing):
     iid = interp.get("interpretation_id")
     s2, _, _ = jr("POST", f"/v1/admin/interpretations/{iid}/approve", principal=APPROVER)
     check("maker-checker: interpretation recorded by the admin, approved by the approver", s == 201 and s2 == 200, f"HTTP {s}/{s2}")
+    if s2 == 200:
+        LEDGER_EXPECT.append(("JURISDICTION_INTERPRETATION_APPROVE", f"interpretation:{iid}", APPROVER))
     body = {"rule_domain": "TAX", "rule_code": "STD", "rule_name": "standard", "effective_from": "2026-01-01T00:00:00Z",
             "rule_payload": {"applies": ["B2C"], "rate": "0.2000"}}
     s, _, rule = jr("POST", f"/v1/admin/jurisdictions/{jid}/rules", body=body)
@@ -419,6 +428,82 @@ def pack_lifecycle(jid, jcode, signing):
     check("pack: sign the artifact", s == 200, f"HTTP {s} {b.get('code')}")
     s, _, v = jr("POST", f"/v1/packs/{ref}/versions/2026.08.1/verify")
     check("pack: the signed artifact verifies (digest and signature)", s == 200 and (v.get("verified") is True or (v.get("verification") or {}).get("verified") is True), f"HTTP {s} {brief(v)}")
+    certify_and_publish(ref, "2026.08.1", art)
+
+
+def complete_bundle(art):
+    """A test bundle covering every rule of the artifact: golden, both sides of
+    the effective boundary, and an unsupported jurisdiction (the harness's
+    coverage gates; cert_integration_test.go completeBundleFor)."""
+    # The artifact wire format (domain.artifactWire): scope.jurisdictions and rule_modules.
+    doc = (art.get("artifact") or {}).get("artifact") or art.get("artifact") or {}
+    codes = {j.get("id"): j.get("code") for j in (doc.get("scope") or {}).get("jurisdictions") or []}
+    rules = [r for r in doc.get("rule_modules") or [] if r.get("rule_domain", "TAX") == "TAX"]
+    cases = []
+
+    def add(cls, juris, at, rule, expect):
+        # at is a datetime, or an exact RFC 3339 string (nanoseconds, which datetime cannot hold).
+        cases.append({"id": f"{cls.lower()}-{len(cases)}", "class": cls, "expect": expect,
+                      "input": {"jurisdiction": juris, "rule_domain": "TAX", "rule_code": rule["rule_code"],
+                                "effective_at": at if isinstance(at, str) else iso(at)}})
+
+    for r in rules:
+        start = datetime.fromisoformat(r["effective_from"].replace("Z", "+00:00"))
+        jc = codes.get(r["jurisdiction_id"])
+        resolved = {"outcome": "RESOLVED", "rule_id": r["rule_id"]}
+        add("GOLDEN", jc, start + timedelta(hours=1), r, resolved)
+        add("BOUNDARY", jc, start, r, resolved)
+        # The harness's coverage gate (JUR-T002) wants the instant just before the start.
+        add("BOUNDARY", jc, (start - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%S") + ".999999999Z", r, {"outcome": "NO_RULE"})
+    if rules:
+        start = datetime.fromisoformat(rules[0]["effective_from"].replace("Z", "+00:00"))
+        add("NEGATIVE", "NOT-IN-THIS-PACK", start + timedelta(hours=2), rules[0], {"outcome": "UNSUPPORTED_JURISDICTION"})
+    return {"bundle_version": "1", "cases": cases}
+
+
+def certify_and_publish(ref, version, art):
+    """DL-4: certification and release are governed decisions that reach the ledger."""
+    base = f"/v1/admin/packs/{ref}/versions/{version}"
+    s, _, b = jr("POST", f"{base}/test-bundle", body=complete_bundle(art))
+    s2, _, run = jr("POST", f"{base}/test-runs")
+    check("certify: the test bundle runs and passes", s in (200, 201) and s2 == 201 and run.get("passed") is True,
+          f"HTTP {s}/{s2} {brief(b)} {brief(run)}")
+    s, _, b = jr("POST", f"{base}/reviews", principal=APPROVER, body={"role": "TAX", "decision": "APPROVE", "findings": "e2e"})
+    check("certify: an independent reviewer approves (legal counsel)", s == 201, f"HTTP {s} {brief(b)}")
+    s, _, cert = jr("POST", f"{base}/certify", principal=CERTIFIER)
+    if not check("certify: an independent certifier certifies (tax officer, 201)", s == 201, f"HTTP {s} {brief(cert)}"):
+        return
+    LEDGER_EXPECT.append(("JURISDICTION_PACK_CERTIFY", f"{ref}@{version}", CERTIFIER))
+    s, _, rel = jr("POST", f"{base}/publish", principal=CERTIFIER, body={"evidence_ref": f"e2e-{RUN}"})
+    if check("publish: the certified version is released (200)", s == 200, f"HTTP {s} {brief(rel)}"):
+        LEDGER_EXPECT.append(("JURISDICTION_PACK_RELEASE", f"{ref}@{version}", CERTIFIER))
+
+
+def decision_ledger():
+    """DL-4: every governed decision this run made is in governance-decision-log-svc
+    within 30 s, recorded by svc-jurisdiction-rules for the person who made it."""
+    if not LEDGER_EXPECT:
+        skip("ledger: governed decisions reach the decision log", "this run made no governed decision")
+        return
+    s, _, _ = call("GET", f"{GDL}/healthz", timeout=5)
+    if s != 200:
+        skip("ledger: governed decisions reach the decision log", "governance-decision-log-svc is not up")
+        return
+    for action, basis, person in LEDGER_EXPECT:
+        def found():
+            h = base_headers(ADMIN)
+            h["X-Purpose-Context"] = "GOVERNANCE_AUDIT"
+            jwt, _ = envelope_jwt(ADMIN)
+            h["Authorization"] = "Bearer " + (jwt or "")
+            st, _, page = call("GET", f"{GDL}/v1/decisions?action={action}&rule_basis={urllib.parse.quote(basis)}&limit=5", h)
+            rows = page.get("records") if isinstance(page, dict) else None
+            return rows if st == 200 and rows else None
+        rows = until(found, 30)
+        if check(f"ledger: {action} {basis} is in the decision log within 30 s", rows, "found" if rows else "not found"):
+            d = rows[0]
+            check(f"ledger: {action} recorded by svc-jurisdiction-rules on behalf of the person who decided",
+                  d.get("actor_id") == "svc-jurisdiction-rules" and (d.get("evaluation_context") or {}).get("on_behalf_of") == person,
+                  f"{d.get('actor_id')} {(d.get('evaluation_context') or {}).get('on_behalf_of')}")
 
 
 def paging():
@@ -661,6 +746,7 @@ def main():
         entity_edge(jid)
         effectivity(jid)
         regulatory_feed(jid)
+        decision_ledger()
     outbox_requeue()
     rls_runtime_role()
 

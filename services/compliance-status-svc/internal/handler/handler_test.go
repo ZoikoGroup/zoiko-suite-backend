@@ -13,123 +13,91 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/compliance-status-svc/internal/domain"
-	"zoiko.io/compliance-status-svc/internal/store"
+	"zoiko.io/compliance-status-svc/internal/events"
 )
 
+// mockStore implements the Store interface for testing
 type mockStore struct {
-	records map[string]*domain.ComplianceHealth
-	gaps    map[string]*domain.ComplianceGap
+	statuses map[string]*domain.ComplianceStatus
 }
 
 func newMockStore() *mockStore {
 	return &mockStore{
-		records: make(map[string]*domain.ComplianceHealth),
-		gaps:    make(map[string]*domain.ComplianceGap),
+		statuses: make(map[string]*domain.ComplianceStatus),
 	}
 }
 
-func (m *mockStore) Evaluate(ctx context.Context, c *domain.ComplianceHealth, _ store.EventMeta) error {
-	if c.StatusID == "" {
-		c.StatusID = "cstat-test-01"
-	}
-	c.LastEvaluatedAt = time.Now().UTC()
-	c.CreatedAt = time.Now().UTC()
-	c.UpdatedAt = time.Now().UTC()
-	c.CalculateHealthScore()
-	m.records[c.StatusID] = c
-	return nil
-}
-
-func (m *mockStore) GetByID(ctx context.Context, id string) (*domain.ComplianceHealth, error) {
-	c, ok := m.records[id]
-	if !ok {
-		return nil, domain.ErrStatusRecordNotFound
-	}
-	return c, nil
-}
-
-func (m *mockStore) List(ctx context.Context, legalEntityID, jurisdictionID, domainName, status string) ([]domain.ComplianceHealth, error) {
-	var out []domain.ComplianceHealth
-	for _, item := range m.records {
-		if legalEntityID != "" && item.LegalEntityID != legalEntityID {
-			continue
-		}
-		if jurisdictionID != "" && item.JurisdictionID != jurisdictionID {
-			continue
-		}
-		if domainName != "" && item.DomainName != domainName {
-			continue
-		}
-		if status != "" && string(item.OverallStatus) != status {
-			continue
-		}
-		out = append(out, *item)
-	}
-	return out, nil
-}
-
-func (m *mockStore) CreateGap(ctx context.Context, g *domain.ComplianceGap, meta store.EventMeta) error {
-	creator := meta.ActorID
-	g.CreatedBy = &creator
-	if g.GapID == "" {
-		g.GapID = "cgap-test-01"
-	}
-	g.DetectedAt = time.Now().UTC()
-	g.CreatedAt = time.Now().UTC()
-	g.UpdatedAt = time.Now().UTC()
-	if g.Status == "" {
-		g.Status = domain.GapOpen
-	}
-	m.gaps[g.GapID] = g
-	return nil
-}
-
-func (m *mockStore) ListGaps(ctx context.Context, legalEntityID, domainName, severity, status string) ([]domain.ComplianceGap, error) {
-	var out []domain.ComplianceGap
-	for _, item := range m.gaps {
-		if legalEntityID != "" && item.LegalEntityID != legalEntityID {
-			continue
-		}
-		if domainName != "" && item.DomainName != domainName {
-			continue
-		}
-		if severity != "" && string(item.Severity) != severity {
-			continue
-		}
-		if status != "" && string(item.Status) != status {
-			continue
-		}
-		out = append(out, *item)
-	}
-	return out, nil
-}
-
-func (m *mockStore) GetGapByID(ctx context.Context, id string) (*domain.ComplianceGap, error) {
-	g, ok := m.gaps[id]
-	if !ok {
-		return nil, domain.ErrGapNotFound
-	}
-	return g, nil
-}
-
-func (m *mockStore) ResolveGap(ctx context.Context, id string, req *domain.ResolveGapRequest, _ store.EventMeta) (*domain.ComplianceGap, error) {
-	g, ok := m.gaps[id]
-	if !ok {
-		return nil, domain.ErrGapNotFound
-	}
-	if g.Status == domain.GapResolved {
-		return nil, domain.ErrGapAlreadyResolved
+func (m *mockStore) CreateComplianceStatus(ctx context.Context, params domain.CreateComplianceStatusParams) (*domain.ComplianceStatus, error) {
+	id := params.ComplianceStatusID
+	if id == "" {
+		id = "cstat-test-01"
 	}
 	now := time.Now().UTC()
-	g.Status = domain.GapResolved
-	g.ResolvedAt = &now
-	g.UpdatedAt = now
-	return g, nil
+	cs := &domain.ComplianceStatus{
+		ComplianceStatusID:       id,
+		TenantID:                 params.TenantID,
+		LegalEntityID:            params.LegalEntityID,
+		DomainCode:               params.DomainCode,
+		StatusCode:               params.StatusCode,
+		StatusReason:             params.StatusReason,
+		EvidenceSufficiencyState: params.EvidenceSufficiencyState,
+		EvaluatedAt:              params.EvaluatedAt,
+		CreatedAt:                now,
+		CreatedByPrincipalID:     params.CreatedByPrincipalID,
+		UpdatedAt:                now,
+		Version:                  1,
+	}
+	m.statuses[id] = cs
+	return cs, nil
 }
 
-// mockAuthzClient grants every request by default, so existing handler
-// behavior tests aren't coupled to a live authorization-svc. Tests that need
-// to exercise denial/unavailability can set decision/err explicitly.
+func (m *mockStore) FindComplianceStatusByID(ctx context.Context, complianceStatusID string) (*domain.ComplianceStatus, error) {
+	cs, ok := m.statuses[complianceStatusID]
+	if !ok {
+		return nil, domain.ErrComplianceStatusNotFound
+	}
+	return cs, nil
+}
+
+func (m *mockStore) ListComplianceStatuses(ctx context.Context, filter domain.ListComplianceStatusFilter) ([]*domain.ComplianceStatus, error) {
+	var out []*domain.ComplianceStatus
+	for _, item := range m.statuses {
+		if filter.LegalEntityID != "" && item.LegalEntityID != filter.LegalEntityID {
+			continue
+		}
+		if filter.DomainCode != "" && item.DomainCode != filter.DomainCode {
+			continue
+		}
+		if filter.StatusCode != "" && item.StatusCode != filter.StatusCode {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out, nil
+}
+
+func (m *mockStore) UpdateComplianceStatus(ctx context.Context, complianceStatusID string, params domain.UpdateComplianceStatusParams, actorID, correlationID string) (*domain.ComplianceStatus, error) {
+	cs, ok := m.statuses[complianceStatusID]
+	if !ok {
+		return nil, domain.ErrComplianceStatusNotFound
+	}
+	if params.ExpectedVersion > 0 && cs.Version != params.ExpectedVersion {
+		return nil, domain.ErrVersionMismatch
+	}
+	cs.StatusCode = params.StatusCode
+	cs.StatusReason = params.StatusReason
+	cs.EvidenceSufficiencyState = params.EvidenceSufficiencyState
+	cs.UpdatedAt = time.Now().UTC()
+	cs.Version++
+	return cs, nil
+}
+
+type mockPublisher struct{}
+
+func (p *mockPublisher) Publish(ctx context.Context, params events.PublishParams) error {
+	return nil
+}
+
 type mockAuthzClient struct {
 	err error
 }
@@ -140,156 +108,289 @@ func (m *mockAuthzClient) CheckAllowed(ctx context.Context, principalID, legalEn
 
 func setupTestRouter() (*chi.Mux, *mockStore) {
 	st := newMockStore()
+	pub := &mockPublisher{}
 	az := &mockAuthzClient{}
 	logger, _ := zap.NewDevelopment()
-	h := New(st, az, logger)
+	h := New(st, pub, az, logger)
 
 	r := chi.NewRouter()
 	RegisterRoutes(r, h)
 	return r, st
 }
 
-func TestEvaluateAndResolveComplianceGap(t *testing.T) {
+func TestCreateAndGetComplianceStatus(t *testing.T) {
 	r, _ := setupTestRouter()
 
-	evalReqPayload := domain.EvaluateComplianceRequest{
-		LegalEntityID:        "entity-001",
-		JurisdictionID:       "GB-UK",
-		DomainName:           "TAX",
-		TotalObligations:     10,
-		FulfilledObligations: 9,
-		PendingObligations:   1,
-		OverdueObligations:   0,
-		OpenExceptions:       0,
-		EffectiveFrom:        "2026-01-01",
-		CreatedBy:            "principal-test-01",
+	reqPayload := map[string]interface{}{
+		"legal_entity_id":             "entity-001",
+		"domain_code":                 "TAX",
+		"status_code":                 "COMPLIANT",
+		"status_reason":               "All obligations fulfilled on time",
+		"evidence_sufficiency_state":  "SUFFICIENT",
+		"evaluated_at":                time.Now().UTC().Format(time.RFC3339),
+		"created_by_principal_id":     "principal-test-01",
 	}
-	body, _ := json.Marshal(evalReqPayload)
+	body, _ := json.Marshal(reqPayload)
 
-	req := httptest.NewRequest("POST", "/v1/compliance-status/evaluate", bytes.NewBuffer(body))
+	req := httptest.NewRequest("POST", "/v1/compliance-status/", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Principal-Id", "principal-test-01")
+	req.Header.Set("X-Tenant-Id", "tenant-001")
 	w := httptest.NewRecorder()
 
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d", w.Code)
+	}
+
+	var result domain.ComplianceStatus
+	if err := json.NewDecoder(w.Body).Decode(&result); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if result.ComplianceStatusID == "" {
+		t.Error("expected compliance_status_id to be set")
+	}
+	if result.LegalEntityID != "entity-001" {
+		t.Errorf("expected legal_entity_id entity-001, got %s", result.LegalEntityID)
+	}
+	if result.DomainCode != "TAX" {
+		t.Errorf("expected domain_code TAX, got %s", result.DomainCode)
+	}
+	if result.StatusCode != "COMPLIANT" {
+		t.Errorf("expected status_code COMPLIANT, got %s", result.StatusCode)
+	}
+
+	// Get by ID
+	getReq := httptest.NewRequest("GET", "/v1/compliance-status/"+result.ComplianceStatusID, nil)
+	getReq.Header.Set("X-Principal-Id", "principal-test-01")
+	getReq.Header.Set("X-Tenant-Id", "tenant-001")
+	getW := httptest.NewRecorder()
+	r.ServeHTTP(getW, getReq)
+
+	if getW.Code != http.StatusOK {
+		t.Errorf("expected status 200 on GetByID, got %d", getW.Code)
+	}
+
+	var getResult domain.ComplianceStatus
+	_ = json.NewDecoder(getW.Body).Decode(&getResult)
+	if getResult.ComplianceStatusID != result.ComplianceStatusID {
+		t.Error("mismatch in GetByID result")
+	}
+}
+
+func TestUpdateComplianceStatus(t *testing.T) {
+	r, st := setupTestRouter()
+
+	// Create initial status
+	now := time.Now().UTC()
+	cs := &domain.ComplianceStatus{
+		ComplianceStatusID:       "cstat-update-01",
+		TenantID:                 "tenant-001",
+		LegalEntityID:            "entity-001",
+		DomainCode:               "TAX",
+		StatusCode:               "COMPLIANT",
+		StatusReason:             "All obligations fulfilled",
+		EvidenceSufficiencyState: "SUFFICIENT",
+		EvaluatedAt:              now,
+		CreatedAt:                now,
+		CreatedByPrincipalID:     "risk_officer",
+		UpdatedAt:                now,
+		Version:                  1,
+	}
+	st.statuses[cs.ComplianceStatusID] = cs
+
+	// Update with correct version
+	updateReq := map[string]interface{}{
+		"status_code":                "AT_RISK",
+		"status_reason":              "One obligation overdue",
+		"evidence_sufficiency_state": "PENDING",
+		"expected_version":           1,
+	}
+	body, _ := json.Marshal(updateReq)
+
+	req := httptest.NewRequest("POST", "/v1/compliance-status/"+cs.ComplianceStatusID, bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
+	req.Header.Set("X-Tenant-Id", "tenant-001")
+	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", w.Code)
 	}
 
-	var evalResult domain.ComplianceHealth
-	if err := json.NewDecoder(w.Body).Decode(&evalResult); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
+	var result domain.ComplianceStatus
+	_ = json.NewDecoder(w.Body).Decode(&result)
+	if result.StatusCode != "AT_RISK" {
+		t.Errorf("expected status_code AT_RISK, got %s", result.StatusCode)
 	}
-	if evalResult.HealthScore != 90.00 {
-		t.Errorf("expected health score 90.00, got %f", evalResult.HealthScore)
-	}
-	if evalResult.OverallStatus != domain.StatusCompliant {
-		t.Errorf("expected status COMPLIANT, got %s", evalResult.OverallStatus)
-	}
-
-	// Create Gap
-	gapReqPayload := domain.CreateGapRequest{
-		LegalEntityID:   "entity-001",
-		JurisdictionID:  "GB-UK",
-		DomainName:      "TAX",
-		GapType:         "MISSING_EVIDENCE",
-		Severity:        domain.SeverityHigh,
-		SourceReference: "whto-2026-001",
-		Description:     "Missing exemption certificate for cross-border WHT",
-	}
-	gapBody, _ := json.Marshal(gapReqPayload)
-
-	gapReq := httptest.NewRequest("POST", "/v1/compliance-status/gaps", bytes.NewBuffer(gapBody))
-	gapReq.Header.Set("Content-Type", "application/json")
-	gapReq.Header.Set("X-Principal-Id", "principal-test-01")
-	gapW := httptest.NewRecorder()
-
-	r.ServeHTTP(gapW, gapReq)
-
-	if gapW.Code != http.StatusCreated {
-		t.Fatalf("expected status 201 on gap create, got %d", gapW.Code)
-	}
-
-	var createdGap domain.ComplianceGap
-	if err := json.NewDecoder(gapW.Body).Decode(&createdGap); err != nil {
-		t.Fatalf("failed to decode gap response: %v", err)
-	}
-
-	// Resolve Gap
-	resReqPayload := domain.ResolveGapRequest{RemediationNotes: "Certificate provided by counterparty"}
-	resBody, _ := json.Marshal(resReqPayload)
-
-	resReq := httptest.NewRequest("POST", "/v1/compliance-status/gaps/"+createdGap.GapID+"/resolve", bytes.NewBuffer(resBody))
-	resReq.Header.Set("Content-Type", "application/json")
-	// Resolved by a different principal than the one who logged the gap
-	// (segregation of duties).
-	resReq.Header.Set("X-Principal-Id", "principal-test-02")
-	resW := httptest.NewRecorder()
-
-	r.ServeHTTP(resW, resReq)
-
-	if resW.Code != http.StatusOK {
-		t.Fatalf("expected status 200 on gap resolve, got %d", resW.Code)
-	}
-
-	var resolvedGap domain.ComplianceGap
-	if err := json.NewDecoder(resW.Body).Decode(&resolvedGap); err != nil {
-		t.Fatalf("failed to decode resolved gap: %v", err)
-	}
-	if resolvedGap.Status != domain.GapResolved {
-		t.Errorf("expected gap status RESOLVED, got %s", resolvedGap.Status)
-	}
-
-	// Resolve Gap Second Time -> 409 Conflict
-	resReq2 := httptest.NewRequest("POST", "/v1/compliance-status/gaps/"+createdGap.GapID+"/resolve", bytes.NewBuffer(resBody))
-	resReq2.Header.Set("Content-Type", "application/json")
-	resReq2.Header.Set("X-Principal-Id", "principal-test-02")
-	resW2 := httptest.NewRecorder()
-	r.ServeHTTP(resW2, resReq2)
-	if resW2.Code != http.StatusConflict {
-		t.Errorf("expected status 409 on duplicate gap resolve, got %d", resW2.Code)
+	if result.Version != 2 {
+		t.Errorf("expected version 2, got %d", result.Version)
 	}
 }
 
-func TestGetAndListComplianceStatusRecords(t *testing.T) {
+func TestListComplianceStatuses(t *testing.T) {
 	r, _ := setupTestRouter()
 
-	// Evaluate two records
-	req1 := domain.EvaluateComplianceRequest{
-		LegalEntityID:        "entity-101",
-		JurisdictionID:       "GB-UK",
-		DomainName:           "FINANCE",
-		TotalObligations:     5,
-		FulfilledObligations: 5,
-		EffectiveFrom:        "2026-01-01",
-		CreatedBy:            "principal-test-01",
+	// Create two statuses
+	now := time.Now().UTC()
+	cs1 := &domain.ComplianceStatus{
+		ComplianceStatusID:       "cstat-list-01",
+		TenantID:                 "tenant-001",
+		LegalEntityID:            "entity-101",
+		DomainCode:               "FINANCE",
+		StatusCode:               "COMPLIANT",
+		StatusReason:             "All good",
+		EvidenceSufficiencyState: "SUFFICIENT",
+		EvaluatedAt:              now,
+		CreatedAt:                now,
+		CreatedByPrincipalID:     "auditor",
+		UpdatedAt:                now,
+		Version:                  1,
 	}
-	body1, _ := json.Marshal(req1)
-	r1 := httptest.NewRequest("POST", "/v1/compliance-status/evaluate", bytes.NewBuffer(body1))
-	r1.Header.Set("Content-Type", "application/json")
-	r1.Header.Set("X-Principal-Id", "principal-test-01")
+	cs2 := &domain.ComplianceStatus{
+		ComplianceStatusID:       "cstat-list-02",
+		TenantID:                 "tenant-001",
+		LegalEntityID:            "entity-101",
+		DomainCode:               "TAX",
+		StatusCode:               "AT_RISK",
+		StatusReason:             "Overdue",
+		EvidenceSufficiencyState: "INSUFFICIENT",
+		EvaluatedAt:              now,
+		CreatedAt:                now,
+		CreatedByPrincipalID:     "auditor",
+		UpdatedAt:                now,
+		Version:                  1,
+	}
+
+	reqPayload1 := map[string]interface{}{
+		"legal_entity_id":             cs1.LegalEntityID,
+		"domain_code":                 string(cs1.DomainCode),
+		"status_code":                 string(cs1.StatusCode),
+		"status_reason":               cs1.StatusReason,
+		"evidence_sufficiency_state":  string(cs1.EvidenceSufficiencyState),
+		"evaluated_at":                cs1.EvaluatedAt.Format(time.RFC3339),
+		"created_by_principal_id":     cs1.CreatedByPrincipalID,
+	}
+	body1, _ := json.Marshal(reqPayload1)
+	req1 := httptest.NewRequest("POST", "/v1/compliance-status/", bytes.NewBuffer(body1))
+	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("X-Principal-Id", "principal-test-01")
+	req1.Header.Set("X-Tenant-Id", "tenant-001")
 	w1 := httptest.NewRecorder()
-	r.ServeHTTP(w1, r1)
+	r.ServeHTTP(w1, req1)
 
-	var rec1 domain.ComplianceHealth
-	_ = json.NewDecoder(w1.Body).Decode(&rec1)
+	reqPayload2 := map[string]interface{}{
+		"legal_entity_id":             cs2.LegalEntityID,
+		"domain_code":                 string(cs2.DomainCode),
+		"status_code":                 string(cs2.StatusCode),
+		"status_reason":               cs2.StatusReason,
+		"evidence_sufficiency_state":  string(cs2.EvidenceSufficiencyState),
+		"evaluated_at":                cs2.EvaluatedAt.Format(time.RFC3339),
+		"created_by_principal_id":     cs2.CreatedByPrincipalID,
+	}
+	body2, _ := json.Marshal(reqPayload2)
+	req2 := httptest.NewRequest("POST", "/v1/compliance-status/", bytes.NewBuffer(body2))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("X-Principal-Id", "principal-test-01")
+	req2.Header.Set("X-Tenant-Id", "tenant-001")
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
 
-	// Get by ID
-	rGet := httptest.NewRequest("GET", "/v1/compliance-status/"+rec1.StatusID, nil)
-	rGet.Header.Set("X-Principal-Id", "principal-test-01")
-	wGet := httptest.NewRecorder()
-	r.ServeHTTP(wGet, rGet)
-	if wGet.Code != http.StatusOK {
-		t.Errorf("expected status 200 on GetByID, got %d", wGet.Code)
+	// List for entity-101
+	listReq := httptest.NewRequest("GET", "/v1/compliance-status/?legal_entity_id=entity-101", nil)
+	listReq.Header.Set("X-Principal-Id", "principal-test-01")
+	listReq.Header.Set("X-Tenant-Id", "tenant-001")
+	listW := httptest.NewRecorder()
+	r.ServeHTTP(listW, listReq)
+
+	if listW.Code != http.StatusOK {
+		t.Errorf("expected status 200 on List, got %d", listW.Code)
 	}
 
-	// List records
-	rList := httptest.NewRequest("GET", "/v1/compliance-status?legal_entity_id=entity-101", nil)
-	rList.Header.Set("X-Principal-Id", "principal-test-01")
-	wList := httptest.NewRecorder()
-	r.ServeHTTP(wList, rList)
-	if wList.Code != http.StatusOK {
-		t.Errorf("expected status 200 on List, got %d", wList.Code)
+	var listResp map[string]interface{}
+	_ = json.NewDecoder(listW.Body).Decode(&listResp)
+	records := listResp["compliance_statuses"]
+	if records == nil {
+		t.Error("expected compliance_statuses in response")
+	}
+}
+
+func TestValidationErrors(t *testing.T) {
+	r, _ := setupTestRouter()
+
+	testCases := []struct {
+		name       string
+		payload    map[string]interface{}
+		wantStatus int
+	}{
+		{
+			name: "missing legal_entity_id",
+			payload: map[string]interface{}{
+				"domain_code":                "TAX",
+				"status_code":                "COMPLIANT",
+				"status_reason":              "test",
+				"evidence_sufficiency_state": "SUFFICIENT",
+				"evaluated_at":               time.Now().UTC().Format(time.RFC3339),
+				"created_by_principal_id":    "test",
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "invalid domain_code",
+			payload: map[string]interface{}{
+				"legal_entity_id":            "entity-001",
+				"domain_code":                "INVALID",
+				"status_code":                "COMPLIANT",
+				"status_reason":              "test",
+				"evidence_sufficiency_state": "SUFFICIENT",
+				"evaluated_at":               time.Now().UTC().Format(time.RFC3339),
+				"created_by_principal_id":    "test",
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "invalid status_code",
+			payload: map[string]interface{}{
+				"legal_entity_id":            "entity-001",
+				"domain_code":                "TAX",
+				"status_code":                "INVALID",
+				"status_reason":              "test",
+				"evidence_sufficiency_state": "SUFFICIENT",
+				"evaluated_at":               time.Now().UTC().Format(time.RFC3339),
+				"created_by_principal_id":    "test",
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "invalid evidence_sufficiency_state",
+			payload: map[string]interface{}{
+				"legal_entity_id":             "entity-001",
+				"domain_code":                 "TAX",
+				"status_code":                 "COMPLIANT",
+				"status_reason":               "test",
+				"evidence_sufficiency_state":  "INVALID",
+				"evaluated_at":                time.Now().UTC().Format(time.RFC3339),
+				"created_by_principal_id":     "test",
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, _ := json.Marshal(tc.payload)
+			req := httptest.NewRequest("POST", "/v1/compliance-status/", bytes.NewBuffer(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Principal-Id", "principal-test-01")
+			req.Header.Set("X-Tenant-Id", "tenant-001")
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != tc.wantStatus {
+				t.Errorf("expected status %d, got %d", tc.wantStatus, w.Code)
+			}
+		})
 	}
 }

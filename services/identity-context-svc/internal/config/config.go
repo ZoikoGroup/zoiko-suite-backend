@@ -74,6 +74,15 @@ type Config struct {
 	TenantRegistryURL string
 	AccessControlURL  string
 
+	// TenantRegistryMTLSURL, when set, sends every tenant-registry call to this
+	// URL (the registry's mTLS listener) with this service's own workload
+	// certificate, provisioned from MTLS_MANAGEMENT_SERVICE_URL with
+	// MTLS_BOOTSTRAP_TOKEN_PATH. The registry's identity gate in require mode
+	// admits a caller with no envelope only as a registered mTLS peer, and a
+	// context resolve has no envelope yet: it is what mints one. Empty means
+	// plain HTTP to TenantRegistryURL.
+	TenantRegistryMTLSURL string
+
 	// CommercialAccountURL is COM-03 Entitlement (commercial-account-svc), the
 	// "commercial entitlement read model" §4 names for the entitlement context
 	// reference. Empty leaves it UPSTREAM_NOT_CONFIGURED. ServicePrincipalID is
@@ -546,6 +555,11 @@ func Load() (*Config, error) {
 	if cfg.IDPClientAuth == "required" && cfg.IDPClientSecretsFile == "" {
 		return nil, errors.New("IDP_CLIENT_AUTH=required needs IDP_CLIENT_SECRETS_FILE: no client could ever log in")
 	}
+	// IC-FE-4 / S1-B1: outside local the console must authenticate as a confidential
+	// client; the fallback local credential list is a development-only crutch.
+	if cfg.Environment != "local" && cfg.IDPClientAuth != "required" {
+		return nil, fmt.Errorf("IDP_CLIENT_AUTH must be 'required' in %s: the console must present a verified client credential (IDP_CLIENT_SECRETS_FILE)", cfg.Environment)
+	}
 
 	keys, err := mfaKeyring(env("MFA_SECRET_KEY", ""), cfg.MFASecretKeyID, env("MFA_SECRET_PREVIOUS_KEYS", ""))
 	if err != nil {
@@ -592,6 +606,10 @@ func Load() (*Config, error) {
 	}
 	if cfg.MTLSEnabled && cfg.MTLSManagementURL == "" {
 		return nil, fmt.Errorf("MTLS_ENABLED=true needs MTLS_MANAGEMENT_SERVICE_URL: the listener's certificate comes from mtls-management-svc")
+	}
+	cfg.TenantRegistryMTLSURL = strings.TrimSpace(env("TENANT_REGISTRY_MTLS_URL", ""))
+	if cfg.TenantRegistryMTLSURL != "" && (cfg.MTLSManagementURL == "" || cfg.MTLSBootstrapTokenPath == "") {
+		return nil, fmt.Errorf("TENANT_REGISTRY_MTLS_URL needs MTLS_MANAGEMENT_SERVICE_URL and MTLS_BOOTSTRAP_TOKEN_PATH: the client certificate comes from mtls-management-svc")
 	}
 
 	if err := loadAuthPlane(cfg); err != nil {

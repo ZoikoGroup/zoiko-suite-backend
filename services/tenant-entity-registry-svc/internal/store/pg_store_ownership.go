@@ -16,8 +16,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"go.uber.org/zap"
@@ -332,16 +334,33 @@ func (s *PgStore) EndOwnershipRelationship(ctx context.Context, relationshipID s
 // the group structure at asOf: approved (ACTIVE) or since SUPERSEDED or ENDED,
 // with valid_from <= asOf < valid_to. A superseded or ended row keeps the date
 // it stopped, so a past date sees it as it was then.
-func (s *PgStore) ListOwnershipInForceAt(ctx context.Context, asOf time.Time) ([]domain.OwnershipRelationship, error) {
-	s.log.Debug("store.ListOwnershipInForceAt", zap.Time("as_of", asOf))
+func (s *PgStore) ListOwnershipInForceAt(ctx context.Context, asOf time.Time, limit int, cursor string) ([]domain.OwnershipRelationship, string, error) {
+	s.log.Debug("store.ListOwnershipInForceAt", zap.Time("as_of", asOf), zap.Int("limit", limit))
 	tid := domain.TenantFromContext(ctx)
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+
+	var afterValidFrom *time.Time
+	afterID := ""
+	if cursor != "" {
+		ds, id, ok := strings.Cut(cursor, "|")
+		d, err := time.Parse(time.RFC3339, ds)
+		if _, perr := uuid.Parse(id); !ok || err != nil || perr != nil {
+			return nil, "", fmt.Errorf("%w: cursor is not one this service issued", registry.ErrInvalidInput)
+		}
+		afterValidFrom, afterID = &d, id
+	}
 
 	var out []domain.OwnershipRelationship
+	var next string
 	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			SELECT `+ownershipColumns+` FROM ownership_relationships
 			 WHERE tenant_id = $1 AND status IN ('ACTIVE', 'SUPERSEDED', 'ENDED')
-			   AND valid_from <= $2 AND (valid_to IS NULL OR valid_to > $2)`, tid, asOf)
+			   AND valid_from <= $2 AND (valid_to IS NULL OR valid_to > $2)
+			   AND ($3::timestamptz IS NULL OR (valid_from, relationship_id) < ($3::timestamptz, $4::uuid))
+			 ORDER BY valid_from ASC, relationship_id ASC LIMIT $5`, tid, asOf, afterValidFrom, nullUUID(afterID), limit+1)
 		if err != nil {
 			return err
 		}
@@ -351,9 +370,14 @@ func (s *PgStore) ListOwnershipInForceAt(ctx context.Context, asOf time.Time) ([
 			if err != nil {
 				return err
 			}
+			if len(out) == limit {
+				last := out[len(out)-1]
+				next = last.ValidFrom.UTC().Format(time.RFC3339) + "|" + last.RelationshipID
+				break
+			}
 			out = append(out, *r)
 		}
 		return rows.Err()
 	})
-	return out, err
+	return out, next, err
 }

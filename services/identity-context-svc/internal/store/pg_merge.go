@@ -17,6 +17,9 @@ import (
 // ErrMergeConflict: the merge cannot be made as asked. The message says why; it is a 409.
 var ErrMergeConflict = errors.New("identity merge conflict")
 
+// ErrMergeStale: the duplicate's record_version is not the If-Match value (412).
+var ErrMergeStale = errors.New("duplicate subject has changed since it was read")
+
 // Link outcomes of a merge.
 const (
 	LinkMoved   = "MOVED"
@@ -71,7 +74,9 @@ func scanMerge(row pgx.Row) (*IdentityMerge, error) {
 //
 // Idempotent by (tenant, duplicate): repeating the same merge returns the recorded one with created=false;
 // merging an already-merged duplicate into a different survivor is ErrMergeConflict.
-func (s *PgStore) MergeIdentities(ctx context.Context, tenantID, survivorID, duplicateID, reason, actor, correlationID string,
+//
+// IC-14 (S1-14): adds duplicateVersion (If-Match) parameter for optimistic locking.
+func (s *PgStore) MergeIdentities(ctx context.Context, tenantID, survivorID, duplicateID, reason, actor, correlationID string, duplicateVersion int64,
 	build func(m IdentityMerge) ([]outbox.Record, error)) (*IdentityMerge, bool, error) {
 	var out *IdentityMerge
 	created := false
@@ -103,33 +108,40 @@ func (s *PgStore) MergeIdentities(ctx context.Context, tenantID, survivorID, dup
 			return nil
 		}
 
-		statuses := map[string]string{}
-		rows, err := tx.Query(ctx, `SELECT principal_id, status FROM principals
-			WHERE tenant_id = $1 AND principal_id IN ($2, $3) ORDER BY principal_id FOR UPDATE`, tenantID, survivorID, duplicateID)
-		if err != nil {
+statuses := map[string]string{}
+	versions := map[string]int64{}
+	rows, err := tx.Query(ctx, `SELECT principal_id, status, record_version FROM principals
+		WHERE tenant_id = $1 AND principal_id IN ($2, $3) ORDER BY principal_id FOR UPDATE`, tenantID, survivorID, duplicateID)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id, st string
+		var ver int64
+		if err := rows.Scan(&id, &st, &ver); err != nil {
+			rows.Close()
 			return err
 		}
-		for rows.Next() {
-			var id, st string
-			if err := rows.Scan(&id, &st); err != nil {
-				rows.Close()
-				return err
-			}
-			statuses[id] = st
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		if _, ok := statuses[survivorID]; !ok {
-			return fmt.Errorf("%w: survivor %s", domain.ErrPrincipalNotFound, survivorID)
-		}
-		if _, ok := statuses[duplicateID]; !ok {
-			return fmt.Errorf("%w: duplicate %s", domain.ErrPrincipalNotFound, duplicateID)
-		}
-		if statuses[survivorID] == string(domain.PrincipalStatusDisabled) {
-			return fmt.Errorf("%w: the survivor is disabled", ErrMergeConflict)
-		}
+		statuses[id] = st
+		versions[id] = ver
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if _, ok := statuses[survivorID]; !ok {
+		return fmt.Errorf("%w: survivor %s", domain.ErrPrincipalNotFound, survivorID)
+	}
+	if _, ok := statuses[duplicateID]; !ok {
+		return fmt.Errorf("%w: duplicate %s", domain.ErrPrincipalNotFound, duplicateID)
+	}
+	if statuses[survivorID] == string(domain.PrincipalStatusDisabled) {
+		return fmt.Errorf("%w: the survivor is disabled", ErrMergeConflict)
+	}
+	// IC-14 (S1-14): If-Match on the duplicate's record_version
+	if duplicateVersion > 0 && versions[duplicateID] != duplicateVersion {
+		return ErrMergeStale
+	}
 		var chained bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM principal_merges WHERE tenant_id = $1
 			AND (duplicate_id = $2 OR survivor_id = $3))

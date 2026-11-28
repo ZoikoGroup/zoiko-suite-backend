@@ -44,7 +44,7 @@ func (f *fakeRevoker) EvictAllForPrincipal(_ context.Context, principalID, tenan
 	return 1, nil
 }
 
-func (f *fakeRevoker) EvictAllForEntity(_ context.Context, legalEntityID, tenantID string, reason domain.InvalidationReason) (int, error) {
+func (f *fakeRevoker) EvictAllForEntity(_ context.Context, legalEntityID, tenantID string, reason domain.InvalidationReason, actorID, correlationID string) (int, error) {
 	if f.err != nil {
 		return 0, f.err
 	}

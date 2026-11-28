@@ -1,10 +1,31 @@
 # evidence-requirements-svc — Progress
 
-**Status (5 Nov 2026): complete for this service's side of the contract, verified live.**
-Plan: `docs/audit_files/EVIDENCE-REQUIREMENTS-PLAN-2026-11-04.md`. Suites green with 0 skip on real
-Postgres; `scripts/audit.sh` 42/42 live; dependency E2E 84/84 live (3 owner-blocked skips, never
-counted as passes); mutation check 3/3; console rebuilt in v2.0. What remains is outside this service
-(see "BLOCKED" and "Cross-team follow-ups").
+**Status (23 Nov 2026).** Plan and step table: `docs/audit_files/DOMAIN1-DOMAIN2-COMPLETION-TRACKER-2026-11-06.md`
+§D2-7 (the 4 Nov plan file was merged there on 6 Nov). Verified live on 5 Nov (`scripts/audit.sh` 42/42, dependency
+E2E 84/84 with 3 owner-blocked skips). Since then:
+
+- **Suite (23 Nov):** `go vet ./...` (default and `-tags integration`) clean. With `TEST_DATABASE_URL` on a scratch
+  database: default 118 pass / 0 fail / 0 skip; `-tags integration` 129 pass / 0 fail / 0 skip. The store resets now
+  drop the whole `public` schema (a hand-kept table list missed new tables).
+- **ER-S6 (23 Nov):** migration 000012 `evidence_request_transitions` (append-only; a trigger on `evidence_requests`
+  writes one row per creation and per change of status, assignee or due date, with the command and the actor the
+  service sets); `GET /v1/pbc/requests/{id}/transitions` and `…/available-actions` (manager-or-assignee read rule).
+  Tests: `TestERS6_HistoryRecordsEveryMoveAndIsAppendOnly` (NOBYPASSRLS), `TestERS6_AvailableActions_*`,
+  `TestERS6_Transitions_*`, `TestERS6_PBCAvailableActions_ByStatus`; openapi parity green.
+- **ER-S2 (23 Nov):** compose clamav pinned to `clamav/clamav:1.5.4` (1.4.1 is not a published tag) under the `scan`
+  profile; its dependants use `required: false`, so `docker compose config` is valid with and without the profile;
+  clamd came up healthy alone.
+
+**Corrections to the 18 Nov notes (verifier check of 23 Nov, kept here so the claims are not repeated):**
+- ER-W6 "zero skips" was false: `deployments/scripts/e2e-evidence-requirements-deps.py` still has the vault-upload,
+  manifest and esignature skip branches. Open as ER-S4/ER-S5.
+- ER-W8 was a to-do, not done: compose still runs `EVIDENCE_EVALUATE_AUTHZ` and `EVIDENCE_IDENTITY_VERIFY` as `warn`.
+  Open as ER-S7.
+- ER-W4: the document-vault user and `CLAMAV_URL` were in compose; clamav was `latest` and its dependants made
+  `compose config` fail without the profile. Fixed in ER-S2 (above).
+- ER-W5: `schemas/evidence.requirement.{satisfied,missing}.v1.json` and
+  `deployments/scripts/register-evidence-requirements-schemas.py` exist; a live registration run is not recorded.
+  Open as ER-S3.
 
 ## Verification of the first execution (verifier protocol, 5 Nov)
 
@@ -485,3 +506,19 @@ Audit files updated: `IMPLEMENTATION-PROGRESS.md` (API-3, API-4), `group2-govern
 - **schema-registry-svc**: register the two event schemas (asyncapi.yaml).
 - **this service, next pass**: authorize `GET /v1/pbc/requests/{id}` at the request's entity (Governance
   row 21); switch compose gates to enforce once callers send the envelope (D-ER-6).
+
+## Decision capture (DL-6, 25 Nov 2026)
+
+Doc 01 §7: every evidence evaluation (`POST /v1/evidence/evaluate`) reaches governance-decision-log-svc as
+`svc-evidence-requirements` (authorization-svc 000046): `EVIDENCE_<action>` with outcome `SATISFIED`,
+`NO_REQUIREMENTS_DEFINED` (both APPROVED) or `MISSING` (DENIED), domain `GOVERNANCE_COMPLIANCE`, `rule_basis`
+`requirements:<domain>/<action>@sha256:<digest of the requirement ids>` (the requirement-set version), the unmet
+requirements and the number of artifacts presented (never the artifacts). Queued in the evaluation's own
+transaction (`internal/store/decision_ledger.go`, `PgStore.SetDecisionLedger`), migration 000013
+`decision_log_outbox`; a replayed evaluation queues nothing new. Metrics `evidence_requirements_decision_log_*`.
+Test: `TestEvaluationRecord_OutcomesAndRequirementSetBasis`.
+
+Built before the 23 Nov D2-7 step table is ✅ (the assignment's order asked for after); the user asked on
+25 Nov 2026 for the whole assignment.
+
+The record is written to `decision_log_outbox` in the transaction of the decision it records and delivered by `identity-envelope/decisionledger`'s relay (lease-based claim, backoff to 10 minutes, a 409 parks the row for an operator, delivered rows purged after `LEDGER_RETENTION_HOURS`, default 168) to `GOVERNANCE_DECISION_LOG_MTLS_URL` with this service's own workload certificate (`mtlsclient`, bootstrap token `MTLS_BOOTSTRAP_TOKEN_PATH`). Deliveries are capped at `LEDGER_RELAY_MAX_PER_SECOND` (default 20): a ledger outage or a burst delays the evidence, it never fails or slows the decision. Status: 🔵 built, not verified (tracker "Assignment 25 Nov 2026").

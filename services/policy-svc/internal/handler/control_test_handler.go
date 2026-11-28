@@ -110,6 +110,7 @@ func (h *Handler) CreateControlTestDefinition(w http.ResponseWriter, r *http.Req
 		SampleApproach:          req.SampleApproach,
 		TestFrequency:           req.TestFrequency,
 		CreatedByPrincipalID:    principalID,
+		Meta:                    eventMeta(r, principalID),
 	}
 
 	d, created, err := h.store.CreateControlTestDefinition(r.Context(), params)
@@ -259,6 +260,7 @@ func (h *Handler) CreateControlTestExecution(w http.ResponseWriter, r *http.Requ
 		ExceptionsNoted:         req.ExceptionsNoted,
 		ReviewerPrincipalID:     req.ReviewerPrincipalID,
 		CreatedByPrincipalID:    principalID,
+		Meta:                    eventMeta(r, principalID),
 	}
 
 	e, err := h.store.CreateControlTestExecution(r.Context(), params)
@@ -287,10 +289,11 @@ func (h *Handler) ListControlTestExecutions(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	if _, ok := h.requireTenant(w, r); !ok {
+	if !requireUUID(w, r, "control_test_definition_id", definitionID) {
 		return
 	}
-	if !requireUUID(w, r, "control_test_definition_id", definitionID) {
+	lr, ok := h.beginList(w, r, nil)
+	if !ok {
 		return
 	}
 	if !h.authorize(w, r, principalID, authz.ActionControlTestExecutionRead, nil) {
@@ -303,10 +306,7 @@ func (h *Handler) ListControlTestExecutions(w http.ResponseWriter, r *http.Reque
 		writeError(w, r, http.StatusServiceUnavailable, codeUnavailable, "store_unavailable", "", nil)
 		return
 	}
-	if results == nil {
-		results = []*domain.ControlTestExecution{}
-	}
-	writeJSON(w, http.StatusOK, results)
+	pageOf(h, w, r, lr, results)
 }
 
 // GetControlEffectiveness handles GET /v1/controls/{control_ref}/effectiveness
@@ -434,6 +434,7 @@ func (h *Handler) CreateAttestation(w http.ResponseWriter, r *http.Request) {
 		EvidenceRefs:         req.EvidenceRefs,
 		ExpiresAt:            req.ExpiresAt,
 		CreatedByPrincipalID: principalID,
+		Meta:                 eventMeta(r, principalID),
 	}
 
 	a, err := h.store.CreateAttestation(r.Context(), params)
@@ -521,7 +522,7 @@ func (h *Handler) RevokeAttestation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a, err := h.store.RevokeAttestation(r.Context(), id, req.Reason)
+	a, err := h.store.RevokeAttestation(r.Context(), id, req.Reason, eventMeta(r, principalID))
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrAttestationNotFound):

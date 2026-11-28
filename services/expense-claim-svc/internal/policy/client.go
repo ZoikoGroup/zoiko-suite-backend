@@ -29,6 +29,10 @@ type Caller struct {
 	Authorization string
 	RequestID     string
 	CorrelationID string
+	// DecisionID is stable for one business decision, so a retried request
+	// records one decision in policy-svc's evidence, not one per attempt.
+	// Empty draws a fresh one (each call is then its own decision).
+	DecisionID string
 }
 
 type Client interface {
@@ -62,7 +66,7 @@ func (c *HTTPClient) EvaluateApprovalThreshold(ctx context.Context, caller Calle
 	actionContext, _ := json.Marshal(map[string]float64{"amount": amount})
 	body := evaluateRequest{
 		PolicyType: "APPROVAL_THRESHOLD", TenantID: tenantID, LegalEntityID: legalEntityID,
-		ActionContext: actionContext, DecisionID: uuid.New().String(),
+		ActionContext: actionContext, DecisionID: decisionID(caller),
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -100,6 +104,12 @@ func (c *HTTPClient) EvaluateApprovalThreshold(ctx context.Context, caller Calle
 		// (controlled categories); this client never invents WITHIN_THRESHOLD.
 		return "", "", domain.ErrNoApplicablePolicy
 	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		// The caller lacks POLICY_EVALUATE (or its identity was refused):
+		// an authorization answer, not an outage (policy-svc register P-13).
+		c.log.Warn("policy-svc refused the caller", zap.Int("status", resp.StatusCode))
+		return "", "", domain.ErrPolicyAccessDenied
+	}
 	if resp.StatusCode != http.StatusOK {
 		// 401/403 is the caller lacking POLICY_EVALUATE, not an outage; the
 		// status is logged so the two can be told apart.
@@ -112,4 +122,11 @@ func (c *HTTPClient) EvaluateApprovalThreshold(ctx context.Context, caller Calle
 		return "", "", domain.ErrPolicyServiceUnavailable
 	}
 	return out.Result, out.PolicyVersionID, nil
+}
+
+func decisionID(c Caller) string {
+	if c.DecisionID != "" {
+		return c.DecisionID
+	}
+	return uuid.New().String()
 }

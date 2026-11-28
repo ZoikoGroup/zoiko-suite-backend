@@ -4,6 +4,51 @@ Status: **ESR complete — `scripts/audit.sh` 146/146 (100%) against a running
 stack, 22 Sep 2026.** See `RELEASE_CERTIFICATE.md` for what was verified,
 against what, and what was deliberately not done.
 
+## CFG-1 · API-3 and API-4 — 24 Nov 2026 (built, not verified)
+
+Plan: `docs/audit_files/DOMAIN1-DOMAIN2-COMPLETION-TRACKER-2026-11-06.md` §D1-3, task CFG-1.
+Not run live: no image rebuild, no dev DB migration (none needed: no new migration).
+
+**If-Match (API-3).** The handler reads the header (`428 precondition_required` without it,
+`400 invalid_if_match` when malformed) and puts it on the request context
+(`domain.WithPrecondition`). The store compares it with the row it has locked
+(`domain.CheckPrecondition`) and refuses a stale one with `412 stale_version`, the current
+version in the body (`current_version`) and the `ETag` header. Two writers holding the same ETag:
+only the first succeeds.
+
+| Route | ETag compared with | Where the caller gets the ETag |
+|---|---|---|
+| `POST /v1/config/changes/{id}/approve` | change `record_version` | create response, `GET …/{id}` |
+| `POST /v1/config/changes/{id}/activate` | change `record_version` (handler pre-check, now also under the lock) | approve response, `GET …/{id}` |
+| `POST /v1/config/changes/{id}/rollback` | target change `record_version` | activate response, `GET …/{id}` |
+| `POST /v1/emergency-changes/{id}/activate` | emergency change `record_version` (also under the lock now) | create response, `GET …/{id}` |
+| `POST /v1/flags/{key}/removal` | retirement `record_version` | retire response |
+| `POST /v1/flags/{key}/release-plans` | latest plan `version` in the scope; `If-None-Match: *` for the first plan | release-plan response |
+
+Fixed on the way: create, approve and activate responses reported a stale `record_version`
+(0 on create, the pre-update value on approve/activate), so the ETag a caller took from them
+could never match. Inserts now `RETURNING record_version`; approve returns the bumped value;
+activate re-reads it after its updates. Create responses carry the `ETag` header.
+
+**Cursor paging (API-4).** `GET /v1/config` and `GET /v1/flags`: `limit` 1–500 (default 100),
+`cursor` from `X-Next-Cursor` / `Link rel="next"`; keyset on (key, environment, tenant), the
+global default first. The body is still a JSON array. The legacy console (`lib/api/configuration.ts`)
+does not follow the cursor yet, so it now shows the first 100 rows of each list.
+
+**Not done in CFG-1 (left open):**
+- `PUT /v1/config/overrides/{scope}`: override rows have no version column (`config_entries`
+  is append-only with `effective_to`); an ETag needs a migration. Open.
+- `POST /v1/flags/{key}/kill-switch` and `POST /v1/flags/{key}/retire` create a new record
+  rather than change one, so they take no If-Match here; retire is already one-per-key
+  (`uq_flag_retirements_key`, 409). Listed for a decision.
+- ETag on the legacy `GET /v1/config/{key}` and `GET /v1/flags/{key}`: those rows have no
+  version either.
+
+**Suite (24 Nov 2026):** `go test -count=1 -p 1 ./...` with `TEST_DATABASE_URL` on a scratch
+database (`cfg_test_c1`): **196 pass, 0 fail, 0 skip** (183 before + 13 new: `TestCFG1_*` in
+`internal/domain`, `internal/handler`, `internal/store`). Mutation check: 13 mutants
+(`D:\zoikocomp\.cache\tools\cfg1_mutants.json`), all killed.
+
 ## Enterprise Service Readiness pass — 22 Sep 2026
 
 Brought this service up to the standard set by `access-control-svc` and

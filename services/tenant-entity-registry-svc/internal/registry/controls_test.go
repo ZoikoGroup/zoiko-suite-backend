@@ -63,9 +63,9 @@ func TestReads_QuarantineAndProposalsNeedTheirReadPermission(t *testing.T) {
 	ms := newMemStore()
 	svc := newSvc(t, ms, denyActions{"entity.registry-conflict.read": true, "approval-request.read": true}, acceptAllJurisd{})
 
-	_, err := svc.ListRegistryConflicts(tenantCtx(orgTenant), true)
+	_, _, err := svc.ListRegistryConflicts(tenantCtx(orgTenant), true, 50, "")
 	require.ErrorIs(t, err, registry.ErrUnauthorized)
-	_, err = svc.ListApprovalRequests(tenantCtx(orgTenant), true)
+	_, _, err = svc.ListApprovalRequests(tenantCtx(orgTenant), true, 50, "")
 	require.ErrorIs(t, err, registry.ErrUnauthorized)
 	_, err = svc.GetApprovalRequest(tenantCtx(orgTenant), "any")
 	require.ErrorIs(t, err, registry.ErrUnauthorized)

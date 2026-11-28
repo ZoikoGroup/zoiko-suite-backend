@@ -1,0 +1,2627 @@
+{
+  "info": {
+    "name": "policy-svc",
+    "description": "Generated from services/policy-svc/openapi.yaml. Every route, grouped by resource. Set baseUrl, envelope (identity-context-svc signed envelope), tenantId, principalId, and the path ids. Lifecycle commands send If-Match: {{etag}} (the version's ETag).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:8085"
+    },
+    {
+      "key": "envelope",
+      "value": ""
+    },
+    {
+      "key": "tenantId",
+      "value": ""
+    },
+    {
+      "key": "principalId",
+      "value": ""
+    },
+    {
+      "key": "etag",
+      "value": "\"v1\""
+    }
+  ],
+  "item": [
+    {
+      "name": "accounting-policies",
+      "item": [
+        {
+          "name": "POST /v1/accounting-policies (draftAccountingPolicy)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/accounting-policies",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "GET /v1/accounting-policies (listApplicableAccountingPolicies)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/accounting-policies"
+          }
+        },
+        {
+          "name": "GET /v1/accounting-policies/resolve (resolveAccountingPolicy)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/accounting-policies/resolve"
+          }
+        },
+        {
+          "name": "GET /v1/accounting-policies/explain (explainAccountingResolution)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/accounting-policies/explain"
+          }
+        },
+        {
+          "name": "GET /v1/accounting-policies/versions/{version_id} (getAccountingPolicyVersion)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/accounting-policies/versions/{{version_id}}"
+          }
+        },
+        {
+          "name": "POST /v1/accounting-policies/versions/{version_id}/submit-review (submitAccountingPolicy)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "If-Match",
+                "value": "{{etag}}"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/accounting-policies/versions/{{version_id}}/submit-review",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "POST /v1/accounting-policies/versions/{version_id}/approve (approveAccountingPolicyVersion)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "If-Match",
+                "value": "{{etag}}"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/accounting-policies/versions/{{version_id}}/approve",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "POST /v1/accounting-policies/versions/{version_id}/activate (activateAccountingPolicyVersion)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "If-Match",
+                "value": "{{etag}}"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/accounting-policies/versions/{{version_id}}/activate",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "POST /v1/accounting-policies/versions/{version_id}/supersede (supersedeAccountingPolicyVersion)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "If-Match",
+                "value": "{{etag}}"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/accounting-policies/versions/{{version_id}}/supersede",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "POST /v1/accounting-policies/versions/{version_id}/emergency-suspend (emergencySuspendAccountingPolicy)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "If-Match",
+                "value": "{{etag}}"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/accounting-policies/versions/{{version_id}}/emergency-suspend",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "POST /v1/accounting-policies/versions/{version_id}/review-suspension (reviewAccountingPolicySuspension)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "If-Match",
+                "value": "{{etag}}"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/accounting-policies/versions/{{version_id}}/review-suspension",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "GET /v1/accounting-policies/versions/{version_id}/impact (getAccountingPolicyImpact)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/accounting-policies/versions/{{version_id}}/impact"
+          }
+        }
+      ]
+    },
+    {
+      "name": "attestations",
+      "item": [
+        {
+          "name": "POST /v1/attestations (createAttestation)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/attestations",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "GET /v1/attestations (listAttestations)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/attestations"
+          }
+        },
+        {
+          "name": "GET /v1/attestations/{id} (getAttestation)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/attestations/{{id}}"
+          }
+        },
+        {
+          "name": "POST /v1/attestations/{id}/revoke (revokeAttestation)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/attestations/{{id}}/revoke",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "control-test-definitions",
+      "item": [
+        {
+          "name": "POST /v1/control-test-definitions (createControlTestDefinition)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/control-test-definitions",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "GET /v1/control-test-definitions (listControlTestDefinitions)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/control-test-definitions"
+          }
+        },
+        {
+          "name": "GET /v1/control-test-definitions/{id} (getControlTestDefinition)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/control-test-definitions/{{id}}"
+          }
+        },
+        {
+          "name": "POST /v1/control-test-definitions/{id}/executions (createControlTestExecution)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/control-test-definitions/{{id}}/executions",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "GET /v1/control-test-definitions/{id}/executions (listControlTestExecutions)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/control-test-definitions/{{id}}/executions"
+          }
+        }
+      ]
+    },
+    {
+      "name": "controls",
+      "item": [
+        {
+          "name": "GET /v1/controls/{control_ref}/effectiveness (getControlEffectiveness)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/controls/{{control_ref}}/effectiveness"
+          }
+        }
+      ]
+    },
+    {
+      "name": "platform",
+      "item": [
+        {
+          "name": "GET /healthz (liveness)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/healthz"
+          }
+        },
+        {
+          "name": "GET /readyz (readiness)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/readyz"
+          }
+        }
+      ]
+    },
+    {
+      "name": "policies",
+      "item": [
+        {
+          "name": "POST /v1/policies (createPolicy)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policies",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "GET /v1/policies (listApplicablePolicyVersions)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policies"
+          }
+        },
+        {
+          "name": "GET /v1/policies/resolve (resolveEffectivePolicy)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policies/resolve"
+          }
+        },
+        {
+          "name": "GET /v1/policies/explain (explainPolicyResolution)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policies/explain"
+          }
+        },
+        {
+          "name": "GET /v1/policies/summary (getPolicySummary)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policies/summary"
+          }
+        },
+        {
+          "name": "POST /v1/policies/evaluate (evaluatePolicy)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policies/evaluate",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "GET /v1/policies/{policy_id} (getPolicy)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policies/{{policy_id}}"
+          }
+        },
+        {
+          "name": "POST /v1/policies/{policy_id}/retire (retirePolicyFamily)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policies/{{policy_id}}/retire",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "POST /v1/policies/{policy_id}/versions (createPolicyVersion)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policies/{{policy_id}}/versions",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "GET /v1/policies/{policy_id}/versions (listVersionHistory)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policies/{{policy_id}}/versions"
+          }
+        },
+        {
+          "name": "POST /v1/policies/{policy_id}/versions/{version_id}/submit-review (submitPolicyVersionForReview)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "If-Match",
+                "value": "{{etag}}"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policies/{{policy_id}}/versions/{{version_id}}/submit-review",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "POST /v1/policies/{policy_id}/versions/{version_id}/approve (approvePolicyVersion)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "If-Match",
+                "value": "{{etag}}"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policies/{{policy_id}}/versions/{{version_id}}/approve",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "POST /v1/policies/{policy_id}/versions/{version_id}/activate (activatePolicyVersion)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "If-Match",
+                "value": "{{etag}}"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policies/{{policy_id}}/versions/{{version_id}}/activate",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "POST /v1/policies/{policy_id}/versions/{version_id}/schedule (schedulePolicyVersion)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "If-Match",
+                "value": "{{etag}}"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policies/{{policy_id}}/versions/{{version_id}}/schedule",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "POST /v1/policies/{policy_id}/versions/{version_id}/suspend (suspendPolicyVersion)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "If-Match",
+                "value": "{{etag}}"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policies/{{policy_id}}/versions/{{version_id}}/suspend",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "POST /v1/policies/{policy_id}/versions/{version_id}/retire (retirePolicyVersion)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "If-Match",
+                "value": "{{etag}}"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policies/{{policy_id}}/versions/{{version_id}}/retire",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "POST /v1/policies/{policy_id}/versions/{version_id}/review-suspension (reviewPolicyVersionSuspension)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "If-Match",
+                "value": "{{etag}}"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policies/{{policy_id}}/versions/{{version_id}}/review-suspension",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "POST /v1/policies/{policy_id}/test-cases (createPolicyTestCase)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policies/{{policy_id}}/test-cases",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "GET /v1/policies/{policy_id}/test-cases (listPolicyTestCases)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policies/{{policy_id}}/test-cases"
+          }
+        },
+        {
+          "name": "POST /v1/policies/{policy_id}/test-cases/{test_case_id}/retire (retirePolicyTestCase)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policies/{{policy_id}}/test-cases/{{test_case_id}}/retire",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "policy-evaluations",
+      "item": [
+        {
+          "name": "GET /v1/policy-evaluations (listPolicyEvaluations)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policy-evaluations"
+          }
+        },
+        {
+          "name": "POST /v1/policy-evaluations/{evidence_id}/redeliver (redeliverPolicyEvidence)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policy-evaluations/{{evidence_id}}/redeliver",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "GET /v1/policy-evaluations/{evidence_id} (getPolicyEvaluation)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policy-evaluations/{{evidence_id}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "policy-families",
+      "item": [
+        {
+          "name": "GET /v1/policy-families (listPolicyFamilies)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policy-families"
+          }
+        }
+      ]
+    },
+    {
+      "name": "policy-test-runs",
+      "item": [
+        {
+          "name": "GET /v1/policy-test-runs/{test_run_id} (getPolicyTestRun)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policy-test-runs/{{test_run_id}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "policy-versions",
+      "item": [
+        {
+          "name": "GET /v1/policy-versions (listPolicyVersions)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policy-versions"
+          }
+        },
+        {
+          "name": "GET /v1/policy-versions/compare (comparePolicyVersions)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policy-versions/compare"
+          }
+        },
+        {
+          "name": "GET /v1/policy-versions/{version_id} (getPolicyVersion)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policy-versions/{{version_id}}"
+          }
+        },
+        {
+          "name": "GET /v1/policy-versions/{version_id}/transitions (listPolicyVersionTransitions)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policy-versions/{{version_id}}/transitions"
+          }
+        },
+        {
+          "name": "POST /v1/policy-versions/{version_id}/test-runs (runPolicyTestSuite)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policy-versions/{{version_id}}/test-runs",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "GET /v1/policy-versions/{version_id}/test-runs (listPolicyTestRuns)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policy-versions/{{version_id}}/test-runs"
+          }
+        },
+        {
+          "name": "GET /v1/policy-versions/{version_id}/certification (getPolicyVersionCertification)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policy-versions/{{version_id}}/certification"
+          }
+        },
+        {
+          "name": "POST /v1/policy-versions/{version_id}/waivers (requestPolicyTestWaiver)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policy-versions/{{version_id}}/waivers",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "GET /v1/policy-versions/{version_id}/waivers (listPolicyTestWaivers)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policy-versions/{{version_id}}/waivers"
+          }
+        },
+        {
+          "name": "POST /v1/policy-versions/{version_id}/rollback-draft (draftPolicyRollback)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policy-versions/{{version_id}}/rollback-draft",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "policy-waivers",
+      "item": [
+        {
+          "name": "POST /v1/policy-waivers/{waiver_id}/approve (approvePolicyTestWaiver)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policy-waivers/{{waiver_id}}/approve",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "POST /v1/policy-waivers/{waiver_id}/revoke (revokePolicyTestWaiver)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/policy-waivers/{{waiver_id}}/revoke",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "simulations",
+      "item": [
+        {
+          "name": "POST /v1/simulations (simulatePolicyVersion)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/simulations",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "GET /v1/simulations/{simulation_id} (getPolicySimulation)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/simulations/{{simulation_id}}"
+          }
+        },
+        {
+          "name": "GET /v1/simulations/{simulation_id}/differences (listPolicySimulationDifferences)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{envelope}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "{{tenantId}}"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{principalId}}"
+              },
+              {
+                "key": "X-Request-Id",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Source-Channel",
+                "value": "postman"
+              }
+            ],
+            "url": "{{baseUrl}}/v1/simulations/{{simulation_id}}/differences"
+          }
+        }
+      ]
+    }
+  ]
+}

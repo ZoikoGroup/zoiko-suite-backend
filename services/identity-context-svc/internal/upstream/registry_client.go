@@ -60,6 +60,9 @@ type RegistryClient struct {
 	cfg    *config.Config
 	log    *zap.Logger
 	client *http.Client
+	// registryURL is the tenant registry's base URL: cfg.TenantRegistryURL,
+	// or the mTLS URL once WithMTLS is applied.
+	registryURL string
 }
 
 func NewRegistryClient(cfg *config.Config, log *zap.Logger) *RegistryClient {
@@ -69,7 +72,24 @@ func NewRegistryClient(cfg *config.Config, log *zap.Logger) *RegistryClient {
 		client: &http.Client{
 			Timeout: 3 * time.Second, // strict timeout — hot path must not hang
 		},
+		registryURL: cfg.TenantRegistryURL,
 	}
+}
+
+// WithMTLS sends every tenant-registry call to mtlsURL through client, which
+// presents this service's workload certificate.
+//
+// tenant-entity-registry-svc's identity gate in require mode admits a caller
+// with no envelope only as a registered mTLS peer. A context resolve has no
+// envelope to send, because minting one is what it is doing, so on the plain
+// URL the registry answers 401 and every sign-in fails closed.
+//
+// The access-control calls share client. They use plain http:// URLs, for
+// which the TLS settings of the transport do not apply.
+func (c *RegistryClient) WithMTLS(mtlsURL string, client *http.Client) *RegistryClient {
+	c.registryURL = mtlsURL
+	c.client = client
+	return c
 }
 
 // Name identifies this dependency in the readiness probe.
@@ -103,7 +123,7 @@ func (c *RegistryClient) Name() string { return "tenant_registry" }
 // asserts it: the tests that let this through used a stub answering every
 // path, which proved the request was made and nothing about where it went.
 func (c *RegistryClient) Ping(ctx context.Context) error {
-	url := strings.TrimRight(c.cfg.TenantRegistryURL, "/") + tenantRegistryHealthPath
+	url := strings.TrimRight(c.registryURL, "/") + tenantRegistryHealthPath
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("build registry health request: %w", err)
@@ -160,7 +180,7 @@ type entityView struct {
 // {"data": [...]} page.
 func (c *RegistryClient) ListTenantHostBindings(ctx context.Context, tenantID string) ([]domain.HostBinding, error) {
 	status, body, err := c.get(ctx, tenantID,
-		fmt.Sprintf("%s/v1/tenants/%s/host-bindings", c.cfg.TenantRegistryURL, url.PathEscape(tenantID)))
+		fmt.Sprintf("%s/v1/tenants/%s/host-bindings", c.registryURL, url.PathEscape(tenantID)))
 	if err != nil {
 		return nil, err
 	}
@@ -186,7 +206,7 @@ func (c *RegistryClient) IsTenantActive(ctx context.Context, tenantID string) (b
 	}
 
 	status, body, err := c.get(ctx, tenantID,
-		fmt.Sprintf("%s/v1/tenants/%s", c.cfg.TenantRegistryURL, tenantID))
+		fmt.Sprintf("%s/v1/tenants/%s", c.registryURL, tenantID))
 	if err != nil {
 		return false, err
 	}
@@ -249,7 +269,7 @@ func (c *RegistryClient) ResolveEntityScope(ctx context.Context, principalID, te
 	}
 
 	status, body, err := c.get(ctx, tenantID,
-		fmt.Sprintf("%s/v1/entities/%s", c.cfg.TenantRegistryURL, legalEntityID))
+		fmt.Sprintf("%s/v1/entities/%s", c.registryURL, legalEntityID))
 	if err != nil {
 		return nil, err
 	}
@@ -498,7 +518,7 @@ func (c *RegistryClient) ResolveHost(ctx context.Context, host string) (tenantID
 		return "", "", false, nil
 	}
 	status, body, err := c.get(ctx, "", fmt.Sprintf("%s/v1/resolve-tenant?hostname=%s",
-		strings.TrimRight(c.cfg.TenantRegistryURL, "/"), url.QueryEscape(host)))
+		strings.TrimRight(c.registryURL, "/"), url.QueryEscape(host)))
 	if err != nil {
 		return "", "", false, fmt.Errorf("%w: %v", ErrUpstreamRead, err)
 	}

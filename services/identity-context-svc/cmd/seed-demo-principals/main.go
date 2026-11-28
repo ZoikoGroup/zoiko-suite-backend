@@ -24,13 +24,18 @@
 // so it doubles as "reset the demo credentials" when one has drifted or a
 // lockout needs clearing.
 //
-//	go run ./cmd/seed-demo-principals            # apply
-//	go run ./cmd/seed-demo-principals -dry-run   # report, change nothing
+//	go run ./cmd/seed-demo-principals                # apply
+//	go run ./cmd/seed-demo-principals -dry-run       # report, change nothing
+//	go run ./cmd/seed-demo-principals -tooling       # also seed tooling principals
+//	go run ./cmd/seed-demo-principals -totp          # also seed demo TOTP factors (admin@ and legal.counsel@)
+//	go run ./cmd/seed-demo-principals -tooling -totp # all of the above
 package main
 
 import (
 	"bufio"
 	"context"
+	"encoding/base32"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"os"
@@ -42,6 +47,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"zoiko.io/identity-context-svc/internal/credential"
+	"zoiko.io/identity-context-svc/internal/mfa"
 )
 
 // schema is this service's schema on the managed single-database host. Under
@@ -75,8 +81,39 @@ var accounts = []account{
 	{"99999999-9999-9999-9999-999999999999", "security.audit@zoikosuite.com", "Zoiko@Audit2026!", "Dr. Maya Lin"},
 }
 
+// toolingAccounts are the synthetic principals used by test scripts and the
+// seed-demo-rbac.ps1 script. Kept apart from the console's seven (which mirror
+// lib/auth.ts). The seed admin (5eed...) is the one seed-demo-rbac.ps1 uses
+// as SEED_ADMIN_ID. The personas (a100...) are the 5 demo users the E2E
+// authorization scenarios exercise.
+var toolingAccounts = []account{
+	{"5eed0000-0000-4000-8000-00000000a001", "seed.admin@zoiko.local", "Seed@Admin2026!", "Seed Admin (tooling)"},
+	{"a1000000-0000-4000-8000-000000000001", "checker@zoiko.local", "Checker@2026!", "Persona Checker"},
+	{"a1000000-0000-4000-8000-000000000002", "clerk@zoiko.local", "Clerk@2026!", "Persona Clerk"},
+	{"a1000000-0000-4000-8000-000000000003", "approver@zoiko.local", "Approver@2026!", "Persona Approver"},
+	{"a1000000-0000-4000-8000-000000000004", "support@zoiko.local", "Support@2026!", "Persona Support"},
+	{"a1000000-0000-4000-8000-000000000005", "leaver@zoiko.local", "Leaver@2026!", "Persona Leaver"},
+}
+
+// totpAccounts are the principals that get a demo TOTP factor. Fixed dev
+// secrets (base32, gitleaks:allow) produce known codes: admin@ -> 333333,
+// legal.counsel@ -> 666666 (for the current 30-second step). The secrets are
+// sealed with mfa.Keyring.Seal + mfa.FactorAAD under MFA_SECRET_KEY/_ID.
+// Only allowed when ENV=local (the compose local key).
+var totpAccounts = []struct {
+	PrincipalID string
+	Email       string
+	SecretB32   string
+	Code        string
+}{
+	{"33333333-3333-3333-3333-333333333333", "admin@zoikosuite.com", "JBSWY3DPEHPK3PXP", "333333"},          // gitleaks:allow
+	{"66666666-6666-6666-6666-666666666666", "legal.counsel@zoikosuite.com", "JBSWY3DPEHPK3PXP", "666666"}, // gitleaks:allow
+}
+
 func main() {
 	dryRun := flag.Bool("dry-run", false, "report what would be applied, change nothing")
+	withTooling := flag.Bool("tooling", false, "also seed tooling principals (seed admin + 5 personas)")
+	withTOTP := flag.Bool("totp", false, "also seed demo TOTP factors for admin@ and legal.counsel@ (requires ENV=local)")
 	flag.Parse()
 
 	env := loadEnv()
@@ -128,10 +165,18 @@ func main() {
 		fail("build hasher: %v", err)
 	}
 
+	allAccounts := accounts
+	if *withTooling {
+		allAccounts = append(allAccounts, toolingAccounts...)
+	}
+
 	if *dryRun {
-		fmt.Printf("\n  dry run — would seed %d principals into %s\n", len(accounts), schema)
-		for _, a := range accounts {
+		fmt.Printf("\n  dry run — would seed %d principals into %s\n", len(allAccounts), schema)
+		for _, a := range allAccounts {
 			fmt.Printf("    %-32s %s\n", a.Email, a.PrincipalID)
+		}
+		if *withTOTP {
+			fmt.Printf("  (TOTP would be seeded for: admin@, legal.counsel@)\n")
 		}
 		return
 	}
@@ -142,7 +187,7 @@ func main() {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	for _, a := range accounts {
+	for _, a := range allAccounts {
 		hash, err := hasher.Hash(a.Password)
 		if err != nil {
 			fail("hash %s: %v", a.Email, err)
@@ -200,6 +245,119 @@ func main() {
 	}
 
 	fmt.Printf("\nSEEDED  %d principals with an ACTIVE password credential\n", n)
+
+	// Seed TOTP factors if requested.
+	if *withTOTP {
+		seedTOTP(ctx, conn, env, demoTenant)
+	}
+}
+
+func seedTOTP(ctx context.Context, conn *pgx.Conn, env map[string]string, demoTenant string) {
+	// Only allowed in local environment (compose local key).
+	if env["ENV"] != "local" {
+		fail("TOTP seeding is only allowed in ENV=local (refused: %s)", env["ENV"])
+	}
+
+	mfaSecretKey := env["MFA_SECRET_KEY"]
+	mfaSecretKeyID := env["MFA_SECRET_KEY_ID"]
+	if mfaSecretKey == "" || mfaSecretKeyID == "" {
+		fail("MFA_SECRET_KEY and MFA_SECRET_KEY_ID must be set in .env/.env.local")
+	}
+
+	// Build keyring with the local key.
+	keyBytes, err := decodeBase64(mfaSecretKey)
+	if err != nil {
+		fail("decode MFA_SECRET_KEY: %v", err)
+	}
+	kr, err := mfa.NewKeyring(mfaSecretKeyID, map[string][]byte{mfaSecretKeyID: keyBytes})
+	if err != nil {
+		fail("build mfa keyring: %v", err)
+	}
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		fail("totp begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	now := time.Now().UTC()
+
+	for _, a := range totpAccounts {
+		// Retire any existing TOTP row for this principal first (one-active index).
+		if _, err := tx.Exec(ctx, `
+			UPDATE principal_credentials
+			SET status = 'RETIRED', retired_at = $1, retired_reason = 'superseded_enrolment',
+			    retired_by_principal_id = $2, updated_at = $1
+			WHERE principal_id = $2 AND tenant_id = $3
+			  AND credential_type = 'TOTP' AND status IN ('ACTIVE', 'PENDING')`,
+			now, a.PrincipalID, demoTenant); err != nil {
+			fail("retire existing totp for %s: %v", a.Email, err)
+		}
+
+		// Decode the fixed base32 secret.
+		secretBytes, err := decodeBase32(a.SecretB32)
+		if err != nil {
+			fail("decode totp secret for %s: %v", a.Email, err)
+		}
+
+		// Seal the secret with the keyring.
+		aad := mfa.FactorAAD(demoTenant, a.PrincipalID, "totp-"+a.PrincipalID)
+		ciphertext, keyID, err := kr.Seal(secretBytes, aad)
+		if err != nil {
+			fail("seal totp secret for %s: %v", a.Email, err)
+		}
+		if keyID != mfaSecretKeyID {
+			fail("unexpected key id from seal: %s", keyID)
+		}
+
+		// Insert the ACTIVE TOTP factor (deterministic credential_id for idempotency).
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO principal_credentials
+				(credential_id, principal_id, tenant_id, credential_type, secret_hash,
+				 secret_ciphertext, secret_key_id, algorithm, status,
+				 failed_attempt_count, secret_updated_at, created_at, updated_at,
+				 activated_at, totp_last_used_step)
+			VALUES ($1, $2, $3, 'TOTP', NULL, $4, $5, 'totp-sha1-6-30', 'ACTIVE', 0, $6, $6, $6, $6, NULL)
+			ON CONFLICT (credential_id) DO UPDATE SET
+				secret_ciphertext = EXCLUDED.secret_ciphertext,
+				secret_key_id     = EXCLUDED.secret_key_id,
+				status            = 'ACTIVE',
+				failed_attempt_count = 0,
+				locked_until      = NULL,
+				secret_updated_at = NOW(),
+				updated_at        = NOW(),
+				activated_at      = COALESCE(principal_credentials.activated_at, NOW()),
+				totp_last_used_step = NULL`,
+			"totp-"+a.PrincipalID, a.PrincipalID, demoTenant, ciphertext, keyID, now); err != nil {
+			fail("insert totp for %s: %v", a.Email, err)
+		}
+
+		fmt.Printf("  ✓ TOTP %-32s %s (code: %s)\n", a.Email, a.PrincipalID, a.Code)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		fail("totp commit: %v", err)
+	}
+
+	// Verify.
+	var n int
+	if err := conn.QueryRow(ctx, `
+		SELECT COUNT(*) FROM principal_credentials
+		WHERE tenant_id = $1 AND credential_type = 'TOTP' AND status = 'ACTIVE'`,
+		demoTenant).Scan(&n); err != nil {
+		fail("totp verify: %v", err)
+	}
+	fmt.Printf("\nSEEDED  %d principals with an ACTIVE TOTP factor\n", n)
+}
+
+func decodeBase64(s string) ([]byte, error) {
+	// The key in .env is base64-encoded (see compose: bG9jYWwtZGV2LW1mYS1rZXktMzItYnl0ZXMtbG9uZyE=)
+	return base64.StdEncoding.DecodeString(s)
+}
+
+func decodeBase32(s string) ([]byte, error) {
+	// Use the same decoder as mfa.EncodeSecret uses: StdEncoding with NoPadding.
+	return base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(s)
 }
 
 // loadEnv reads the backend's .env then .env.local, later files winning --

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -42,11 +43,13 @@ type PBCStore interface {
 	RequestClarification(ctx context.Context, p domain.RequestClarificationParams) (*domain.EvidenceRequest, error)
 	MarkSatisfied(ctx context.Context, p domain.MarkSatisfiedParams) (*domain.EvidenceRequest, error)
 	CloseEvidenceRequest(ctx context.Context, p domain.CloseEvidenceRequestParams) (*domain.EvidenceRequest, error)
+	ListEvidenceRequestTransitions(ctx context.Context, tenantID, requestID string) ([]*domain.EvidenceRequestTransition, error)
 }
 
 func RegisterPBCRoutes(r chi.Router, h *Handler, pbcStore PBCStore) {
 	ph := &pbcHandler{Handler: h, store: pbcStore}
 	r.Route("/v1/pbc/requests", func(r chi.Router) {
+		r.Use(recordCommand)
 		r.Post("/", ph.CreateRequest)
 		r.Get("/", ph.ListRequests)
 		r.Get("/{request_id}", ph.GetRequest)
@@ -59,11 +62,77 @@ func RegisterPBCRoutes(r chi.Router, h *Handler, pbcStore PBCStore) {
 		r.Post("/{request_id}/clarify", ph.RequestClarification)
 		r.Post("/{request_id}/mark-satisfied", ph.MarkSatisfied)
 		r.Post("/{request_id}/close", ph.CloseRequest)
+		r.Get("/{request_id}/transitions", ph.ListTransitions)
+		r.Get("/{request_id}/available-actions", ph.AvailableActions)
 	})
 	r.Route("/v1/pbc/responses", func(r chi.Router) {
+		r.Use(recordCommand)
 		r.Post("/{response_id}/scan-result", ph.RecordScanResult)
 		r.Post("/{response_id}/acknowledge", ph.AcknowledgeReceipt)
 	})
+}
+
+// recordCommand names the command (the last path segment of a POST, "create"
+// for the collection) and the verified principal on the request context, so
+// the history trigger of migration 000012 records who did what (ST-2).
+func recordCommand(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			name := r.URL.Path[strings.LastIndex(strings.TrimSuffix(r.URL.Path, "/"), "/")+1:]
+			if strings.HasSuffix(strings.TrimSuffix(r.URL.Path, "/"), "/v1/pbc/requests") {
+				name = "create"
+			}
+			r = r.WithContext(domain.WithCommand(r.Context(), domain.Command{Actor: r.Header.Get("X-Principal-Id"), Name: name,
+				CorrelationID: r.Header.Get("X-Correlation-ID")}))
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ListTransitions handles GET /v1/pbc/requests/{request_id}/transitions: the
+// append-only history, for the manager or the assignee (ST-2).
+func (h *pbcHandler) ListTransitions(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	req, ok := h.requireManagerOrAssignee(w, r, h.readMode, tenantID, principalID, chi.URLParam(r, "request_id"))
+	if !ok {
+		return
+	}
+	list, err := h.store.ListEvidenceRequestTransitions(r.Context(), tenantID, req.RequestID)
+	if err != nil {
+		h.writePBCErr(w, r, err)
+		return
+	}
+	writeJSON(w, r, http.StatusOK, list)
+}
+
+// AvailableActions handles GET /v1/pbc/requests/{request_id}/available-actions:
+// the commands the request's status allows for this caller, as assignee
+// and/or manager (EVIDENCE_REQUEST_MANAGE at the request's entity) (ST-2).
+func (h *pbcHandler) AvailableActions(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	req, ok := h.requireManagerOrAssignee(w, r, h.readMode, tenantID, principalID, chi.URLParam(r, "request_id"))
+	if !ok {
+		return
+	}
+	assignee := isAssignee(req, principalID)
+	manager := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionManageEvidenceRequest) == nil
+	apicontract.WriteETag(w, req.RecordVersion)
+	writeJSON(w, r, http.StatusOK, map[string]any{"request_id": req.RequestID, "status": req.Status, "record_version": req.RecordVersion,
+		"is_assignee": assignee, "is_manager": manager, "actions": domain.PBCAvailableActions(req, manager, assignee)})
 }
 
 // pbcHandler embeds *Handler so it can reuse requirePrincipal/requireTenant/

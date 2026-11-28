@@ -63,10 +63,15 @@ type RiskAssessment struct {
 	CoverageStatus        string     `json:"coverage_status"`
 	AssessedByPrincipalID *string    `json:"assessed_by_principal_id,omitempty"`
 	AssessedAt            *time.Time `json:"assessed_at,omitempty"`
-	CreatedByPrincipalID  string     `json:"created_by_principal_id"`
-	CreatedAt             time.Time  `json:"created_at"`
-	EffectiveFrom         time.Time  `json:"effective_from"`
-	EffectiveTo           *time.Time `json:"effective_to,omitempty"`
+	// CoveredByWorkpaperID is the workpaper whose procedures executed the
+	// response; set with CoverageStatus COVERED (000031).
+	CoveredByWorkpaperID *string    `json:"covered_by_workpaper_id,omitempty"`
+	CoveredByPrincipalID *string    `json:"covered_by_principal_id,omitempty"`
+	CoveredAt            *time.Time `json:"covered_at,omitempty"`
+	CreatedByPrincipalID string     `json:"created_by_principal_id"`
+	CreatedAt            time.Time  `json:"created_at"`
+	EffectiveFrom        time.Time  `json:"effective_from"`
+	EffectiveTo          *time.Time `json:"effective_to,omitempty"`
 }
 
 const (
@@ -127,6 +132,15 @@ type AssessRiskParams struct {
 type MarkSignificantRiskParams struct {
 	RiskID, TenantID, ActorPrincipalID, CorrelationID string
 }
+
+// RecordRiskCoverageParams names the workpaper that covers a risk.
+type RecordRiskCoverageParams struct {
+	RiskID, TenantID, WorkpaperID, ActorPrincipalID string
+}
+
+// ErrAuditRiskCoverageWorkpaperInvalid is a coverage claim whose workpaper is
+// of another engagement or has not been prepared (no executed procedures).
+var ErrAuditRiskCoverageWorkpaperInvalid = errorString("the workpaper does not cover this risk: it must be of the same engagement and prepared")
 
 type LinkAssertionParams struct {
 	RiskID, TenantID, AssertionCode string

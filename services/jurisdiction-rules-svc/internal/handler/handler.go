@@ -90,10 +90,14 @@ type Handler struct {
 	// registry and registryPub are the optional ZS-JUR-001 registries (see WithRegistry).
 	registry    RegistryStore
 	registryPub events.RegistryPublisher
-	signer      domain.Signer
-	minReviews  int
-	resolver    *resolver.Resolver
-	ops         OpsPolicy
+	// ledgerDB, when set, is the transaction decision-log records are
+	// queued in (DL-4, WithDecisionLedger).
+	ledgerDB func(context.Context) store.Querier
+
+	signer     domain.Signer
+	minReviews int
+	resolver   *resolver.Resolver
+	ops        OpsPolicy
 
 	// entities is the optional entity-jurisdiction applicability projection (see WithEntityApplicability).
 	entities EntityApplicabilityReader

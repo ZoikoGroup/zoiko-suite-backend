@@ -21,11 +21,23 @@ from datetime import datetime, timedelta, timezone
 
 sys.stdout.reconfigure(encoding="utf-8")
 AUTHZ = "http://127.0.0.1:8089"
+IDENTITY = "http://127.0.0.1:8080"
 TENANT = "11111111-1111-1111-1111-111111111111"
 ENTITY = "22222222-2222-2222-2222-222222222222"
 ADMIN = "33333333-3333-3333-3333-333333333333"
 CLERK = "a1000000-0000-4000-8000-000000000002"
 APPROVER = "a1000000-0000-4000-8000-000000000003"
+
+# Credentials for getting identity envelopes.
+CREDS = {
+    ADMIN: ("admin@zoikosuite.com", "Zoiko@Governance1"),
+    CLERK: ("clerk@zoiko.local", "Clerk@2026!"),
+    APPROVER: ("approver@zoiko.local", "Approver@2026!"),
+}
+
+# Cache for identity envelopes: principal_id -> (token, expires_at)
+EnvelopeCache = {}
+EnvelopeCacheTTL = 240  # seconds (4 minutes)
 
 MIX = [
     (CLERK, "zt.payment.prepare", None),
@@ -36,11 +48,68 @@ MIX = [
 ]
 
 
+def get_envelope(principal):
+    """Get a signed identity envelope for the principal, cached for 4 minutes."""
+    now = time.time()
+    if principal in EnvelopeCache:
+        token, expires = EnvelopeCache[principal]
+        if now < expires:
+            return token
+
+    if principal not in CREDS:
+        return None
+
+    email, password = CREDS[principal]
+
+    # Authenticate with identity-context-svc (console client, since 3 Nov
+    # IDP_CLIENT_AUTH=required), then resolve the signed envelope for the demo
+    # entity. 25 Nov 2026: this sent `username` and read `identity_token`,
+    # which identity-context-svc never answered, so every run fell back to
+    # bare headers.
+    def post(url, body, extra=None):
+        h = {"Content-Type": "application/json", "X-Tenant-Id": TENANT, "X-Legal-Entity-Id": ENTITY,
+             "X-Request-Id": str(uuid.uuid4()), "X-Correlation-ID": str(uuid.uuid4()),
+             "Idempotency-Key": str(uuid.uuid4()), "X-Source-Channel": "api"}
+        h.update(extra or {})
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST", headers=h)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
+
+    try:
+        auth_result = post(f"{IDENTITY}/v1/authenticate", {
+            "tenant_id": TENANT, "email": email, "password": password,
+            "client_id": "zoiko-console", "client_secret": "local-dev-console-client-secret"})
+        access_token = auth_result["access_token"]
+    except Exception as e:
+        print(f"WARN: Failed to authenticate {email}: {e}", flush=True)
+        print("WARN: Falling back to headers-only mode (works under warn)", flush=True)
+        return None
+
+    try:
+        resolve_result = post(f"{IDENTITY}/v1/context/resolve",
+                              {"bearer_token": access_token, "legal_entity_id": ENTITY})
+        identity_token = resolve_result["envelope_jwt"]
+    except Exception as e:
+        print(f"WARN: Failed to resolve context for {email}: {e}", flush=True)
+        print("WARN: Falling back to headers-only mode (works under warn)", flush=True)
+        return None
+
+    # Cache the envelope.
+    EnvelopeCache[principal] = (identity_token, now + EnvelopeCacheTTL)
+    return identity_token
+
+
 def hdrs(principal=ADMIN, write=False, if_match=None):
     rid = str(uuid.uuid4())
     h = {"X-Tenant-Id": TENANT, "X-Principal-Id": principal, "X-Legal-Entity-Id": ENTITY,
          "X-Correlation-ID": "zt-load-" + rid[:8], "X-Request-Id": rid, "X-Source-Channel": "api",
          "Content-Type": "application/json"}
+
+    # Add Authorization bearer from identity envelope.
+    env_token = get_envelope(principal)
+    if env_token:
+        h["Authorization"] = f"Bearer {env_token}"
+
     if write:
         h["Idempotency-Key"] = str(uuid.uuid4())
     if if_match:

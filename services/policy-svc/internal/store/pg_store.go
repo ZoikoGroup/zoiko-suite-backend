@@ -20,6 +20,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/policy-svc/internal/domain"
+	"zoiko.io/policy-svc/internal/signatory"
 	svcmiddleware "zoiko.io/policy-svc/internal/middleware"
 )
 
@@ -72,6 +73,20 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) 
 	return tx.Commit(ctx)
 }
 
+// withRelay runs fn in a transaction marked as a background worker
+// (app.outbox_relay): the evidence relay, the activation scheduler and the
+// backlog metrics act for no tenant, and migration 000010's row-level
+// security lets only this context read every tenant's outbox, evidence-outbox
+// and schedule rows.
+func (s *PgStore) withRelay(ctx context.Context, fn func(pgx.Tx) error) error {
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT set_config('app.outbox_relay', 'true', true);`); err != nil {
+			return fmt.Errorf("set_config app.outbox_relay: %w", err)
+		}
+		return fn(tx)
+	})
+}
+
 // isUniqueViolation reports whether err is a Postgres unique_violation.
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
@@ -89,6 +104,9 @@ func (s *PgStore) domainError(op string, err error) error {
 		domain.ErrSupersessionRequired, domain.ErrInvalidSupersedes,
 		domain.ErrControlTestDefinitionNotFound, domain.ErrAttestationNotFound,
 		domain.ErrInvalidAttestationTransition,
+		domain.ErrPolicyRetired, domain.ErrPolicyInUse, domain.ErrEvidenceAlreadyRecorded,
+		domain.ErrCertificationRequired, domain.ErrTestCaseNotFound, domain.ErrWaiverNotFound, domain.ErrInvalidWaiver,
+		domain.ErrNoEvaluator, domain.ErrSimulationNotFound, domain.ErrNotRollbackEligible,
 	} {
 		if errors.Is(err, known) {
 			return err
@@ -108,6 +126,19 @@ type PgStore struct {
 	// the same process clock, so a version activated a moment ago is never
 	// "not yet known" because the database's clock ran ahead.
 	now func() time.Time
+
+	// gate is the PDC-05 certification gate on activation (domain.Gate*).
+	// New leaves it off; cmd/server sets POLICY_CERTIFICATION_GATE.
+	gate string
+}
+
+// WithCertificationGate sets the PDC-05 certification gate: "enforce"
+// refuses to activate or schedule an evaluable version that is not certified
+// against its family's current suite, "warn" logs and admits, anything else
+// is off.
+func (s *PgStore) WithCertificationGate(mode string) *PgStore {
+	s.gate = mode
+	return s
 }
 
 // New returns an open PgStore. Caller must call pool.Close() when done.
@@ -127,7 +158,10 @@ const policyColumns = `
 	versioning_mode,
 	created_at,
 	created_by_principal_id,
-	record_version`
+	record_version,
+	retired_by_principal_id,
+	retired_at,
+	retirement_reason`
 
 func scanPolicy(row pgx.Row) (*domain.Policy, error) {
 	p := &domain.Policy{}
@@ -142,8 +176,68 @@ func scanPolicy(row pgx.Row) (*domain.Policy, error) {
 		&p.CreatedAt,
 		&p.CreatedByPrincipalID,
 		&p.RecordVersion,
+		&p.RetiredByPrincipalID,
+		&p.RetiredAt,
+		&p.RetirementReason,
 	)
 	return p, err
+}
+
+// RetirePolicy retires a policy family: refused while a version of it is
+// ACTIVE or SCHEDULED (those are retired or superseded first, through their
+// own lifecycle), compare-and-set on record_version, evidenced on the row and
+// by policy.retired in the same transaction. Retiring a retired family is an
+// idempotent no-op.
+func (s *PgStore) RetirePolicy(ctx context.Context, params domain.RetirePolicyParams) (*domain.Policy, bool, error) {
+	var out *domain.Policy
+	var changed bool
+	err := s.withRLS(ctx, contextTenantID(ctx), func(tx pgx.Tx) error {
+		p, err := scanPolicy(tx.QueryRow(ctx, `SELECT `+policyColumns+` FROM policies WHERE policy_id = $1 FOR UPDATE;`, params.PolicyID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrPolicyNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if p.PolicyStatus == domain.PolicyStatusRetired {
+			out = p
+			return nil
+		}
+		if p.RecordVersion != params.ExpectedVersion {
+			return domain.ErrConcurrencyConflict
+		}
+		var governing bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (SELECT 1 FROM policy_versions
+			               WHERE policy_id = $1 AND version_status IN ('ACTIVE', 'SCHEDULED'));`,
+			params.PolicyID).Scan(&governing); err != nil {
+			return err
+		}
+		if governing {
+			return domain.ErrPolicyInUse
+		}
+		out, err = scanPolicy(tx.QueryRow(ctx, `
+			UPDATE policies
+			SET policy_status = 'RETIRED', retired_by_principal_id = $2, retired_at = $3,
+			    retirement_reason = $4, record_version = record_version + 1
+			WHERE policy_id = $1
+			RETURNING `+policyColumns+`;`, params.PolicyID, params.ActorID, s.now(), params.Reason))
+		if err != nil {
+			return err
+		}
+		changed = true
+		ev := policyEvent("policy.retired", out, params.Meta)
+		ev.ActorID = params.ActorID
+		ev.AggregateVersion = int(out.RecordVersion)
+		if ev.IdempotencyKey == "" {
+			ev.IdempotencyKey = "policy.retired:" + out.PolicyID
+		}
+		return s.enqueue(ctx, tx, ev)
+	})
+	if err != nil {
+		return nil, false, s.domainError("RetirePolicy", err)
+	}
+	return out, changed, nil
 }
 
 // FindPolicyByID looks up a policy family visible to the caller's tenant: a
@@ -388,6 +482,11 @@ func (s *PgStore) createVersionTx(ctx context.Context, tx pgx.Tx, params domain.
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
+		}
+		// A replay of a version drafted before retirement still answers
+		// above; a new one is refused.
+		if family.PolicyStatus == domain.PolicyStatusRetired {
+			return domain.ErrPolicyRetired
 		}
 
 		var next int
@@ -686,6 +785,11 @@ func (s *PgStore) apply(ctx context.Context, tx pgx.Tx, v *domain.PolicyVersion,
 			return nil, err
 		}
 		if from == domain.StatusApproved {
+			if err := s.guardCertification(ctx, tx, v, policyType); err != nil {
+				return nil, err
+			}
+		}
+		if from == domain.StatusApproved {
 			if err := s.guardSupersession(ctx, tx, v, cmd.SupersedesVersionID); err != nil {
 				return nil, err
 			}
@@ -812,6 +916,15 @@ func (s *PgStore) guardActivation(ctx context.Context, tx pgx.Tx, v *domain.Poli
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1));`, "policy-svc:policy_type:"+policyType); err != nil {
 		return err
 	}
+	if policyType == signatory.PolicyType {
+		// Several signatory matrices share a scope (the ordinary one and
+		// instrument-specific high-risk ones); only matrices that would govern
+		// the same instrument in the same risk regime conflict.
+		if err := s.guardSignatoryOverlap(ctx, tx, v); err != nil {
+			return err
+		}
+		return s.guardPendingSchedule(ctx, tx, v)
+	}
 	var conflicting string
 	err = tx.QueryRow(ctx, `
 		SELECT pv.policy_version_id
@@ -927,6 +1040,9 @@ func (s *PgStore) activateNow(ctx context.Context, tx pgx.Tx, v *domain.PolicyVe
 	}); err != nil {
 		return nil, err
 	}
+	if err := s.enqueueSignatoryPublished(ctx, tx, next, actor, meta, versionIDs(superseded)); err != nil {
+		return nil, err
+	}
 	active := domain.StatusActive
 	for _, old := range superseded {
 		if err := s.insertTransition(ctx, tx, old, &active, domain.StatusSuperseded, actor, "superseded by "+next.PolicyVersionID, "", meta.CorrelationID); err != nil {
@@ -967,23 +1083,27 @@ func (s *PgStore) PromoteDueActivations(ctx context.Context, limit int) (int, er
 		id     string
 		tenant *string
 	}
-	rows, err := s.pool.Query(ctx, `
-		SELECT policy_version_id, tenant_id FROM policy_activation_schedule
-		WHERE due_at <= $1 ORDER BY due_at LIMIT $2;`, s.now(), limit)
-	if err != nil {
-		return 0, s.domainError("PromoteDueActivations", err)
-	}
+	// Listing is cross-tenant (the relay context); each promotion then runs
+	// in its own version's tenant scope.
 	var list []due
-	for rows.Next() {
-		var d due
-		if err := rows.Scan(&d.id, &d.tenant); err != nil {
-			rows.Close()
-			return 0, s.domainError("PromoteDueActivations", err)
+	err := s.withRelay(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT policy_version_id, tenant_id FROM policy_activation_schedule
+			WHERE due_at <= $1 ORDER BY due_at LIMIT $2;`, s.now(), limit)
+		if err != nil {
+			return err
 		}
-		list = append(list, d)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+		defer rows.Close()
+		for rows.Next() {
+			var d due
+			if err := rows.Scan(&d.id, &d.tenant); err != nil {
+				return err
+			}
+			list = append(list, d)
+		}
+		return rows.Err()
+	})
+	if err != nil {
 		return 0, s.domainError("PromoteDueActivations", err)
 	}
 

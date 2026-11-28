@@ -49,6 +49,12 @@ type Config struct {
 	// never to a fabricated ALLOW.
 	CartaServiceURL string
 
+	// CartaResourceSensitivity is the default resource sensitivity passed to
+	// carta-svc when no resource-classification registry exists.
+	// Valid values: LOW, MEDIUM, HIGH, CRITICAL. Default MEDIUM.
+	// See docs/architecture/full-architecture-gap-analysis.md #16.
+	CartaResourceSensitivity string
+
 	// SIEMServiceURL is siem-integration-svc. Empty disables streaming:
 	// security-event export is best-effort and tenant-opt-in (a tenant with
 	// no configured exporter is normal, not an error), so its absence must
@@ -151,6 +157,11 @@ type Config struct {
 	RateLoginPerSecond float64
 	RateLoginBurst     int
 
+	// Per-IP bucket for authentication failures (invalid_token, etc.).
+	// Counted and alertable but not throttled by default; set > 0 to enable.
+	RateAuthFailurePerSecond float64
+	RateAuthFailureBurst     int
+
 	// Trusted proxy configuration for client IP extraction (S5-D3).
 	// TrustedProxyCIDRs is a comma-separated list of CIDR ranges that are
 	// considered trusted (e.g., the GCP load balancer ranges). The client IP is
@@ -211,6 +222,7 @@ func Load() (*Config, error) {
 		IdentityIntrospectURL:     strEnv("IDENTITY_INTROSPECT_URL", "http://identity-svc:8080/v1/context/session/introspect"),
 		RevocationFail:            strings.ToLower(strEnv("IDENTITY_REVOCATION_FAIL", "closed")),
 		CartaServiceURL:           strEnv("CARTA_SERVICE_URL", ""),
+		CartaResourceSensitivity:  strEnv("CARTA_RESOURCE_SENSITIVITY", "MEDIUM"),
 		SIEMServiceURL:            strEnv("SIEM_SERVICE_URL", ""),
 		CommercialAccountServiceURL: strEnv("COMMERCIAL_ACCOUNT_SERVICE_URL", ""),
 		IdentityTokenExchangeURL:      strEnv("IDENTITY_TOKEN_EXCHANGE_URL", ""),
@@ -310,6 +322,8 @@ type admission struct {
 	ipBurst, tenantBurst       int
 	loginRPS                   float64
 	loginBurst                 int
+	authFailureRPS             float64
+	authFailureBurst           int
 	trustedProxyCIDRs          []string
 	trustedProxyDepth          int
 	maxInFlight, window, abuse int
@@ -322,6 +336,7 @@ func (a admission) apply(c *Config) {
 	c.RateIPPerSecond, c.RateIPBurst = a.ipRPS, a.ipBurst
 	c.RateTenantPerSecond, c.RateTenantBurst = a.tenantRPS, a.tenantBurst
 	c.RateLoginPerSecond, c.RateLoginBurst = a.loginRPS, a.loginBurst
+	c.RateAuthFailurePerSecond, c.RateAuthFailureBurst = a.authFailureRPS, a.authFailureBurst
 	c.TrustedProxyCIDRs, c.TrustedProxyDepth = a.trustedProxyCIDRs, a.trustedProxyDepth
 	c.MaxInFlight, c.DecisionWindow, c.AbuseThresholdPerMinute = a.maxInFlight, a.window, a.abuse
 	c.AdminAddr, c.AdminTokenFile = a.adminAddr, a.adminTokenFile
@@ -359,6 +374,12 @@ func loadAdmission() (admission, error) {
 	if a.loginBurst, err = intEnv("GATEWAY_LOGIN_BURST", 10); err != nil {
 		return a, err
 	}
+	if a.authFailureRPS, err = floatEnv("GATEWAY_AUTH_FAILURE_RATE_PER_SECOND", 0); err != nil {
+		return a, err
+	}
+	if a.authFailureBurst, err = intEnv("GATEWAY_AUTH_FAILURE_BURST", 0); err != nil {
+		return a, err
+	}
 	a.trustedProxyCIDRs = listEnv("GATEWAY_TRUSTED_PROXY_CIDRS", []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"})
 	a.trustedProxyDepth = intEnvOr("GATEWAY_TRUSTED_PROXY_DEPTH", 1)
 	if a.maxInFlight, err = intEnv("GATEWAY_MAX_INFLIGHT", 2000); err != nil {
@@ -381,6 +402,7 @@ func loadAdmission() (admission, error) {
 		"GATEWAY_RATE_IP_PER_SECOND": a.ipRPS, "GATEWAY_RATE_IP_BURST": float64(a.ipBurst),
 		"GATEWAY_RATE_TENANT_PER_SECOND": a.tenantRPS, "GATEWAY_RATE_TENANT_BURST": float64(a.tenantBurst),
 		"GATEWAY_LOGIN_RATE_PER_SECOND": a.loginRPS, "GATEWAY_LOGIN_BURST": float64(a.loginBurst),
+		"GATEWAY_AUTH_FAILURE_RATE_PER_SECOND": a.authFailureRPS, "GATEWAY_AUTH_FAILURE_BURST": float64(a.authFailureBurst),
 		"GATEWAY_MAX_INFLIGHT": float64(a.maxInFlight), "GATEWAY_DECISION_WINDOW": float64(a.window),
 		"GATEWAY_ABUSE_THRESHOLD_PER_MINUTE": float64(a.abuse),
 	} {
@@ -388,7 +410,7 @@ func loadAdmission() (admission, error) {
 			return a, fmt.Errorf("%s must not be negative (use 0 to disable)", name)
 		}
 	}
-	if (a.ipRPS > 0 && a.ipBurst < 1) || (a.tenantRPS > 0 && a.tenantBurst < 1) || (a.loginRPS > 0 && a.loginBurst < 1) {
+	if (a.ipRPS > 0 && a.ipBurst < 1) || (a.tenantRPS > 0 && a.tenantBurst < 1) || (a.loginRPS > 0 && a.loginBurst < 1) || (a.authFailureRPS > 0 && a.authFailureBurst < 1) {
 		return a, fmt.Errorf("an enabled rate limit needs a burst of at least 1")
 	}
 	return a, nil

@@ -121,7 +121,7 @@ external dependency · 🧭 waits on a named decision. The implementer never set
 | F28 | Router ↔ openapi parity + kin-openapi validity | 🔵 (`TestOpenAPIMatchesTheRouter`, `TestOpenAPIDocumentIsValid`) |
 | R4 | RLS + FORCE on tenant data | 🔵 (000032 on five tables incl. async_operations 000036) |
 | R5 | Every checked action registered in access-control | 🔵 (access-control 000052: six new actions, nine templates) |
-| R10 | Negative paths named after their spec id | 🔵 (see §4; 17 🧭, 29 🟡) |
+| R10 | Negative paths named after their spec id | 🔵 (see §4: every id has a named test except JUR-NEG-17 🧭 and the n/a PDC-02 NP-15/NP-16; JUR-NEG-29 🟡) |
 | JR-FE-1 | Console summary route `GET /v1/jurisdiction-summary` | 🔵 |
 | S2 | asyncapi.yaml, RUNBOOK.md, RELEASE_CERTIFICATE.md, scripts/audit.sh, Postman | 🔵 (all present; Postman folders 04–07) |
 | S4 | `deployments/scripts/e2e-jurisdiction-rules-deps.py` | 🔵 (82/82 on 13 Nov with workflow-svc and the feed consumer; 59 + 2 SKIP with `--no-workflow`) |
@@ -335,3 +335,47 @@ Before step 21 (not run live then, 17 checks): certify and everything after it i
 certifier independent of the author, compiler, test author and reviewers: three principals with
 JURISDICTION_* grants. Locally only admin and legal counsel hold them; granting a third is the user's call
 (tracker JR-8). The rest of the gaps are in the tracker, D2-1 "Remaining gaps (16 Nov)".
+
+## 7. VC-1 and the console gaps 13, 14 (18 Nov 2026)
+
+Verified by a session that built none of the rows. Tracker D2-1: 26 ✅, F24 🟡, F05 ⛔, F26 🧭.
+
+| Check | Result |
+|---|---|
+| Image | rebuilt from the branch (host binaries over the 16 Nov image); `000032_registry_facts` from main applied to the dev DB (43/43) |
+| Suites | 809 pass / 0 fail / 0 skip: unit, store 92, registryit 144 on scratch databases |
+| Mutants | 2/2 killed: the author activates their own rule (`TestActivation_RefusesTheAuthorBeforeAskingWorkflow`); a cursor not bound to its tenant (`TestAPI4_PagesCoverTheListOnceAndCursorsAreBound`) |
+| Migrations | 000032–000037 up / down / up on scratch |
+| Live | `e2e-jurisdiction-rules-deps.py` 82/82 (workflow-svc, feed consumer, dev signing key); `scripts/audit.sh` 24/0 |
+| Console | `jurisdictions.spec.ts` 12/12 (frontend `6c90395`, `a9b0d3e`) |
+
+Gap 13: the console's pack version could carry only rule modules, so no due date could come from a pack
+made there. It now names calendar versions and obligation rules; the spec packs a TAX_BANDS rule, an
+e-invoice profile rule and a due-date rule, and the released pack answers a calculation (200.00 on 1500),
+a due date moved off a Saturday (2026-11-09) and a registered submission. Gap 14: with cfo@ granted
+through the Authorization console (user's decision), a P0 hotfix is refused certification with one
+approving reviewer, certified after a second, refused in ring order and for a non-commander, and deployed
+by its incident commander under the ring-order exception; the retrospective is recorded.
+
+F24 stays 🟡: reads and runtime resolutions accept a headers-only identity (`warn`) until the tax and
+payroll readers outside D1/D2 forward the envelope.
+
+## Decision capture (DL-4, 25 Nov 2026)
+
+Doc 01 §7: the Jurisdiction engine's governed decisions reach governance-decision-log-svc as
+`svc-jurisdiction-rules` (migration 000046 in authorization-svc): pack certify (`CERTIFIED`), release/publish
+(`RELEASED`), block (`BLOCKED`), unblock (`UNBLOCKED`), withdraw (`WITHDRAWN`), rollback (`ROLLED_BACK`), supersede
+(`SUPERSEDED`); interpretation approval and jurisdiction import approval (`APPROVED`); calendar publication
+(`PUBLISHED`); payment-term approval (`ACTIVATED`). `rule_basis` is `<pack_ref>@<version>` (calendar
+`calendar:<code>@<version>`, term `payment_term:<code>@<version>`, `interpretation:<id>`, `import:<batch>`); the
+person who decided is `evaluation_context.on_behalf_of`; packs are platform reference data, so the record's
+legal entity is the ledger's `PLATFORM` scope and its tenant is the requester's.
+
+- One hook: `handler.emitRegistry` queues the record in the request's unit of work beside the registry event
+  (`internal/handler/decision_ledger.go`); import approval queues it in its own transaction. A record that cannot
+  be queued aborts the unit, exactly like its event (J-11).
+- Migration 000038 `decision_log_outbox`; metrics `jurisdiction_decision_log_*` (`internal/ledgermetrics`).
+- Tests: `TestLedgerRecord_GovernedDecisionsOnly`, `TestLedgerRecord_DecisionIDIsStablePerChange`; the dependency
+  e2e gains a ledger section (certify by an independent certifier, publish, interpretation approval).
+
+The record is written to `decision_log_outbox` in the transaction of the decision it records and delivered by `identity-envelope/decisionledger`'s relay (lease-based claim, backoff to 10 minutes, a 409 parks the row for an operator, delivered rows purged after `LEDGER_RETENTION_HOURS`, default 168) to `GOVERNANCE_DECISION_LOG_MTLS_URL` with this service's own workload certificate (`mtlsclient`, bootstrap token `MTLS_BOOTSTRAP_TOKEN_PATH`). Deliveries are capped at `LEDGER_RELAY_MAX_PER_SECOND` (default 20): a ledger outage or a burst delays the evidence, it never fails or slows the decision. Status: 🔵 built, not verified (tracker "Assignment 25 Nov 2026").

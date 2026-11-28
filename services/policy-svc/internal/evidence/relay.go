@@ -134,6 +134,13 @@ type ledgerContext struct {
 	ArtifactDigest         string          `json:"artifact_digest"`
 	SelectedRuleIDs        []string        `json:"selected_rule_ids"`
 	EvaluatorVersion       string          `json:"evaluator_version"`
+	// The ZS-GOV-INT-002 decision: contract version, shared outcome, reason
+	// codes and validity (absent on legacy evaluations). The signed
+	// envelope itself stays in policy-svc, fetched by decision id.
+	ContractVersion string     `json:"contract_version,omitempty"`
+	DecisionOutcome string     `json:"decision_outcome,omitempty"`
+	ReasonCodes     []string   `json:"reason_codes,omitempty"`
+	ValidUntil      *time.Time `json:"valid_until,omitempty"`
 }
 
 // RecordFor builds the ledger record for an evaluation.
@@ -152,6 +159,10 @@ func RecordFor(ev *domain.Evaluation, principal string) (decisionlog.Record, err
 		ArtifactDigest:         ev.ArtifactDigest,
 		SelectedRuleIDs:        ev.SelectedRuleIDs,
 		EvaluatorVersion:       ev.EvaluatorVersion,
+		ContractVersion:        ev.ContractVersion,
+		DecisionOutcome:        ev.DecisionOutcome,
+		ReasonCodes:            ev.ReasonCodes,
+		ValidUntil:             ev.ValidUntil,
 	})
 	if err != nil {
 		return decisionlog.Record{}, err

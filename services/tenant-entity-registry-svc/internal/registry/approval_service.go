@@ -220,16 +220,19 @@ func (s *Service) requireCreationApproval(ctx context.Context, t *domain.Tenant)
 // ---------------------------------------------------------------------------
 
 // ListApprovalRequests lists the caller's tenant's approval requests.
-func (s *Service) ListApprovalRequests(ctx context.Context, pendingOnly bool) ([]*domain.ApprovalRequest, error) {
+func (s *Service) ListApprovalRequests(ctx context.Context, pendingOnly bool, limit int, cursor string) ([]*domain.ApprovalRequest, string, error) {
 	if domain.TenantFromContext(ctx) == "" {
-		return nil, ErrNotFound
+		return nil, "", ErrNotFound
 	}
 	// Purpose limitation: proposals carry the command payload (evidence refs,
 	// names, decisions) and are for the principals who decide them.
 	if err := s.authorize(ctx, "approval-request", "read"); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return s.store.ListApprovalRequests(ctx, pendingOnly)
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+	return s.store.ListApprovalRequests(ctx, pendingOnly, limit, cursor)
 }
 
 // GetApprovalRequest returns one approval request in the caller's tenant.

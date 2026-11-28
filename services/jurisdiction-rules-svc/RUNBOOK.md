@@ -111,6 +111,11 @@ tick start from now (crossings in between are not announced).
 Push invalidation (LISTEN/NOTIFY) drops caches on pack changes; the TTL is the backstop.
 Force it with `POST /v1/admin/resolver-cache:invalidate` on a replica.
 
+### Due instants on a daylight-saving change
+A calendar cutoff (or end of day) that falls in a clock change resolves by the rule in
+SPEC_DEVIATIONS (R-001 §7.3): inside a forward gap, the first instant after the gap; inside a
+backward fold, the earlier occurrence. The `explanation` of `POST /v1/obligation-calculations:calculate` names the
+rule applied. A customer question "why is this due at 01:00 UTC, not 01:30" is answered from it.
 ## Verification
 
 - `bash scripts/audit.sh` — static, suites on scratch databases (0 skips), live checks.

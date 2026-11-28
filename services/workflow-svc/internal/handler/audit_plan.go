@@ -357,6 +357,39 @@ func (h *Handler) MarkSignificantRisk(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, r, http.StatusOK, risk)
 }
 
+type recordCoverageRequest struct {
+	WorkpaperID string `json:"workpaper_id"`
+}
+
+// RecordRiskCoverage handles POST /v1/audit/risks/{risk_id}/coverage: the
+// workpaper whose procedures executed the risk's response covers it
+// (AUD-CTRL-005). Until 26 Nov 2026 nothing set COVERED, so an engagement with
+// a HIGH risk could never complete fieldwork.
+func (h *Handler) RecordRiskCoverage(w http.ResponseWriter, r *http.Request) {
+	riskID := chi.URLParam(r, "risk_id")
+	if _, ok := h.getRiskForManage(w, r, riskID); !ok {
+		return
+	}
+	tenantID, _ := h.requireTenant(w, r)
+	principalID, _ := h.requirePrincipal(w, r)
+	var req recordCoverageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.WorkpaperID == "" {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "workpaper_id"})
+		return
+	}
+	if !isValidUUID(req.WorkpaperID) {
+		writeJSON(w, r, http.StatusBadRequest, map[string]string{"error": "invalid_uuid", "field": "workpaper_id"})
+		return
+	}
+	risk, _, err := h.store.RecordRiskCoverage(r.Context(), domain.RecordRiskCoverageParams{
+		RiskID: riskID, TenantID: tenantID, WorkpaperID: req.WorkpaperID, ActorPrincipalID: principalID})
+	if err != nil {
+		h.writeAuditPlanErr(w, r, err)
+		return
+	}
+	writeJSON(w, r, http.StatusOK, risk)
+}
+
 // ApprovePlan refuses self-approval — the plan's own preparer cannot
 // approve it, the same posture as every other maker/checker pair in this
 // build (ErrAuditEngagementSelfAcceptance, ErrSelfApprovalNotAllowed).
@@ -412,6 +445,10 @@ func (h *Handler) writeAuditPlanErr(w http.ResponseWriter, r *http.Request, err 
 		writeJSON(w, r, http.StatusUnprocessableEntity, map[string]string{"error": "risk_requires_assertion_and_response"})
 	case errors.Is(err, domain.ErrAuditPlanSelfApproval):
 		writeJSON(w, r, http.StatusForbidden, map[string]string{"error": "self_approval_not_allowed"})
+	case errors.Is(err, domain.ErrWorkpaperNotFound):
+		writeJSON(w, r, http.StatusNotFound, map[string]string{"error": "workpaper_not_found"})
+	case errors.Is(err, domain.ErrAuditRiskCoverageWorkpaperInvalid):
+		writeJSON(w, r, http.StatusUnprocessableEntity, map[string]string{"error": "coverage_workpaper_invalid", "message": err.Error()})
 	default:
 		writeJSON(w, r, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 	}

@@ -14,11 +14,14 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 	apicontract "zoiko.io/identity-envelope/apicontract"
+	"zoiko.io/identity-envelope/govdecision"
 
 	"zoiko.io/policy-svc/internal/authz"
 	"zoiko.io/policy-svc/internal/domain"
 	"zoiko.io/policy-svc/internal/envelope"
 	svcmiddleware "zoiko.io/policy-svc/internal/middleware"
+	"zoiko.io/policy-svc/internal/policytype"
+	"zoiko.io/policy-svc/internal/signatory"
 	"zoiko.io/policy-svc/internal/store"
 )
 
@@ -48,7 +51,7 @@ type PolicyStore interface {
 	ResolveControlEffectiveness(ctx context.Context, controlRef string) (*domain.ControlEffectiveness, error)
 	CreateAttestation(ctx context.Context, params domain.CreateAttestationParams) (*domain.Attestation, error)
 	FindAttestationByID(ctx context.Context, id string) (*domain.Attestation, error)
-	RevokeAttestation(ctx context.Context, attestationID, reason string) (*domain.Attestation, error)
+	RevokeAttestation(ctx context.Context, attestationID, reason string, meta domain.EventMeta) (*domain.Attestation, error)
 }
 
 // CandidateSource returns resolution candidates — the cache in production.
@@ -87,6 +90,14 @@ type Options struct {
 	ReadAuthz Mode
 	// Now is the clock; the store stamps lifecycle times from the same one.
 	Now func() time.Time
+	// Cursors signs every list's next_cursor (API-4). Nil gets a per-process
+	// random key, which is only right for tests and local runs.
+	Cursors *apicontract.CursorSigner
+	// DecisionSigner signs every canonical decision (ZS-GOV-INT-002 §2.2
+	// integrity assertion). Nil disables the signatory routes (503).
+	DecisionSigner *govdecision.Signer
+	// Decisions counts decisions by family and outcome; nil counts nothing.
+	Decisions DecisionObserver
 }
 
 // Handler holds all HTTP handler methods.
@@ -95,6 +106,7 @@ type Handler struct {
 	candidates CandidateSource
 	authz      authz.Client
 	opts       Options
+	cursors    *apicontract.CursorSigner
 	log        *zap.Logger
 }
 
@@ -103,13 +115,16 @@ func New(st PolicyStore, candidates CandidateSource, authzClient authz.Client, o
 	if opts.Now == nil {
 		opts.Now = func() time.Time { return time.Now().UTC() }
 	}
+	if opts.Cursors == nil {
+		opts.Cursors = newRandomCursorSigner()
+	}
 	if opts.EvaluateAuthz == "" {
 		opts.EvaluateAuthz = ModeEnforce
 	}
 	if opts.ReadAuthz == "" {
 		opts.ReadAuthz = ModeEnforce
 	}
-	return &Handler{store: st, candidates: candidates, authz: authzClient, opts: opts, log: log}
+	return &Handler{store: st, candidates: candidates, authz: authzClient, opts: opts, cursors: opts.Cursors, log: log}
 }
 
 // ── errors ───────────────────────────────────────────────────────────────────
@@ -130,6 +145,9 @@ const (
 	codeNotFound            = "NOT_FOUND"
 	codeUnavailable         = "SERVICE_UNAVAILABLE"
 	codeNotImplemented      = "NOT_IMPLEMENTED"
+	codePolicyInUse         = "POLICY_IN_USE"
+	codePolicyRetired       = "POLICY_RETIRED"
+	codeEvidenceRecorded    = "EVIDENCE_ALREADY_RECORDED"
 )
 
 func writeError(w http.ResponseWriter, r *http.Request, status int, code, legacy, message string, extra map[string]any) {
@@ -153,7 +171,9 @@ func writeError(w http.ResponseWriter, r *http.Request, status int, code, legacy
 		Status:    status,
 		Code:      code,
 		Detail:    detail,
-		Retryable: status >= 500,
+		// A missing capability (501) or a payload integrity fault does not
+		// heal on retry; only an outage might.
+		Retryable: status >= 500 && status != http.StatusNotImplemented && code != codeEvidenceIntegrity,
 		Extra:     extra,
 	})
 }
@@ -542,6 +562,27 @@ type createPolicyVersionRequest struct {
 // evaluator will need (V-001 §10.1 step 2), so a version that could never be
 // evaluated is refused at authoring time, not at the first evaluation.
 func validateRulePayload(w http.ResponseWriter, r *http.Request, policyType string, payload json.RawMessage) bool {
+	switch {
+	case policyType == signatory.PolicyType:
+		// Bands, offices, sequencing and exemptions are checked whole: a
+		// matrix that could resolve ambiguously never reaches review.
+		if _, err := signatory.ParseMatrix(payload); err != nil {
+			writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_rule_payload", err.Error(),
+				map[string]any{"field": "rule_payload", "policy_type": policyType})
+			return false
+		}
+		return true
+	case policytype.ReferenceOnly(policyType):
+		// A family another service decides holds a reference to that
+		// service's published rule set, never rule content of its own.
+		if err := policytype.ValidateReference(policyType, payload); err != nil {
+			info, _ := policytype.Lookup(policyType)
+			writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_rule_payload", err.Error(),
+				map[string]any{"field": "rule_payload", "policy_type": policyType, "owning_service": info.OwningService})
+			return false
+		}
+		return true
+	}
 	if len(payload) == 0 {
 		if policyType == policyTypeApprovalThreshold {
 			missingField(w, r, "rule_payload.threshold_amount")
@@ -562,6 +603,29 @@ func validateRulePayload(w http.ResponseWriter, r *http.Request, policyType stri
 		}
 		if amount.Sign() < 0 {
 			writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_rule_payload", "threshold_amount must not be negative", nil)
+			return false
+		}
+		if raw, present := obj["currency"]; present {
+			var cur string
+			if json.Unmarshal(raw, &cur) != nil || !isCurrencyCode(cur) {
+				writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_rule_payload",
+					"currency must be an ISO 4217 code (three upper-case letters)", map[string]any{"field": "rule_payload.currency"})
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// isCurrencyCode reports whether s has the shape of an ISO 4217 code. Which
+// codes exist is reference data (tenant-entity-registry's FX set), not a list
+// kept here.
+func isCurrencyCode(s string) bool {
+	if len(s) != 3 {
+		return false
+	}
+	for _, c := range s {
+		if c < 'A' || c > 'Z' {
 			return false
 		}
 	}
@@ -685,6 +749,9 @@ func (h *Handler) CreatePolicyVersion(w http.ResponseWriter, r *http.Request) {
 			writeError(w, r, http.StatusNotFound, codeNotFound, "policy_not_found", "", map[string]any{"policy_id": policyID})
 		case errors.Is(err, domain.ErrInvalidScope):
 			writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_scope", "a version of a tenant-owned policy must be in its owner's scope", nil)
+		case errors.Is(err, domain.ErrPolicyRetired):
+			writeError(w, r, http.StatusConflict, codePolicyRetired, "policy_retired",
+				"the policy family is retired and takes no new versions", map[string]any{"policy_id": policyID})
 		case errors.Is(err, domain.ErrIdempotencyMismatch), errors.Is(err, domain.ErrConflict):
 			writeError(w, r, http.StatusConflict, codeIdempotencyMismatch, "policy_version_conflict",
 				"this Idempotency-Key or policy_version_id was already used with different content", map[string]any{"policy_id": policyID})
@@ -698,13 +765,6 @@ func (h *Handler) CreatePolicyVersion(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusCreated
 	}
 	writeJSONWithETag(w, status, v, int64(v.RowVersion))
-}
-
-// writeVersion writes a version with its row_version as the ETag, the value
-// a caller returns in If-Match or expected_version.
-func writeVersion(w http.ResponseWriter, status int, v *domain.PolicyVersion) {
-	w.Header().Set("ETag", `"`+strconv.Itoa(v.RowVersion)+`"`)
-	writeJSON(w, status, v)
 }
 
 // ── lifecycle commands ───────────────────────────────────────────────────────
@@ -741,18 +801,50 @@ var lifecycleAction = map[string][2]string{
 	domain.CommandReviewSuspension: {authz.ActionPolicyVersionApprove, authz.ActionPolicyVersionApproveGlobal},
 }
 
-// ifMatch parses If-Match ("3" or 3) into a row_version.
-func ifMatch(r *http.Request) (*int, bool) {
-	v := strings.TrimSpace(r.Header.Get("If-Match"))
-	if v == "" {
-		return nil, true
+// commandVersion reads the row_version a lifecycle command decided on, from
+// If-Match or the body's expected_version (GCP §16 expected_version, API-3
+// If-Match). Either one may carry it, and if both do they must agree. A
+// wildcard names no version, so it is refused. A command that names no
+// version is 428: a lifecycle command never applies to "whatever is there
+// now". The same rule holds for the GOV-05 and the accounting commands.
+func commandVersion(w http.ResponseWriter, r *http.Request, body *int) (int, bool) {
+	header, wildcard, present, err := apicontract.IfMatchVersion(r)
+	if present && (err != nil || wildcard) {
+		apicontract.WriteProblem(w, r, apicontract.ProblemFor(http.StatusBadRequest, "invalid_if_match",
+			"If-Match must be the single ETag of the version's latest representation; a wildcard names no version"))
+		return 0, false
 	}
-	v = strings.TrimPrefix(v, "W/")
-	n, err := strconv.Atoi(strings.Trim(v, `"`))
-	if err != nil {
-		return nil, false
+	if body != nil && *body < 1 {
+		writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "invalid_expected_version",
+			"expected_version must be the version's row_version (1 or more)", nil)
+		return 0, false
 	}
-	return &n, true
+	switch {
+	case present && body != nil && int64(*body) != header:
+		writeError(w, r, http.StatusBadRequest, codeInvalidRequest, "expected_version_mismatch", "If-Match and expected_version disagree", nil)
+		return 0, false
+	case present:
+		return int(header), true
+	case body != nil:
+		return *body, true
+	}
+	apicontract.WriteProblem(w, r, apicontract.ProblemFor(http.StatusPreconditionRequired, "precondition_required",
+		"send the version's row_version as If-Match or expected_version (GET the version for its ETag)"))
+	return 0, false
+}
+
+// refuseStale answers 412 with the current ETag when the version has moved on
+// since the caller read it.
+func refuseStale(w http.ResponseWriter, r *http.Request, expected, current int) bool {
+	if expected == current {
+		return false
+	}
+	cur := int64(current)
+	p := apicontract.ProblemFor(http.StatusPreconditionFailed, "stale_version", "The version has changed since the supplied ETag")
+	p.CurrentVersion = &cur
+	apicontract.WriteETag(w, cur)
+	apicontract.WriteProblem(w, r, p)
+	return true
 }
 
 // lifecycle handles POST /v1/policies/{policy_id}/versions/{version_id}/<command>
@@ -794,7 +886,10 @@ func (h *Handler) lifecycle(command string) http.HandlerFunc {
 		if !decodeOptionalJSON(w, r, &req) {
 			return
 		}
-		// Fetch the current version first for If-Match check
+		expected, ok := commandVersion(w, r, req.ExpectedVersion)
+		if !ok {
+			return
+		}
 		existing, err := h.store.FindPolicyVersionByID(r.Context(), versionID)
 		if err != nil {
 			if errors.Is(err, domain.ErrPolicyVersionNotFound) {
@@ -838,17 +933,7 @@ func (h *Handler) lifecycle(command string) http.HandlerFunc {
 		if !h.authorize(w, r, principalID, action, existing.LegalEntityID) {
 			return
 		}
-
-		// Check If-Match using standard helper against the current version from store
-		if !h.requireIfMatch(w, r, int64(existing.RowVersion)) {
-			return
-		}
-		// Also verify the expected_version from body matches the current version
-		if req.ExpectedVersion != nil && int64(*req.ExpectedVersion) != int64(existing.RowVersion) {
-			p := apicontract.ProblemFor(http.StatusPreconditionFailed, "stale_version", "The aggregate has changed since the supplied ETag")
-			currentVer := int64(existing.RowVersion)
-			p.CurrentVersion = &currentVer
-			apicontract.WriteProblem(w, r, p)
+		if refuseStale(w, r, expected, existing.RowVersion) {
 			return
 		}
 		reason := strings.TrimSpace(req.ReasonCode)
@@ -871,25 +956,11 @@ func (h *Handler) lifecycle(command string) http.HandlerFunc {
 			return
 		}
 
-		// The checker's actions name the maker, so authorization-svc's
-		// own-object SoD applies as well as this service's own check.
-		switch command {
-		case domain.CommandApprove, domain.CommandActivate, domain.CommandSchedule:
-			r = r.WithContext(authz.WithResourceOwner(r.Context(), existing.CreatedByPrincipalID))
-		case domain.CommandReviewSuspension:
-			if existing.SuspendedByPrincipalID != nil {
-				r = r.WithContext(authz.WithResourceOwner(r.Context(), *existing.SuspendedByPrincipalID))
-			}
-		}
-		if !h.authorize(w, r, principalID, action, existing.LegalEntityID) {
-			return
-		}
-
 		res, err := h.store.Transition(r.Context(), domain.TransitionCommand{
 			PolicyVersionID:   versionID,
 			Command:           command,
 			ActorID:           principalID,
-			ExpectedVersion:   &existing.RowVersion,
+			ExpectedVersion:   &expected,
 			Reason:            reason,
 			ApprovalReference: strings.TrimSpace(req.ApprovalReference),
 			Outcome:           outcome,
@@ -916,6 +987,9 @@ func (h *Handler) writeTransitionError(w http.ResponseWriter, r *http.Request, v
 	switch {
 	case errors.Is(err, domain.ErrPolicyVersionNotFound):
 		writeError(w, r, http.StatusNotFound, codeNotFound, "policy_version_not_found", "", extra)
+	case errors.Is(err, domain.ErrCertificationRequired):
+		writeError(w, r, http.StatusConflict, codeCertificationRequired, "certification_required",
+			err.Error()+": run the family's test suite against this version (POST /v1/policy-versions/{id}/test-runs) and waive or fix what fails", extra)
 	case errors.Is(err, domain.ErrApprovalRequired):
 		writeError(w, r, http.StatusConflict, codeApprovalRequired, "approval_required",
 			"submit the version for review and have an independent approver approve it before activation", extra)
@@ -941,13 +1015,14 @@ func (h *Handler) writeTransitionError(w http.ResponseWriter, r *http.Request, v
 // ── reads ────────────────────────────────────────────────────────────────────
 
 // ListVersionHistory handles GET /v1/policies/{policy_id}/versions: every
-// version visible to the caller's tenant, newest first.
+// version visible to the caller's tenant, newest first, paged (API-4).
 func (h *Handler) ListVersionHistory(w http.ResponseWriter, r *http.Request) {
 	policyID := chi.URLParam(r, "policy_id")
-	if _, ok := h.requireTenant(w, r); !ok {
+	if !requireUUID(w, r, "policy_id", policyID) {
 		return
 	}
-	if !requireUUID(w, r, "policy_id", policyID) {
+	lr, ok := h.beginList(w, r, nil)
+	if !ok {
 		return
 	}
 	if _, ok := h.gate(w, r, h.opts.ReadAuthz, authz.ActionPolicyRead, nil); !ok {
@@ -962,15 +1037,10 @@ func (h *Handler) ListVersionHistory(w http.ResponseWriter, r *http.Request) {
 		h.storeUnavailable(w, r, "ListVersionHistory", err)
 		return
 	}
-	if results == nil {
-		results = []*domain.PolicyVersion{}
-	}
-	// List endpoint: ETag based on first item's row_version
-	var etag int64
-	if len(results) > 0 {
-		etag = int64(results[0].RowVersion)
-	}
-	writeJSONWithETag(w, http.StatusOK, results, etag)
+	// No ETag on a list: a list is not an If-Match target, and the first
+	// item's row_version (which this used) stayed the same when any other
+	// version moved, so a cache would keep serving the stale list.
+	pageOf(h, w, r, lr, results)
 }
 
 // GetPolicyVersionByID handles GET /v1/policy-versions/{version_id} — the
@@ -1007,7 +1077,8 @@ func (h *Handler) ListTransitions(w http.ResponseWriter, r *http.Request) {
 	if !requireUUID(w, r, "version_id", versionID) {
 		return
 	}
-	if _, ok := h.requireTenant(w, r); !ok {
+	lr, ok := h.beginList(w, r, nil)
+	if !ok {
 		return
 	}
 	if _, ok := h.gate(w, r, h.opts.ReadAuthz, authz.ActionPolicyRead, nil); !ok {
@@ -1022,15 +1093,9 @@ func (h *Handler) ListTransitions(w http.ResponseWriter, r *http.Request) {
 		h.storeUnavailable(w, r, "ListTransitions", err)
 		return
 	}
-	if ts == nil {
-		ts = []*domain.VersionTransition{}
-	}
-	// List endpoint: ETag based on first item's transition_id
-	var etag int64
-	if len(ts) > 0 {
-		etag = ts[0].TransitionID
-	}
-	writeJSONWithETag(w, http.StatusOK, ts, etag)
+	// No ETag on a list (see ListVersionHistory): a transition id is not a
+	// version of anything a caller could send back.
+	pageOf(h, w, r, lr, ts)
 }
 
 // ── plumbing ─────────────────────────────────────────────────────────────────
@@ -1046,11 +1111,6 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func writeJSONWithETag(w http.ResponseWriter, status int, body any, version int64) {
 	apicontract.WriteETag(w, version)
 	writeJSON(w, status, body)
-}
-
-// requireIfMatch checks the If-Match header and returns false if the request should be rejected.
-func (h *Handler) requireIfMatch(w http.ResponseWriter, r *http.Request, currentVersion int64) bool {
-	return apicontract.CheckIfMatch(w, r, currentVersion)
 }
 
 // maxRequestBytes caps a JSON request body.

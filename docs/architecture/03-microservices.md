@@ -472,7 +472,11 @@ The sections below apply this structure to the most important services first.
 - `POST /v1/policies/evaluate` — evaluate policy against action context (returns `evidence_id`; a repeated `decision_id` returns the original result)
 - `POST /v1/policies`, `GET /v1/policies/{policy_id}` — policy families (tenant-owned by default; `scope: GLOBAL` for platform families)
 - `POST /v1/policies/{policy_id}/versions`, `GET /v1/policies/{policy_id}/versions` — CreatePolicyDraft; retrieve policy version history
-- `POST /v1/policies/{policy_id}/versions/{version_id}/submit-review | approve | activate | schedule | suspend | review-suspension | retire` — SubmitPolicyReview, ApprovePolicy, ActivatePolicy, ScheduleActivation, EmergencySuspendPolicy (and its independent review), retirement; SupersedePolicy is the activation of a successor. Each needs `If-Match` / `expected_version`
+- `POST /v1/policies/{policy_id}/versions/{version_id}/submit-review | approve | activate | schedule | suspend | review-suspension | retire` — SubmitPolicyReview, ApprovePolicy, ActivatePolicy, ScheduleActivation, EmergencySuspendPolicy (and its independent review), retirement; SupersedePolicy is the activation of a successor. Each needs the version's row_version as `If-Match` or `expected_version` (they must agree when both are sent; a wildcard is refused; neither is 428; a stale one is 412)
+- `POST /v1/policies/{policy_id}/retire` — retire a policy family (refused while a version is ACTIVE or SCHEDULED; final)
+- REF-07 accounting policy (recorded 16 Nov 2026): `POST`/`GET /v1/accounting-policies`, `GET /v1/accounting-policies/resolve | explain`, `GET /v1/accounting-policies/versions/{id}` and `…/{id}/impact`, `POST /v1/accounting-policies/versions/{id}/submit-review | approve | activate | supersede | emergency-suspend | review-suspension` (emergency suspension only under a live break-glass session)
+- Registers and KPIs (API-4 paged): `GET /v1/policies/summary`, `GET /v1/policy-families`, `GET /v1/policy-versions`, `GET /v1/policy-evaluations`, `GET /v1/control-test-definitions`, `GET /v1/attestations`; `POST /v1/policy-evaluations/{evidence_id}/redeliver` re-queues evidence the ledger refused
+- V-001 PDC-05 (recorded 16 Nov 2026): test cases `POST`/`GET /v1/policies/{policy_id}/test-cases` and `…/{test_case_id}/retire`; runs `POST`/`GET /v1/policy-versions/{version_id}/test-runs`, `GET /v1/policy-test-runs/{id}`; `GET /v1/policy-versions/{version_id}/certification`; waivers `POST`/`GET /v1/policy-versions/{version_id}/waivers`, `POST /v1/policy-waivers/{id}/approve | revoke`; `POST /v1/simulations`, `GET /v1/simulations/{id}` and `…/differences`; `POST /v1/policy-versions/{version_id}/rollback-draft`. Activation and scheduling of an evaluable version require certification (409 `CERTIFICATION_REQUIRED`)
 - `GET /v1/policy-versions/{version_id}`, `GET /v1/policy-versions/compare?base=&target=`, `GET /v1/policy-versions/{version_id}/transitions` — GetPolicyVersion, ComparePolicyVersions, lifecycle evidence
 - `GET /v1/policy-evaluations/{evidence_id}` — evaluation evidence
 - Control tests and attestations (doc7 §E3 / §E6, traceability GOV-02): `POST /v1/control-test-definitions`, `GET /v1/control-test-definitions/{id}`, `POST`/`GET /v1/control-test-definitions/{id}/executions`, `GET /v1/controls/{control_ref}/effectiveness`, `POST /v1/attestations`, `GET /v1/attestations/{id}`, `POST /v1/attestations/{id}/revoke`
@@ -490,6 +494,8 @@ Errors carry the GCP §16 stable class in `code`. A conflict between two equally
 - policy.rule.retired
 
 *Also published (recorded 14 Oct 2026 for the GOV-05 lifecycle, in the same naming pending group decision C3):* `policy.version.submitted`, `policy.version.approved`, `policy.version.scheduled`, `policy.version.suspended`, `policy.version.suspension_reviewed`, `policy.applicability.conflicted`. `policy.rule.retired` covers both supersession and retirement (its payload names which).
+
+*Also published (recorded 16 Nov 2026; the full contract is `services/policy-svc/asyncapi.yaml`):* `policy.retired` (family), `policy.evidence.redelivery_requested`; REF-07 `accounting.policy.approved | activated | superseded | suspended`; doc7 `policy.control_test.defined | executed`, `policy.attestation.signed | revoked`; V-001 PDC-05 `policy.test_case.added | retired`, `policy.test_run.completed`, `policy.version.certified`, `policy.waiver.requested | approved | revoked`, `policy.simulation.completed`.
 
 **Consumed Events**
 
@@ -587,6 +593,8 @@ Errors carry the GCP §16 stable class in `code`. A conflict between two equally
 
 **Critical Constraint**
  Historical actions must always be explainable against the rule set active at time of execution.
+
+- Due-instant rule for daylight-saving changes (recorded 23 Nov 2026, JR-DST-1): `CalculateDueDate` resolves the authority-local cutoff or end of day through `domain.ResolveLocalInstant` (`services/jurisdiction-rules-svc/internal/domain/obligations.go`). A local time that does not exist (clocks go forward) resolves to the first instant after the gap; a local time that occurs twice (clocks go back) resolves to the earlier occurrence. The calculation's explanation names the rule applied (`NONEXISTENT_FIRST_INSTANT_AFTER_GAP` or `AMBIGUOUS_EARLIER_OCCURRENCE`), satisfying R-001 §7.3 and R-INV-18.
 
 ## **8.3 Authorization Service**
 
@@ -765,6 +773,8 @@ Errors carry the GCP §16 stable class in `code`. A conflict between two equally
 
 *Physical surface (21 Oct 2026): `services/obligations-svc/openapi.yaml`. obligation.updated also covers attribute edits, workflow link changes and filing-status changes, naming them in `changed_fields`.*
 
+*Deadline clocks (recorded 23 Nov 2026; R-001 WFC-05): obligations-svc owns `obligation_clocks` (classes HARD_LEGAL, REGULATORY, CONTRACTUAL, INTERNAL_SLA, ADVISORY; states PLANNED, ACTIVE, DUE_SOON, DUE, OVERDUE, FULFILLED, WAIVED, NOT_APPLICABLE, SUPERSEDED), `obligation_clock_milestones`, `obligation_clock_transitions` (append-only), `escalation_policies` (versioned) and `escalation_events` (append-only), migration 000016. A due instant is only ever jurisdiction-rules-svc's `POST /v1/obligation-calculations:calculate` answer, stored with its provenance; it never changes in place (recalculation supersedes). The state is computed at read time. Routes: `POST /v1/obligations/evaluate`, `POST /v1/obligations/{id}/satisfy`, `GET /v1/obligations/summary`, `…/clocks[/{cid}[/activate|satisfy|waive|not-applicable|recalculate|transitions|milestones|escalations|available-actions]]`, `/v1/escalation-policies…`. Also published: `obligation.clock.started`, `.activated`, `.due_soon`, `.due`, `.overdue`, `.fulfilled`, `.waived`, `.not_applicable`, `.superseded` and `obligation.escalated` (`services/obligations-svc/asyncapi.yaml`). Consumed: `business-calendar.updated`, `jurisdiction.calendar.changed`. Decision D-OB-1 (user, 23 Nov 2026): ComplianceStatus, ExceptionCase and EscalationRecord are not owned here (§13.7, §13.9, §18); migration 000015 removed them.*
+
 **Critical Enhancement**
  Supports **Atomic Linking** — every obligation must be able to point to the originating source, including specific contract clause, filing rule, policy mandate, or jurisdictional rule reference.
 
@@ -831,6 +841,8 @@ Errors carry the GCP §16 stable class in `code`. A conflict between two equally
 
 **Critical Constraint**
  Every governance decision must be queryable by audit, actor, entity, action, rule basis, and time range.
+
+*Writers (recorded 25 Nov 2026, DL-0): policy-svc, workflow-svc, authorization-svc (`DENY` / `REQUIRE_APPROVAL` only), jurisdiction-rules-svc, obligations-svc and evidence-requirements-svc append through the :8450 mTLS listener as their service principals (`svc-<name>`, `GOVERNANCE_DECISION_RECORD` by authorization-svc migrations 000043 and 000046), each from a transactional outbox; the person who caused the decision is in `evaluation_context.on_behalf_of`. Only service identities hold `GOVERNANCE_DECISION_RECORD` (D-DL-2); people read, verify and export. Outcome words and domain keywords of the new writers: migration 000020. Catalogue: `services/governance-decision-log-svc/CONTEXT.md` "Writers".*
 
 # **09 · IDENTITY, SCOPE ****&**** FOUNDATION SERVICES**
 
@@ -944,6 +956,8 @@ Errors carry the GCP §16 stable class in `code`. A conflict between two equally
 
 **Critical Constraint**
  Notification failure must not collapse source operational workflows.
+
+*Workflow notices (added 26 Nov 2026): workflow-svc tells approvers a request waits on them and requesters how it was decided. Each transition writes its notices to workflow-svc's `outbox_events` (destination `notification`) in its own transaction; a relay sends them to `POST /v1/notifications` (IN_APP and EMAIL) as `svc-workflow` (`NOTIFICATION_SEND`, `IDENTITY_PRINCIPAL_READ`, authorization-svc 000048), keyed `workflow-notice:<outbox id>`. A notice that cannot be delivered waits and retries; the decision is never affected. Physical surface: `services/workflow-svc/internal/notify`, `internal/notifyclient`.*
 
 ## **9.8 Search Index Service**
 

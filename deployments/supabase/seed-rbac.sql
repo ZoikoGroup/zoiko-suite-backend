@@ -193,6 +193,53 @@ ON CONFLICT (principal_role_assignment_id) DO UPDATE
         effective_to    = NULL,
         legal_entity_id = NULL;
 
+-- ── 5. workflow-svc's notice sender ─────────────────────────────────────────
+-- workflow-svc tells approvers a request waits on them and requesters how it
+-- was decided (26 Nov 2026). Its outbox relay sends each notice to
+-- notification-svc's POST /v1/notifications as its own service principal,
+-- which needs NOTIFICATION_SEND; notification-svc then resolves an email
+-- recipient's address from identity-context-svc as that same principal, which
+-- needs IDENTITY_PRINCIPAL_READ. This role holds those two actions and nothing
+-- else (authorization-svc 000048 grants the same in every tenant); without it
+-- every decision still commits and its notices wait in the outbox.
+INSERT INTO authorization_svc.roles
+    (role_id, tenant_id, role_code, role_name, role_scope_type,
+     active_flag, created_by_principal_id)
+VALUES
+    ('a0000000-0000-4000-8000-000000000003',
+     '11111111-1111-1111-1111-111111111111',
+     'WORKFLOW_NOTIFIER',
+     'Workflow notice sender (service principal)',
+     'TENANT',
+     TRUE,
+     'servicectl-seed')
+ON CONFLICT (tenant_id, role_code) DO UPDATE
+    SET active_flag = TRUE,
+        role_name   = EXCLUDED.role_name;
+
+INSERT INTO authorization_svc.permission_bundles
+    (permission_bundle_id, role_id, bundle_code, permitted_actions, active_flag)
+VALUES
+    ('b0000000-0000-4000-8000-000000000003',
+     'a0000000-0000-4000-8000-000000000003',
+     'WORKFLOW_NOTIFIER_BUNDLE',
+     '["NOTIFICATION_SEND", "IDENTITY_PRINCIPAL_READ"]'::jsonb,
+     TRUE)
+ON CONFLICT (role_id, bundle_code) DO UPDATE
+    SET permitted_actions = EXCLUDED.permitted_actions,
+        active_flag       = TRUE;
+
+INSERT INTO authorization_svc.principal_role_assignments
+    (principal_role_assignment_id, principal_id, role_id, legal_entity_id,
+     effective_from, effective_to, assigned_by)
+VALUES
+    ('c0000000-0000-4000-8000-000000000004', 'svc-workflow',
+     'a0000000-0000-4000-8000-000000000003', NULL, NOW() - INTERVAL '1 minute', NULL, 'servicectl-seed')
+ON CONFLICT (principal_role_assignment_id) DO UPDATE
+    SET effective_from  = EXCLUDED.effective_from,
+        effective_to    = NULL,
+        legal_entity_id = NULL;
+
 -- =============================================================================
 -- VERIFICATION — this reproduces the service's own evaluation query
 -- =============================================================================

@@ -64,3 +64,9 @@ b4634f13b0fe152baeb1971abbf6c1c68a7c8852:services/eventing/integration/integrati
 # stored sealed and never echoed. It is not a secret. The line now carries
 # `gitleaks:allow`; this covers the commit already pushed.
 37d5b86950db3d6e54cb4d3575837f902d2dbbb4:services/siem-integration-svc/internal/handler/pg_integration_test.go:generic-api-key:162
+
+# PR #268 (shashi-changes, DL-3): services/authorization-svc/internal/ledger/ledger_test.go line 18
+# carries a test fixture UUID (AccessDecisionID) flagged as generic-api-key.
+# It is not a secret; the line now carries `gitleaks:allow`; this covers the
+# commit that introduced it, already pushed.
+1f0357f397b3edc30ec2e43d6afa86dc8eee607a:services/authorization-svc/internal/ledger/ledger_test.go:generic-api-key:18

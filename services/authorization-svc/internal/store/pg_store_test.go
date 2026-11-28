@@ -51,7 +51,7 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 	// for the same reason: 000009 creates them, and CREATE OR REPLACE FUNCTION
 	// cannot change a function's return type, so a stale definition from an
 	// earlier schema version fails the migration rather than being replaced.
-	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS principal_role_assignment_history, authz_versions, sod_exceptions, entity_status_projection, authz_config_history, idempotency_keys, outbox_events, access_reviews, workload_bindings, authority_limits, support_sessions, break_glass_sessions, privileged_sessions, principal_status_projection, abac_rules, access_decision_log, sod_rules, delegated_authorities, principal_role_assignments, permission_bundles, roles CASCADE;")
+	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS decision_log_outbox, principal_role_assignment_history, authz_versions, sod_exceptions, entity_status_projection, authz_config_history, idempotency_keys, outbox_events, access_reviews, workload_bindings, authority_limits, support_sessions, break_glass_sessions, privileged_sessions, principal_status_projection, abac_rules, access_decision_log, sod_rules, delegated_authorities, principal_role_assignments, permission_bundles, roles CASCADE;")
 	_, _ = pool.Exec(ctx, "DROP VIEW IF EXISTS access_decision_log_retention_status;")
 	_, _ = pool.Exec(ctx, "DROP FUNCTION IF EXISTS detach_access_decision_log_partitions_before(DATE);")
 	_, _ = pool.Exec(ctx, "DROP FUNCTION IF EXISTS create_access_decision_log_partition(DATE);")
@@ -150,8 +150,17 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 		"000042_decision_log_service_readers.up.sql",
 		// 000043: svc-policy / svc-workflow ledger writers and svc-access-control, per tenant.
 		"000043_platform_service_identity_grants.up.sql",
+		// 000044-000048: later platform service identities (obligations,
+		// identity provisioning, the decision-log writers, workflow notices)
+		// and the decision-log outbox. Each migration replaces the same grant
+		// function, so they must run in filename order.
+		"000044_obligations_service_identity.up.sql",
+		"000045_identity_provisioning_operator.up.sql",
+		"000046_decision_log_writers.up.sql",
+		"000047_decision_log_outbox.up.sql",
+		"000048_workflow_notifier.up.sql",
 	}
-	// Three migrations have now been missed from this list. Refuse to run
+	// Migrations have been missed from this list before. Refuse to run
 	// against a schema the list does not fully describe.
 	onDisk, err := filepath.Glob("../../deployments/migrations/*.up.sql")
 	if err != nil {

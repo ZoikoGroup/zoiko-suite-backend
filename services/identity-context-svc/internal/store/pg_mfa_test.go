@@ -169,7 +169,7 @@ func TestMigration000012_ShapeAndDown_Integration(t *testing.T) {
 	}
 
 	_, filename, _, _ := runtime.Caller(0)
-	down, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "../../deployments/migrations/000012_totp_second_factor.down.sql"))
+	down, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "../../deployments/migrations/000021_totp_second_factor.down.sql"))
 	if err != nil {
 		t.Fatal(err)
 	}
